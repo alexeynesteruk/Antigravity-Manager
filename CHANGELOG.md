@@ -1038,9 +1038,9 @@
             -   **Responsive Status Sync**: Fixed the "sleep-before-check" logic, ensuring immediate UI status updates on startup.
             -   **Persistence Bug Fix**: Resolved race conditions where high-frequency polling could rollback manual proxy additions.
         -   **Proxy Pool 2.0 Logic Breakdown**:
-            -   **Scene 1: Full-chain Locking** — Once Account A is bound to Node-01, all requests (Token refresh, Quota sync, AI inference) are forced through Node-01. Google sees a consistent IP for the account.
-            -   **Scene 2: Auto-Isolation for Public Pool** — Account B has no binding. Node-01 is automatically excluded from the public rotation as it's exclusively used by A, eliminating association risks.
-            -   **Scene 3: Self-healing & Failover** — If Node-01 fails and "Auto failover" is on, Account A temporarily borrows from the public pool for urgent tasks (e.g., Token refresh) with audit logs.
+            -   **Scene 1: Full-chain Locking** - Once Account A is bound to Node-01, all requests (Token refresh, Quota sync, AI inference) are forced through Node-01. Google sees a consistent IP for the account.
+            -   **Scene 2: Auto-Isolation for Public Pool** - Account B has no binding. Node-01 is automatically excluded from the public rotation as it's exclusively used by A, eliminating association risks.
+            -   **Scene 3: Self-healing & Failover** - If Node-01 fails and "Auto failover" is on, Account A temporarily borrows from the public pool for urgent tasks (e.g., Token refresh) with audit logs.
         -   **[New Feature] UserToken Page & Monitoring Enhancements (PR #1475)**:
             -   **Page Navigation**: Added dedicated UserToken management page for granular token control.
             -   **Monitoring**: Enhanced system monitoring and routing integration for better observability.
