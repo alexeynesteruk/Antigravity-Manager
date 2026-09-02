@@ -514,6 +514,7 @@ pub fn read_from_system_keyring() -> Result<crate::modules::migration::ImportedO
     #[cfg(target_os = "macos")]
     {
         use base64::{engine::general_purpose::STANDARD, Engine as _};
+        use std::process::Command;
         let output = Command::new("security")
             .args([
                 "find-generic-password",
@@ -607,6 +608,7 @@ pub fn read_from_system_keyring() -> Result<crate::modules::migration::ImportedO
 
     #[cfg(target_os = "linux")]
     {
+        use std::process::Command;
         let output = Command::new("secret-tool")
             .args([
                 "lookup",
