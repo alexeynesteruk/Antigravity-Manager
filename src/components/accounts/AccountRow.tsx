@@ -26,7 +26,7 @@ interface AccountRowProps {
 
 function AccountRow({ account, selected, onSelect, isCurrent, isRefreshing, isSwitching = false, onSwitch, onRefresh, onViewDetails, onExport, onDelete, onToggleProxy, onViewDevice }: AccountRowProps) {
     const { t } = useTranslation();
-    // [重构] 按优先级查找配额模型
+    // [Refactor] Find the quota model by priority
     const geminiProModel = findQuotaModel(account.quota?.models, 'gemini-pro');
     const geminiFlashModel = findQuotaModel(account.quota?.models, 'gemini-flash');
 
@@ -49,7 +49,7 @@ function AccountRow({ account, selected, onSelect, isCurrent, isRefreshing, isSw
     const claudeModel = findQuotaModel(account.quota?.models, 'claude');
     const isDisabled = Boolean(account.disabled);
 
-    // 颜色映射，避免动态类名被 Tailwind purge
+    // Color mapping, to avoid dynamic class names being purged by Tailwind
     const getColorClass = (percentage: number) => {
         const color = getQuotaColor(percentage);
         switch (color) {
@@ -75,7 +75,7 @@ function AccountRow({ account, selected, onSelect, isCurrent, isRefreshing, isSw
             isCurrent && "bg-blue-50/50 dark:bg-blue-900/10",
             (isRefreshing || isDisabled) && "opacity-70"
         )}>
-            {/* 序号 */}
+            {/* Index */}
             <td className="pl-6 py-1 w-12">
                 <input
                     type="checkbox"
@@ -86,7 +86,7 @@ function AccountRow({ account, selected, onSelect, isCurrent, isRefreshing, isSw
                 />
             </td>
 
-            {/* 邮箱 */}
+            {/* Email */}
             <td className="px-4 py-1">
                 <div className="flex items-center gap-3">
                     <span className={cn(
@@ -130,7 +130,7 @@ function AccountRow({ account, selected, onSelect, isCurrent, isRefreshing, isSw
                             </span>
                         )}
 
-                        {/* 订阅类型徽章 */}
+                        {/* Subscription type badge */}
                         {account.quota?.subscription_tier && (() => {
                             const tier = account.quota.subscription_tier.toLowerCase();
                             if (tier.includes('ultra')) {
@@ -160,7 +160,7 @@ function AccountRow({ account, selected, onSelect, isCurrent, isRefreshing, isSw
                 </div>
             </td>
 
-            {/* 模型配额 */}
+            {/* Model quota */}
             <td className="px-4 py-1">
                 {account.quota?.is_forbidden ? (
                     <div className="flex items-center gap-2 text-xs text-red-500 dark:text-red-400 bg-red-50/50 dark:bg-red-900/10 p-1.5 rounded-lg border border-red-100 dark:border-red-900/30">
@@ -306,7 +306,7 @@ function AccountRow({ account, selected, onSelect, isCurrent, isRefreshing, isSw
                 )}
             </td>
 
-            {/* 最后使用 */}
+            {/* Last used */}
             <td className="px-4 py-1">
                 <div className="flex flex-col">
                     <span className="text-xs font-medium text-gray-600 dark:text-gray-400 font-mono whitespace-nowrap">
@@ -318,7 +318,7 @@ function AccountRow({ account, selected, onSelect, isCurrent, isRefreshing, isSw
                 </div>
             </td>
 
-            {/* 操作 */}
+            {/* Actions */}
             <td className="px-4 py-1">
                 <div className="flex items-center gap-0.5 opacity-60 group-hover:opacity-100 transition-opacity">
                     <button

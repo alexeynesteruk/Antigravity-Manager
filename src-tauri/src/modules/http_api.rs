@@ -9,7 +9,7 @@ use axum::{
     Json, Router,
 };
 use serde::{Deserialize, Serialize};
-// 预留 HTTP API 模块，当前未在主流程中启用
+// Reserved HTTP API module, not currently enabled in the main flow
 
 use std::collections::HashMap;
 use std::sync::Arc;

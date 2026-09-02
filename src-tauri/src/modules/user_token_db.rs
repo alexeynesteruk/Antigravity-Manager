@@ -1,8 +1,8 @@
 //! User Token Database Module
-//! UserToken 数据库操作模块
+//! UserToken database operations module
 
 #![allow(dead_code)]
-// 用户令牌存储，部分接口留作后续扩展
+// User token storage; some interfaces are reserved for future extension
 
 use chrono::{FixedOffset, Timelike, Utc};
 use rusqlite::{params, Connection, OptionalExtension};
@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use uuid::Uuid;
 
-/// 用户令牌结构体
+/// User token struct
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UserToken {
     pub id: String,
@@ -21,8 +21,8 @@ pub struct UserToken {
     pub expires_type: String, // "day", "week", "month", "never"
     pub expires_at: Option<i64>,
     pub max_ips: i32,                 // 0 = unlimited
-    pub curfew_start: Option<String>, // "HH:MM" 宵禁开始时间
-    pub curfew_end: Option<String>,   // "HH:MM" 宵禁结束时间
+    pub curfew_start: Option<String>, // "HH:MM" curfew start time
+    pub curfew_end: Option<String>,   // "HH:MM" curfew end time
     pub created_at: i64,
     pub updated_at: i64,
     pub last_used_at: Option<i64>,
@@ -30,7 +30,7 @@ pub struct UserToken {
     pub total_tokens_used: i64,
 }
 
-/// 令牌 IP 绑定结构体
+/// Token IP binding struct
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TokenIpBinding {
     pub id: String,
@@ -42,7 +42,7 @@ pub struct TokenIpBinding {
     pub user_agent: Option<String>,
 }
 
-/// 令牌使用日志结构体
+/// Token usage log struct
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TokenUsageLog {
     pub id: String,
@@ -55,25 +55,25 @@ pub struct TokenUsageLog {
     pub status: u16,
 }
 
-/// 获取数据库路径
+/// Get the database path
 pub fn get_db_path() -> Result<PathBuf, String> {
     let mut path = crate::modules::account::get_data_dir()?;
     path.push("user_tokens.db");
     Ok(path)
 }
 
-/// 连接数据库
+/// Connect to the database
 pub fn connect_db() -> Result<Connection, String> {
     let path = get_db_path()?;
     let conn = Connection::open(&path).map_err(|e| format!("Failed to open database: {}", e))?;
     Ok(conn)
 }
 
-/// 初始化数据库
+/// Initialize the database
 pub fn init_db() -> Result<(), String> {
     let conn = connect_db()?;
 
-    // 创建 user_tokens 表
+    // Create the user_tokens table
     conn.execute(
         "CREATE TABLE IF NOT EXISTS user_tokens (
             id TEXT PRIMARY KEY,
@@ -96,7 +96,7 @@ pub fn init_db() -> Result<(), String> {
     )
     .map_err(|e| format!("Failed to create user_tokens table: {}", e))?;
 
-    // 尝试添加新列 (用于旧数据库迁移，忽略已存在的错误)
+    // Try to add new columns (for migrating old databases, ignore errors if they already exist)
     let _ = conn.execute("ALTER TABLE user_tokens ADD COLUMN expires_type TEXT", []);
     let _ = conn.execute("ALTER TABLE user_tokens ADD COLUMN expires_at INTEGER", []);
     let _ = conn.execute(
@@ -118,7 +118,7 @@ pub fn init_db() -> Result<(), String> {
     let _ = conn.execute("ALTER TABLE user_tokens ADD COLUMN curfew_start TEXT", []);
     let _ = conn.execute("ALTER TABLE user_tokens ADD COLUMN curfew_end TEXT", []);
 
-    // 创建 token_ip_bindings 表
+    // Create the token_ip_bindings table
     conn.execute(
         "CREATE TABLE IF NOT EXISTS token_ip_bindings (
             id TEXT PRIMARY KEY,
@@ -135,7 +135,7 @@ pub fn init_db() -> Result<(), String> {
     )
     .map_err(|e| format!("Failed to create token_ip_bindings table: {}", e))?;
 
-    // 创建 token_usage_logs 表
+    // Create the token_usage_logs table
     conn.execute(
         "CREATE TABLE IF NOT EXISTS token_usage_logs (
             id TEXT PRIMARY KEY,
@@ -152,15 +152,15 @@ pub fn init_db() -> Result<(), String> {
     )
     .map_err(|e| format!("Failed to create token_usage_logs table: {}", e))?;
 
-    // 创建索引
+    // Create indexes
     let _ = conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_token_usage_logs_token_id ON token_usage_logs(token_id)",
         [],
     );
     let _ = conn.execute("CREATE INDEX IF NOT EXISTS idx_token_usage_logs_request_time ON token_usage_logs(request_time)", []);
 
-    // [FIX Issue #1719] 数据清洗：修复旧版本升级导致的 NULL 字段
-    // 这些字段在旧版本中可能不存在，ALTER TABLE 添加后默认为 NULL，导致反序列化失败
+    // [FIX Issue #1719] Data sanitization: fix NULL fields caused by upgrading from old versions
+    // These fields may not have existed in older versions; after ALTER TABLE adds them they default to NULL, causing deserialization to fail
     let _ = conn.execute("UPDATE user_tokens SET expires_type = 'never' WHERE expires_type IS NULL OR expires_type = ''", []);
     let _ = conn.execute(
         "UPDATE user_tokens SET max_ips = 0 WHERE max_ips IS NULL",
@@ -182,7 +182,7 @@ pub fn init_db() -> Result<(), String> {
     Ok(())
 }
 
-/// 创建新令牌
+/// Create a new token
 pub fn create_token(
     username: String,
     expires_type: String,
@@ -190,7 +190,7 @@ pub fn create_token(
     max_ips: i32,
     curfew_start: Option<String>,
     curfew_end: Option<String>,
-    custom_expires_at: Option<i64>, // 自定义过期时间戳 (秒)
+    custom_expires_at: Option<i64>, // Custom expiry timestamp (seconds)
 ) -> Result<UserToken, String> {
     let conn = connect_db()?;
     let id = Uuid::new_v4().to_string();
@@ -216,7 +216,7 @@ pub fn create_token(
                 .unwrap()
                 .timestamp(),
         ),
-        "custom" => custom_expires_at, // 使用自定义时间戳
+        "custom" => custom_expires_at, // Use the custom timestamp
         _ => None,                     // "never" or other
     };
 
@@ -266,7 +266,7 @@ pub fn create_token(
     Ok(user_token)
 }
 
-/// 列出所有令牌
+/// List all tokens
 pub fn list_tokens() -> Result<Vec<UserToken>, String> {
     let conn = connect_db()?;
     let mut stmt = conn
@@ -280,8 +280,8 @@ pub fn list_tokens() -> Result<Vec<UserToken>, String> {
                 token: row.get("token")?,
                 username: row.get("username")?,
                 description: row.get("description")?,
-                enabled: row.get("enabled").unwrap_or(true), // 防御性默认值
-                expires_type: row.get("expires_type").unwrap_or("never".to_string()), // 防御性默认值
+                enabled: row.get("enabled").unwrap_or(true), // Defensive default value
+                expires_type: row.get("expires_type").unwrap_or("never".to_string()), // Defensive default value
                 expires_at: row.get("expires_at").unwrap_or(None),
                 max_ips: row.get("max_ips").unwrap_or(0),
                 curfew_start: row.get("curfew_start").unwrap_or(None),
@@ -303,7 +303,7 @@ pub fn list_tokens() -> Result<Vec<UserToken>, String> {
     Ok(tokens)
 }
 
-/// 获取单个令牌信息
+/// Get information for a single token
 pub fn get_token_by_id(id: &str) -> Result<Option<UserToken>, String> {
     let conn = connect_db()?;
     let mut stmt = conn
@@ -336,7 +336,7 @@ pub fn get_token_by_id(id: &str) -> Result<Option<UserToken>, String> {
     Ok(token)
 }
 
-/// 根据 Token 值获取令牌信息
+/// Get token information based on the Token value
 pub fn get_token_by_value(token: &str) -> Result<Option<UserToken>, String> {
     let conn = connect_db()?;
     let mut stmt = conn
@@ -369,7 +369,7 @@ pub fn get_token_by_value(token: &str) -> Result<Option<UserToken>, String> {
     Ok(token)
 }
 
-/// 更新令牌状态/备注等
+/// Update token status/notes, etc.
 pub fn update_token(
     id: &str,
     username: Option<String>,
@@ -425,7 +425,7 @@ pub fn update_token(
     query.push_str(&format!(" WHERE id = ?{}", param_idx));
     params_vec.push(Box::new(id.to_string()));
 
-    // 将 Vec<Box<dyn ToSql>> 转换为 &[&dyn ToSql]
+    // Convert Vec<Box<dyn ToSql>> to &[&dyn ToSql]
     let params_refs: Vec<&dyn rusqlite::ToSql> = params_vec.iter().map(|p| p.as_ref()).collect();
 
     conn.execute(&query, params_refs.as_slice())
@@ -434,7 +434,7 @@ pub fn update_token(
     Ok(())
 }
 
-/// 续期令牌
+/// Renew a token
 pub fn renew_token(id: &str, expires_type: &str) -> Result<(), String> {
     let conn = connect_db()?;
     let now = Utc::now().timestamp();
@@ -469,7 +469,7 @@ pub fn renew_token(id: &str, expires_type: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// 删除令牌
+/// Delete a token
 pub fn delete_token(id: &str) -> Result<(), String> {
     let conn = connect_db()?;
     conn.execute("DELETE FROM user_tokens WHERE id = ?1", params![id])
@@ -477,7 +477,7 @@ pub fn delete_token(id: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// 获取令牌的所有 IP 绑定
+/// Get all IP bindings for a token
 pub fn get_token_ips(token_id: &str) -> Result<Vec<TokenIpBinding>, String> {
     let conn = connect_db()?;
     let mut stmt = conn
@@ -506,7 +506,7 @@ pub fn get_token_ips(token_id: &str) -> Result<Vec<TokenIpBinding>, String> {
     Ok(bindings)
 }
 
-/// 记录/更新令牌使用情况 (同时处理 user_tokens 和 token_ip_bindings)
+/// Record/update token usage (handles both user_tokens and token_ip_bindings)
 pub fn record_token_usage_and_ip(
     token_id: &str,
     ip: &str,
@@ -522,7 +522,7 @@ pub fn record_token_usage_and_ip(
         .map_err(|e| format!("Failed to create transaction: {}", e))?;
     let now = Utc::now().timestamp();
 
-    // 1. 更新 user_tokens 主表
+    // 1. Update the main user_tokens table
     tx.execute(
         "UPDATE user_tokens SET 
             last_used_at = ?1, 
@@ -533,7 +533,7 @@ pub fn record_token_usage_and_ip(
     )
     .map_err(|e| format!("Failed to update user_tokens stats: {}", e))?;
 
-    // 2. 更新或插入 token_ip_bindings 表
+    // 2. Update or insert into the token_ip_bindings table
     let binding_exists: bool = tx.query_row(
         "SELECT EXISTS(SELECT 1 FROM token_ip_bindings WHERE token_id = ?1 AND ip_address = ?2)",
         params![token_id, ip],
@@ -561,7 +561,7 @@ pub fn record_token_usage_and_ip(
         .map_err(|e| format!("Failed to insert ip binding: {}", e))?;
     }
 
-    // 3. 插入 token_usage_logs 表
+    // 3. Insert into the token_usage_logs table
     let log_id = Uuid::new_v4().to_string();
     tx.execute(
         "INSERT INTO token_usage_logs (
@@ -586,13 +586,13 @@ pub fn record_token_usage_and_ip(
     Ok(())
 }
 
-/// 检查 Token 是否有效 (包含过期时间检查和 IP 限制检查)
-/// 返回: (是否有效, 拒绝原因)
+/// Check whether the Token is valid (includes expiry check and IP limit check)
+/// Returns: (whether valid, rejection reason)
 pub fn validate_token(token_str: &str, ip: &str) -> Result<(bool, Option<String>), String> {
     let token_opt = get_token_by_value(token_str)?;
 
     if let Some(token) = token_opt {
-        // 1. 检查过期时间
+        // 1. Check the expiry time
         if token.expires_type != "never" {
             if let Some(expires_at) = token.expires_at {
                 if expires_at < Utc::now().timestamp() {
@@ -607,11 +607,11 @@ pub fn validate_token(token_str: &str, ip: &str) -> Result<(bool, Option<String>
             }
         }
 
-        // 2. 检查 IP 限制
+        // 2. Check the IP limit
         if token.max_ips > 0 {
             let conn = connect_db()?;
 
-            // 检查当前 IP 是否已绑定
+            // Check whether the current IP is already bound
             let is_bound: bool = conn.query_row(
                 "SELECT EXISTS(SELECT 1 FROM token_ip_bindings WHERE token_id = ?1 AND ip_address = ?2)",
                 params![token.id, ip],
@@ -619,7 +619,7 @@ pub fn validate_token(token_str: &str, ip: &str) -> Result<(bool, Option<String>
             ).unwrap_or(false);
 
             if !is_bound {
-                // 如果未绑定，检查是否达到上限
+                // If not bound, check whether the limit has been reached
                 let current_ip_count: i32 = conn
                     .query_row(
                         "SELECT COUNT(*) FROM token_ip_bindings WHERE token_id = ?1",
@@ -634,10 +634,10 @@ pub fn validate_token(token_str: &str, ip: &str) -> Result<(bool, Option<String>
             }
         }
 
-        // 3. 检查宵禁时间 (Curfew)
-        // 逻辑：如果当前北京时间在 start 和 end 之间，则拒绝
-        // 格式：HH:MM
-        // 使用固定 UTC+8 (北京时间)，不依赖服务器本地时区
+        // 3. Check the curfew time
+        // Logic: reject if the current Beijing time falls between start and end
+        // Format: HH:MM
+        // Uses a fixed UTC+8 (Beijing time), independent of the server's local timezone
         if let (Some(start_str), Some(end_str)) = (&token.curfew_start, &token.curfew_end) {
             if !start_str.is_empty() && !end_str.is_empty() {
                 let beijing_offset = FixedOffset::east_opt(8 * 3600).unwrap();
@@ -645,8 +645,8 @@ pub fn validate_token(token_str: &str, ip: &str) -> Result<(bool, Option<String>
                 let current_time_str =
                     format!("{:02}:{:02}", now_beijing.hour(), now_beijing.minute());
 
-                // 跨午夜处理: start > end (e.g. 23:00 to 06:00)
-                // 正常: start < end (e.g. 09:00 to 18:00)
+                // Handling crossing midnight: start > end (e.g. 23:00 to 06:00)
+                // Normal: start < end (e.g. 09:00 to 18:00)
                 let is_curfew = if start_str > end_str {
                     current_time_str >= *start_str || current_time_str < *end_str
                 } else {
@@ -659,7 +659,7 @@ pub fn validate_token(token_str: &str, ip: &str) -> Result<(bool, Option<String>
             }
         }
 
-        // 一切正常，Token 有效
+        // Everything is fine, the Token is valid
         Ok((true, None))
     } else {
         Ok((
@@ -669,8 +669,8 @@ pub fn validate_token(token_str: &str, ip: &str) -> Result<(bool, Option<String>
     }
 }
 
-/// 获取 IP 关联的用户名 (用于 IP 管理页面)
-/// 返回最近一次使用该 IP 的 Token 所属的用户名
+/// Get the username associated with an IP (used by the IP management page)
+/// Returns the username of the Token that most recently used this IP
 pub fn get_username_for_ip(ip: &str) -> Result<Option<String>, String> {
     let conn = connect_db()?;
     let result: Option<String> = conn

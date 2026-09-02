@@ -33,7 +33,7 @@ function Layout() {
 
     return (
         <div className="h-screen flex flex-col bg-[#FAFBFC] dark:bg-base-300">
-            {/* 全局窗口拖拽区域 - 使用 JS 手动触发拖拽，解决 HTML 属性失效问题 */}
+            {/* Global window drag region - uses JS to manually trigger dragging, fixing the HTML attribute not working */}
             <div
                 className="fixed top-0 left-0 right-0 h-9"
                 style={{

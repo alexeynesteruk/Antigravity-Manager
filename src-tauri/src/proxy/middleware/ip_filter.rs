@@ -7,29 +7,29 @@ use axum::{
     response::{IntoResponse, Response},
 };
 
-/// IP 黑白名单过滤中间件
+/// IP blocklist/allowlist filtering middleware
 pub async fn ip_filter_middleware(
     State(state): State<AppState>,
     request: Request,
     next: Next,
 ) -> Response {
-    // 提取客户端 IP
+    // Extract the client IP
     let client_ip = extract_client_ip(&request);
 
     if let Some(ip) = &client_ip {
-        // 读取安全配置
+        // Read the security config
         let security_config = state.security.read().await;
 
-        // 1. 检查白名单 (如果启用白名单模式,只允许白名单 IP)
+        // 1. Check the allowlist (if allowlist mode is enabled, only allowlisted IPs are allowed)
         if security_config.security_monitor.whitelist.enabled {
             match security_db::is_ip_in_whitelist(ip) {
                 Ok(true) => {
-                    // 在白名单中,直接放行
+                    // In the allowlist, pass through directly
                     tracing::debug!("[IP Filter] IP {} is in whitelist, allowing", ip);
                     return next.run(request).await;
                 }
                 Ok(false) => {
-                    // 不在白名单中,且启用了白名单模式,拒绝访问
+                    // Not in the allowlist, and allowlist mode is enabled, deny access
                     tracing::warn!("[IP Filter] IP {} not in whitelist, blocking", ip);
                     return create_blocked_response(
                         ip,
@@ -41,7 +41,7 @@ pub async fn ip_filter_middleware(
                 }
             }
         } else {
-            // 白名单优先模式: 如果在白名单中,跳过黑名单检查
+            // Allowlist-priority mode: if in the allowlist, skip the blocklist check
             if security_config
                 .security_monitor
                 .whitelist
@@ -53,7 +53,7 @@ pub async fn ip_filter_middleware(
                         return next.run(request).await;
                     }
                     Ok(false) => {
-                        // 继续检查黑名单
+                        // Continue to check the blocklist
                     }
                     Err(e) => {
                         tracing::error!("[IP Filter] Failed to check whitelist: {}", e);
@@ -62,13 +62,13 @@ pub async fn ip_filter_middleware(
             }
         }
 
-        // 2. 检查黑名单
+        // 2. Check the blocklist
         if security_config.security_monitor.blacklist.enabled {
             match security_db::get_blacklist_entry_for_ip(ip) {
                 Ok(Some(entry)) => {
                     tracing::warn!("[IP Filter] IP {} is in blacklist, blocking", ip);
 
-                    // 构建详细的封禁消息
+                    // Build a detailed ban message
                     let reason = entry
                         .reason
                         .as_deref()
@@ -102,7 +102,7 @@ pub async fn ip_filter_middleware(
                     let detailed_message =
                         format!("Access denied. Reason: {}. {}", reason, ban_type);
 
-                    // 记录被封禁的访问日志
+                    // Log the blocked access
                     let log = security_db::IpAccessLog {
                         id: uuid::Uuid::new_v4().to_string(),
                         client_ip: ip.clone(),
@@ -131,7 +131,7 @@ pub async fn ip_filter_middleware(
                     return create_blocked_response(ip, &detailed_message);
                 }
                 Ok(None) => {
-                    // 不在黑名单中,放行
+                    // Not in the blocklist, allow
                     tracing::debug!("[IP Filter] IP {} not in blacklist, allowing", ip);
                 }
                 Err(e) => {
@@ -143,20 +143,20 @@ pub async fn ip_filter_middleware(
         tracing::warn!("[IP Filter] Unable to extract client IP from request");
     }
 
-    // 放行请求
+    // Allow the request through
     next.run(request).await
 }
 
-/// 从请求中提取客户端 IP
+/// Extracts the client IP from a request
 fn extract_client_ip(request: &Request) -> Option<String> {
-    // 1. 优先从 X-Forwarded-For 提取 (取第一个 IP)
+    // 1. Prefer extracting from X-Forwarded-For (take the first IP)
     request
         .headers()
         .get("x-forwarded-for")
         .and_then(|v| v.to_str().ok())
         .map(|s| s.split(',').next().unwrap_or(s).trim().to_string())
         .or_else(|| {
-            // 2. 备选从 X-Real-IP 提取
+            // 2. Fall back to extracting from X-Real-IP
             request
                 .headers()
                 .get("x-real-ip")
@@ -164,8 +164,8 @@ fn extract_client_ip(request: &Request) -> Option<String> {
                 .map(|s| s.to_string())
         })
         .or_else(|| {
-            // 3. 最后尝试从 ConnectInfo 获取 (TCP 连接 IP)
-            // 这可以解决本地开发/测试时没有代理头导致 IP 获取失败的问题
+            // 3. Finally, try getting it from ConnectInfo (the TCP connection IP)
+            // This handles local dev/testing where the absence of proxy headers would otherwise cause IP extraction to fail
             request
                 .extensions()
                 .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
@@ -173,7 +173,7 @@ fn extract_client_ip(request: &Request) -> Option<String> {
         })
 }
 
-/// 创建被封禁的响应
+/// Creates a blocked response
 fn create_blocked_response(ip: &str, message: &str) -> Response {
     let body = serde_json::json!({
         "error": {

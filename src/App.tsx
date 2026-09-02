@@ -94,7 +94,7 @@ function App() {
     if (!isTauri()) return;
     const unlistenPromises: Promise<() => void>[] = [];
 
-    // 监听托盘切换账号事件
+    // Listen for the tray's account switch event
     unlistenPromises.push(
       listen('tray://account-switched', () => {
         console.log('[App] Tray account switched, refreshing...');
@@ -103,7 +103,7 @@ function App() {
       })
     );
 
-    // 监听托盘刷新事件
+    // Listen for the tray's refresh event
     unlistenPromises.push(
       listen('tray://refresh-current', () => {
         console.log('[App] Tray refresh triggered, refreshing...');
@@ -112,7 +112,7 @@ function App() {
       })
     );
 
-    // 监听后端全量刷新事件 (Command / Scheduler)
+    // Listen for the backend's full-refresh event (Command / Scheduler)
     unlistenPromises.push(
       listen('accounts://refreshed', () => {
         console.log('[App] Backend triggered quota refresh, syncing UI...');
@@ -142,8 +142,8 @@ function App() {
 
         if (shouldCheck) {
           setShowUpdateNotification(true);
-          // 我们这里只负责显示通知组件，通知组件内部会去调用 check_for_updates
-          // 我们在显示组件后，标记已经检查过了（即便失败或无更新，组件内部也会处理）
+          // We're only responsible for showing the notification component here; internally it calls check_for_updates
+          // After showing the component, we mark it as checked (even on failure or no update, the component handles it internally)
           await invoke('update_last_check_time');
           console.log('[App] Update check cycle initiated and last check time updated.');
         }

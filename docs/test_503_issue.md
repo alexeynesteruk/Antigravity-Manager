@@ -1,14 +1,14 @@
-# 503 错误（Service Unavailable）修复验证指南
+# 503 Error (Service Unavailable) Fix Verification Guide
 
-本指南针对近期反馈的 503 错误（Issue #1794 及后端容量限制）提供测试验证示例。
+This guide provides test verification examples for the recently reported 503 errors (Issue #1794 and backend capacity limits).
 
-## 1. 验证 Project ID 获取失败后的自动回退 (Issue #1794)
+## 1. Verify Automatic Fallback After a Project ID Fetch Failure (Issue #1794)
 
-**场景描述**：
-部分账号（特别是 Free 账号或受限账号）在调用官方接口获取项目 ID 时会报错 `账号无资格获取官方 cloudaicompanionProject`。在修复前，系统会直接跳过该账号导致最终返回 503；修复后，系统将自动使用通用 Project ID (`bamboo-precept-lgxtn`)。
+**Scenario**:
+Some accounts (especially Free accounts or restricted accounts) get an error when calling the official endpoint to fetch a project ID: `Account is not eligible for the official cloudaicompanionProject`. Before the fix, the system would simply skip that account, leading to a 503 in the end; after the fix, the system automatically falls back to a generic Project ID (`bamboo-precept-lgxtn`).
 
-### A. 使用 `curl` 进行基础连通性测试
-请使用一个之前报错 503 的账号对应的 API Key（或直接通过代理）：
+### A. Basic Connectivity Test With `curl`
+Use an API Key corresponding to an account that previously returned 503 (or go through the proxy directly):
 
 ```bash
 curl http://localhost:8045/v1/chat/completions \
@@ -17,15 +17,15 @@ curl http://localhost:8045/v1/chat/completions \
   -d '{
     "model": "gemini-2.0-flash",
     "messages": [
-      {"role": "user", "content": "你好，请确认你的工作状态。"}
+      {"role": "user", "content": "Hello, please confirm your working status."}
     ],
     "stream": false
   }'
 ```
 
-### B. 观察服务端日志 (npm run tauri dev)
-**预期现象**：
-当系统检测到权限问题时，日志中会出现如下 **Warn** 信息，但请求**不应报错 503**，而是继续执行：
+### B. Watch the Server-Side Logs (npm run tauri dev)
+**Expected behavior**:
+When the system detects a permission issue, the following **Warn** message appears in the logs, but the request **should not error with 503**; it should continue executing instead:
 
 ```text
 WARN Failed to fetch project_id for user@example.com, using fallback: Account is not eligible for official cloudaicompanionProject
@@ -34,43 +34,43 @@ DEBUG [TokenManager] Using project_id: bamboo-precept-lgxtn for request
 
 ---
 
-## 2. 验证 Quota Protection（配额保护）对 503 的预防
+## 2. Verify That Quota Protection Prevents 503s
 
-**场景描述**：
-当账号配额耗尽或后端因高负载返回 503 时，系统应正确识别并尝试轮换账号，而不是直接透传 503 给客户端。
+**Scenario**:
+When an account's quota is exhausted, or the backend returns 503 due to high load, the system should correctly detect this and try rotating to another account rather than passing the 503 straight through to the client.
 
-### 测试指令 (Claude CLI)
+### Test Instruction (Claude CLI)
 ```bash
-claude "这段代码哪里有 Bug？[附带一段长代码]"
+claude "Where's the bug in this code? [attach a long code snippet]"
 ```
 
-**验证点**：
-- 如果当前账号返回 503，日志中应显示 `[RetryStrategy] Status 503 detected, rotating account...`。
-- 系统应自动尝试下一个可用账号，直到获得成功响应或消耗完重试次数。
+**Verification points**:
+- If the current account returns 503, the log should show `[RetryStrategy] Status 503 detected, rotating account...`.
+- The system should automatically try the next available account until it gets a successful response or exhausts its retries.
 
 ---
 
-## 3. 区分“代码 Bug”与“后端容量限制” (Opus 4.6)
+## 3. Distinguishing a "Code Bug" From a "Backend Capacity Limit" (Opus 4.6)
 
-**场景描述**：
-由于 `claude-opus-4-6-thinking` 模型目前处于试验阶段，Google 后端时常返回 `No capacity available` (503)。
+**Scenario**:
+Since the `claude-opus-4-6-thinking` model is currently experimental, the Google backend frequently returns `No capacity available` (503).
 
-### 测试指令
+### Test Instruction
 ```bash
-claude --model claude-opus-4-6-thinking "执行一次深度的推理任务，比较 Rust 和 C++ 的异步内存模型。"
+claude --model claude-opus-4-6-thinking "Perform a deep reasoning task comparing the async memory models of Rust and C++."
 ```
 
-**预期结果分析**：
-1. **如果返回 503 且消息包含 "No capacity available"**：
-   - 这是 **Google 后端容量限制**，并非本软件 Bug。
-   - 代理会自动通过重试策略尝试其他账号，但如果所有账号都遇到容量限制，最终会透传此 503。
-   - **建议**：在此负载高峰期切换到 `gemini-2.0-flash-thinking-exp` 或 `claude-3-7-sonnet` 进行测试。
+**Expected result analysis**:
+1. **If it returns 503 with a message containing "No capacity available"**:
+   - This is a **Google backend capacity limit**, not a bug in this software.
+   - The proxy will automatically try other accounts via the retry strategy, but if every account hits the capacity limit, the 503 is eventually passed through.
+   - **Recommendation**: switch to `gemini-2.0-flash-thinking-exp` or `claude-3-7-sonnet` for testing during this peak-load period.
 
-2. **如果返回成功**：
-   - 说明当前后端容量充足。
+2. **If it returns successfully**:
+   - This means the backend currently has sufficient capacity.
 
 ---
 
-## 调试辅助技巧
+## Debugging Tips
 
-如果您想强制模拟 Project ID 失败的场景进行代码级验证，可以在 `src-tauri/src/proxy/token_manager.rs` 中暂时修改模拟逻辑。但在大多数情况下，通过观察日志中是否出现 `using fallback: ...` 字样即可确认修复生效。
+If you want to force-simulate a Project ID failure scenario for code-level verification, you can temporarily modify the simulation logic in `src-tauri/src/proxy/token_manager.rs`. In most cases, though, you can confirm the fix is working simply by watching the logs for the string `using fallback: ...`.

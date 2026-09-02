@@ -1,9 +1,9 @@
-// 预热处理器 - 内部预热 API
+// Warmup handler - internal warmup API
 //
-// 提供 /internal/warmup 端点，支持：
-// - 指定账号（通过 email）
-// - 指定模型（不做映射，直接使用原始模型名称）
-// - 复用代理的所有基础设施（UpstreamClient、TokenManager）
+// Provides the /internal/warmup endpoint, supporting:
+// - Specifying an account (via email)
+// - Specifying a model (no mapping, uses the raw model name directly)
+// - Reusing all of the proxy's infrastructure (UpstreamClient, TokenManager)
 
 use axum::{
     extract::State,
@@ -18,20 +18,20 @@ use crate::proxy::mappers::gemini::wrapper::wrap_request;
 use crate::proxy::monitor::ProxyRequestLog;
 use crate::proxy::server::AppState;
 
-/// 预热请求体
+/// Warmup request body
 #[derive(Debug, Deserialize)]
 pub struct WarmupRequest {
-    /// 账号邮箱
+    /// Account email
     pub email: String,
-    /// 模型名称（原始名称，不做映射）
+    /// Model name (raw name, no mapping)
     pub model: String,
-    /// 可选：直接提供 Access Token（用于不在 TokenManager 中的账号）
+    /// Optional: provide the Access Token directly (for accounts not in TokenManager)
     pub access_token: Option<String>,
-    /// 可选：直接提供 Project ID
+    /// Optional: provide the Project ID directly
     pub project_id: Option<String>,
 }
 
-/// 预热响应
+/// Warmup response
 #[derive(Debug, Serialize)]
 pub struct WarmupResponse {
     pub success: bool,
@@ -40,7 +40,7 @@ pub struct WarmupResponse {
     pub error: Option<String>,
 }
 
-/// 处理预热请求
+/// Handle a warmup request
 pub async fn handle_warmup(
     State(state): State<AppState>,
     Json(req): Json<WarmupRequest>,
@@ -52,7 +52,7 @@ pub async fn handle_warmup(
         req.email, req.model
     );
 
-    // ===== 步骤 1: 获取 Token =====
+    // ===== Step 1: Obtain a token =====
     let (access_token, project_id, account_id) =
         if let (Some(at), Some(pid)) = (&req.access_token, &req.project_id) {
             (at.clone(), pid.clone(), String::new())
@@ -77,12 +77,12 @@ pub async fn handle_warmup(
             }
         };
 
-    // ===== 步骤 2: 根据模型类型构建请求体 =====
+    // ===== Step 2: Build the request body based on model type =====
     let is_claude = req.model.to_lowercase().contains("claude");
     let is_image = req.model.to_lowercase().contains("image");
 
     let body: Value = if is_claude {
-        // Claude 模型：使用 transform_claude_request_in 转换
+        // Claude model: transform using transform_claude_request_in
         let session_id = format!(
             "warmup_{}_{}",
             chrono::Utc::now().timestamp_millis(),
@@ -135,7 +135,7 @@ pub async fn handle_warmup(
             }
         }
     } else {
-        // Gemini 模型：使用 wrap_request
+        // Gemini model: use wrap_request
         let session_id = format!(
             "warmup_{}_{}",
             chrono::Utc::now().timestamp_millis(),
@@ -174,7 +174,7 @@ pub async fn handle_warmup(
         ) // [FIX] Added None for token param
     };
 
-    // ===== 步骤 3: 调用 UpstreamClient =====
+    // ===== Step 3: Call UpstreamClient =====
     let model_lower = req.model.to_lowercase();
     let prefer_non_stream = model_lower.contains("flash-lite") || model_lower.contains("2.5-pro");
 
@@ -195,7 +195,7 @@ pub async fn handle_warmup(
         )
         .await;
 
-    // 如果流式请求失败，尝试非流式请求
+    // If the streaming request fails, try a non-streaming request
     if result.is_err() && !prefer_non_stream {
         result = state
             .upstream
@@ -211,14 +211,14 @@ pub async fn handle_warmup(
 
     let duration = start_time.elapsed().as_millis() as u64;
 
-    // ===== 步骤 4: 处理响应并记录流量日志 =====
+    // ===== Step 4: Process the response and log traffic =====
     match result {
         Ok(call_result) => {
             let response = call_result.response;
             let status = response.status();
             let status_code = status.as_u16();
 
-            // 记录预热请求到流量日志
+            // Log the warmup request to traffic logs
             let log = ProxyRequestLog {
                 id: uuid::Uuid::new_v4().to_string(),
                 timestamp: chrono::Utc::now().timestamp_millis(),
@@ -265,13 +265,15 @@ pub async fn handle_warmup(
             } else {
                 let error_text = response.text().await.unwrap_or_default();
 
-                // [FIX] 预热阶段检测到 403 时，标记账号为 forbidden，避免无效账号继续参与轮询
-                // 如果 account_id 为空（直接传入 access_token 的场景），通过 email 从索引中找到 ID
+                // [FIX] When a 403 is detected during warmup, mark the account as forbidden
+                // to keep invalid accounts out of the rotation.
+                // If account_id is empty (the access_token was passed directly), look up the
+                // ID from the index by email.
                 if status_code == 403 {
                     let resolved_account_id = if !account_id.is_empty() {
                         account_id.clone()
                     } else {
-                        // 尝试通过 email 查找账号 ID
+                        // Try to look up the account ID by email
                         crate::modules::account::find_account_id_by_email(&req.email)
                             .unwrap_or_default()
                     };
@@ -304,7 +306,7 @@ pub async fn handle_warmup(
                     .into_response()
             };
 
-            // 添加响应头，让监控中间件捕获账号信息
+            // Add response headers so the monitoring middleware can capture account info
             if let Ok(email_val) = axum::http::HeaderValue::from_str(&req.email) {
                 response.headers_mut().insert("X-Account-Email", email_val);
             }
@@ -320,7 +322,7 @@ pub async fn handle_warmup(
                 req.email, req.model, e, duration
             );
 
-            // 记录失败的预热请求到流量日志
+            // Log the failed warmup request to traffic logs
             let log = ProxyRequestLog {
                 id: uuid::Uuid::new_v4().to_string(),
                 timestamp: chrono::Utc::now().timestamp_millis(),
@@ -356,7 +358,7 @@ pub async fn handle_warmup(
             )
                 .into_response();
 
-            // 即使失败也添加响应头，以便监控
+            // Add response headers even on failure, for monitoring
             if let Ok(email_val) = axum::http::HeaderValue::from_str(&req.email) {
                 response.headers_mut().insert("X-Account-Email", email_val);
             }

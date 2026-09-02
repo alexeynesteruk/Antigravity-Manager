@@ -10,12 +10,12 @@ use std::os::windows::process::CommandExt;
 #[cfg(target_os = "windows")]
 const CREATE_NO_WINDOW: u32 = 0x08000000;
 
-/// Windows 常见 CLI 安装路径扫描
+/// Scan common Windows CLI install paths
 #[cfg(target_os = "windows")]
 fn scan_windows_cli_paths(cmd: &str) -> Option<PathBuf> {
     let mut common_paths: Vec<PathBuf> = Vec::new();
 
-    // 常见 Windows 安装路径，按优先级排序（仅加入可推导出的绝对路径，避免空/相对路径误判）
+    // Common Windows install paths, ordered by priority (only add derivable absolute paths to avoid empty/relative path misdetection)
     if let Some(app_data) = std::env::var_os("APPDATA") {
         let npm_base = PathBuf::from(app_data).join("npm");
         common_paths.push(npm_base.join(format!("{}.cmd", cmd)));
@@ -49,11 +49,11 @@ fn scan_windows_cli_paths(cmd: &str) -> Option<PathBuf> {
         }
     }
 
-    // 扫描 NVM Windows 目录
+    // Scan the NVM Windows directory
     if let Ok(nvm_home) = std::env::var("NVM_HOME") {
         let nvm_path = PathBuf::from(nvm_home);
         if nvm_path.is_dir() {
-            // NVM Windows 结构: %NVM_HOME%\v{version}\{cmd}.cmd
+            // NVM Windows layout: %NVM_HOME%\v{version}\{cmd}.cmd
             if let Ok(entries) = fs::read_dir(&nvm_path) {
                 for entry in entries.flatten() {
                     let cmd_path = entry.path().join(format!("{}.cmd", cmd));
@@ -61,7 +61,7 @@ fn scan_windows_cli_paths(cmd: &str) -> Option<PathBuf> {
                         tracing::debug!("[CLI-Sync] Detected {} via NVM_HOME: {:?}", cmd, cmd_path);
                         return Some(cmd_path);
                     }
-                    // 也检查 .exe 版本
+                    // Also check the .exe variant
                     let exe_path = entry.path().join(format!("{}.exe", cmd));
                     if is_safe_path(&exe_path) {
                         tracing::debug!("[CLI-Sync] Detected {} via NVM_HOME: {:?}", cmd, exe_path);
@@ -75,7 +75,7 @@ fn scan_windows_cli_paths(cmd: &str) -> Option<PathBuf> {
     None
 }
 
-/// 解析 where 命令输出获取第一个有效路径
+/// Parse the output of the `where` command to get the first valid path
 #[cfg(target_os = "windows")]
 fn parse_where_output(output: &[u8]) -> Option<PathBuf> {
     let stdout = String::from_utf8_lossy(output);
@@ -91,7 +91,7 @@ fn parse_where_output(output: &[u8]) -> Option<PathBuf> {
     None
 }
 
-/// 检查路径是否是 .cmd/.bat 文件
+/// Check whether the path is a .cmd/.bat file
 #[cfg(target_os = "windows")]
 fn is_cmd_file(path: &PathBuf) -> bool {
     path.extension()
@@ -100,20 +100,20 @@ fn is_cmd_file(path: &PathBuf) -> bool {
         .unwrap_or(false)
 }
 
-/// 验证路径是否安全（防止命令注入）
+/// Validate that a path is safe (prevent command injection)
 #[cfg(target_os = "windows")]
 fn is_safe_path(path: &PathBuf) -> bool {
-    // 检查路径是否存在且是文件
+    // Check that the path exists and is a file
     if !path.exists() || !path.is_file() {
         return false;
     }
 
-    // 必须为绝对路径，避免执行相对路径文件
+    // Must be an absolute path, to avoid executing a relative-path file
     if !path.is_absolute() {
         return false;
     }
 
-    // 检查路径是否包含危险字符
+    // Check whether the path contains dangerous characters
     let path_str = path.to_string_lossy();
     let dangerous_chars = ['&', '|', ';', '<', '>', '(', ')', '`', '$', '^', '%', '!'];
     if path_str.chars().any(|c| dangerous_chars.contains(&c)) {
@@ -127,16 +127,16 @@ fn is_safe_path(path: &PathBuf) -> bool {
     true
 }
 
-/// 执行版本命令（Windows 特殊处理 .cmd/.bat）
+/// Run the version command (special handling for .cmd/.bat on Windows)
 #[cfg(target_os = "windows")]
 fn run_version_command(executable_path: &PathBuf) -> Option<String> {
-    // 安全校验：验证路径不包含危险字符
+    // Safety check: verify the path contains no dangerous characters
     if !is_safe_path(executable_path) {
         return None;
     }
 
     let output = if is_cmd_file(executable_path) {
-        // 使用引号包裹路径防止注入，使用 /S 开关确保安全解析
+        // Wrap the path in quotes to prevent injection, use the /S switch to ensure safe parsing
         let quoted_path = format!("\"{}\"", executable_path.to_string_lossy());
         Command::new("cmd.exe")
             .arg("/C")
@@ -154,17 +154,17 @@ fn run_version_command(executable_path: &PathBuf) -> Option<String> {
     match output {
         Ok(out) if out.status.success() => {
             let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
-            // 使用正则提取版本号（更精确）
+            // Use a regex to extract the version number (more precise)
             extract_version(&s)
         }
         _ => None,
     }
 }
 
-/// 提取版本号（使用更精确的 semver 匹配）
+/// Extract the version number (using more precise semver matching)
 #[cfg(target_os = "windows")]
 fn extract_version(s: &str) -> Option<String> {
-    // 匹配 semver 格式: x.y.z 或 x.y
+    // Match semver format: x.y.z or x.y
     let re = regex::Regex::new(r"(\d+\.\d+(?:\.\d+)?)").ok()?;
     re.captures(s)
         .and_then(|caps| caps.get(1))
@@ -266,16 +266,16 @@ pub struct CliStatus {
     pub is_synced: bool,
     pub has_backup: bool,
     pub current_base_url: Option<String>,
-    pub files: Vec<String>, // 返回关联的文件名列表供前端展示
+    pub files: Vec<String>, // Returns the list of associated file names for the frontend to display
 }
 
-/// 检测 CLI 是否安装并获取版本
+/// Detect whether the CLI is installed and get its version
 pub fn check_cli_installed(app: &CliApp) -> (bool, Option<String>) {
     let cmd = app.as_str();
-    // 默认使用命令名，如果 fallback 找到路径则更新为绝对路径
+    // Default to the command name; update to an absolute path if the fallback finds one
     let mut executable_path = PathBuf::from(cmd);
 
-    // 1. 优先使用 which/where 检测 (遵循 PATH)
+    // 1. Prefer detection via which/where (follows PATH)
     let which_output = if cfg!(target_os = "windows") {
         let mut c = Command::new("where");
         c.arg(cmd);
@@ -308,8 +308,8 @@ pub fn check_cli_installed(app: &CliApp) -> (bool, Option<String>) {
         }
     }
 
-    // [FIX #765] macOS 增强检测: 如果 which 失败,显式搜索常用二进制路径
-    // 解决 Tauri 进程 PATH 可能不完整导致检测不到已安装 CLI 的问题
+    // [FIX #765] macOS enhanced detection: if which fails, explicitly search common binary paths
+    // Fixes the issue where an incomplete Tauri process PATH fails to detect an installed CLI
     if !installed && !cfg!(target_os = "windows") {
         let home = dirs::home_dir().unwrap_or_default();
         let mut common_paths = vec![
@@ -324,7 +324,7 @@ pub fn check_cli_installed(app: &CliApp) -> (bool, Option<String>) {
             PathBuf::from("/usr/bin"),
         ];
 
-        // 增强：扫描 nvm 目录下的所有 node 版本
+        // Enhancement: scan all node versions under the nvm directory
         let nvm_base = home.join(".nvm/versions/node");
         if nvm_base.exists() {
             if let Ok(entries) = std::fs::read_dir(&nvm_base) {
@@ -356,7 +356,7 @@ pub fn check_cli_installed(app: &CliApp) -> (bool, Option<String>) {
         return (false, None);
     }
 
-    // 2. 获取版本（Windows 使用特殊处理 .cmd/.bat）
+    // 2. Get the version (special handling for .cmd/.bat on Windows)
     #[cfg(target_os = "windows")]
     let version = run_version_command(&executable_path);
 
@@ -384,7 +384,7 @@ pub fn check_cli_installed(app: &CliApp) -> (bool, Option<String>) {
     (true, version)
 }
 
-/// 读取当前配置并检测同步状态
+/// Read the current config and detect the sync status
 pub fn get_sync_status(app: &CliApp, proxy_url: &str) -> (bool, bool, Option<String>) {
     let files = app.config_files();
     if files.is_empty() {
@@ -396,7 +396,7 @@ pub fn get_sync_status(app: &CliApp, proxy_url: &str) -> (bool, bool, Option<Str
     let mut current_base_url = None;
 
     for file in &files {
-        // 使用更简单的命名规则: original_name + .antigravity.bak
+        // Use a simpler naming rule: original_name + .antigravity.bak
         let backup_path = file
             .path
             .with_file_name(format!("{}.antigravity.bak", file.name));
@@ -405,10 +405,9 @@ pub fn get_sync_status(app: &CliApp, proxy_url: &str) -> (bool, bool, Option<Str
             has_backup = true;
         }
 
-        // 如果物理文件不存在
-        // 如果物理文件不存在
+        // If the physical file does not exist
         if !file.path.exists() {
-            // Gemini 的 settings.json/config.json 只要有一个存在即可，或者都不存在（视为未同步）
+            // For Gemini, it's fine as long as one of settings.json/config.json exists, or neither exists (treated as not synced)
             if app == &CliApp::Gemini
                 && (file.name == "settings.json" || file.name == "config.json")
             {
@@ -451,7 +450,7 @@ pub fn get_sync_status(app: &CliApp, proxy_url: &str) -> (bool, bool, Option<Str
             }
             CliApp::Codex => {
                 if file.name == "config.toml" {
-                    // 正则匹配 base_url
+                    // Regex-match base_url
                     let re =
                         regex::Regex::new(r#"(?m)^\s*base_url\s*=\s*['"]([^'"]+)['"]"#).unwrap();
                     if let Some(caps) = re.captures(&content) {
@@ -503,7 +502,7 @@ pub fn get_sync_status(app: &CliApp, proxy_url: &str) -> (bool, bool, Option<Str
     (all_synced, has_backup, current_base_url)
 }
 
-/// 执行同步逻辑
+/// Execute the sync logic
 pub fn sync_config(
     app: &CliApp,
     proxy_url: &str,
@@ -513,7 +512,7 @@ pub fn sync_config(
     let files = app.config_files();
 
     for file in &files {
-        // Gemini 兼容性逻辑：优先使用 settings.json
+        // Gemini compatibility logic: prefer settings.json
         if app == &CliApp::Gemini && file.name == "config.json" && !file.path.exists() {
             let settings_path = file.path.with_file_name("settings.json");
             if settings_path.exists() {
@@ -522,11 +521,11 @@ pub fn sync_config(
         }
 
         if let Some(parent) = file.path.parent() {
-            fs::create_dir_all(parent).map_err(|e| format!("无法创建目录: {}", e))?;
+            fs::create_dir_all(parent).map_err(|e| format!("Failed to create directory: {}", e))?;
         }
 
-        // [New Feature] 自动备份：如果文件存在且没有备份，创建 .antigravity.bak 备份
-        // 这样可以保留用户最初的配置，后续多次同步不会覆盖这个备份
+        // [New Feature] Auto backup: if the file exists and has no backup, create an .antigravity.bak backup
+        // This preserves the user's original config so later syncs don't overwrite this backup
         if file.path.exists() {
             let backup_path = file
                 .path
@@ -591,24 +590,24 @@ pub fn sync_config(
                                     "ANTHROPIC_API_KEY".to_string(),
                                     Value::String(api_key.to_string()),
                                 );
-                                // [FIX] 避免冲突：如果存在则移除 ANTHROPIC_AUTH_TOKEN
+                                // [FIX] Avoid conflicts: remove ANTHROPIC_AUTH_TOKEN if present
                                 env_obj.remove("ANTHROPIC_AUTH_TOKEN");
                             }
 
-                            // [FIX] 清理可能来自其他 Provider 的模型覆盖设置
+                            // [FIX] Clean up model override settings that may come from another Provider
                             env_obj.remove("ANTHROPIC_MODEL");
                             env_obj.remove("ANTHROPIC_DEFAULT_HAIKU_MODEL");
                             env_obj.remove("ANTHROPIC_DEFAULT_OPUS_MODEL");
                             env_obj.remove("ANTHROPIC_DEFAULT_SONNET_MODEL");
                         } else {
-                            // 如果 API Key 为空，则移除该键，避免设置为空字符串
+                            // If the API Key is empty, remove the key instead of setting it to an empty string
                             env_obj.remove("ANTHROPIC_API_KEY");
                             env_obj.remove("ANTHROPIC_AUTH_TOKEN");
                         }
                     }
 
                     if let Some(m) = model {
-                        // 注意：Claude Code 的官方配置中，当前选定模型放在根节点的 model 字段
+                        // Note: in Claude Code's official config, the currently selected model lives in the root-level model field
                         json.as_object_mut()
                             .unwrap()
                             .insert("model".to_string(), Value::String(m.to_string()));
@@ -628,7 +627,7 @@ pub fn sync_config(
                         if proxy_url.contains("apikey.fun") {
                             obj.remove("OPENAI_BASE_URL");
                         } else {
-                            // Codex 的 auth.json 似乎也支持 OPENAI_BASE_URL，但 ccs 没写，我们也同步写一下
+                            // Codex's auth.json also seems to support OPENAI_BASE_URL; ccs doesn't write it, but we'll sync-write it too
                             obj.insert(
                                 "OPENAI_BASE_URL".to_string(),
                                 Value::String(proxy_url.to_string()),
@@ -642,7 +641,7 @@ pub fn sync_config(
                         .parse::<DocumentMut>()
                         .unwrap_or_else(|_| DocumentMut::new());
 
-                    // 必须使用 custom 提供商，Codex 不支持原生的 codex provider
+                    // Must use the custom provider; Codex does not support a native codex provider
                     let provider_key = "custom";
                     let display_name = if proxy_url.contains("apikey.fun") {
                         "APIKEY.FUN"
@@ -650,7 +649,7 @@ pub fn sync_config(
                         "Custom Node"
                     };
 
-                    // 优先设置 Root Keys 确保位于顶部
+                    // Set the Root Keys first to ensure they're at the top
                     doc.insert("model_provider", value(provider_key));
 
                     if proxy_url.contains("apikey.fun") {
@@ -669,11 +668,11 @@ pub fn sync_config(
                         }
                     }
 
-                    // 移除可能的根级别旧配置
+                    // Remove any leftover root-level legacy config
                     doc.remove("openai_api_key");
                     doc.remove("openai_base_url");
 
-                    // 设置层级 [model_providers.custom]
+                    // Set the [model_providers.custom] hierarchy
                     let providers = doc
                         .entry("model_providers")
                         .or_insert(toml_edit::Item::Table(toml_edit::Table::new()));
@@ -791,10 +790,10 @@ pub fn sync_config(
             }
         }
 
-        // 使用临时文件原子写入
+        // Use a temp file for an atomic write
         let tmp_path = file.path.with_extension("tmp");
-        fs::write(&tmp_path, &content).map_err(|e| format!("写入临时文件失败: {}", e))?;
-        fs::rename(&tmp_path, &file.path).map_err(|e| format!("重命名配置文件失败: {}", e))?;
+        fs::write(&tmp_path, &content).map_err(|e| format!("Failed to write temp file: {}", e))?;
+        fs::rename(&tmp_path, &file.path).map_err(|e| format!("Failed to rename config file: {}", e))?;
     }
 
     Ok(())
@@ -849,28 +848,28 @@ pub async fn execute_cli_restore(app_type: CliApp) -> Result<(), String> {
         let files = app_type.config_files();
         let mut restored_count = 0;
 
-        // 尝试从备份恢复
+        // Try to restore from a backup
         for file in &files {
             let backup_path = file
                 .path
                 .with_file_name(format!("{}.antigravity.bak", file.name));
             if backup_path.exists() {
-                // 还原：覆盖原文件
+                // Restore: overwrite the original file
                 if let Err(e) = fs::rename(&backup_path, &file.path) {
-                    return Err(format!("恢复备份失败 {}: {}", file.name, e));
+                    return Err(format!("Failed to restore backup {}: {}", file.name, e));
                 }
                 restored_count += 1;
             }
         }
 
         if restored_count > 0 {
-            // 如果成功恢复了至少一个备份，就认为是恢复成功
+            // If at least one backup was successfully restored, treat this as a success
             return Ok(());
         }
 
-        // 如果没有备份，则执行原来的逻辑：恢复为默认配置
+        // If there is no backup, fall back to the original logic: restore the default config
         let default_url = app_type.default_url();
-        // 恢复默认时清空 API Key，让用户重新授权或使用官方 Key
+        // Clear the API Key when restoring defaults, so the user re-authorizes or uses the official key
         sync_config(&app_type, default_url, "", None)
     })
     .await
@@ -888,18 +887,18 @@ pub async fn get_cli_config_content(
             files
                 .into_iter()
                 .find(|f| f.name == name)
-                .ok_or("找不到指定的文件".to_string())?
+                .ok_or("Could not find the specified file".to_string())?
         } else {
             files
                 .into_iter()
                 .next()
-                .ok_or("找不到配置文件".to_string())?
+                .ok_or("Could not find the config file".to_string())?
         };
 
         if !file.path.exists() {
-            return Err("配置文件不存在".to_string());
+            return Err("Config file does not exist".to_string());
         }
-        fs::read_to_string(&file.path).map_err(|e| format!("读取配置文件失败: {}", e))
+        fs::read_to_string(&file.path).map_err(|e| format!("Failed to read config file: {}", e))
     })
     .await
     .unwrap_or_else(|_| Err("Task panicked".to_string()))

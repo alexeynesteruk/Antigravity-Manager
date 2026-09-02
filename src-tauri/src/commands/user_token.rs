@@ -9,7 +9,7 @@ pub struct CreateTokenRequest {
     pub max_ips: i32,
     pub curfew_start: Option<String>,
     pub curfew_end: Option<String>,
-    pub custom_expires_at: Option<i64>, // 自定义过期时间戳 (秒)
+    pub custom_expires_at: Option<i64>, // Custom expiry timestamp (seconds)
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -22,15 +22,15 @@ pub struct UpdateTokenRequest {
     pub curfew_end: Option<Option<String>>,
 }
 
-// 命令实现
+// Command implementations
 
-/// 列出所有令牌
+/// List all tokens
 #[tauri::command]
 pub async fn list_user_tokens() -> Result<Vec<UserToken>, String> {
     user_token_db::list_tokens()
 }
 
-/// 创建新令牌
+/// Create a new token
 #[tauri::command]
 pub async fn create_user_token(request: CreateTokenRequest) -> Result<UserToken, String> {
     user_token_db::create_token(
@@ -44,7 +44,7 @@ pub async fn create_user_token(request: CreateTokenRequest) -> Result<UserToken,
     )
 }
 
-/// 更新令牌
+/// Update a token
 #[tauri::command]
 pub async fn update_user_token(id: String, request: UpdateTokenRequest) -> Result<(), String> {
     user_token_db::update_token(
@@ -58,19 +58,19 @@ pub async fn update_user_token(id: String, request: UpdateTokenRequest) -> Resul
     )
 }
 
-/// 删除令牌
+/// Delete a token
 #[tauri::command]
 pub async fn delete_user_token(id: String) -> Result<(), String> {
     user_token_db::delete_token(&id)
 }
 
-/// 续期令牌
+/// Renew a token
 #[tauri::command]
 pub async fn renew_user_token(id: String, expires_type: String) -> Result<(), String> {
     user_token_db::renew_token(&id, &expires_type)
 }
 
-/// 获取令牌 IP 绑定
+/// Get token IP bindings
 #[tauri::command]
 pub async fn get_token_ip_bindings(token_id: String) -> Result<Vec<TokenIpBinding>, String> {
     user_token_db::get_token_ips(&token_id)
@@ -84,20 +84,20 @@ pub struct UserTokenStats {
     pub today_requests: i64,
 }
 
-/// 获取简单的统计信息
+/// Get simple statistics
 #[tauri::command]
 pub async fn get_user_token_summary() -> Result<UserTokenStats, String> {
     let tokens = user_token_db::list_tokens()?;
     let active_tokens = tokens.iter().filter(|t| t.enabled).count();
 
-    // 统计唯一用户
+    // Count unique users
     let mut users = std::collections::HashSet::new();
     for t in &tokens {
         users.insert(t.username.clone());
     }
 
-    // 这里简单返回一些数据，请求数最好从数据库聚合查询
-    // 目前仅作为演示，请求数暂不精确统计今日的
+    // This simply returns some data here; the request count is better queried via database aggregation
+    // Currently this is just a demo; the request count does not yet precisely count today's requests
 
     Ok(UserTokenStats {
         total_tokens: tokens.len(),

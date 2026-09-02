@@ -1,9 +1,9 @@
-// Claude 数据模型
-// Claude 协议相关数据模型
+// Claude data models
+// Data models related to the Claude protocol
 
 use serde::{Deserialize, Serialize};
 
-/// Claude API 请求
+/// Claude API request
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ClaudeRequest {
     pub model: String,
@@ -36,7 +36,7 @@ pub struct ClaudeRequest {
     pub quality: Option<String>,
 }
 
-/// Thinking 配置
+/// Thinking configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ThinkingConfig {
     #[serde(rename = "type")]
@@ -225,7 +225,7 @@ pub struct OutputConfig {
     pub effort: Option<String>,
 }
 
-/// Claude API 响应
+/// Claude API response
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ClaudeResponse {
     pub id: String,
@@ -253,7 +253,7 @@ pub struct Usage {
     pub server_tool_use: Option<serde_json::Value>,
 }
 
-// ========== Gemini 数据模型 ==========
+// ========== Gemini data models ==========
 
 /// Gemini Content
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -313,7 +313,7 @@ pub struct InlineData {
     pub data: String,
 }
 
-/// Gemini 完整响应
+/// Full Gemini response
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GeminiResponse {
     #[serde(skip_serializing_if = "Option::is_none")]

@@ -1,5 +1,5 @@
-//! 测试 determine_retry_strategy 和 should_rotate_account 的所有分支，
-//! 重点覆盖 404 重试与账号轮换逻辑。
+//! Tests all branches of determine_retry_strategy and should_rotate_account,
+//! focusing on the 404 retry and account rotation logic.
 
 use crate::proxy::handlers::common::{
     determine_retry_strategy, should_rotate_account, RetryStrategy,

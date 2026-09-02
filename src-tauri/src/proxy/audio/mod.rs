@@ -5,12 +5,12 @@ use std::path::Path;
 pub struct AudioProcessor;
 
 impl AudioProcessor {
-    /// 检测音频 MIME 类型
+    /// Detects the audio MIME type
     pub fn detect_mime_type(filename: &str) -> Result<String, String> {
         let ext = Path::new(filename)
             .extension()
             .and_then(|s| s.to_str())
-            .ok_or("无法获取文件扩展名")?;
+            .ok_or("Could not get file extension")?;
 
         match ext.to_lowercase().as_str() {
             "mp3" => Ok("audio/mp3".to_string()),
@@ -19,23 +19,23 @@ impl AudioProcessor {
             "ogg" => Ok("audio/ogg".to_string()),
             "flac" => Ok("audio/flac".to_string()),
             "aiff" | "aif" => Ok("audio/aiff".to_string()),
-            _ => Err(format!("不支持的音频格式: {}", ext)),
+            _ => Err(format!("Unsupported audio format: {}", ext)),
         }
     }
 
-    /// 将音频数据编码为 Base64
+    /// Encodes audio data to Base64
     pub fn encode_to_base64(audio_data: &[u8]) -> String {
         general_purpose::STANDARD.encode(audio_data)
     }
 
-    /// 判断文件是否超过大小限制
+    /// Determines whether a file exceeds the size limit
     pub fn exceeds_size_limit(size_bytes: usize) -> bool {
         const MAX_SIZE: usize = 15 * 1024 * 1024; // 15MB
         size_bytes > MAX_SIZE
     }
 }
 
-/// 将 OpenAI 的音频格式标识 (如 "wav" / "mp3" / "audio/wav") 归一化为 Gemini 需要的 MIME 类型
+/// Normalizes an OpenAI audio format identifier (e.g. "wav" / "mp3" / "audio/wav") into the MIME type Gemini requires
 pub fn normalize_audio_mime(format: &str) -> String {
     let f = format.trim().to_lowercase();
     let bare = f.strip_prefix("audio/").unwrap_or(&f);
@@ -50,19 +50,19 @@ pub fn normalize_audio_mime(format: &str) -> String {
     }
 }
 
-/// 根据文件路径/URL 的扩展名推断音频 MIME，失败时回退到 audio/mp3
+/// Infers the audio MIME type from a file path/URL extension, falling back to audio/mp3 on failure
 fn mime_from_path(path: &str) -> String {
     let clean = path.split(['?', '#']).next().unwrap_or(path);
     AudioProcessor::detect_mime_type(clean).unwrap_or_else(|_| "audio/mp3".to_string())
 }
 
-/// 把 OpenAI 风格的音频引用转换为 Gemini part。
+/// Converts an OpenAI-style audio reference into a Gemini part.
 ///
-/// 支持四种来源：
+/// Supports four kinds of sources:
 ///   * `data:audio/wav;base64,...`  -> inlineData
 ///   * `http(s)://...`              -> fileData (fileUri)
-///   * `file:///path` 或本地路径     -> 读盘后 inlineData
-///   * 裸 base64 (input_audio.data) -> inlineData (需要 declared_mime)
+///   * `file:///path` or a local path -> inlineData after reading from disk
+///   * bare base64 (input_audio.data) -> inlineData (requires declared_mime)
 pub fn audio_part_from_source(src: &str, declared_mime: Option<&str>) -> Option<Value> {
     let declared = declared_mime.map(normalize_audio_mime);
 
@@ -81,13 +81,13 @@ pub fn audio_part_from_source(src: &str, declared_mime: Option<&str>) -> Option<
         return Some(json!({ "inlineData": { "mimeType": mime, "data": data } }));
     }
 
-    // 2) 远程 URL：交给 Gemini 侧拉取
+    // 2) remote URL: let Gemini's side fetch it
     if src.starts_with("http://") || src.starts_with("https://") {
         let mime = declared.unwrap_or_else(|| mime_from_path(src));
         return Some(json!({ "fileData": { "fileUri": src, "mimeType": mime } }));
     }
 
-    // 3) 本地文件 (file:// 或普通路径)
+    // 3) local file (file:// or a plain path)
     let looks_like_path = src.starts_with("file://") || (src.len() < 4096 && Path::new(src).is_file());
     if looks_like_path {
         let file_path = if let Some(rest) = src.strip_prefix("file://") {
@@ -107,24 +107,24 @@ pub fn audio_part_from_source(src: &str, declared_mime: Option<&str>) -> Option<
             Ok(bytes) => {
                 if AudioProcessor::exceeds_size_limit(bytes.len()) {
                     tracing::warn!(
-                        "[Audio] 本地音频超过 15MB ({} bytes)，仍会尝试上传: {}",
+                        "[Audio] Local audio exceeds 15MB ({} bytes), will still attempt upload: {}",
                         bytes.len(),
                         file_path
                     );
                 }
                 let mime = declared.unwrap_or_else(|| mime_from_path(&file_path));
                 let b64 = AudioProcessor::encode_to_base64(&bytes);
-                tracing::debug!("[Audio] 已加载本地音频 {} ({} bytes, {})", file_path, bytes.len(), mime);
+                tracing::debug!("[Audio] Loaded local audio {} ({} bytes, {})", file_path, bytes.len(), mime);
                 return Some(json!({ "inlineData": { "mimeType": mime, "data": b64 } }));
             }
             Err(e) => {
-                tracing::warn!("[Audio] 读取本地音频失败 {}: {}", file_path, e);
+                tracing::warn!("[Audio] Failed to read local audio {}: {}", file_path, e);
                 return None;
             }
         }
     }
 
-    // 4) 裸 base64 (OpenAI input_audio.data)
+    // 4) bare base64 (OpenAI input_audio.data)
     if src.is_empty() {
         return None;
     }
@@ -136,7 +136,7 @@ pub fn audio_part_from_source(src: &str, declared_mime: Option<&str>) -> Option<
 fn warn_if_oversized(base64_len: usize, mime: &str) {
     let raw = (base64_len * 3) / 4;
     if AudioProcessor::exceeds_size_limit(raw) {
-        tracing::warn!("[Audio] 内联音频 {} 约 {} bytes，超过 15MB 建议上限", mime, raw);
+        tracing::warn!("[Audio] Inline audio {} is approximately {} bytes, exceeding the recommended 15MB limit", mime, raw);
     }
 }
 
@@ -193,8 +193,8 @@ mod tests {
     fn test_exceeds_size_limit() {
         assert!(!AudioProcessor::exceeds_size_limit(10 * 1024 * 1024)); // 10MB
         assert!(AudioProcessor::exceeds_size_limit(20 * 1024 * 1024)); // 20MB
-        assert!(AudioProcessor::exceeds_size_limit(15 * 1024 * 1024 + 1)); // 刚好超过
-        assert!(!AudioProcessor::exceeds_size_limit(15 * 1024 * 1024)); // 刚好等于限制
+        assert!(AudioProcessor::exceeds_size_limit(15 * 1024 * 1024 + 1)); // just over the limit
+        assert!(!AudioProcessor::exceeds_size_limit(15 * 1024 * 1024)); // exactly at the limit
     }
 
     #[test]

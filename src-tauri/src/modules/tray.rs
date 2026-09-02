@@ -89,7 +89,7 @@ pub fn create_tray(app: &tauri::AppHandle) -> tauri::Result<()> {
                     }
                 }
                 "quit" => {
-                    // 先停止 Admin Server 和反代服务，避免进程残留和端口占用
+                    // First stop the Admin Server and reverse proxy service, to avoid leftover processes and held ports
                     let state = app.state::<crate::commands::proxy::ProxyServiceState>();
                     let admin_server = state.admin_server.clone();
                     let instance = state.instance.clone();

@@ -10,20 +10,21 @@ use std::collections::HashSet;
 use tokio::time::{sleep, Duration};
 use tracing::{debug, info};
 
-// ===== 统一重试与退避策略 =====
+// ===== Unified retry and backoff strategy =====
 
-/// 重试策略枚举
+/// Retry strategy enum
 #[derive(Debug, Clone)]
 pub enum RetryStrategy {
-    /// 不重试，直接返回错误
+    /// No retry, return the error directly
     NoRetry,
-    /// 固定延迟
+    /// Fixed delay
     FixedDelay(Duration),
-    /// 线性退避：base_ms * (attempt + 1)
+    /// Linear backoff: base_ms * (attempt + 1)
     LinearBackoff { base_ms: u64 },
-    /// 指数退避：base_ms * 2^attempt，上限 max_ms
+    /// Exponential backoff: base_ms * 2^attempt, capped at max_ms
     ExponentialBackoff { base_ms: u64, max_ms: u64 },
-    /// [NEW] 原地重试 (Grace Retry)：在当前账号上小窗口等待后直接重试，不计入常规切换
+    /// [NEW] In-place retry (Grace Retry): wait a short window on the current account then
+    /// retry directly, without counting toward the usual account rotation
     GraceRetry(Duration),
 }
 
@@ -98,7 +99,7 @@ impl FailureStatusTracker {
     }
 }
 
-/// 根据错误状态码和错误信息确定重试策略
+/// Determine the retry strategy based on the error status code and error text
 pub fn determine_retry_strategy(
     status_code: u16,
     error_text: &str,
@@ -140,7 +141,7 @@ fn determine_retry_strategy_inner(
     // 400 signature errors must be case-insensitive and cover all Google variants.
     let lower = error_text.to_lowercase();
     match status_code {
-        // 400 错误：仅在特定 Thinking 签名失败时重试一次
+        // 400 error: only retry once for a specific Thinking signature failure
         400 if !retried_without_thinking
             && (lower.contains("invalid thought signature")
                 || lower.contains("invalid `signature`")
@@ -154,15 +155,16 @@ fn determine_retry_strategy_inner(
             RetryStrategy::FixedDelay(Duration::from_millis(200))
         }
 
-        // 429 限流错误
+        // 429 rate limit error
         429 => {
-            // 优先使用服务端返回的 Retry-After / quotaResetDelay
+            // Prefer the Retry-After / quotaResetDelay returned by the server
             if let Some(parsed_delay) = crate::proxy::upstream::retry::parse_retry_delay_with_source(
                 error_text,
                 retry_after,
             ) {
                 let delay_ms = parsed_delay.raw_ms;
-                // 短期原账号重试已使用时，立即回到现有换号逻辑
+                // If a short-window same-account retry has already been used, fall back to the
+                // existing account-rotation logic immediately
                 if crate::proxy::upstream::retry::should_grace_retry(delay_ms) {
                     if allow_grace_retry {
                         let actual_delay = parsed_delay.actual_wait_ms();
@@ -179,34 +181,35 @@ fn determine_retry_strategy_inner(
                     RetryStrategy::FixedDelay(Duration::from_millis(actual_delay))
                 }
             } else {
-                // 否则使用线性退避：起始 5s，逐步增加
+                // Otherwise use linear backoff: starting at 5s, increasing gradually
                 RetryStrategy::LinearBackoff { base_ms: 5000 }
             }
         }
 
-        // 503 服务不可用 / 529 服务器过载
+        // 503 service unavailable / 529 server overloaded
         503 | 529 => {
-            // 指数退避：起始 10s，上限 60s (针对 Google 边缘节点过载)
+            // Exponential backoff: starting at 10s, capped at 60s (for Google edge node overload)
             RetryStrategy::ExponentialBackoff {
                 base_ms: 10000,
                 max_ms: 60000,
             }
         }
 
-        // 500 服务器内部错误
+        // 500 internal server error
         500 => {
-            // 线性退避：起始 3s
+            // Linear backoff: starting at 3s
             RetryStrategy::LinearBackoff { base_ms: 3000 }
         }
 
-        // 401/403 认证/权限错误：切换账号前给予极短缓冲
+        // 401/403 authentication/permission error: give a very short buffer before switching accounts
         401 | 403 => RetryStrategy::FixedDelay(Duration::from_millis(200)),
 
-        // 404 资源未找到：Google Cloud Code API 的 404 通常是账号级别的间歇性问题
-        // (灰度发布、账号权限不同步等)，轮换账号往往能解决
+        // 404 resource not found: a 404 from the Google Cloud Code API is usually an
+        // account-level intermittent issue (staged rollout, unsynced account permissions, etc.);
+        // rotating accounts often resolves it
         404 => RetryStrategy::FixedDelay(Duration::from_millis(300)),
 
-        // 其他错误：不重试
+        // Other errors: do not retry
         _ => RetryStrategy::NoRetry,
     }
 }
@@ -266,7 +269,7 @@ mod tests {
     }
 }
 
-/// 执行退避策略并返回是否应该继续重试
+/// Execute the backoff strategy and return whether retrying should continue
 pub async fn apply_retry_strategy(
     strategy: RetryStrategy,
     attempt: usize,
@@ -332,22 +335,23 @@ pub async fn apply_retry_strategy(
                 duration.as_millis()
             );
             sleep(duration).await;
-            true // 原地重试在 handlers 层面通过 should_rotate_account 判断是否切换
+            true // Whether an in-place retry switches accounts is decided at the handlers
+                 // level via should_rotate_account
         }
     }
 }
 
-/// 判断是否应该轮换账号
+/// Determine whether the account should be rotated
 pub fn should_rotate_account(status_code: u16, strategy: Option<&RetryStrategy>) -> bool {
-    // [NEW] 如果识别为 Grace Retry，则显式要求不轮换账号
+    // [NEW] If identified as a Grace Retry, explicitly require no account rotation
     if let Some(RetryStrategy::GraceRetry(_)) = strategy {
         return false;
     }
 
     match status_code {
-        // 这些错误是账号级别或特定节点配额的，需要轮换
+        // These errors are account-level or tied to a specific node's quota, so rotate
         429 | 401 | 403 | 404 | 500 => true,
-        // 503/529 通常是后端过载，切号效果有限，暂不轮换
+        // 503/529 are usually backend overload; switching accounts has limited effect, so don't rotate for now
         503 | 529 => false,
         _ => false,
     }

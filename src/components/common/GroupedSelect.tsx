@@ -16,7 +16,7 @@ interface GroupedSelectProps {
     placeholder?: string;
     className?: string;
     disabled?: boolean;
-    allowCustomInput?: boolean; // 新增: 是否允许自定义输入
+    allowCustomInput?: boolean; // Added: whether to allow custom input
 }
 
 export default function GroupedSelect({
@@ -26,17 +26,17 @@ export default function GroupedSelect({
     placeholder = 'Select...',
     className = '',
     disabled = false,
-    allowCustomInput = false // 新增: 默认不允许自定义输入
+    allowCustomInput = false // Added: custom input is not allowed by default
 }: GroupedSelectProps) {
     const [isOpen, setIsOpen] = useState(false);
     const [dropdownPosition, setDropdownPosition] = useState({ top: 0, left: 0, width: 0 });
-    const [customInput, setCustomInput] = useState(''); // 新增: 自定义输入值
+    const [customInput, setCustomInput] = useState(''); // Added: custom input value
     const containerRef = useRef<HTMLDivElement>(null);
     const buttonRef = useRef<HTMLButtonElement>(null);
-    const dropdownRef = useRef<HTMLDivElement>(null); // 新增: 下拉菜单引用
-    const customInputRef = useRef<HTMLInputElement>(null); // 新增: 自定义输入框引用
+    const dropdownRef = useRef<HTMLDivElement>(null); // Added: dropdown menu ref
+    const customInputRef = useRef<HTMLInputElement>(null); // Added: custom input field ref
 
-    // 按组分组选项
+    // Group options by group
     const groupedOptions = options.reduce((acc, option) => {
         const group = option.group || 'Other';
         if (!acc[group]) {
@@ -46,26 +46,26 @@ export default function GroupedSelect({
         return acc;
     }, {} as Record<string, SelectOption[]>);
 
-    // 获取当前选中项的标签
+    // Get the label of the currently selected item
     const selectedOption = options.find(opt => opt.value === value);
     const selectedLabel = selectedOption?.label || value || placeholder;
 
-    // 更新下拉菜单位置
+    // Update the dropdown menu position
     const updateDropdownPosition = () => {
         if (buttonRef.current) {
             const rect = buttonRef.current.getBoundingClientRect();
             setDropdownPosition({
                 top: rect.bottom + window.scrollY + 4,
                 left: rect.left + window.scrollX,
-                width: Math.max(rect.width * 1.1, 220) // 增加宽度到 1.1 倍,最小 220px
+                width: Math.max(rect.width * 1.1, 220) // Widen to 1.1x, minimum 220px
             });
         }
     };
 
-    // 点击外部关闭下拉菜单
+    // Close the dropdown when clicking outside
     useEffect(() => {
         const handleClickOutside = (event: MouseEvent) => {
-            // 修复: 检查点击是否在容器或下拉菜单内部
+            // Fix: check whether the click is inside the container or the dropdown menu
             const target = event.target as Node;
             const isClickInsideContainer = containerRef.current?.contains(target);
             const isClickInsideDropdown = dropdownRef.current?.contains(target);
@@ -115,7 +115,7 @@ export default function GroupedSelect({
 
     return (
         <div ref={containerRef} className={cn('relative', className)}>
-            {/* 触发按钮 */}
+            {/* Trigger button */}
             <button
                 ref={buttonRef}
                 type="button"
@@ -146,7 +146,7 @@ export default function GroupedSelect({
                 />
             </button>
 
-            {/* 下拉菜单 - 使用 Portal 渲染到 body */}
+            {/* Dropdown menu - rendered to body via Portal */}
             {isOpen && createPortal(
                 <div
                     ref={dropdownRef}
@@ -167,12 +167,12 @@ export default function GroupedSelect({
                 >
                     {Object.entries(groupedOptions).map(([group, groupOptions]) => (
                         <div key={group}>
-                            {/* 分组标题 */}
+                            {/* Group title */}
                             <div className="px-3 py-1.5 text-[9px] font-bold text-gray-500 dark:text-gray-400 uppercase tracking-wider bg-gray-50 dark:bg-gray-900/50 sticky top-0 z-10">
                                 {group}
                             </div>
 
-                            {/* 分组选项 */}
+                            {/* Group options */}
                             {groupOptions.map((option) => (
                                 <button
                                     key={option.value}
@@ -198,7 +198,7 @@ export default function GroupedSelect({
                         </div>
                     ))}
 
-                    {/* 自定义输入区域 */}
+                    {/* Custom input area */}
                     {allowCustomInput && (
                         <div className="border-t border-gray-200 dark:border-gray-700 bg-gray-50 dark:bg-gray-900/50 p-2">
                             <div className="flex items-center gap-1.5">
@@ -214,7 +214,7 @@ export default function GroupedSelect({
                                             handleCustomInputSubmit();
                                         }
                                     }}
-                                    placeholder="输入自定义模型 ID..."
+                                    placeholder="Enter a custom model ID..."
                                     className={cn(
                                         'flex-1 px-2 py-1 text-[10px] font-mono',
                                         'bg-white dark:bg-gray-800',
@@ -236,7 +236,7 @@ export default function GroupedSelect({
                                             : 'bg-gray-200 dark:bg-gray-700 text-gray-400 dark:text-gray-500 cursor-not-allowed'
                                     )}
                                 >
-                                    确定
+                                    Confirm
                                 </button>
                             </div>
                         </div>

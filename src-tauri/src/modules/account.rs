@@ -1721,7 +1721,7 @@ pub fn update_account_quota(account_id: &str, quota: QuotaData) -> Result<(), St
     // Save account first
     save_account(&account)?;
 
-    // [FIX] 同时更新索引文件中的摘要信息，确保列表页图标即时刷新
+    // [FIX] Also update the summary information in the index file, to ensure the list page icon refreshes immediately
     {
         if let Ok(mut index) = load_account_index() {
             if let Some(summary) = index.accounts.iter_mut().find(|a| a.id == account_id) {

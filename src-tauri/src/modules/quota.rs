@@ -11,7 +11,7 @@ const QUOTA_API_ENDPOINTS: [&str; 3] = [
     "https://cloudcode-pa.googleapis.com/v1internal:fetchAvailableModels",
 ];
 
-// Quota Summary API endpoints (weekly + 5h grouped quota, fallback order 同上)
+// Quota Summary API endpoints (weekly + 5h grouped quota, fallback order same as above)
 const QUOTA_SUMMARY_ENDPOINTS: [&str; 3] = [
     "https://daily-cloudcode-pa.sandbox.googleapis.com/v1internal:retrieveUserQuotaSummary",
     "https://daily-cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSummary",
@@ -65,7 +65,7 @@ struct QuotaInfo {
     reset_time: Option<String>,
 }
 
-// ---- retrieveUserQuotaSummary 响应反序列化结构 ----
+// ---- retrieveUserQuotaSummary response deserialization structures ----
 
 #[derive(Debug, Deserialize)]
 struct QuotaSummaryResponse {
@@ -138,7 +138,7 @@ async fn create_standard_client(account_id: Option<&str>) -> rquest::Client {
 }
 
 /// Get shared HTTP Client (60s timeout) for pure info fetching (No JA3)
-#[allow(dead_code)] // 预留给预热/后台任务调用
+#[allow(dead_code)] // Reserved for warmup/background task usage
 async fn create_long_standard_client(account_id: Option<&str>) -> rquest::Client {
     if let Some(pool) = crate::proxy::proxy_pool::get_global_proxy_pool() {
         pool.get_effective_standard_client(account_id, 60).await
@@ -302,7 +302,7 @@ pub async fn fetch_quota_with_cache(
                     if let Err(_) = response.error_for_status_ref() {
                         let status = response.status();
 
-                        // [FIX] 403 Forbidden 处理：如果是带有 project_id 的请求，尝试剥离后重试
+                        // [FIX] 403 Forbidden handling: if this is a request with a project_id, try stripping it and retrying
                         if status == rquest::StatusCode::FORBIDDEN {
                             if current_payload.get("project").is_some() && !retry_without_project {
                                 crate::modules::logger::log_warn(&format!(
@@ -472,7 +472,7 @@ async fn fetch_quota_summary(
                         "QuotaSummary API {} returned {}, trying next endpoint",
                         ep_url, status
                     ));
-                    // 4xx (非 429) 通常所有端点行为一致,直接退出避免无谓重试
+                    // 4xx (other than 429) usually behaves the same across all endpoints, exit directly to avoid pointless retries
                     if status.is_client_error() && status != rquest::StatusCode::TOO_MANY_REQUESTS {
                         return None;
                     }
@@ -657,7 +657,7 @@ pub async fn warm_up_all_accounts() -> Result<String, String> {
 
     loop {
         let all_accounts = crate::modules::account::list_accounts().unwrap_or_default();
-        // [FIX] 过滤掉禁用反代的账号
+        // [FIX] Filter out accounts with the reverse proxy disabled
         let target_accounts: Vec<_> = all_accounts
             .into_iter()
             .filter(|a| !a.disabled && !a.proxy_disabled)
@@ -701,7 +701,7 @@ pub async fn warm_up_all_accounts() -> Result<String, String> {
 
             for handle in handles {
                 if let Ok(Some((id, email, token, pid, Some((fresh_quota, _))))) = handle.await {
-                    // [FIX] 预热阶段检测到 403 时，使用统一禁用逻辑，确保账号文件和索引同时更新
+                    // [FIX] When a 403 is detected during warmup, use the unified disable logic to ensure the account file and index are updated together
                     if fresh_quota.is_forbidden {
                         crate::modules::logger::log_warn(&format!(
                             "[Warmup] Account {} returned 403 Forbidden during quota fetch, marking as forbidden",
@@ -866,8 +866,8 @@ pub async fn warm_up_account(account_id: &str) -> Result<String, String> {
             .await
             .map_err(|e| format!("Failed to fetch quota: {}", e))?;
 
-    // [FIX] 预热阶段检测到 403 时，使用统一的 mark_account_forbidden 逻辑，
-    // 确保账号文件和索引文件同时更新，且前端刷新后能感知到禁用状态
+    // [FIX] When a 403 is detected during warmup, use the unified mark_account_forbidden logic,
+    // to ensure the account file and index file are updated together, so the frontend can detect the disabled state after refreshing
     if fresh_quota.is_forbidden {
         crate::modules::logger::log_warn(&format!(
             "[Warmup] Account {} returned 403 Forbidden during quota fetch, marking as forbidden",

@@ -1,5 +1,5 @@
 /**
- * 模型分类工具函数（无 React / icons 依赖，可在 Node 环境直接导入）
+ * Model categorization utility functions (no React/icons dependency, can be imported directly in a Node environment)
  */
 
 export type ModelCategory = 'gemini-pro' | 'gemini-flash' | 'gemini-pro-image' | 'gemini-flash-image' | 'claude' | 'other';
@@ -54,7 +54,7 @@ export function getModelDisplayName(
 }
 
 /**
- * 按优先级查找配额模型：先精确匹配首选名，再按类别 fallback。
+ * Find the quota model by priority: exact-match the preferred name first, then fall back by category.
  */
 export function findQuotaModel<T extends { name: string }>(
     models: T[] | undefined,
@@ -88,8 +88,8 @@ export function getModelProtectionKey(name: string): string | null {
 }
 
 /**
- * 在任意图片类别中查找第一个实际模型。
- * 用于让新旧 image selector 共享同一配额槽位。
+ * Find the first actual model within any image category.
+ * Used so old and new image selectors share the same quota slot.
  */
 export function findImageQuotaModel<T extends { name: string }>(
     models: T[] | undefined,
@@ -101,7 +101,7 @@ export function findImageQuotaModel<T extends { name: string }>(
     });
 }
 
-/** 账号管理 pin 列表缺省图像选择器时补入代表 Image，与仪表盘对齐。 */
+/** In the account management pinned list, insert a representative Image entry when the image selector is missing, to align with the dashboard. */
 export const DEFAULT_IMAGE_PIN_SELECTOR = 'gemini-3.1-flash-image';
 
 export function ensurePinnedImageSelector(selectorIds: string[] | undefined): string[] {

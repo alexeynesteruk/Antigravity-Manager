@@ -412,8 +412,8 @@ pub async fn monitor_middleware(
 
     let request_body_str;
 
-    // [FIX] 从请求 extensions 提取 UserTokenIdentity (由 Auth 中间件注入)
-    // 必须在处理 request body 之前提取，因为 into_parts() 后需要保留这个值
+    // [FIX] Extract UserTokenIdentity from the request extensions (injected by the Auth middleware)
+    // Must be extracted before processing the request body, since this value needs to survive into_parts()
     let user_token_identity = request.extensions().get::<UserTokenIdentity>().cloned();
 
     let request = if method == "POST" {
@@ -460,7 +460,7 @@ pub async fn monitor_middleware(
 
     let response = next.run(request).await;
 
-    // user_token_identity 已在上面从请求 extensions 中提取
+    // user_token_identity was already extracted above from the request extensions
 
     let duration = start.elapsed().as_millis() as u64;
     let status = response.status().as_u16();
@@ -968,7 +968,7 @@ pub async fn monitor_middleware(
             Ok(bytes) => {
                 if let Ok(s) = std::str::from_utf8(&bytes) {
                     if let Ok(json) = serde_json::from_str::<Value>(&s) {
-                        // 支持 OpenAI "usage" 或 Gemini "usageMetadata"
+                        // Supports OpenAI's "usage" or Gemini's "usageMetadata"
                         if let Some(usage) = json
                             .get("usage")
                             .or(json.get("usageMetadata"))

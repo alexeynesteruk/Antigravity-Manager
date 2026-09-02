@@ -1,5 +1,5 @@
-// Claude 请求转换 (Claude → Gemini v1internal)
-// 对应 transformClaudeRequestIn
+// Claude request transformation (Claude → Gemini v1internal)
+// Corresponds to transformClaudeRequestIn
 
 use super::models::*;
 use crate::proxy::mappers::signature_store::get_thought_signature; // Deprecated, kept for fallback
@@ -82,15 +82,15 @@ fn build_safety_settings() -> Value {
     ])
 }
 
-/// 清理消息中的 cache_control 字段
+/// Clean up cache_control fields in messages
 ///
-/// 这个函数会深度遍历所有消息内容块,移除 cache_control 字段。
-/// 这是必要的,因为:
-/// 1. VS Code 等客户端会将历史消息(包含 cache_control)原封不动发回
-/// 2. Anthropic API 不接受请求中包含 cache_control 字段
-/// 3. 即使是转发到 Gemini,也应该清理以保持协议纯净性
+/// This function deep-traverses all message content blocks and removes cache_control fields.
+/// This is necessary because:
+/// 1. Clients like VS Code send historical messages (including cache_control) back unchanged
+/// 2. The Anthropic API does not accept requests containing cache_control fields
+/// 3. Even when forwarding to Gemini, it should be cleaned to keep the protocol pure
 ///
-/// [FIX #593] 增强版本:添加详细日志用于调试 MCP 工具兼容性问题
+/// [FIX #593] Enhanced version: added detailed logging to debug MCP tool compatibility issues
 pub fn clean_cache_control_from_messages(messages: &mut [Message]) {
     tracing::info!(
         "[DEBUG-593] Starting cache_control cleanup for {} messages",
@@ -164,10 +164,10 @@ pub fn clean_cache_control_from_messages(messages: &mut [Message]) {
     }
 }
 
-/// [FIX #593] 递归深度清理 JSON 中的 cache_control 字段
+/// [FIX #593] Recursively deep-clean cache_control fields in JSON
 ///
-/// 用于处理嵌套结构和非标准位置的 cache_control。
-/// 这是最后一道防线,确保发送给 Antigravity 的请求中不包含任何 cache_control。
+/// Handles cache_control in nested structures and non-standard positions.
+/// This is the last line of defense, ensuring the request sent to Antigravity contains no cache_control.
 fn deep_clean_cache_control(value: &mut Value) {
     match value {
         Value::Object(map) => {
@@ -268,11 +268,11 @@ fn sort_thinking_blocks_first(messages: &mut [Message]) {
     }
 }
 
-/// 合并 ClaudeRequest 中连续的同角色消息
+/// Merge consecutive same-role messages in ClaudeRequest
 ///
-/// 场景: 当从 Spec/Plan 模式切换回编码模式时，可能出现连续两条 "user" 消息
-/// (一条是 ToolResult，一条是 <system-reminder>)。
-/// 这会违反角色交替规则，导致 400 报错。
+/// Scenario: When switching back from Spec/Plan mode to coding mode, two consecutive "user" messages may appear
+/// (one is a ToolResult, the other is a <system-reminder>).
+/// This violates the role alternation rule and causes a 400 error.
 pub fn merge_consecutive_messages(messages: &mut Vec<Message>) {
     if messages.len() <= 1 {
         return;
@@ -285,7 +285,7 @@ pub fn merge_consecutive_messages(messages: &mut Vec<Message>) {
     if let Some(mut current) = messages_iter.next() {
         for next in messages_iter {
             if current.role == next.role {
-                // 合并内容
+                // Merge content
                 match (&mut current.content, next.content) {
                     (MessageContent::Array(current_blocks), MessageContent::Array(next_blocks)) => {
                         current_blocks.extend(next_blocks);
@@ -315,7 +315,7 @@ pub fn merge_consecutive_messages(messages: &mut Vec<Message>) {
     *messages = merged;
 }
 
-/// 转换 Claude 请求为 Gemini v1internal 格式
+/// Transform a Claude request into Gemini v1internal format
 
 /// [FIX #709] Reorder serialized Gemini parts to ensure thinking blocks are first
 fn reorder_gemini_parts(parts: &mut Vec<Value>) {
@@ -355,16 +355,16 @@ pub fn transform_claude_request_in(
     is_retry: bool,
     account_id: Option<&str>,
     _session_id: &str,
-    token: Option<&crate::proxy::token_manager::ProxyToken>, // [NEW] 支持动态规格
+    token: Option<&crate::proxy::token_manager::ProxyToken>, // [NEW] Supports dynamic specs
 ) -> Result<Value, String> {
     let message_count = claude_req.messages.len();
 
-    // [CRITICAL FIX] 预先清理所有消息中的 cache_control 字段
-    // 这解决了 VS Code 插件等客户端在多轮对话中将历史消息的 cache_control 字段
-    // 原封不动发回导致的 "Extra inputs are not permitted" 错误
+    // [CRITICAL FIX] Pre-clean cache_control fields in all messages
+    // This fixes the issue where clients like the VS Code plugin send back the cache_control field
+    // of historical messages unchanged during multi-turn conversations, causing an "Extra inputs are not permitted" error
     let mut cleaned_req = claude_req.clone();
 
-    // [CRITICAL FIX] 提取并过滤 role == "system" 的消息，防止混入 contents 导致 Gemini 返回 400 INVALID_ARGUMENT
+    // [CRITICAL FIX] Extract and filter out role == "system" messages to prevent them mixing into contents and causing Gemini to return 400 INVALID_ARGUMENT
     let mut extra_system_messages = Vec::new();
     let mut filtered_messages = Vec::new();
     for msg in cleaned_req.messages {
@@ -387,8 +387,8 @@ pub fn transform_claude_request_in(
     }
     cleaned_req.messages = filtered_messages;
 
-    // [FIX #813] 合并连续的同角色消息 (Consecutive User Messages)
-    // 确保请求符合 Anthropic 和 Gemini 的角色交替协议
+    // [FIX #813] Merge consecutive same-role messages (Consecutive User Messages)
+    // Ensure the request complies with the Anthropic and Gemini role alternation protocol
     merge_consecutive_messages(&mut cleaned_req.messages);
 
     clean_cache_control_from_messages(&mut cleaned_req.messages);
@@ -415,14 +415,14 @@ pub fn transform_claude_request_in(
         });
     }
 
-    let claude_req = &cleaned_req; // 后续使用清理后的请求
+    let claude_req = &cleaned_req; // Use the cleaned request from here on
 
     // [NEW] Generate session ID for signature tracking
     // This enables session-isolated signature storage, preventing cross-conversation pollution
     let session_id = SessionManager::extract_session_id(claude_req);
     tracing::debug!("[Claude-Request] Session ID: {}", session_id);
 
-    // 检测是否有联网工具 (server tool or built-in tool)
+    // Detect whether there is a web-access tool (server tool or built-in tool)
     let has_web_search_tool = claude_req
         .tools
         .as_ref()
@@ -437,10 +437,10 @@ pub fn transform_claude_request_in(
         })
         .unwrap_or(false);
 
-    // 用于存储 tool_use id -> name 映射
+    // Used to store the tool_use id -> name mapping
     let mut tool_id_to_name: HashMap<String, String> = HashMap::new();
 
-    // 检测是否有 mcp__ 开头的工具
+    // Detect whether there are tools with an mcp__ prefix
     let has_mcp_tools = claude_req
         .tools
         .as_ref()
@@ -454,7 +454,7 @@ pub fn transform_claude_request_in(
         })
         .unwrap_or(false);
 
-    // [New] 预先构建工具名称到原始 Schema 的映射，用于后续参数类型修正
+    // [New] Pre-build a mapping from tool name to original Schema, used for later parameter type correction
     let mut tool_name_to_schema = HashMap::new();
     if let Some(tools) = &claude_req.tools {
         for tool in tools {
@@ -464,7 +464,7 @@ pub fn transform_claude_request_in(
         }
     }
 
-    // 1. System Instruction (注入动态身份防护 & MCP XML 协议)
+    // 1. System Instruction (inject dynamic identity guard & MCP XML protocol)
     let system_instruction = build_system_instruction(
         &claude_req.system,
         &claude_req.model,
@@ -473,14 +473,14 @@ pub fn transform_claude_request_in(
     );
 
     //  Map model name (Use standard mapping)
-    // [IMPROVED] 提取 web search 模型为常量，便于维护
+    // [IMPROVED] Extract the web search model into a constant for maintainability
     #[allow(dead_code)]
     const WEB_SEARCH_FALLBACK_MODEL: &str = "gemini-2.5-flash";
 
     let mapped_model =
         crate::proxy::common::model_mapping::map_claude_model_to_gemini(&claude_req.model);
 
-    // 将 Claude 工具转为 Value 数组以便探测联网
+    // Convert Claude tools into a Value array to detect web access
     let tools_val: Option<Vec<Value>> = claude_req.tools.as_ref().map(|list| {
         list.iter()
             .map(|t| serde_json::to_value(t).unwrap_or(json!({})))
@@ -524,9 +524,9 @@ pub fn transform_claude_request_in(
         is_thinking_enabled = false;
     }
 
-    // [REMOVED] 智能降级检查 (should_disable_thinking_due_to_history)
-    // 原因: 该检查过于激进，会导致 Claude Code CLI 在历史记录不完美时永久禁用思考模式 (Issue #2006)
-    // 现在的策略是依赖 thinking_utils.rs 中的 Recovery 机制来修复历史，而不是禁用思考。
+    // [REMOVED] Smart downgrade check (should_disable_thinking_due_to_history)
+    // Reason: this check was too aggressive and caused Claude Code CLI to permanently disable thinking mode when history was imperfect (Issue #2006)
+    // The current strategy relies on the Recovery mechanism in thinking_utils.rs to repair history instead of disabling thinking.
 
     // [FIX #295 & #298] If thinking enabled but no signature available,
     // disable thinking to prevent Gemini 3 Pro rejection
@@ -575,14 +575,14 @@ pub fn transform_claude_request_in(
                 &session_id,
             )
         {
-            // [FIX #2167] Flash / gemini-pro-agent 无签名时使用哨兵值而不是禁用 thinking
-            // 禁用 thinking 会导致模型失去思考能力，哨兵值可让 Gemini 跳过签名校验
+            // [FIX #2167] For Flash / gemini-pro-agent, use a sentinel value instead of disabling thinking when there is no signature
+            // Disabling thinking causes the model to lose reasoning ability; the sentinel value lets Gemini skip signature validation
             if model_keeps_thinking_without_signature(&mapped_model) {
                 tracing::info!(
                     "[Thinking-Mode] [FIX #2167] No signature for model function calls. \
                      Will rely on sentinel injection in build_contents."
                 );
-                // 保持 is_thinking_enabled = true，由 build_contents 内的哨兵处理覆盖
+                // Keep is_thinking_enabled = true; the sentinel handling inside build_contents covers this
             } else {
                 tracing::warn!(
                     "[Thinking-Mode] [FIX #295] No valid signature found for function calls. \
@@ -599,7 +599,7 @@ pub fn transform_claude_request_in(
         &mapped_model,
         has_web_search_tool,
         is_thinking_enabled,
-        token, // [NEW] 传递 token 用于动态限额
+        token, // [NEW] Pass token for dynamic quota limits
     );
 
     // 2. Contents (Messages)
@@ -638,7 +638,7 @@ pub fn transform_claude_request_in(
 
     if let Some(tools_val) = tools {
         inner_request["tools"] = tools_val;
-        // 显式设置工具配置模式为 VALIDATED 并开启 includeServerSideToolInvocations (同时支持 camelCase 与 snake_case 以对齐 Google v1internal 接口)
+        // Explicitly set the tool config mode to VALIDATED and enable includeServerSideToolInvocations (support both camelCase and snake_case to align with the Google v1internal interface)
         inner_request["toolConfig"] = json!({
             "functionCallingConfig": {
                 "mode": "VALIDATED"
@@ -653,7 +653,7 @@ pub fn transform_claude_request_in(
         });
     }
 
-    // 深度清理 [undefined] 字符串 (Cherry Studio 等客户端常见注入)
+    // Deep-clean "[undefined]" strings (commonly injected by clients like Cherry Studio)
     crate::proxy::mappers::common_utils::deep_clean_undefined(&mut inner_request, 0);
 
     if config.inject_google_search && !has_web_search_tool {
@@ -697,13 +697,13 @@ pub fn transform_claude_request_in(
         }
     }
 
-    // [ADDED v4.1.24] 注入稳定 sessionId 对齐官方规范
+    // [ADDED v4.1.24] Inject a stable sessionId to align with the official spec
     if let Some(account_id) = account_id {
         inner_request["sessionId"] =
             json!(crate::proxy::common::session::derive_session_id(account_id));
     }
 
-    // 生成 requestId
+    // Generate requestId
     // [CHANGED v4.1.24] Structured requestId to match official format
     let request_id = format!(
         "agent/antigravity/{}/{}",
@@ -711,7 +711,7 @@ pub fn transform_claude_request_in(
         message_count
     );
 
-    // 构建最终请求体
+    // Build the final request body
     let mut body = json!({
         "project": project_id,
         "requestId": request_id,
@@ -722,15 +722,15 @@ pub fn transform_claude_request_in(
         "requestType": if config.request_type == "image_gen" { "image_gen" } else { "agent" },
     });
 
-    // 如果提供了 metadata.user_id，则复用为 sessionId
+    // If metadata.user_id is provided, reuse it as sessionId
     if let Some(metadata) = &claude_req.metadata {
         if let Some(user_id) = &metadata.user_id {
             body["request"]["sessionId"] = json!(user_id);
         }
     }
 
-    // [FIX #593] 最后一道防线: 递归深度清理所有 cache_control 字段
-    // 确保发送给 Antigravity 的请求中不包含任何 cache_control
+    // [FIX #593] Last line of defense: recursively deep-clean all cache_control fields
+    // Ensure the request sent to Antigravity contains no cache_control
     deep_clean_cache_control(&mut body);
     tracing::debug!("[DEBUG-593] Final deep clean complete, request ready to send");
 
@@ -777,8 +777,8 @@ fn should_enable_thinking_by_default(model: &str) -> bool {
         return true;
     }
 
-    // [FEATURE] 为 gemini-*-flash 自动开启 thinking
-    // 让 Cherry Studio 等客户端即使未显式传 thinking.type 也能获取思维链内容
+    // [FEATURE] Automatically enable thinking for gemini-*-flash
+    // Let clients like Cherry Studio get thinking chain content even without explicitly passing thinking.type
     if model_lower.contains("gemini")
         && (model_lower.contains("flash") || model_lower.contains("-flash-"))
     {
@@ -810,7 +810,7 @@ fn model_supports_thinking(mapped_model: &str) -> bool {
         || (mapped_model.contains("gemini-3.1-pro")
             && !mapped_model.contains("-high")
             && !mapped_model.contains("-low"))
-        // [FIX #2167] gemini-*-flash 支持 thinking，必须纳入识别范围
+        // [FIX #2167] gemini-*-flash supports thinking and must be included in the recognition scope
         || (mapped_model.contains("gemini")
             && (mapped_model.contains("flash") || mapped_model.contains("-flash-")))
 }
@@ -900,7 +900,7 @@ fn has_valid_signature_for_function_calls(
     false
 }
 
-/// 构建 System Instruction (支持动态身份映射与 Prompt 隔离)
+/// Build the System Instruction (supports dynamic identity mapping and prompt isolation)
 fn build_system_instruction(
     system: &Option<SystemPrompt>,
     _model_name: &str,
@@ -909,13 +909,13 @@ fn build_system_instruction(
 ) -> Option<Value> {
     let mut parts = Vec::new();
 
-    // [NEW] Antigravity 身份指令 (原始简化版)
+    // [NEW] Antigravity identity instruction (original simplified version)
     let antigravity_identity = "You are Antigravity, a powerful agentic AI coding assistant designed by the Google Deepmind team working on Advanced Agentic Coding.\n\
     You are pair programming with a USER to solve their coding task. The task may require creating a new codebase, modifying or debugging an existing codebase, or simply answering a question.\n\
     **Absolute paths only**\n\
     **Proactiveness**";
 
-    // [HYBRID] 检查用户是否已提供 Antigravity 身份
+    // [HYBRID] Check whether the user has already provided the Antigravity identity
     let mut user_has_antigravity = false;
     if let Some(sys) = system {
         match sys {
@@ -935,18 +935,18 @@ fn build_system_instruction(
         }
     }
 
-    // 如果用户没有提供 Antigravity 身份,则注入
+    // If the user did not provide the Antigravity identity, inject it
     if !user_has_antigravity {
         parts.push(json!({"text": antigravity_identity}));
     }
 
-    // [NEW] 注入全局系统提示词 (紧跟 Antigravity 身份之后)
+    // [NEW] Inject the global system prompt (right after the Antigravity identity)
     let global_prompt_config = crate::proxy::config::get_global_system_prompt();
     if global_prompt_config.enabled && !global_prompt_config.content.trim().is_empty() {
         parts.push(json!({"text": global_prompt_config.content}));
     }
 
-    // 添加用户的系统提示词
+    // Add the user's system prompt
     if let Some(sys) = system {
         match sys {
             SystemPrompt::String(text) => {
@@ -967,27 +967,27 @@ fn build_system_instruction(
         }
     }
 
-    // 添加提取出来的 role == "system" 消息
+    // Add the extracted role == "system" messages
     for extra_text in extra_system_messages {
         if !extra_text.trim().is_empty() {
             parts.push(json!({"text": format!("\n{}", extra_text)}));
         }
     }
 
-    // [NEW] MCP XML Bridge: 如果存在 mcp__ 开头的工具，注入专用的调用协议
-    // 这能有效规避部分 MCP 链路在标准的 tool_use 协议下解析不稳的问题
+    // [NEW] MCP XML Bridge: if tools with an mcp__ prefix exist, inject the dedicated call protocol
+    // This effectively avoids parsing instability in some MCP chains under the standard tool_use protocol
     if has_mcp_tools {
         let mcp_xml_prompt = "\n\
-        ==== MCP XML 工具调用协议 (Workaround) ====\n\
-        当你需要调用名称以 `mcp__` 开头的 MCP 工具时：\n\
-        1) 优先尝试 XML 格式调用：输出 `<mcp__tool_name>{\"arg\":\"value\"}</mcp__tool_name>`。\n\
-        2) 必须直接输出 XML 块，无需 markdown 包装，内容为 JSON 格式的入参。\n\
-        3) 这种方式具有更高的连通性和容错性，适用于大型结果返回场景。\n\
+        ==== MCP XML Tool Call Protocol (Workaround) ====\n\
+        When you need to call an MCP tool whose name starts with `mcp__`:\n\
+        1) Prefer the XML format call: output `<mcp__tool_name>{\"arg\":\"value\"}</mcp__tool_name>`.\n\
+        2) You must output the XML block directly, with no markdown wrapping; the content is the JSON-formatted arguments.\n\
+        3) This approach has higher connectivity and fault tolerance, suitable for scenarios with large result returns.\n\
         ===========================================";
         parts.push(json!({"text": mcp_xml_prompt}));
     }
 
-    // 如果用户没有提供任何系统提示词,添加结束标记
+    // If the user did not provide any system prompt, add an end marker
     if !user_has_antigravity {
         parts.push(json!({"text": "\n--- [SYSTEM_PROMPT_END] ---"}));
     }
@@ -998,7 +998,7 @@ fn build_system_instruction(
     }))
 }
 
-/// 构建 Contents (Messages)
+/// Build Contents (Messages)
 fn build_contents(
     content: &MessageContent,
     is_assistant: bool,
@@ -1043,8 +1043,8 @@ fn build_contents(
                 match item {
                     ContentBlock::Text { text } => {
                         if text != "(no content)" && !text.trim().is_empty() {
-                            // [NEW] 任务去重逻辑: 如果当前是 User 消息，且紧跟在 ToolResult 之后，
-                            // 检查该文本是否与上一轮任务描述完全一致。
+                            // [NEW] Task deduplication logic: if this is a User message immediately following a ToolResult,
+                            // check whether this text is exactly identical to the previous turn's task description.
                             if !is_assistant && *previous_was_tool_result {
                                 if let Some(last_task) = last_user_task_text_normalized {
                                     let current_normalized =
@@ -1065,7 +1065,7 @@ fn build_contents(
                             );
                             saw_non_thinking = true;
 
-                            // 记录最近一次 User 任务文本用于后续比对
+                            // Record the most recent User task text for later comparison
                             if !is_assistant {
                                 *last_user_task_text_normalized =
                                     Some(text.replace(|c: char| c.is_whitespace(), ""));
@@ -1206,7 +1206,7 @@ fn build_contents(
                         }
                     }
                     ContentBlock::RedactedThinking { data } => {
-                        // [FIX] 将 RedactedThinking 作为普通文本处理，保留上下文
+                        // [FIX] Treat RedactedThinking as plain text to preserve context
                         tracing::debug!("[Claude-Request] Degrade RedactedThinking to text");
                         parts.push(json!({
                             "text": format!("[Redacted Thinking: {}]", data)
@@ -1245,7 +1245,7 @@ fn build_contents(
                     } => {
                         let mut final_input = input.clone();
 
-                        // [New] 利用通用引擎修正参数类型 (替代以前硬编码的 shell 工具修复逻辑)
+                        // [New] Use the generic engine to fix parameter types (replaces the old hardcoded shell tool fix logic)
                         if let Some(original_schema) = tool_name_to_schema.get(name) {
                             crate::proxy::common::json_schema::fix_tool_call_args(
                                 &mut final_input,
@@ -1267,7 +1267,7 @@ fn build_contents(
                             pending_tool_use_ids.push(id.clone());
                         }
 
-                        // 存储 id -> name 映射
+                        // Store the id -> name mapping
                         tool_id_to_name.insert(id.clone(), name.clone());
 
                         // Signature resolution logic
@@ -1410,14 +1410,14 @@ fn build_contents(
                     } => {
                         // Mark this tool ID as resolved in this turn
                         current_turn_tool_result_ids.insert(tool_use_id.clone());
-                        // 优先使用之前记录的 name，否则用 tool_use_id
+                        // Prefer the previously recorded name; otherwise use tool_use_id
                         let func_name = tool_id_to_name
                             .get(tool_use_id)
                             .cloned()
                             .unwrap_or_else(|| tool_use_id.clone());
 
-                        // [FIX #593] 工具输出压缩: 处理超大工具输出
-                        // 使用智能压缩策略(浏览器快照、大文件提示等)
+                        // [FIX #593] Tool output compression: handle oversized tool output
+                        // Use a smart compression strategy (browser snapshots, large-file hints, etc.)
                         let mut compacted_content = content.clone();
                         if let Some(blocks) = compacted_content.as_array_mut() {
                             tool_result_compressor::sanitize_tool_result_blocks(blocks);
@@ -1474,7 +1474,7 @@ fn build_contents(
                             merged_content = truncated;
                         }
 
-                        // [优化] 如果结果为空，注入显式确认信号，防止模型幻觉
+                        // [Optimization] If the result is empty, inject an explicit confirmation signal to prevent model hallucination
                         if merged_content.trim().is_empty() {
                             if is_error.unwrap_or(false) {
                                 merged_content =
@@ -1492,7 +1492,7 @@ fn build_contents(
                             }
                         });
 
-                        // [FIX] Tool Result 也需要回填签名（如果上下文中有）
+                        // [FIX] Tool Result also needs the signature backfilled (if available in context)
                         if let Some(sig) = last_thought_signature.as_ref() {
                             part["thoughtSignature"] = json!(sig);
                             part["thought_signature"] = json!(sig);
@@ -1500,18 +1500,18 @@ fn build_contents(
 
                         parts.push(part);
 
-                        // 追加图片 parts
+                        // Append image parts
                         for extra in extra_parts {
                             parts.push(extra);
                         }
 
-                        // 标记状态，用于下一条 User 消息的去重判断
+                        // Mark the state, used for deduplication on the next User message
                         *previous_was_tool_result = true;
                     }
                     // ContentBlock::RedactedThinking handled above at line 583
                     ContentBlock::ServerToolUse { .. }
                     | ContentBlock::WebSearchToolResult { .. } => {
-                        // 搜索结果 block 不应由客户端发回给上游 (已由 tool_result 替代)
+                        // Search result blocks should not be sent back upstream by the client (already replaced by tool_result)
                         continue;
                     }
                 }
@@ -1557,7 +1557,7 @@ fn build_contents(
             p.get("thought").and_then(|v| v.as_bool()).unwrap_or(false)
                 || p.get("thoughtSignature").is_some()
                 || p.get("thought_signature").is_some()
-                || p.get("thought").and_then(|v| v.as_str()).is_some() // 某些情况下可能是 text + thought: true 的组合
+                || p.get("thought").and_then(|v| v.as_str()).is_some() // In some cases this may be a text + thought: true combination
         });
 
         if !has_thought_part {
@@ -1574,17 +1574,17 @@ fn build_contents(
                 parts.len()
             );
         } else {
-            // [Crucial Check] 即使有 thought 块，也必须保证它位于 parts 的首位 (Index 0)
-            // 且必须包含 thought: true 标记
+            // [Crucial Check] Even if a thought block exists, it must be guaranteed to be first in parts (Index 0)
+            // and must include the thought: true marker
             let first_is_thought = parts.get(0).map_or(false, |p| {
                 (p.get("thought").is_some()
                     || p.get("thoughtSignature").is_some()
                     || p.get("thought_signature").is_some())
-                    && p.get("text").is_some() // 对于 v1internal，通常 text + thought: true 才是合规的思维块
+                    && p.get("text").is_some() // For v1internal, text + thought: true is typically what qualifies as a valid thinking block
             });
 
             if !first_is_thought {
-                // 如果首项不符合思维块特征，强制补入一个
+                // If the first item doesn't match the thinking block pattern, force-insert one
                 parts.insert(
                     0,
                     json!({
@@ -1594,7 +1594,7 @@ fn build_contents(
                 );
                 tracing::debug!("First part of model message at {} is not a valid thought block. Prepending dummy.", parts.len());
             } else {
-                // 确保首项包含了 thought: true (防止只有 signature 的情况)
+                // Ensure the first item includes thought: true (to guard against cases with only a signature)
                 if let Some(p0) = parts.get_mut(0) {
                     if p0.get("thought").is_none() {
                         p0.as_object_mut()
@@ -1608,7 +1608,7 @@ fn build_contents(
     Ok(parts)
 }
 
-/// 构建 Contents (Messages)
+/// Build Contents (Messages)
 fn build_google_content(
     msg: &Message,
     claude_req: &ClaudeRequest,
@@ -1695,7 +1695,7 @@ fn build_google_content(
     }))
 }
 
-/// 构建 Contents (Messages)
+/// Build Contents (Messages)
 fn build_google_contents(
     messages: &[Message],
     claude_req: &ClaudeRequest,
@@ -1713,7 +1713,7 @@ fn build_google_contents(
     // Track pending tool_use IDs for recovery
     let mut pending_tool_use_ids: Vec<String> = Vec::new();
 
-    // [NEW] 用于识别并过滤 Claude Code 重复回显的任务指令
+    // [NEW] Used to identify and filter out Claude Code's duplicated echo of task instructions
     let mut last_user_task_text_normalized: Option<String> = None;
     let mut previous_was_tool_result = false;
 
@@ -1811,7 +1811,7 @@ fn merge_adjacent_roles(mut contents: Vec<Value>) -> Vec<Value> {
     merged
 }
 
-/// 构建 Tools
+/// Build Tools
 fn build_tools(
     tools: &Option<Vec<Tool>>,
     has_web_search: bool,
@@ -1859,9 +1859,9 @@ fn build_tools(
 
         let mut tool_list = Vec::new();
 
-        // [优化] Gemini 2.0+ 及 3.0 系列模型通常支持混合工具调用 (Function Calling + Google Search)
-        // 但由于反代使用的 Google v1internal 接口为受限环境，不支持 include_server_side_tool_invocations，混合调用会报 400 错误。
-        // 因此在 v1internal 架构下，我们强制不开启混合工具调用以避免 400 报错。
+        // [Optimization] Gemini 2.0+ and 3.0 series models generally support mixed tool calling (Function Calling + Google Search)
+        // But since the reverse proxy uses the restricted Google v1internal interface, which does not support include_server_side_tool_invocations, mixed calling returns a 400 error.
+        // Therefore, under the v1internal architecture, we force mixed tool calling off to avoid the 400 error.
         let supports_mixed_tools = false;
 
         if !function_declarations.is_empty() {
@@ -1903,7 +1903,7 @@ fn build_tools(
     Ok(None)
 }
 
-/// 构建 Generation Config
+/// Build Generation Config
 fn build_generation_config(
     claude_req: &ClaudeRequest,
     mapped_model: &str,
@@ -1913,7 +1913,7 @@ fn build_generation_config(
 ) -> Value {
     let mut config = json!({});
 
-    // Thinking 配置
+    // Thinking configuration
     if is_thinking_enabled {
         let mut thinking_config = json!({"includeThoughts": true});
         let user_thinking_type = claude_req.thinking.as_ref().map(|t| t.type_.as_str());
@@ -1935,7 +1935,7 @@ fn build_generation_config(
             crate::proxy::config::ThinkingBudgetMode::Passthrough => budget_tokens as u64,
             crate::proxy::config::ThinkingBudgetMode::Custom => {
                 let mut custom_value = tb_config.custom_value as u64;
-                // [FIX #1602] 针对 Gemini 系列模型，在自定义模式下也强制执行动态限额
+                // [FIX #1602] For Gemini series models, also enforce the dynamic quota limit in custom mode
                 let model_lower = mapped_model.to_lowercase();
                 let is_gemini_limited = (model_lower.contains("gemini")
                     && !model_lower.contains("-image"))
@@ -1968,14 +1968,14 @@ fn build_generation_config(
                     budget_tokens as u64
                 }
             }
-            crate::proxy::config::ThinkingBudgetMode::Adaptive => budget_tokens as u64, // Adaptive 模式透传原始预算（但不作为限制），用于后续逻辑判断
+            crate::proxy::config::ThinkingBudgetMode::Adaptive => budget_tokens as u64, // In Adaptive mode, pass through the original budget (but not as a limit), used for later logic decisions
         };
 
         let global_mode_is_adaptive = matches!(
             tb_config.mode,
             crate::proxy::config::ThinkingBudgetMode::Adaptive
         );
-        // 只要用户指定 adaptive 或者全局配置为 adaptive，且是支持的思维模型，就启用自适应
+        // Enable adaptive mode whenever the user specifies adaptive, or the global config is adaptive, and the model supports thinking
         let should_use_adaptive = (user_is_adaptive || global_mode_is_adaptive)
             && (mapped_model.to_lowercase().contains("claude")
                 || mapped_model.to_lowercase().contains("gemini-3"));
@@ -1993,7 +1993,7 @@ fn build_generation_config(
             // for gemini-3.1-pro-high / gemini-3.1-pro-low in adaptive mode.
             let lower_mapped = mapped_model.to_lowercase();
             if lower_mapped.contains("claude") {
-                // Claude 系列走 Vertex AI 原生协议，支持 thinkingLevel 分级参数
+                // Claude series uses the native Vertex AI protocol, which supports the tiered thinkingLevel parameter
                 let mapped_level = match effort.map(|e| e.to_lowercase()).as_deref() {
                     Some("low") => "low",
                     Some("medium") => "medium",
@@ -2011,7 +2011,7 @@ fn build_generation_config(
                     .unwrap()
                     .remove("thinkingBudget");
             } else {
-                // Gemini 系列（含 gemini-3.x）走 v1internal 协议，只接受 thinkingBudget，不支持 thinkingLevel
+                // Gemini series (including gemini-3.x) uses the v1internal protocol, which only accepts thinkingBudget and does not support thinkingLevel
                 // [FIX #2007] Cherry Studio / Claude Protocol 400 Error Fix
                 // Gemini 1.5/2.0 models via Vertex AI often reject thinkingBudget: -1 (Adaptive) with 400 Invalid Argument
                 // especially when maxOutputTokens is high.
@@ -2020,7 +2020,7 @@ fn build_generation_config(
                 thinking_config["thinkingBudget"] = json!(24576);
             }
 
-            // 针对自适应模式，如果没有显式设置，确保 maxOutputTokens 给足空间
+            // For adaptive mode, if not explicitly set, ensure maxOutputTokens has enough room
             // OpenAI mapper uses 57344 (24576 + 32768), we normally use 64k limit.
             if config.get("maxOutputTokens").is_none() {
                 config["maxOutputTokens"] = json!(64000);
@@ -2044,7 +2044,7 @@ fn build_generation_config(
         config["thinkingConfig"] = thinking_config;
     }
 
-    // 其他参数
+    // Other parameters
     if let Some(temp) = claude_req.temperature {
         config["temperature"] = json!(temp);
     }
@@ -2059,20 +2059,20 @@ fn build_generation_config(
         config["topK"] = json!(40); // [ADDED v4.1.24] Default topK=40 to match official client
     }
 
-    // web_search 强制 candidateCount=1
+    // Force candidateCount=1 for web_search
     /*if has_web_search {
         config["candidateCount"] = json!(1);
     }*/
 
-    // max_tokens 映射为 maxOutputTokens
-    // [FIX] 不再默认设置 81920，防止非思维模型 (如 claude-sonnet-4-6) 报 400 Invalid Argument
+    // Map max_tokens to maxOutputTokens
+    // [FIX] No longer default to 81920, to prevent non-thinking models (e.g. claude-sonnet-4-6) from returning 400 Invalid Argument
     let mut final_max_tokens: Option<i64> = claude_req.max_tokens.map(|t| t as i64);
 
-    // [NEW] 确保 maxOutputTokens 大于 thinkingBudget (API 强约束)
-    // [NEW] 确保 maxOutputTokens 大于 thinkingBudget (API 强约束)
+    // [NEW] Ensure maxOutputTokens is greater than thinkingBudget (a hard API constraint)
+    // [NEW] Ensure maxOutputTokens is greater than thinkingBudget (a hard API constraint)
     let model_lower = mapped_model.to_lowercase();
-    // 重新计算 should_use_adaptive (因为上面定义的作用域仅在其 if 块内有效，或者我们可以假设在这里也需要同样的逻辑)
-    // 但为了简洁和解耦，我们这里重新从 config 读取
+    // Recompute should_use_adaptive (since the one defined above is only valid within its if block; we assume the same logic is needed here too)
+    // But for simplicity and decoupling, we re-read from config here
     let tb_config_chk = crate::proxy::config::get_thinking_budget_config();
     let global_adaptive = matches!(
         tb_config_chk.mode,
@@ -2102,7 +2102,7 @@ fn build_generation_config(
         {
             let current = final_max_tokens.unwrap_or(0);
             if current <= budget as i64 {
-                // [FIX #1675] 针对图像模型使用更小的增量 (2048)
+                // [FIX #1675] Use a smaller increment (2048) for image models
                 let overhead = if mapped_model.contains("-image") {
                     2048
                 } else {
@@ -2143,7 +2143,7 @@ fn build_generation_config(
         }
     }
 
-    // [优化] 设置全局停止序列,防止模型幻觉出对话标记
+    // [Optimization] Set global stop sequences to prevent the model from hallucinating conversation markers
     // [FIX #2007] Opus 4.6 Thinking Alignment
     // Successful OpenAI logs show NO stop sequences were sent for Opus 4.6 Thinking.
     if !(model_lower.contains("claude-opus-4-6-thinking") && is_thinking_enabled) {
@@ -2481,7 +2481,7 @@ mod tests {
 
     #[test]
     fn test_cache_control_cleanup() {
-        // 模拟 VS Code 插件发送的包含 cache_control 的历史消息
+        // Simulate historical messages containing cache_control sent by the VS Code plugin
         let req = ClaudeRequest {
             model: "claude-sonnet-4-6".to_string(),
             messages: vec![
@@ -2495,7 +2495,7 @@ mod tests {
                         ContentBlock::Thinking {
                             thinking: "Let me think...".to_string(),
                             signature: Some("sig123".to_string()),
-                            cache_control: Some(json!({"type": "ephemeral"})), // 这个应该被清理
+                            cache_control: Some(json!({"type": "ephemeral"})), // This should be cleaned up
                         },
                         ContentBlock::Text {
                             text: "Here is my response".to_string(),
@@ -2510,7 +2510,7 @@ mod tests {
                             media_type: "image/png".to_string(),
                             data: "iVBORw0KGgo=".to_string(),
                         },
-                        cache_control: Some(json!({"type": "ephemeral"})), // 这个也应该被清理
+                        cache_control: Some(json!({"type": "ephemeral"})), // This should also be cleaned up
                     }]),
                 },
             ],
@@ -2532,19 +2532,19 @@ mod tests {
             transform_claude_request_in(&req, "test-project", false, None, "test_session", None);
         assert!(result.is_ok());
 
-        // 验证请求成功转换
+        // Verify the request converts successfully
         let body = result.unwrap();
         assert_eq!(body["project"], "test-project");
 
-        // 注意: cache_control 的清理发生在内部,我们无法直接从 JSON 输出验证
-        // 但如果没有清理,后续发送到 Anthropic API 时会报错
-        // 这个测试主要确保清理逻辑不会导致转换失败
+        // Note: cache_control cleanup happens internally; we cannot verify it directly from the JSON output
+        // But if it were not cleaned up, sending it to the Anthropic API afterward would error
+        // This test mainly ensures the cleanup logic does not cause the conversion to fail
     }
 
     #[test]
     fn test_thinking_mode_auto_disable_on_tool_use_history() {
-        // [场景] 历史消息中有一个工具调用链，且 Assistant 消息没有 Thinking 块
-        // 期望: 系统自动降级，禁用 Thinking 模式，以避免 400 错误
+        // [Scenario] The message history has a tool call chain, and the Assistant message has no Thinking block
+        // Expected: the system automatically downgrades and disables Thinking mode to avoid a 400 error
         let req = ClaudeRequest {
             model: "claude-sonnet-4-6".to_string(),
             messages: vec![
@@ -2552,7 +2552,7 @@ mod tests {
                     role: "user".to_string(),
                     content: MessageContent::String("Check files".to_string()),
                 },
-                // Assistant 使用工具，但在非 Thinking 模式下
+                // Assistant uses a tool, but not in Thinking mode
                 Message {
                     role: "assistant".to_string(),
                     content: MessageContent::Array(vec![
@@ -2568,7 +2568,7 @@ mod tests {
                         },
                     ]),
                 },
-                // 用户返回工具结果
+                // User returns the tool result
                 Message {
                     role: "user".to_string(),
                     content: MessageContent::Array(vec![ContentBlock::ToolResult {
@@ -2610,8 +2610,8 @@ mod tests {
         let body = result.unwrap();
         let request = &body["request"];
 
-        // 验证: generationConfig 中不应包含 thinkingConfig (因为被降级了)
-        // 即使请求中明确启用了 thinking
+        // Verify: generationConfig should not contain thinkingConfig (since it was downgraded)
+        // even though thinking was explicitly enabled in the request
         if let Some(gen_config) = request.get("generationConfig") {
             assert!(
                 gen_config.get("thinkingConfig").is_none(),
@@ -2619,13 +2619,13 @@ mod tests {
             );
         }
 
-        // 验证: 依然能生成有效的请求体
+        // Verify: a valid request body can still be generated
         assert!(request.get("contents").is_some());
     }
 
     #[test]
     fn test_thinking_block_not_prepend_when_disabled() {
-        // 验证当 thinking 未启用时,不会补全 thinking 块
+        // Verify that thinking blocks are not backfilled when thinking is not enabled
         let req = ClaudeRequest {
             model: "claude-sonnet-4-6".to_string(),
             messages: vec![
@@ -2647,7 +2647,7 @@ mod tests {
             temperature: None,
             top_p: None,
             top_k: None,
-            thinking: None, // 未启用 thinking
+            thinking: None, // Thinking not enabled
             metadata: None,
             output_config: None,
             size: None,
@@ -2669,22 +2669,22 @@ mod tests {
 
         let parts = last_model_msg["parts"].as_array().unwrap();
 
-        // 验证没有补全 thinking 块
+        // Verify that no thinking block was backfilled
         assert_eq!(parts.len(), 1, "Should only have the original text block");
         assert_eq!(parts[0]["text"], "Response");
     }
 
     #[test]
     fn test_thinking_block_empty_content_fix() {
-        // [场景] 客户端发送了一个内容为空的 thinking 块
-        // 期望: 自动填充 "..."
+        // [Scenario] The client sent a thinking block with empty content
+        // Expected: automatically fill in "..."
         let req = ClaudeRequest {
             model: "claude-sonnet-4-6".to_string(),
             messages: vec![Message {
                 role: "assistant".to_string(),
                 content: MessageContent::Array(vec![
                     ContentBlock::Thinking {
-                        thinking: "".to_string(), // 空内容
+                        thinking: "".to_string(), // Empty content
                         signature: Some("sig".to_string()),
                         cache_control: None,
                     },
@@ -2718,7 +2718,7 @@ mod tests {
         let contents = body["request"]["contents"].as_array().unwrap();
         let parts = contents[0]["parts"].as_array().unwrap();
 
-        // 验证 thinking 块
+        // Verify the thinking block
         assert_eq!(
             parts[0]["text"], "...",
             "Empty thinking should be filled with ..."
@@ -2731,8 +2731,8 @@ mod tests {
 
     #[test]
     fn test_redacted_thinking_degradation() {
-        // [场景] 客户端包含 RedactedThinking
-        // 期望: 降级为普通文本，不带 thought: true
+        // [Scenario] The client includes RedactedThinking
+        // Expected: downgrade to plain text, without thought: true
         let req = ClaudeRequest {
             model: "claude-sonnet-4-6".to_string(),
             messages: vec![Message {
@@ -2766,7 +2766,7 @@ mod tests {
         let body = result.unwrap();
         let parts = body["request"]["contents"][0]["parts"].as_array().unwrap();
 
-        // 验证 RedactedThinking -> Text
+        // Verify RedactedThinking -> Text
         let text = parts[0]["text"].as_str().unwrap();
         assert!(text.contains("[Redacted Thinking: some data]"));
         assert!(
@@ -3210,10 +3210,10 @@ mod tests {
 
     #[test]
     fn test_mixed_tools_injection_for_gemini_2_0() {
-        // [场景] 使用 Gemini 2.0 模型，同时提供自定义工具和启用全网搜索
-        // 期望: 转换后的请求应同时包含 googleSearch 和 functionDeclarations
+        // [Scenario] Using a Gemini 2.0 model, providing custom tools while enabling web-wide search
+        // Expected: the converted request should contain both googleSearch and functionDeclarations
         let req = ClaudeRequest {
-            model: "claude-sonnet-4-6".to_string(), // 映射到 gemini-2.0-flash-exp
+            model: "claude-sonnet-4-6".to_string(), // Maps to gemini-2.0-flash-exp
             messages: vec![Message {
                 role: "user".to_string(),
                 content: MessageContent::String("Help me search and use tools".to_string()),
@@ -3242,10 +3242,10 @@ mod tests {
             quality: None,
         };
 
-        // 模拟映射到 Gemini 2.0
+        // Simulate mapping to Gemini 2.0
         let mapped_model = "gemini-2.0-flash-exp";
 
-        // 这里我们直接测试 build_tools 函数 (它是 pub(crate) 且在同模块下)
+        // Here we test the build_tools function directly (it is pub(crate) and in the same module)
         let result = build_tools(&req.tools, true, mapped_model);
         assert!(result.is_ok());
 
@@ -3257,8 +3257,8 @@ mod tests {
             .iter()
             .any(|t| t.get("functionDeclarations").is_some());
 
-        // 在 v1internal 接口受限环境下，强制禁用混合工具调用以避免 400 报错
-        // 存在自定义工具时，优先使用 functionDeclarations，不注入 googleSearch
+        // Under the restricted v1internal interface, mixed tool calling is force-disabled to avoid a 400 error
+        // When custom tools exist, functionDeclarations take priority and googleSearch is not injected
         assert!(
             !has_google_search,
             "v1internal should avoid mixed Google Search when functionDeclarations present"
@@ -3271,8 +3271,8 @@ mod tests {
 
     #[test]
     fn test_no_mixed_tools_for_older_gemini() {
-        // [场景] 使用 Gemini 1.5 模型，同时提供自定义工具和启用全网搜索
-        // 期望: 转换后的请求应只包含 functionDeclarations，googleSearch 被跳过以避免 400
+        // [Scenario] Using a Gemini 1.5 model, providing custom tools while enabling web-wide search
+        // Expected: the converted request should contain only functionDeclarations; googleSearch is skipped to avoid a 400
         let req = ClaudeRequest {
             model: "claude-sonnet-4-6".to_string(),
             messages: vec![Message {
@@ -3303,10 +3303,10 @@ mod tests {
             quality: None,
         };
 
-        // 模拟映射到 Gemini 1.5
+        // Simulate mapping to Gemini 1.5
         let mapped_model = "gemini-1.5-flash-002";
 
-        // 测试 build_tools 函数
+        // Test the build_tools function
         let result = build_tools(&req.tools, true, mapped_model);
         assert!(result.is_ok());
 

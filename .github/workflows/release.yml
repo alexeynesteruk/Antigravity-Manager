@@ -77,11 +77,11 @@ jobs:
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         run: npm run tauri build -- ${{ matrix.args }}
 
-      # 3. 处理 macOS 架构重命名冲突 (解决 422 Already Exists)
+      # 3. Handle macOS architecture rename conflicts (fixes 422 Already Exists)
       - name: Rename macOS assets for architecture
         if: matrix.platform == 'macos-latest'
         run: |
-          # 识别架构
+          # Detect the architecture
           if [[ "${{ matrix.args }}" == *"--target aarch64-apple-darwin"* ]]; then
             ARCH="aarch64"
           elif [[ "${{ matrix.args }}" == *"--target x86_64-apple-darwin"* ]]; then
@@ -94,17 +94,17 @@ jobs:
           
           echo "Detected architecture: $ARCH"
           
-          # 进入产物目录
+          # Enter the artifact directory
           cd src-tauri/target/*/release/bundle/macos/
           
-          # 重命名 .app.tar.gz 和 .sig
+          # Rename .app.tar.gz and .sig
           if [ -f "Antigravity Tools.app.tar.gz" ]; then
             mv "Antigravity Tools.app.tar.gz" "Antigravity Tools_${ARCH}.app.tar.gz"
             mv "Antigravity Tools.app.tar.gz.sig" "Antigravity Tools_${ARCH}.app.tar.gz.sig"
             echo "Renamed assets to append Arch: $ARCH"
           fi
           
-          # 更新对应的 updater.json (指向重命名后的文件)
+          # Update the corresponding updater.json (point it at the renamed files)
           UPDATER_JSON="../../../updater/install.json"
           if [ ! -f "$UPDATER_JSON" ]; then
              UPDATER_JSON=$(find ../../../updater -name "*.json" | head -n 1)
@@ -115,7 +115,7 @@ jobs:
             sed -i '' "s/Antigravity%20Tools.app.tar.gz/Antigravity%20Tools_${ARCH}.app.tar.gz/g" "$UPDATER_JSON"
           fi
 
-      # 1. 上传 updater.json 到 Artifacts (供后续合并使用)
+      # 1. Upload updater.json to Artifacts (for later merging)
       - name: Upload updater json
         uses: actions/upload-artifact@v4
         with:
@@ -123,7 +123,7 @@ jobs:
           path: src-tauri/target/**/release/bundle/updater/*.json
           if-no-files-found: ignore
 
-      # 2. 上传安装包到 Artifacts (供后续统一发布任务下载)
+      # 2. Upload installers to Artifacts (for the unified publish job to download later)
       - name: Upload Release Artifacts
         uses: actions/upload-artifact@v4
         with:
@@ -154,7 +154,7 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      # 下载所有构建产物 (仅限 release 相关的 assets 和 updater)
+      # Download all build artifacts (only release-related assets and updater)
       - name: Download all artifacts
         uses: actions/download-artifact@v4
         with:
@@ -272,7 +272,7 @@ jobs:
           done
           find release-files -maxdepth 1 -type f -print
 
-      # 使用 ncipollo/release-action 进行统一发布，支持稳健覆盖
+      # Use ncipollo/release-action for unified publishing, with robust overwrite support
       - name: Create or Update GitHub Release
         uses: ncipollo/release-action@v1
         if: startsWith(github.ref, 'refs/tags/')

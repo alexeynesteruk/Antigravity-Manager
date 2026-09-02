@@ -21,7 +21,7 @@ static SPECS: Lazy<SpecsConfig> = Lazy::new(|| {
     serde_json::from_str(json_str).expect("Failed to parse model_specs.json")
 });
 
-/// 获取归一化后的模型 ID (基于别名)
+/// Get the normalized model ID (based on alias)
 pub fn resolve_alias(model_id: &str) -> String {
     SPECS
         .aliases
@@ -30,48 +30,48 @@ pub fn resolve_alias(model_id: &str) -> String {
         .unwrap_or_else(|| model_id.to_string())
 }
 
-/// 获取模型输出 Token 限额 (动态优先)
+/// Get the model output token limit (dynamic takes priority)
 pub fn get_max_output_tokens(model_id: &str, token: Option<&ProxyToken>) -> u64 {
     let std_id = resolve_alias(model_id);
 
-    // 1. 尝试从账号动态数据中读取
+    // 1. Try reading from the account's dynamic data
     if let Some(t) = token {
         if let Some(&limit) = t.model_limits.get(&std_id) {
             return limit;
         }
-        // 如果原始 ID 没找到，尝试用归一化后的 ID 找
+        // If the raw ID wasn't found, try looking up with the normalized ID
         if let Some(&limit) = t.model_limits.get(model_id) {
             return limit;
         }
     }
 
-    // 2. 回退到静态 JSON
+    // 2. Fall back to static JSON
     if let Some(spec) = SPECS.models.get(&std_id) {
         if let Some(limit) = spec.max_output_tokens {
             return limit;
         }
     }
 
-    // 3. 全局兜底
+    // 3. Global fallback
     65535
 }
 
-/// 获取思维链预算 (动态优先)
+/// Get the thinking chain budget (dynamic takes priority)
 pub fn get_thinking_budget(model_id: &str, _token: Option<&ProxyToken>) -> u64 {
     let std_id = resolve_alias(model_id);
 
-    // 1. 优先尝试从 token 的 quota 信息中推断 (如果以后 quota 返回了具体 budget)
-    // 目前 ProxyToken 结构体暂未直接缓存每个模型的 thinking_budget，
-    // 但可以通过 model_limits 比例或直接从 JSON 补全。
+    // 1. First try to infer from the token's quota info (if quota later returns a specific budget)
+    // Currently the ProxyToken struct does not directly cache each model's thinking_budget,
+    // but it could be filled in via a model_limits ratio or directly from JSON.
 
-    // 2. 静态 JSON 配置
+    // 2. Static JSON config
     if let Some(spec) = SPECS.models.get(&std_id) {
         if let Some(budget) = spec.thinking_budget {
             return budget;
         }
     }
 
-    // 3. 默认安全限额
+    // 3. Default safe limit
     if std_id.contains("claude") {
         16000
     } else {
@@ -79,7 +79,7 @@ pub fn get_thinking_budget(model_id: &str, _token: Option<&ProxyToken>) -> u64 {
     }
 }
 
-/// 判断是否为思维模型
+/// Determine whether this is a thinking model
 #[allow(dead_code)]
 pub fn is_thinking_model(model_id: &str) -> bool {
     let std_id = resolve_alias(model_id);

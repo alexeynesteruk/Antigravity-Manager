@@ -1,5 +1,5 @@
-// Claude mapper 模块
-// 负责 Claude ↔ Gemini 协议转换
+// Claude mapper module
+// Responsible for Claude ↔ Gemini protocol transformation
 
 pub mod collector;
 pub mod models;
@@ -25,7 +25,7 @@ use bytes::Bytes;
 use futures::Stream;
 use std::pin::Pin;
 
-/// 创建从 Gemini SSE 流到 Claude SSE 流的转换
+/// Create a transformation from a Gemini SSE stream to a Claude SSE stream
 pub fn create_claude_sse_stream<S, E>(
     mut gemini_stream: Pin<Box<S>>,
     trace_id: String,
@@ -58,7 +58,7 @@ where
         let mut buffer = BytesMut::new();
 
         loop {
-            // [NEW] 60秒心跳保活: 延长超时时间以增加网络抖动容错
+            // [NEW] 60-second heartbeat keepalive: extend the timeout to increase tolerance for network jitter
             let next_chunk = tokio::time::timeout(
                 std::time::Duration::from_secs(60),
                 gemini_stream.next()
@@ -98,9 +98,9 @@ where
                         }
                     }
                 }
-                Ok(None) => break, // Stream 正常结束
+                Ok(None) => break, // Stream ended normally
                 Err(_) => {
-                    // 超时，发送心跳包 (SSE Comment 格式)
+                    // Timed out, send a heartbeat packet (SSE Comment format)
                     yield Ok(Bytes::from(": ping\n\n"));
                 }
             }
@@ -216,7 +216,7 @@ where
     })
 }
 
-/// 处理单行 SSE 数据
+/// Process a single line of SSE data
 fn process_sse_line(
     line: &str,
     state: &mut StreamingState,
@@ -240,7 +240,7 @@ fn process_sse_line(
         return Some(chunks);
     }
 
-    // 解析 JSON
+    // Parse JSON
     let json_value: serde_json::Value = match serde_json::from_str(data_str) {
         Ok(v) => v,
         Err(_) => return None,
@@ -248,18 +248,18 @@ fn process_sse_line(
 
     let mut chunks = Vec::new();
 
-    // 解包 response 字段 (如果存在)
+    // Unwrap the response field (if present)
     let raw_json = json_value.get("response").unwrap_or(&json_value);
 
-    // 发送 message_start
+    // Send message_start
     if !state.message_start_sent {
         chunks.push(state.emit_message_start(raw_json));
     }
 
-    // 捕获 groundingMetadata (Web Search)
+    // Capture groundingMetadata (Web Search)
     if let Some(candidate) = raw_json.get("candidates").and_then(|c| c.get(0)) {
         if let Some(grounding) = candidate.get("groundingMetadata") {
-            // 提取搜索词
+            // Extract the search query
             if let Some(query) = grounding
                 .get("webSearchQueries")
                 .and_then(|v| v.as_array())
@@ -269,7 +269,7 @@ fn process_sse_line(
                 state.web_search_query = Some(query.to_string());
             }
 
-            // 提取结果块
+            // Extract the result chunks
             if let Some(chunks_arr) = grounding.get("groundingChunks").and_then(|v| v.as_array()) {
                 state.grounding_chunks = Some(chunks_arr.clone());
             } else if let Some(chunks_arr) = grounding
@@ -282,7 +282,7 @@ fn process_sse_line(
         }
     }
 
-    // 处理所有 parts
+    // Process all parts
     if let Some(parts) = raw_json
         .get("candidates")
         .and_then(|c| c.get(0))
@@ -315,7 +315,7 @@ fn process_sse_line(
     }
     */
 
-    // 检查是否结束
+    // Check whether it has ended
     if let Some(finish_reason) = raw_json
         .get("candidates")
         .and_then(|c| c.get(0))
@@ -356,7 +356,7 @@ fn process_sse_line(
     }
 }
 
-/// 发送强制结束事件
+/// Send a forced termination event
 pub fn emit_force_stop(state: &mut StreamingState) -> Vec<Bytes> {
     if !state.message_stop_sent {
         let mut chunks = state.emit_finish(None, None);
@@ -524,7 +524,7 @@ mod tests {
         let chunks = result.unwrap();
         assert!(!chunks.is_empty());
 
-        // 应该包含 message_start 和 text delta
+        // Should contain message_start and a text delta
         let all_text: String = chunks
             .iter()
             .map(|b| String::from_utf8(b.to_vec()).unwrap_or_default())
@@ -539,9 +539,9 @@ mod tests {
     async fn test_thinking_only_interruption_recovery() {
         use futures::StreamExt;
 
-        // 1. 模拟一个只发送 Thinking 然后就结束的流
+        // 1. Simulate a stream that only sends Thinking and then ends
         let mock_stream = async_stream::stream! {
-            // 发送 Thinking 块
+            // Send a Thinking block
             let thinking_json = serde_json::json!({
                 "candidates": [{
                     "content": {
@@ -553,10 +553,10 @@ mod tests {
             });
             yield Ok::<_, String>(bytes::Bytes::from(format!("data: {}\n\n", thinking_json)));
 
-            // 然后突然结束 (没有 Text, 没有 Usage, 直接 None)
+            // Then end abruptly (no Text, no Usage, straight to None)
         };
 
-        // 2. 创建转换后的流
+        // 2. Create the transformed stream
         let mut claude_stream = create_claude_sse_stream(
             Box::pin(mock_stream),
             "trace_test".to_string(),
@@ -570,7 +570,7 @@ mod tests {
             Vec::new(), // registered_tool_names
         );
 
-        // 3. 收集输出
+        // 3. Collect the output
         let mut all_chunks = Vec::new();
         while let Some(result) = claude_stream.next().await {
             if let Ok(bytes) = result {
@@ -579,14 +579,14 @@ mod tests {
         }
         let output = all_chunks.join("");
 
-        // 4. 验证恢复逻辑
-        // 必须包含 Thinking
+        // 4. Verify the recovery logic
+        // Must contain Thinking
         assert!(output.contains("Thinking..."));
 
-        // 必须包含恢复的系统提示
+        // Must contain the recovery system message
         assert!(output.contains("Recovered by Antigravity"));
 
-        // 必须包含模拟的 Usage
+        // Must contain the simulated Usage
         assert!(output.contains("\"usage\":"));
         assert!(output.contains("\"output_tokens\":100")); // Should contain the recovery usage
     }

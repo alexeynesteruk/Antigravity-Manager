@@ -427,9 +427,9 @@ fn extract_oauth_state_from_file(db_path: &PathBuf) -> Result<ImportedOAuthState
     let conn = rusqlite::Connection::open(db_path)
         .map_err(|e| format!("Failed to open database: {}", e))?;
 
-    // 1. 尝试新版格式 (>= 1.16.5)
-    // 键: antigravityUnifiedStateSync.oauthToken
-    // 结构: Outer(F1) -> Inner(F2) -> Inner2(F1) -> Base64 -> OAuthInfo
+    // 1. Try the new format (>= 1.16.5)
+    // Key: antigravityUnifiedStateSync.oauthToken
+    // Structure: Outer(F1) -> Inner(F2) -> Inner2(F1) -> Base64 -> OAuthInfo
     let new_format_data: Option<String> = conn
         .query_row(
             "SELECT value FROM ItemTable WHERE key = ?",
@@ -447,7 +447,7 @@ fn extract_oauth_state_from_file(db_path: &PathBuf) -> Result<ImportedOAuthState
             return Err(format!("Unexpected OAuth sentinel key: {}", sentinel_key));
         }
 
-        // 解析 OAuthInfo (Field 3) -> Refresh Token
+        // Parse OAuthInfo (Field 3) -> Refresh Token
         let refresh_bytes = protobuf::find_field(&oauth_info_blob, 3)
             .map_err(|e| format!("Parsing OAuthInfo Field 3 failed: {}", e))?
             .ok_or("Refresh Token not found in OAuthInfo (Field 3)")?;
@@ -464,7 +464,7 @@ fn extract_oauth_state_from_file(db_path: &PathBuf) -> Result<ImportedOAuthState
         });
     }
 
-    // 2. 尝试旧版格式 (< 1.16.5)
+    // 2. Try the old format (< 1.16.5)
     crate::modules::logger::log_info(
         "Falling back to old format database (jetskiStateSync.agentManagerInitState)",
     );

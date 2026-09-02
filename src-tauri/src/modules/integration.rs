@@ -2,21 +2,21 @@ use crate::models::Account;
 use crate::modules::{db, device, process, version};
 use std::fs;
 pub trait SystemIntegration: Send + Sync {
-    /// 当切换账号时执行的系统层操作（如杀进程、写入文件、注入数据库）
+    /// System-level operations executed when switching accounts (e.g. killing processes, writing files, injecting into the database)
     async fn on_account_switch(
         &self,
         account: &crate::models::Account,
         target_ide: Option<&str>,
     ) -> Result<(), String>;
 
-    /// 更新系统托盘（如果适用）
+    /// Update the system tray (if applicable)
     fn update_tray(&self);
 
-    /// 发送系统通知
+    /// Send a system notification
     fn show_notification(&self, title: &str, body: &str);
 }
 
-/// 桌面版实现：包含完整的进程控制 and UI 同步
+/// Desktop implementation: includes full process control and UI sync
 pub struct DesktopIntegration {
     pub app_handle: tauri::AppHandle,
 }
@@ -59,12 +59,12 @@ impl SystemIntegration for DesktopIntegration {
             return Ok(());
         }
 
-        // 1. 先关闭外部正在运行的进程（无论是原生还是IDE，先安全关闭，避免文件或凭据冲突）
+        // 1. First close any externally running process (whether native or IDE, close it safely first to avoid file or credential conflicts)
         if process::is_antigravity_running(target_ide) {
             process::close_antigravity(20, target_ide)?;
         }
 
-        // 2. 智能决策：是否使用最新的系统 Keychain 凭据管理器方式存储 Token
+        // 2. Smart decision: whether to store the Token via the latest system Keychain credential manager approach
         let mut is_ide = target_ide == Some("ide");
 
         // Auto-detect IDE: if the located executable is the IDE, treat as IDE mode
@@ -84,10 +84,10 @@ impl SystemIntegration for DesktopIntegration {
         let mut use_keyring = false;
 
         if !is_ide {
-            // 经典原生版：自动探测版本号
+            // Classic native version: auto-detect the version number
             match version::get_antigravity_version(target_ide) {
                 Ok(ver) => {
-                    // 如果版本号 >= 2.0.0
+                    // If the version number >= 2.0.0
                     if version::compare_version(&ver.short_version, "2.0.0")
                         != std::cmp::Ordering::Less
                     {
@@ -104,7 +104,7 @@ impl SystemIntegration for DesktopIntegration {
                     }
                 }
                 Err(e) => {
-                    // 如果探测失败，为防止对最新版由于没有 storage.json 造成报错阻断，默认作为新凭据注入
+                    // If detection fails, default to injecting as a new credential to prevent the latest version from being blocked by an error due to missing storage.json
                     use_keyring = true;
                     crate::modules::logger::log_warn(&format!(
                         "[Desktop] Failed to detect Antigravity version ({}), defaulting to system Keyring for robustness.",
@@ -115,27 +115,27 @@ impl SystemIntegration for DesktopIntegration {
         }
 
         if use_keyring {
-            // ================== 最新版 Antigravity 原生应用逻辑 (>= 2.0.0) ==================
-            // 2.1 写入系统 Keychain/Keyring
+            // ================== Latest Antigravity native app logic (>= 2.0.0) ==================
+            // 2.1 Write to the system Keychain/Keyring
             write_to_system_keyring(account)?;
 
-            // 2.2 原生应用可能没有 storage.json，但如果有的话，我们也可以尝试安全地写入设备 Profile，以兼容指纹信息
+            // 2.2 The native app may not have storage.json, but if it does, we can also try to safely write the device Profile, to remain compatible with fingerprint information
             if let Ok(storage_path) = device::get_storage_path(target_ide) {
                 if let Some(ref profile) = account.device_profile {
                     let _ = device::write_profile(&storage_path, profile);
                 }
             }
         } else {
-            // ================== 原有 Antigravity 旧版或定制 IDE 逻辑 (< 2.0.0) ==================
-            // 2.1 获取存储路径
+            // ================== Legacy Antigravity old version or custom IDE logic (< 2.0.0) ==================
+            // 2.1 Get the storage path
             let storage_path = device::get_storage_path(target_ide)?;
 
-            // 2.2 写入设备 Profile
+            // 2.2 Write the device Profile
             if let Some(ref profile) = account.device_profile {
                 device::write_profile(&storage_path, profile)?;
             }
 
-            // 2.3 数据库处理与 Token 注入
+            // 2.3 Database handling and Token injection
             let db_path = db::get_db_path(target_ide)?;
             if db_path.exists() {
                 let backup_path = db_path.with_extension("vscdb.backup");
@@ -155,16 +155,16 @@ impl SystemIntegration for DesktopIntegration {
                 target_ide,
             )?;
 
-            // 2.4 同步 Service Machine ID 到数据库
+            // 2.4 Sync the Service Machine ID to the database
             if let Some(ref profile) = account.device_profile {
                 let _ = db::write_service_machine_id(&db_path, &profile.mac_machine_id);
             }
         }
 
-        // 3. 重启外部进程
+        // 3. Restart the external process
         process::start_antigravity(target_ide)?;
 
-        // 4. 更新托盘
+        // 4. Update the tray
         let _ = crate::modules::tray::update_tray_menus(&self.app_handle);
 
         Ok(())
@@ -175,14 +175,14 @@ impl SystemIntegration for DesktopIntegration {
     }
 
     fn show_notification(&self, title: &str, body: &str) {
-        // 使用 tauri-plugin-dialog 或原生通知（此处简化）
+        // Uses tauri-plugin-dialog or native notifications (simplified here)
         crate::modules::logger::log_info(&format!("[Notification] {}: {}", title, body));
     }
 }
 
-/// 辅助方法：向宿主操作系统的 Keychain/Credentials Manager 写入 Token
+/// Helper method: write the Token to the host operating system's Keychain/Credentials Manager
 fn write_to_system_keyring(account: &crate::models::Account) -> Result<(), String> {
-    // 1. 构建 Token 的 JSON Payload，并将过期时间戳格式化为符合 RFC3339 的带微秒格式
+    // 1. Build the Token's JSON Payload, and format the expiry timestamp to an RFC3339-compliant format with microseconds
     let expiry_datetime = chrono::DateTime::from_timestamp(account.token.expiry_timestamp, 0)
         .unwrap_or_else(|| chrono::Utc::now());
     let expiry_str = expiry_datetime.to_rfc3339_opts(chrono::SecondsFormat::Micros, true);
@@ -217,7 +217,7 @@ fn write_to_system_keyring(account: &crate::models::Account) -> Result<(), Strin
         account.email
     ));
 
-    // 2. 跨平台凭据注入
+    // 2. Cross-platform credential injection
     #[cfg(target_os = "macos")]
     {
         use base64::{engine::general_purpose::STANDARD, Engine as _};
@@ -226,7 +226,7 @@ fn write_to_system_keyring(account: &crate::models::Account) -> Result<(), Strin
         let full_keyring_value = format!("go-keyring-base64:{}", encoded_payload);
 
         // 2.1 macOS Keychain Access
-        // 删除旧的
+        // Delete the old one
         let _ = Command::new("security")
             .args([
                 "delete-generic-password",
@@ -237,7 +237,7 @@ fn write_to_system_keyring(account: &crate::models::Account) -> Result<(), Strin
             ])
             .output();
 
-        // 写入新的 (-A 参数允许所有本地应用免密码、无感直接读取凭据)
+        // Write the new one (the -A flag allows all local apps to read the credential directly without a password prompt)
         let output = Command::new("security")
             .args([
                 "add-generic-password",
@@ -406,7 +406,7 @@ fn write_to_system_keyring(account: &crate::models::Account) -> Result<(), Strin
         "[Desktop] Successfully wrote token to system credential store.",
     );
 
-    // 同步写入 ~/.gemini/ 目录下的文件凭据，兼容 SSH 会话、容器环境和无 Keyring/D-Bus 场景
+    // Also write file-based credentials under ~/.gemini/, for compatibility with SSH sessions, container environments, and scenarios without Keyring/D-Bus
     if let Err(e) = write_to_file_credentials(account) {
         crate::modules::logger::log_warn(&format!(
             "[Desktop] File credential sync warning: {}",
@@ -417,8 +417,8 @@ fn write_to_system_keyring(account: &crate::models::Account) -> Result<(), Strin
     Ok(())
 }
 
-/// 辅助方法：同步写入本地文件凭据 (~/.gemini/oauth_creds.json 以及 ~/.gemini/google_accounts.json)
-/// 用于在 SSH 会话、容器环境或无系统 Keyring / D-Bus 的场景下保障 CLI/工具的凭据兼容性
+/// Helper method: write local file-based credentials (~/.gemini/oauth_creds.json and ~/.gemini/google_accounts.json)
+/// Used to ensure CLI/tool credential compatibility in SSH sessions, container environments, or scenarios without a system Keyring / D-Bus
 fn write_to_file_credentials(account: &crate::models::Account) -> Result<(), String> {
     let home = match dirs::home_dir() {
         Some(h) => h,
@@ -509,7 +509,7 @@ fn write_to_file_credentials(account: &crate::models::Account) -> Result<(), Str
     Ok(())
 }
 
-/// 辅助方法：从宿主操作系统的 Keychain/Credentials Manager 读取 Token
+/// Helper method: read the Token from the host operating system's Keychain/Credentials Manager
 pub fn read_from_system_keyring() -> Result<crate::modules::migration::ImportedOAuthState, String> {
     #[cfg(target_os = "macos")]
     {
@@ -651,7 +651,7 @@ fn parse_keyring_payload(payload_str: &str) -> Result<crate::modules::migration:
     })
 }
 
-/// Headless/Docker 实现：仅执行数据层操作，忽略 UI 和进程控制
+/// Headless/Docker implementation: only performs data-layer operations, ignores UI and process control
 pub struct HeadlessIntegration;
 
 impl SystemIntegration for HeadlessIntegration {
@@ -671,8 +671,8 @@ impl SystemIntegration for HeadlessIntegration {
             "[Headless] Account switched in memory: {}",
             account.email
         ));
-        // Docker 模式下通常不直接控制宿主机的 VS Code 进程
-        // 如果需要同步配置 to 某个 volume，可以在此处添加逻辑
+        // In Docker mode, we typically don't directly control the host's VS Code process
+        // If configuration needs to be synced to some volume, logic can be added here
         Ok(())
     }
 
@@ -685,7 +685,7 @@ impl SystemIntegration for HeadlessIntegration {
     }
 }
 
-/// 系统集成管理器：替代 Arc<dyn SystemIntegration> 以解决 async trait 的 dyn 兼容性问题
+/// System integration manager: replaces Arc<dyn SystemIntegration> to resolve async trait dyn compatibility issues
 #[derive(Clone)]
 pub enum SystemManager {
     Desktop(tauri::AppHandle),

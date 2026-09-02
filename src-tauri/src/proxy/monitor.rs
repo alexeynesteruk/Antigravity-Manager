@@ -12,17 +12,17 @@ pub struct ProxyRequestLog {
     pub url: String,
     pub status: u16,
     pub duration: u64,                // ms
-    pub model: Option<String>,        // 客户端请求的模型名
-    pub mapped_model: Option<String>, // 实际路由后使用的模型名
+    pub model: Option<String>,        // Model name requested by the client
+    pub mapped_model: Option<String>, // Model name actually used after routing
     pub account_email: Option<String>,
-    pub client_ip: Option<String>, // 客户端 IP 地址
+    pub client_ip: Option<String>, // Client IP address
     pub error: Option<String>,
     pub request_body: Option<String>,
     pub response_body: Option<String>,
     pub input_tokens: Option<u32>,
     pub output_tokens: Option<u32>,
     pub cached_tokens: Option<u32>,
-    pub protocol: Option<String>, // 协议类型: "openai", "anthropic", "gemini"
+    pub protocol: Option<String>, // Protocol type: "openai", "anthropic", "gemini"
     pub username: Option<String>, // User token username
 }
 

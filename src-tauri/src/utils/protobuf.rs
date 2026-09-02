@@ -184,7 +184,7 @@ pub fn create_email_field(email: &str) -> Vec<u8> {
     f
 }
 
-/// 编码长度分隔字段 (wire_type = 2)
+/// Encode a length-delimited field (wire_type = 2)
 pub fn encode_len_delim_field(field_num: u32, data: &[u8]) -> Vec<u8> {
     let tag = (field_num << 3) | 2;
     let mut f = encode_varint(tag as u64);
@@ -193,12 +193,12 @@ pub fn encode_len_delim_field(field_num: u32, data: &[u8]) -> Vec<u8> {
     f
 }
 
-/// 编码字符串字段 (wire_type = 2)
+/// Encode a string field (wire_type = 2)
 pub fn encode_string_field(field_num: u32, value: &str) -> Vec<u8> {
     encode_len_delim_field(field_num, value.as_bytes())
 }
 
-/// 编码 varint 字段 (wire_type = 0)
+/// Encode a varint field (wire_type = 0)
 pub fn encode_varint_field(field_num: u32, value: u64) -> Vec<u8> {
     let tag = (field_num << 3) | 0;
     let mut f = encode_varint(tag as u64);
@@ -206,7 +206,7 @@ pub fn encode_varint_field(field_num: u32, value: u64) -> Vec<u8> {
     f
 }
 
-/// 创建 OAuthTokenInfo 消息（不包含 Field 6 包装，用于新格式）
+/// Create an OAuthTokenInfo message (without the Field 6 wrapper, used for the new format)
 pub fn create_oauth_info(
     access_token: &str,
     refresh_token: &str,
@@ -215,8 +215,8 @@ pub fn create_oauth_info(
     id_token: Option<&str>,
     email: Option<&str>,
 ) -> Vec<u8> {
-    // 智能纠正 is_gcp_tos (兼容性核心逻辑)
-    // 逻辑：如果确定是个人账号（通过邮件后缀），或者被明确要求修正，则强制关闭 Field 6
+    // Smartly correct is_gcp_tos (core compatibility logic)
+    // Logic: if it's determined to be a personal account (via the email suffix), or a correction is explicitly requested, forcibly turn off Field 6
     if let Some(email_str) = email {
         let is_personal = email_str.to_lowercase().ends_with("@gmail.com")
             || email_str.to_lowercase().ends_with("@outlook.com")
@@ -226,7 +226,7 @@ pub fn create_oauth_info(
 
         if is_personal && is_gcp_tos {
             crate::modules::logger::log_info(&format!(
-                "[Protobuf] 自动纠正个人账号 ({}) 的 GCP 标志位以确保 IDE 刷新兼容性。",
+                "[Protobuf] Automatically corrected the GCP flag for personal account ({}) to ensure IDE refresh compatibility.",
                 email_str
             ));
             is_gcp_tos = false;
@@ -242,26 +242,26 @@ pub fn create_oauth_info(
     // Field 3: refresh_token
     let field3 = encode_string_field(3, refresh_token);
 
-    // Field 4: expiry (嵌套的 Timestamp 消息)
+    // Field 4: expiry (nested Timestamp message)
     // message Timestamp { int64 seconds = 1; int32 nanos = 2; }
     let seconds_tag = (1 << 3) | 0;
     let mut timestamp_msg = encode_varint(seconds_tag);
     timestamp_msg.extend(encode_varint(expiry as u64));
 
-    // 添加 Field 2: nanos (0)
+    // Add Field 2: nanos (0)
     let nanos_tag = (2 << 3) | 0;
     timestamp_msg.extend(encode_varint(nanos_tag));
     timestamp_msg.extend(encode_varint(0));
 
     let field4 = encode_len_delim_field(4, &timestamp_msg);
 
-    // Field 5: id_token (如果存在)
+    // Field 5: id_token (if present)
     let field5 = id_token.map(|it| encode_string_field(5, it));
 
     // Field 6: is_gcp_tos
     let field6 = is_gcp_tos.then(|| encode_varint_field(6, 1));
 
-    // 合并所有字段为 OAuthTokenInfo 消息
+    // Merge all fields into the OAuthTokenInfo message
     let mut oauth_info = Vec::new();
     oauth_info.extend(field1);
     oauth_info.extend(field2);
@@ -332,7 +332,7 @@ fn decode_legacy_unified_state_entry(outer_blob: &[u8]) -> Result<(String, Vec<u
     Ok((sentinel_key, payload))
 }
 
-/// 创建统一状态同步条目：Topic(Field 1 data map) -> DataEntry(Field 1 key, Field 2 Row) -> Row(Field 1 base64 payload)
+/// Create a unified state sync entry: Topic(Field 1 data map) -> DataEntry(Field 1 key, Field 2 Row) -> Row(Field 1 base64 payload)
 pub fn create_unified_state_entry(sentinel_key: &str, payload: &[u8]) -> String {
     use base64::{engine::general_purpose, Engine as _};
 
@@ -347,8 +347,8 @@ pub fn create_unified_state_entry(sentinel_key: &str, payload: &[u8]) -> String 
     general_purpose::STANDARD.encode(topic)
 }
 
-/// 解码统一状态同步条目，返回 sentinel key 和原始 payload。
-/// 优先支持官方 Topic/Row 格式，并兼容早期工具写入的错误嵌套格式。
+/// Decode a unified state sync entry, returning the sentinel key and the raw payload.
+/// Prioritizes the official Topic/Row format, while remaining compatible with the incorrect nested format written by earlier tools.
 pub fn decode_unified_state_entry(outer_b64: &str) -> Result<(String, Vec<u8>), String> {
     use base64::{engine::general_purpose, Engine as _};
 
@@ -360,7 +360,7 @@ pub fn decode_unified_state_entry(outer_b64: &str) -> Result<(String, Vec<u8>), 
         .or_else(|_| decode_legacy_unified_state_entry(&outer_blob))
 }
 
-/// 查找指定 protobuf varint 字段
+/// Find the specified protobuf varint field
 pub fn find_varint_field(data: &[u8], target_field: u32) -> Result<Option<u64>, String> {
     let mut offset = 0;
 
@@ -380,21 +380,21 @@ pub fn find_varint_field(data: &[u8], target_field: u32) -> Result<Option<u64>, 
     Ok(None)
 }
 
-/// 创建 unified-state stringValue payload
+/// Create a unified-state stringValue payload
 pub fn create_string_value_payload(value: &str) -> Vec<u8> {
     // Matches the upstream `fs` message: { value: { case: "stringValue", value } }
     encode_string_field(3, value)
 }
 
-/// 创建最小可用的 UserStatus payload。
+/// Create a minimal viable UserStatus payload.
 ///
-/// Antigravity 的认证链路要求 `uss-userStatus` 里至少存在 sentinel key；
-/// 账号展示和会话绑定依赖名字和邮箱，因此这里写入最小身份信息即可。
+/// Antigravity's auth chain requires that `uss-userStatus` contain at least a sentinel key;
+/// account display and session binding rely on the name and email, so writing minimal identity information here is sufficient.
 pub fn create_minimal_user_status_payload(email: &str) -> Vec<u8> {
     [encode_string_field(3, email), encode_string_field(7, email)].concat()
 }
 
-/// 创建 unified-state Topic.data entry。
+/// Create a unified-state Topic.data entry.
 pub fn create_unified_topic_entry(sentinel_key: &str, payload: &[u8]) -> Vec<u8> {
     use base64::{engine::general_purpose, Engine as _};
     let row = encode_string_field(1, &general_purpose::STANDARD.encode(payload));
@@ -406,7 +406,7 @@ pub fn create_unified_topic_entry(sentinel_key: &str, payload: &[u8]) -> Vec<u8>
     encode_len_delim_field(1, &entry)
 }
 
-/// 从 Topic.data 中移除指定 map entry，保留同 topic 下其他 sentinel row。
+/// Remove the specified map entry from Topic.data, preserving other sentinel rows under the same topic.
 pub fn remove_unified_topic_entry(data: &[u8], target_key: &str) -> Result<Vec<u8>, String> {
     let mut result = Vec::new();
     let mut offset = 0;
@@ -422,7 +422,7 @@ pub fn remove_unified_topic_entry(data: &[u8], target_key: &str) -> Result<Vec<u
             let (length, content_offset) = read_varint(data, new_offset)?;
             let length = length as usize;
             if content_offset + length > data.len() {
-                return Err("Topic.data entry 数据不完整".to_string());
+                return Err("Topic.data entry data is incomplete".to_string());
             }
             let entry = &data[content_offset..content_offset + length];
             unified_topic_entry_key(entry) == Some(target_key)

@@ -12,13 +12,13 @@ const CREATE_NO_WINDOW: u32 = 0x08000000;
 #[cfg(target_os = "windows")]
 const CREATE_NEW_PROCESS_GROUP: u32 = 0x00000200;
 
-/// Cloudflared隧道模式
+/// Cloudflared tunnel mode
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "snake_case")]
 pub enum TunnelMode {
-    /// 快速隧道(临时URL)
+    /// Quick tunnel (temporary URL)
     Quick,
-    /// 认证隧道(使用Token)
+    /// Authenticated tunnel (uses a Token)
     Auth,
 }
 
@@ -28,19 +28,19 @@ impl Default for TunnelMode {
     }
 }
 
-/// Cloudflared配置
+/// Cloudflared configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CloudflaredConfig {
     #[serde(default)]
     pub enabled: bool,
     #[serde(default)]
     pub mode: TunnelMode,
-    /// 代理的本地端口
+    /// Local port being proxied
     pub port: u16,
-    /// 认证模式的Token
+    /// Token for authenticated mode
     #[serde(default)]
     pub token: Option<String>,
-    /// 使用http2协议(更兼容)
+    /// Use the http2 protocol (more compatible)
     #[serde(default)]
     pub use_http2: bool,
 }
@@ -52,12 +52,12 @@ impl Default for CloudflaredConfig {
             mode: TunnelMode::Quick,
             port: 8045,
             token: None,
-            use_http2: true, // 默认启用http2，更稳定
+            use_http2: true, // Enable http2 by default, more stable
         }
     }
 }
 
-/// Cloudflared状态
+/// Cloudflared status
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CloudflaredStatus {
     pub installed: bool,
@@ -79,12 +79,12 @@ impl Default for CloudflaredStatus {
     }
 }
 
-/// Cloudflared管理器状态
+/// Cloudflared manager state
 pub struct CloudflaredManager {
     process: Arc<RwLock<Option<Child>>>,
     status: Arc<RwLock<CloudflaredStatus>>,
     bin_path: PathBuf,
-    /// 用于通知进程监控任务停止
+    /// Used to notify the process monitor task to stop
     shutdown_tx: RwLock<Option<tokio::sync::oneshot::Sender<()>>>,
 }
 
@@ -105,7 +105,7 @@ impl CloudflaredManager {
         }
     }
 
-    /// 检查是否已安装
+    /// Check whether it's already installed
     pub async fn check_installed(&self) -> (bool, Option<String>) {
         if !self.bin_path.exists() {
             return (false, None);
@@ -132,18 +132,18 @@ impl CloudflaredManager {
         }
     }
 
-    /// 获取当前状态
+    /// Get the current status
     pub async fn get_status(&self) -> CloudflaredStatus {
         self.status.read().await.clone()
     }
 
-    /// 更新状态
+    /// Update the status
     async fn update_status(&self, f: impl FnOnce(&mut CloudflaredStatus)) {
         let mut status = self.status.write().await;
         f(&mut status);
     }
 
-    /// 安装cloudflared
+    /// Install cloudflared
     pub async fn install(&self) -> Result<CloudflaredStatus, String> {
         let bin_dir = self.bin_path.parent().unwrap();
         if !bin_dir.exists() {
@@ -220,9 +220,9 @@ impl CloudflaredManager {
         Ok(self.get_status().await)
     }
 
-    /// 启动隧道
+    /// Start the tunnel
     pub async fn start(&self, config: CloudflaredConfig) -> Result<CloudflaredStatus, String> {
-        // 检查是否已在运行
+        // Check whether it's already running
         {
             let proc = self.process.read().await;
             if proc.is_some() {
@@ -230,7 +230,7 @@ impl CloudflaredManager {
             }
         }
 
-        // 停止之前的监控任务
+        // Stop the previous monitor task
         if let Some(tx) = self.shutdown_tx.write().await.take() {
             let _ = tx.send(());
         }
@@ -245,8 +245,7 @@ impl CloudflaredManager {
 
         let mut cmd = Command::new(&self.bin_path);
 
-        // 设置工作目录
-        // 设置工作目录
+        // Set the working directory
         if let Some(bin_dir) = self.bin_path.parent() {
             cmd.current_dir(bin_dir);
             debug!("[cloudflared] Working directory: {:?}", bin_dir);
@@ -256,14 +255,14 @@ impl CloudflaredManager {
             TunnelMode::Quick => {
                 cmd.arg("tunnel").arg("--url").arg(&local_url);
 
-                // 注意：--no-autoupdate 参数在较新版本的 cloudflared 中已不被支持，会导致进程立即退出
+                // Note: the --no-autoupdate flag is no longer supported in newer versions of cloudflared, it causes the process to exit immediately
                 // cmd.arg("--no-autoupdate");
 
                 if config.use_http2 {
                     cmd.arg("--protocol").arg("http2");
                 }
 
-                // 注意：--loglevel 参数在此上下文中也会导致 Incorrect Usage 错误，故移除以使用默认值
+                // Note: the --loglevel flag also causes an Incorrect Usage error in this context, so it's removed to use the default value
                 // cmd.arg("--loglevel").arg("info");
 
                 info!("[cloudflared] Command args: tunnel --url {} ...", local_url);
@@ -272,14 +271,14 @@ impl CloudflaredManager {
                 if let Some(token) = &config.token {
                     cmd.arg("tunnel").arg("run").arg("--token").arg(token);
 
-                    // 注意：--no-autoupdate 参数不被支持
+                    // Note: the --no-autoupdate flag is not supported
                     // cmd.arg("--no-autoupdate");
 
                     if config.use_http2 {
                         cmd.arg("--protocol").arg("http2");
                     }
 
-                    // 注意：--loglevel 参数不被支持
+                    // Note: the --loglevel flag is not supported
                     // cmd.arg("--loglevel").arg("info");
 
                     info!("[cloudflared] Command args: tunnel run --token [HIDDEN] ...");
@@ -289,7 +288,7 @@ impl CloudflaredManager {
             }
         }
 
-        // 恢复管道
+        // Restore the pipes
         cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
 
         // CREATE_NO_WINDOW supresses console window on Windows
@@ -319,7 +318,7 @@ impl CloudflaredManager {
         })
         .await;
 
-        // 启动进程监控任务
+        // Start the process monitor task
         let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
         *self.shutdown_tx.write().await = Some(shutdown_tx);
 
@@ -339,7 +338,7 @@ impl CloudflaredManager {
                         if let Some(ref mut child) = *proc_lock {
                             match child.try_wait() {
                                 Ok(Some(exit_status)) => {
-                                    // 进程已退出
+                                    // Process has exited
                                     info!("[cloudflared] Process exited with status: {:?}", exit_status);
                                     *proc_lock = None;
                                     drop(proc_lock);
@@ -350,7 +349,7 @@ impl CloudflaredManager {
                                     break;
                                 }
                                 Ok(None) => {
-                                    // 进程仍在运行
+                                    // Process is still running
                                 }
                                 Err(e) => {
                                     info!("[cloudflared] Error checking process: {}", e);
@@ -364,7 +363,7 @@ impl CloudflaredManager {
                                 }
                             }
                         } else {
-                            // 进程不存在
+                            // Process does not exist
                             drop(proc_lock);
                             let mut s = status_ref.write().await;
                             if s.running {
@@ -381,7 +380,7 @@ impl CloudflaredManager {
         Ok(self.get_status().await)
     }
 
-    /// 停止隧道
+    /// Stop the tunnel
     pub async fn stop(&self) -> Result<CloudflaredStatus, String> {
         let mut proc_lock = self.process.write().await;
         if let Some(mut child) = proc_lock.take() {
@@ -400,7 +399,7 @@ impl CloudflaredManager {
     }
 }
 
-/// 获取下载URL
+/// Get the download URL
 fn get_download_url() -> Result<String, String> {
     let os = std::env::consts::OS;
     let arch = std::env::consts::ARCH;
@@ -428,7 +427,7 @@ where
         let reader = BufReader::new(stream);
         let mut lines = reader.lines();
         while let Ok(Some(line)) = lines.next_line().await {
-            // 恢复日志级别为 debug，避免污染生产环境日志
+            // Keep the log level at debug, to avoid polluting production logs
             debug!("[cloudflared output] {}", line);
             if let Some(url) = extract_tunnel_url(&line) {
                 info!("[cloudflared] Tunnel URL: {}", url);
@@ -439,12 +438,12 @@ where
     });
 }
 
-/// 从日志行提取隧道URL
-/// 支持两种模式：
-/// 1. 快速隧道：直接提取 .trycloudflare.com URL
-/// 2. 命名隧道：从 ingress 配置中解析 hostname
+/// Extract the tunnel URL from a log line
+/// Supports two modes:
+/// 1. Quick tunnel: directly extract the .trycloudflare.com URL
+/// 2. Named tunnel: parse the hostname from the ingress configuration
 fn extract_tunnel_url(line: &str) -> Option<String> {
-    // 快速隧道模式：直接查找 trycloudflare.com URL
+    // Quick tunnel mode: directly look for the trycloudflare.com URL
     if let Some(url) = line
         .split_whitespace()
         .find(|s| s.starts_with("https://") && s.contains(".trycloudflare.com"))
@@ -452,12 +451,12 @@ fn extract_tunnel_url(line: &str) -> Option<String> {
         return Some(url.to_string());
     }
 
-    // 命名隧道模式：从 "Updated to new configuration" 日志中解析 hostname
-    // 日志格式示例：Updated to new configuration config="{\"ingress\":[{\"hostname\":\"api.example.com\", ...}]}"
+    // Named tunnel mode: parse the hostname from the "Updated to new configuration" log line
+    // Log format example: Updated to new configuration config="{\"ingress\":[{\"hostname\":\"api.example.com\", ...}]}"
     if line.contains("Updated to new configuration") && line.contains("ingress") {
-        // 查找 hostname 字段
+        // Look for the hostname field
         if let Some(start) = line.find("\\\"hostname\\\":\\\"") {
-            let after_key = &line[start + 15..]; // 跳过 \"hostname\":\" (共15字符)
+            let after_key = &line[start + 15..]; // Skip \"hostname\":\" (15 characters total)
             if let Some(end) = after_key.find("\\\"") {
                 let hostname = &after_key[..end];
                 if !hostname.is_empty() {

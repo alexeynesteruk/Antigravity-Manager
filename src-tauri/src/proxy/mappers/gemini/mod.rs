@@ -1,5 +1,5 @@
-// Gemini mapper 模块
-// 负责 v1internal 包装/解包
+// Gemini mapper module
+// Responsible for v1internal wrap/unwrap
 
 pub mod collector;
 pub mod models;

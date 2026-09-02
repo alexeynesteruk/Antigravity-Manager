@@ -85,9 +85,9 @@ pub fn resolve_request_config(
         };
     }
 
-    // 检测是否有联网工具定义 (内置功能调用)
+    // Detect whether a web-access tool is defined (built-in function call)
     let has_networking_tool = detects_networking_tool(tools);
-    // 检测是否包含非联网工具 (如 MCP 本地工具)
+    // Detect whether a non-web-access tool is present (e.g. an MCP local tool)
     let has_non_networking = contains_non_networking_tool(tools);
 
     // Strip -online suffix from original model if present (to detect networking intent)
@@ -113,8 +113,8 @@ pub fn resolve_request_config(
         || mapped_model.contains("claude-4");
 
     // Determine if we should enable networking
-    // [FIX] 禁用基于模型的自动联网逻辑，防止图像请求被联网搜索结果覆盖。
-    // 仅在用户显式请求联网时启用：1) -online 后缀 2) 携带联网工具定义
+    // [FIX] Disable model-based automatic web-access logic, to prevent image requests from being overridden by web search results.
+    // Only enable it when the user explicitly requests web access: 1) the -online suffix 2) a web-access tool definition is present
     // [FIX] cloudcode-pa (v1internal) rejects googleSearch mixed with functionDeclarations
     // and does NOT honor tool_config.includeServerSideToolInvocations (verified: upstream
     // returns HTTP 400 even with the flag set). So when real (non-networking) function tools
@@ -215,11 +215,11 @@ fn parse_image_config_with_normalized_params(
 ) -> (Value, String) {
     let mut aspect_ratio = "1:1";
 
-    // 1. 优先从 size 参数解析宽高比
+    // 1. Prefer parsing the aspect ratio from the size parameter
     if let Some(parsed_ratio) = size.and_then(image_aspect_ratio_from_size) {
         aspect_ratio = parsed_ratio;
     } else {
-        // 2. 回退到模型后缀解析（保持向后兼容）
+        // 2. Fall back to parsing the model suffix (kept for backward compatibility)
         if model_name.contains("-21x9") || model_name.contains("-21-9") {
             aspect_ratio = "21:9";
         } else if model_name.contains("-16x9") || model_name.contains("-16-9") {
@@ -246,15 +246,15 @@ fn parse_image_config_with_normalized_params(
     let mut config = serde_json::Map::new();
     config.insert("aspectRatio".to_string(), json!(aspect_ratio));
 
-    // [NEW] 0. 最高优先级：直接使用 image_size 参数
+    // [NEW] 0. Highest priority: use the image_size parameter directly
     if let Some(image_size) = image_size {
         config.insert("imageSize".to_string(), json!(image_size));
     } else {
-        // 3. 优先从 quality 参数解析分辨率
+        // 3. Prefer parsing the resolution from the quality parameter
         if let Some(image_size) = quality.and_then(image_size_from_quality) {
             config.insert("imageSize".to_string(), json!(image_size));
         } else {
-            // 4. 回退到模型后缀解析（保持向后兼容）
+            // 4. Fall back to parsing the model suffix (kept for backward compatibility)
             let is_hd = model_name.contains("-4k") || model_name.contains("-hd");
             let is_2k = model_name.contains("-2k");
             let is_1k = model_name.contains("-1k") || model_name.contains("-standard");
@@ -351,16 +351,16 @@ fn clean_image_model_name(model_name: &str) -> String {
     clean_name
 }
 
-/// 动态计算宽高比（解决硬编码问题）
+/// Dynamically compute the aspect ratio (solves the hardcoding problem)
 ///
-/// 从 "WIDTHxHEIGHT" 格式的字符串解析并计算宽高比，
-/// 使用容差匹配常见的标准比例。
+/// Parse and compute the aspect ratio from a "WIDTHxHEIGHT" format string,
+/// using tolerance matching against common standard ratios.
 ///
 /// # Arguments
-/// * `size` - 尺寸字符串，格式为 "WIDTHxHEIGHT" (e.g., "1280x720", "1792x1024")
+/// * `size` - The size string, in "WIDTHxHEIGHT" format (e.g., "1280x720", "1792x1024")
 ///
 /// # Returns
-/// 标准宽高比字符串 ("1:1", "16:9", "9:16", "4:3", "3:4", "21:9")
+/// A standard aspect ratio string ("1:1", "16:9", "9:16", "4:3", "3:4", "21:9")
 pub fn image_aspect_ratio_from_size(size: &str) -> Option<&'static str> {
     let size = size.trim();
     if size.is_empty() || size.eq_ignore_ascii_case("auto") {
@@ -387,7 +387,7 @@ pub fn image_aspect_ratio_from_size(size: &str) -> Option<&'static str> {
             if width > 0.0 && height > 0.0 {
                 let ratio = width / height;
 
-                // 容差匹配常见比例（容差 0.05，避免 3:4 和 2:3 重叠）
+                // Tolerance-match common ratios (tolerance 0.05, to avoid overlap between 3:4 and 2:3)
                 if (ratio - 21.0 / 9.0).abs() < 0.05 {
                     return Some("21:9");
                 }
@@ -449,7 +449,7 @@ pub fn inject_google_search_tool(body: &mut Value, _mapped_model: Option<&str>) 
                 return;
             }
 
-            // 首先清理掉已存在的 googleSearch 或 googleSearchRetrieval，以防重复产生冲突
+            // First clean out any existing googleSearch or googleSearchRetrieval, to prevent duplicate conflicts
             tools_arr.retain(|t| {
                 if let Some(o) = t.as_object() {
                     !(o.contains_key("googleSearch") || o.contains_key("googleSearchRetrieval"))
@@ -458,7 +458,7 @@ pub fn inject_google_search_tool(body: &mut Value, _mapped_model: Option<&str>) 
                 }
             });
 
-            // 注入统一的 googleSearch (v1internal 规范)
+            // Inject the unified googleSearch (v1internal spec)
             tools_arr.push(json!({
                 "googleSearch": {}
             }));
@@ -466,14 +466,14 @@ pub fn inject_google_search_tool(body: &mut Value, _mapped_model: Option<&str>) 
     }
 }
 
-/// 深度迭代清理客户端发送的 [undefined] 脏字符串，防止 Gemini 接口校验失败
+/// Deeply and iteratively clean up dirty "[undefined]" strings sent by the client, to prevent Gemini interface validation failures
 pub fn deep_clean_undefined(value: &mut Value, depth: usize) {
     if depth > 10 {
         return;
     }
     match value {
         Value::Object(map) => {
-            // 移除值为 "[undefined]" 的键
+            // Remove keys whose value is "[undefined]"
             map.retain(|_, v| {
                 if let Some(s) = v.as_str() {
                     s != "[undefined]"
@@ -481,7 +481,7 @@ pub fn deep_clean_undefined(value: &mut Value, depth: usize) {
                     true
                 }
             });
-            // 递归处理嵌套
+            // Recursively process nested values
             for v in map.values_mut() {
                 deep_clean_undefined(v, depth + 1);
             }
@@ -500,7 +500,7 @@ pub fn deep_clean_undefined(value: &mut Value, depth: usize) {
 pub fn detects_networking_tool(tools: &Option<Vec<Value>>) -> bool {
     if let Some(list) = tools {
         for tool in list {
-            // 1. 直发风格 (Claude/Simple OpenAI/Anthropic Builtin/Vertex): { "name": "..." } 或 { "type": "..." }
+            // 1. Direct style (Claude/Simple OpenAI/Anthropic Builtin/Vertex): { "name": "..." } or { "type": "..." }
             if let Some(n) = tool.get("name").and_then(|v| v.as_str()) {
                 if n == "web_search"
                     || n == "google_search"
@@ -523,7 +523,7 @@ pub fn detects_networking_tool(tools: &Option<Vec<Value>>) -> bool {
                 }
             }
 
-            // 2. OpenAI 嵌套风格: { "type": "function", "function": { "name": "..." } }
+            // 2. OpenAI nested style: { "type": "function", "function": { "name": "..." } }
             if let Some(func) = tool.get("function") {
                 if let Some(n) = func.get("name").and_then(|v| v.as_str()) {
                     let keywords = [
@@ -539,7 +539,7 @@ pub fn detects_networking_tool(tools: &Option<Vec<Value>>) -> bool {
                 }
             }
 
-            // 3. Gemini 原生风格: { "functionDeclarations": [ { "name": "..." } ] }
+            // 3. Gemini native style: { "functionDeclarations": [ { "name": "..." } ] }
             if let Some(decls) = tool.get("functionDeclarations").and_then(|v| v.as_array()) {
                 for decl in decls {
                     if let Some(n) = decl.get("name").and_then(|v| v.as_str()) {
@@ -554,7 +554,7 @@ pub fn detects_networking_tool(tools: &Option<Vec<Value>>) -> bool {
                 }
             }
 
-            // 4. Gemini googleSearch 声明 (含 googleSearchRetrieval 变体)
+            // 4. Gemini googleSearch declaration (including the googleSearchRetrieval variant)
             if tool.get("googleSearch").is_some() || tool.get("googleSearchRetrieval").is_some() {
                 return true;
             }
@@ -563,13 +563,13 @@ pub fn detects_networking_tool(tools: &Option<Vec<Value>>) -> bool {
     false
 }
 
-/// 探测是否包含非联网相关的本地函数工具
+/// Detect whether a local function tool unrelated to web access is present
 pub fn contains_non_networking_tool(tools: &Option<Vec<Value>>) -> bool {
     if let Some(list) = tools {
         for tool in list {
             let mut is_networking = false;
 
-            // 简单逻辑：如果它是一个函数声明且名字不是联网关键词，则视为非联网工具
+            // Simple logic: if it's a function declaration and its name isn't a web-access keyword, treat it as a non-web-access tool
             if let Some(n) = tool.get("name").and_then(|v| v.as_str()) {
                 let keywords = [
                     "web_search",
@@ -599,7 +599,7 @@ pub fn contains_non_networking_tool(tools: &Option<Vec<Value>>) -> bool {
             {
                 is_networking = true;
             } else if tool.get("functionDeclarations").is_some() {
-                // 如果是 Gemini 风格的 functionDeclarations，进去看一眼
+                // If it's Gemini-style functionDeclarations, take a look inside
                 if let Some(decls) = tool.get("functionDeclarations").and_then(|v| v.as_array()) {
                     for decl in decls {
                         if let Some(n) = decl.get("name").and_then(|v| v.as_str()) {
@@ -610,12 +610,12 @@ pub fn contains_non_networking_tool(tools: &Option<Vec<Value>>) -> bool {
                                 "builtin_web_search",
                             ];
                             if !keywords.contains(&n) {
-                                return true; // 发现本地函数
+                                return true; // Found a local function
                             }
                         }
                     }
                 }
-                is_networking = true; // 即使全是联网，外层也标记为联网
+                is_networking = true; // Even if everything is web-access, mark the outer level as web-access too
             }
 
             if !is_networking {
@@ -1066,8 +1066,8 @@ pub fn sanitize_system_prompt_for_tokens(text: &str) -> String {
     use regex::Regex;
     let mut cleaned = text.to_string();
 
-    // [CACHE] Step 1: 剥离动态内容（时间戳、UUID），确保跨请求的前缀一致性
-    // 这对 Gemini 隐式前缀缓存命中至关重要
+    // [CACHE] Step 1: strip dynamic content (timestamps, UUIDs) to ensure prefix consistency across requests
+    // This is critical for hitting Gemini's implicit prefix cache
     let time_patterns = [
         r"(?im)^Current (date|time)(\s+is)?\s*:.*$",
         r"(?im)^Today is\s*:.*$",
@@ -1079,13 +1079,13 @@ pub fn sanitize_system_prompt_for_tokens(text: &str) -> String {
         }
     }
 
-    // 剥离 UUID
+    // Strip UUIDs
     if let Ok(re) = Regex::new(r"\b[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}\b")
     {
         cleaned = re.replace_all(&cleaned, "{uuid}").into_owned();
     }
 
-    // 剥离随机 request/session/trace ID
+    // Strip random request/session/trace IDs
     if let Ok(re) = Regex::new(r"\b(req|sid|trace)_[a-f0-9]{6,32}\b") {
         cleaned = re.replace_all(&cleaned, "{id}").into_owned();
     }

@@ -1,4 +1,4 @@
-// OpenAI 协议响应转换模块
+// OpenAI protocol response transformation module
 use super::models::*;
 use serde_json::Value;
 
@@ -65,26 +65,26 @@ pub fn transform_openai_response(
     let empty_set = std::collections::HashSet::new();
     let client_tool_names = client_tool_names.unwrap_or(&empty_set);
 
-    // 解包 response 字段
+    // Unwrap the response field
     let raw = gemini_response.get("response").unwrap_or(gemini_response);
 
     let mut choices = Vec::new();
 
-    // 支持多候选结果 (n > 1)
+    // Support multiple candidate results (n > 1)
     if let Some(candidates) = raw.get("candidates").and_then(|c| c.as_array()) {
         for (idx, candidate) in candidates.iter().enumerate() {
             let mut content_out = String::new();
             let mut thought_out = String::new();
             let mut tool_calls = Vec::new();
 
-            // 提取 content 和 tool_calls
+            // Extract content and tool_calls
             if let Some(parts) = candidate
                 .get("content")
                 .and_then(|c| c.get("parts"))
                 .and_then(|p| p.as_array())
             {
                 for part in parts {
-                    // 捕获 thoughtSignature (Gemini 3 工具调用必需)
+                    // Capture thoughtSignature (required for Gemini 3 tool calls)
                     if let Some(sig) = part
                         .get("thoughtSignature")
                         .or(part.get("thought_signature"))
@@ -95,30 +95,30 @@ pub fn transform_openai_response(
                         }
                     }
 
-                    // 检查该 part 是否是思考内容 (thought: true)
+                    // Check whether this part is thinking content (thought: true)
                     let is_thought_part = part
                         .get("thought")
                         .and_then(|v| v.as_bool())
                         .unwrap_or(false);
 
-                    // 文本部分
+                    // Text portion
                     if let Some(text) = part.get("text").and_then(|t| t.as_str()) {
                         if is_thought_part {
-                            // thought: true 时，text 是思考内容
+                            // When thought: true, text is thinking content
                             thought_out.push_str(text);
                         } else {
-                            // 正常内容
+                            // Normal content
                             content_out.push_str(text);
                         }
                     }
 
-                    // 工具调用部分
+                    // Tool call portion
                     if let Some(fc) = part.get("functionCall") {
                         let name = fc.get("name").and_then(|v| v.as_str()).unwrap_or("unknown");
                         let mut args_json =
                             fc.get("args").unwrap_or(&serde_json::json!({})).clone();
 
-                        // [FIX #1575] 标准化 shell 工具参数名称
+                        // [FIX #1575] Normalize shell tool parameter names
                         if name == "shell" || name == "bash" || name == "local_shell" {
                             if let Some(obj) = args_json.as_object_mut() {
                                 if !obj.contains_key("command") {
@@ -154,7 +154,7 @@ pub fn transform_openai_response(
                                     content_out.push('\n');
                                 }
                                 content_out.push_str(&format!(
-                                    "apply_patch 格式非法，已停止执行以避免重复失败。第 {line} 行：{message}"
+                                    "apply_patch format is invalid; execution has been stopped to avoid repeated failures. Line {line}: {message}"
                                 ));
                                 continue;
                             }
@@ -181,7 +181,7 @@ pub fn transform_openai_response(
                         });
                     }
 
-                    // 图片处理 (响应中直接返回图片的情况)
+                    // Image handling (when the response returns an image directly)
                     if let Some(img) = part.get("inlineData") {
                         let mime_type = img
                             .get("mimeType")
@@ -194,7 +194,7 @@ pub fn transform_openai_response(
                         }
                     }
 
-                    // 处理原生代码执行 (executableCode)
+                    // Handle native code execution (executableCode)
                     if let Some(exec_code) = part.get("executableCode") {
                         let lang = exec_code
                             .get("language")
@@ -210,7 +210,7 @@ pub fn transform_openai_response(
                         }
                     }
 
-                    // 处理代码执行结果 (codeExecutionResult)
+                    // Handle the code execution result (codeExecutionResult)
                     if let Some(exec_result) = part.get("codeExecutionResult") {
                         let output = exec_result
                             .get("output")
@@ -226,21 +226,21 @@ pub fn transform_openai_response(
                 }
             }
 
-            // 提取并处理该候选结果的联网搜索引文 (Grounding Metadata)
+            // Extract and process this candidate's web search citations (Grounding Metadata)
             if let Some(grounding) = candidate.get("groundingMetadata") {
                 let mut grounding_text = String::new();
 
-                // 1. 处理搜索词
+                // 1. Handle the search query
                 if let Some(queries) = grounding.get("webSearchQueries").and_then(|q| q.as_array())
                 {
                     let query_list: Vec<&str> = queries.iter().filter_map(|v| v.as_str()).collect();
                     if !query_list.is_empty() {
-                        grounding_text.push_str("\n\n---\n**🔍 已为您搜索：** ");
+                        grounding_text.push_str("\n\n---\n**🔍 Searched for you:** ");
                         grounding_text.push_str(&query_list.join(", "));
                     }
                 }
 
-                // 2. 处理来源链接 (Chunks)
+                // 2. Handle source links (Chunks)
                 if let Some(chunks) = grounding.get("groundingChunks").and_then(|c| c.as_array()) {
                     let mut links = Vec::new();
                     for (i, chunk) in chunks.iter().enumerate() {
@@ -248,14 +248,14 @@ pub fn transform_openai_response(
                             let title = web
                                 .get("title")
                                 .and_then(|v| v.as_str())
-                                .unwrap_or("网页来源");
+                                .unwrap_or("Web source");
                             let uri = web.get("uri").and_then(|v| v.as_str()).unwrap_or("#");
                             links.push(format!("[{}] [{}]({})", i + 1, title, uri));
                         }
                     }
 
                     if !links.is_empty() {
-                        grounding_text.push_str("\n\n**🌐 来源引文：**\n");
+                        grounding_text.push_str("\n\n**🌐 Source citations:**\n");
                         grounding_text.push_str(&links.join("\n"));
                     }
                 }
@@ -265,18 +265,18 @@ pub fn transform_openai_response(
                 }
             }
 
-            // 提取传统的 citationMetadata
+            // Extract the legacy citationMetadata
             if let Some(citation) = candidate.get("citationMetadata") {
                 if let Some(sources) = citation.get("citationSources").and_then(|s| s.as_array()) {
                     let mut links = Vec::new();
                     for (i, source) in sources.iter().enumerate() {
                         if let Some(uri) = source.get("uri").and_then(|v| v.as_str()) {
-                            // 由于有时没有 title，直接用 URI 当标题
+                            // Since a title isn't always present, use the URI as the title directly
                             links.push(format!("[{}] [{}]({})", i + 1, uri, uri));
                         }
                     }
                     if !links.is_empty() {
-                        content_out.push_str("\n\n**📚 引用来源：**\n");
+                        content_out.push_str("\n\n**📚 Reference sources:**\n");
                         content_out.push_str(&links.join("\n"));
                     }
                 }
@@ -295,7 +295,7 @@ pub fn transform_openai_response(
                 .unwrap_or("stop");
 
             let refusal_val = if finish_reason == "content_filter" {
-                Some("生成由于安全策略或背诵保护被中止".to_string())
+                Some("Generation was aborted due to safety policy or recitation protection".to_string())
             } else {
                 None
             };
@@ -328,14 +328,14 @@ pub fn transform_openai_response(
         }
     }
 
-    // 如果 candidates 为空，但存在 promptFeedback（被安全拦截），伪造一个被拒绝的 choice
+    // If candidates is empty but promptFeedback is present (blocked by safety), fabricate a rejected choice
     if choices.is_empty() {
         if let Some(feedback) = raw.get("promptFeedback") {
             let reason = feedback
                 .get("blockReason")
                 .and_then(|v| v.as_str())
                 .unwrap_or("UNKNOWN");
-            let refusal_msg = format!("请求由于安全策略被拦截 (blockReason: {})", reason);
+            let refusal_msg = format!("The request was blocked due to safety policy (blockReason: {})", reason);
             choices.push(Choice {
                 index: 0,
                 message: OpenAIMessage {
@@ -356,7 +356,7 @@ pub fn transform_openai_response(
     // Supports both legacy v1internal format (promptTokenCount/candidatesTokenCount/totalTokenCount/cachedContentTokenCount)
     // and new Interactions API format (total_input_tokens/total_output_tokens/total_thought_tokens/total_cached_tokens)
     let usage = raw.get("usageMetadata").and_then(|u| {
-        // 优先使用新格式字段，fallback 到旧格式
+        // Prefer the new format fields, falling back to the old format
         let prompt_tokens = u
             .get("total_input_tokens")
             .or_else(|| u.get("promptTokenCount"))
@@ -377,7 +377,7 @@ pub fn transform_openai_response(
             .or_else(|| u.get("cachedContentTokenCount"))
             .and_then(|v| v.as_u64())
             .map(|v| v as u32);
-        // [NEW] 从新格式提取 reasoning/thought tokens
+        // [NEW] Extract reasoning/thought tokens from the new format
         let reasoning_tokens = u
             .get("total_thought_tokens")
             .or_else(|| u.get("totalThoughtTokens"))

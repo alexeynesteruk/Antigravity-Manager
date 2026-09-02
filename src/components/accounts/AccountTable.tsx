@@ -1,6 +1,6 @@
 /**
- * 账号表格组件
- * 支持拖拽排序功能，用户可以通过拖拽行来调整账号顺序
+ * Account table component
+ * Supports drag-and-drop sorting: users can drag rows to reorder accounts
  */
 import { useMemo, useState } from 'react';
 import {
@@ -58,7 +58,7 @@ import { getValidationBlockedStatusLabel } from './accountValidationStatus';
 import { getLiveLimitForModel } from '../../utils/liveLimit';
 
 // ============================================================================
-// 类型定义
+// Type definitions
 // ============================================================================
 
 interface AccountTableProps {
@@ -78,7 +78,7 @@ interface AccountTableProps {
     onToggleProxy: (accountId: string) => void;
     onWarmup?: (accountId: string) => void;
     onUpdateLabel?: (accountId: string, label: string) => void;
-    /** 拖拽排序回调，当用户完成拖拽时触发 */
+    /** Drag-sort callback, fired when the user finishes dragging */
     onReorder?: (accountIds: string[]) => void;
     onViewError: (accountId: string) => void;
     quotaWindow?: '5h' | 'weekly';
@@ -125,7 +125,7 @@ interface AccountRowContentProps {
 }
 
 // ============================================================================
-// 辅助函数
+// Helper functions
 // ============================================================================
 
 
@@ -155,12 +155,12 @@ function isModelProtected(protectedModels: string[] | undefined, modelName: stri
 }
 
 // ============================================================================
-// 子组件
+// Subcomponents
 // ============================================================================
 
 /**
- * 可拖拽的表格行组件
- * 使用 @dnd-kit/sortable 实现拖拽功能
+ * Draggable table row component
+ * Implements drag-and-drop using @dnd-kit/sortable
  */
 function SortableAccountRow({
     account,
@@ -210,7 +210,7 @@ function SortableAccountRow({
                 !isDragging && "hover:bg-gray-50 dark:hover:bg-base-200"
             )}
         >
-            {/* 拖拽手柄 */}
+            {/* Drag handle */}
             <td className="pl-2 py-1 w-8 align-middle">
                 <div
                     {...attributes}
@@ -221,7 +221,7 @@ function SortableAccountRow({
                     <GripVertical className="w-4 h-4" />
                 </div>
             </td>
-            {/* 复选框 */}
+            {/* Checkbox */}
             <td className="px-2 py-1 w-10 align-middle">
                 <input
                     type="checkbox"
@@ -254,8 +254,8 @@ function SortableAccountRow({
 }
 
 /**
- * 账号行内容组件
- * 渲染邮箱、配额、最后使用时间和操作按钮等列
+ * Account row content component
+ * Renders columns for email, quota, last used time, and action buttons
  */
 function AccountRowContent({
     account,
@@ -279,7 +279,7 @@ function AccountRowContent({
     const { config, showAllQuotas } = useConfigStore();
     const validationBlockedLabel = getValidationBlockedStatusLabel(account.validation_blocked_reason, t);
 
-    // 自定义标签编辑状态
+    // Custom label editing state
     const [isEditingLabel, setIsEditingLabel] = useState(false);
     const [labelInput, setLabelInput] = useState(account.custom_label || '');
 
@@ -303,7 +303,7 @@ function AccountRowContent({
         }
     };
 
-    // 解析周配额项 (当处于 weekly 视图时)
+    // Parse weekly quota items (when in weekly view)
     const weeklyItems = useMemo(() => {
         if (quotaWindow !== 'weekly') return [];
         return (account.quota?.quota_groups || []).flatMap(group => {
@@ -315,7 +315,7 @@ function AccountRowContent({
                         .replace(/Claude and GPT/i, 'Claude/GPT');
                     return {
                         id: `${group.display_name}-${b.bucket_id}`,
-                        label: b.display_name ? `${shortGroupName} (${b.display_name})` : `${shortGroupName} (周)`,
+                        label: b.display_name ? `${shortGroupName} (${b.display_name})` : `${shortGroupName} (Weekly)`,
                         percentage: Math.round((b.remaining_fraction || 0) * 100),
                         resetTime: b.reset_time,
                         Icon: shortGroupName.toLowerCase().includes('claude') ? Sparkles : Bot,
@@ -324,12 +324,12 @@ function AccountRowContent({
         });
     }, [quotaWindow, account.quota?.quota_groups]);
 
-    // 获取要显示的模型列表
+    // Get the list of models to display
     const pinnedModels = ensurePinnedImageSelector(
         config?.pinned_quota_models?.models || Object.keys(MODEL_CONFIG),
     );
 
-    // 根据 show_all 状态决定显示哪些模型
+    // Decide which models to display based on show_all state
     const uniqueLabels = new Set<string>();
     const displayModels = sortModels(
         (showAllQuotas
@@ -361,13 +361,13 @@ function AccountRowContent({
                 };
             }).filter((item): item is { id: string; label: string; protectedKey: string; data: ModelQuota | undefined } => item !== null)
     ).filter(m => {
-            // 过滤特定的 Claude/Gemini 思考变体 (在列表页隐藏)
+            // Filter out specific Claude/Gemini thinking variants (hidden on the list page)
             const isHiddenThinking = m.id.includes('thinking');
 
             if (isHiddenThinking) return false;
 
-            // 基于标签去重 (例如 G3.1 Pro 只显示一次)
-            // 优先显示有配额数据的 ID
+            // Deduplicate based on label (e.g. G3.1 Pro is shown only once)
+            // Prefer showing the ID that has quota data
             const labelKey = `${m.label}-${m.protectedKey}`;
             if (uniqueLabels.has(labelKey)) {
                 return false;
@@ -379,7 +379,7 @@ function AccountRowContent({
             return true;
         })
     ).filter((m, index, self) => {
-        // 第二次过滤：确保即使没有数据的重复 Label 也只保留一个
+        // Second filter pass: ensure only one of each duplicate label remains, even without data
         const labelKey = `${m.label}-${m.protectedKey}`;
         return self.findIndex(t => `${t.label}-${t.protectedKey}` === labelKey) === index;
     });
@@ -387,7 +387,7 @@ function AccountRowContent({
 
     return (
         <>
-            {/* 邮箱列 */}
+            {/* Email column */}
             <td className="px-2 py-1 align-middle">
                 <div className="flex flex-wrap items-center gap-x-3 gap-y-1">
                     <span className={cn(
@@ -435,7 +435,7 @@ function AccountRowContent({
                         )}
 
 
-                        {/* 订阅类型徽章 */}
+                        {/* Subscription type badge */}
                         {account.quota?.subscription_tier && (() => {
                             const tier = account.quota.subscription_tier.toLowerCase();
                             if (tier.includes('ultra')) {
@@ -461,14 +461,14 @@ function AccountRowContent({
                                 );
                             }
                         })()}
-                        {/* 自定义标签 */}
+                        {/* Custom label */}
                         {account.custom_label && !isEditingLabel && (
                             <span className="flex items-center gap-1 px-2 py-0.5 rounded-md bg-orange-100 dark:bg-orange-900/40 text-orange-700 dark:text-orange-300 text-[10px] font-bold shadow-sm border border-orange-200/50 dark:border-orange-800/50">
                                 <Tag className="w-2.5 h-2.5" />
                                 {account.custom_label}
                             </span>
                         )}
-                        {/* 标签编辑输入框 */}
+                        {/* Label edit input */}
                         {isEditingLabel && (
                             <div className="flex items-center gap-1">
                                 <input
@@ -501,7 +501,7 @@ function AccountRowContent({
                 </div>
             </td>
 
-            {/* 模型配额列 */}
+            {/* Model quota column */}
             <td className="px-2 py-1 align-middle">
                 {isDisabled || account.quota?.is_forbidden || account.validation_blocked ? (
                     <div className={cn(
@@ -569,7 +569,7 @@ function AccountRowContent({
                 )}
             </td>
 
-            {/* 最后使用时间列 */}
+            {/* Last used time column */}
             <td className="px-2 py-1 align-middle">
                 <div className="flex flex-col">
                     <span className="text-xs font-medium text-gray-600 dark:text-gray-400 font-mono whitespace-nowrap">
@@ -581,12 +581,12 @@ function AccountRowContent({
                 </div>
             </td>
 
-            {/* 操作列 */}
+            {/* Action column */}
             <td className={cn(
                 "px-1 py-1 sticky right-0 z-10 shadow-[-12px_0_12px_-12px_rgba(0,0,0,0.1)] dark:shadow-[-12px_0_12px_-12px_rgba(255,255,255,0.05)] text-center align-middle",
-                // 动态背景色处理
+                // Dynamic background color handling
                 isCurrent
-                    ? "bg-[#f1f6ff] dark:bg-[#1e2330]" // 接近 blue-50/50 的实色
+                    ? "bg-[#f1f6ff] dark:bg-[#1e2330]" // A solid color close to blue-50/50
                     : "bg-white dark:bg-base-100",
                 !isCurrent && "group-hover:bg-gray-50 dark:group-hover:bg-base-200"
             )}>
@@ -605,7 +605,7 @@ function AccountRowContent({
                     >
                         <Fingerprint className="w-3.5 h-3.5" />
                     </button>
-                    {/* 自定义标签按钮 */}
+                    {/* Custom label button */}
                     {onUpdateLabel && (
                         <button
                             className={cn(
@@ -623,7 +623,7 @@ function AccountRowContent({
                     <button
                         className={`p-1.5 text-gray-500 dark:text-gray-400 rounded-lg transition-all ${(isSwitching || isDisabled) ? 'bg-blue-50 dark:bg-blue-900/10 text-blue-600 dark:text-blue-400 cursor-not-allowed' : 'hover:text-blue-600 dark:hover:text-blue-400 hover:bg-blue-50 dark:hover:bg-blue-900/30'}`}
                         onClick={(e) => { e.stopPropagation(); onSwitch(); }}
-                        title={isDisabled ? t('accounts.disabled_tooltip') : (isSwitching ? t('common.loading') : t('accounts.switch_to_classic', '切换到 Antigravity (经典版)'))}
+                        title={isDisabled ? t('accounts.disabled_tooltip') : (isSwitching ? t('common.loading') : t('accounts.switch_to_classic', 'Switch to Antigravity (Classic)'))}
                         disabled={isSwitching || isDisabled}
                     >
                         <ArrowRightLeft className={`w-3.5 h-3.5 ${isSwitching ? 'animate-spin' : ''}`} />
@@ -631,7 +631,7 @@ function AccountRowContent({
                     <button
                         className={`p-1.5 text-gray-500 dark:text-gray-400 rounded-lg transition-all ${(isSwitching || isDisabled) ? 'bg-blue-50 dark:bg-blue-900/10 text-blue-600 dark:text-blue-400 cursor-not-allowed' : 'hover:text-sky-600 dark:hover:text-sky-400 hover:bg-sky-50 dark:hover:bg-sky-900/30'}`}
                         onClick={(e) => { e.stopPropagation(); onSwitch('ide'); }}
-                        title={isDisabled ? t('accounts.disabled_tooltip') : (isSwitching ? t('common.loading') : t('accounts.switch_to_ide', '切换到 Antigravity IDE'))}
+                        title={isDisabled ? t('accounts.disabled_tooltip') : (isSwitching ? t('common.loading') : t('accounts.switch_to_ide', 'Switch to Antigravity IDE'))}
                         disabled={isSwitching || isDisabled}
                     >
                         <Repeat2 className={`w-3.5 h-3.5 ${isSwitching ? 'animate-spin' : ''}`} />
@@ -639,7 +639,7 @@ function AccountRowContent({
                     <button
                         className={`p-1.5 text-gray-500 dark:text-gray-400 rounded-lg transition-all ${(isSwitching || isDisabled) ? 'bg-blue-50 dark:bg-blue-900/10 text-blue-600 dark:text-blue-400 cursor-not-allowed' : 'hover:text-emerald-600 dark:hover:text-emerald-400 hover:bg-emerald-50 dark:hover:bg-emerald-900/30'}`}
                         onClick={(e) => { e.stopPropagation(); onSwitch('agy'); }}
-                        title={isDisabled ? t('accounts.disabled_tooltip') : (isSwitching ? t('common.loading') : t('accounts.switch_to_agy', '切换到 Antigravity CLI (agy)'))}
+                        title={isDisabled ? t('accounts.disabled_tooltip') : (isSwitching ? t('common.loading') : t('accounts.switch_to_agy', 'Switch to Antigravity CLI (agy)'))}
                         disabled={isSwitching || isDisabled}
                     >
                         <Terminal className={`w-3.5 h-3.5 ${isSwitching ? 'animate-spin' : ''}`} />
@@ -648,7 +648,7 @@ function AccountRowContent({
                         <button
                             className={`p-1.5 text-gray-500 dark:text-gray-400 rounded-lg transition-all ${(isRefreshing || isDisabled) ? 'bg-orange-50 dark:bg-orange-900/10 text-orange-600 dark:text-orange-400 cursor-not-allowed' : 'hover:text-orange-500 dark:hover:text-orange-400 hover:bg-orange-50 dark:hover:bg-orange-900/30'}`}
                             onClick={(e) => { e.stopPropagation(); onWarmup(); }}
-                            title={isDisabled ? t('accounts.disabled_tooltip') : (isRefreshing ? t('common.loading') : t('accounts.warmup_this', '预热该账号'))}
+                            title={isDisabled ? t('accounts.disabled_tooltip') : (isRefreshing ? t('common.loading') : t('accounts.warmup_this', 'Warm Up This Account'))}
                             disabled={isRefreshing || isDisabled}
                         >
                             <Sparkles className={`w-3.5 h-3.5 ${isRefreshing ? 'animate-pulse' : ''}`} />
@@ -699,12 +699,12 @@ function AccountRowContent({
 }
 
 // ============================================================================
-// 主组件
+// Main component
 // ============================================================================
 
 /**
- * 账号表格组件
- * 支持拖拽排序、多选、批量操作等功能
+ * Account table component
+ * Supports drag-and-drop sorting, multi-select, batch operations, and more
  */
 function AccountTable({
     accounts,
@@ -730,12 +730,12 @@ function AccountTable({
     const { t } = useTranslation();
 
     const [activeId, setActiveId] = useState<string | null>(null);
-    // showAllQuotas 已经在 useConfigStore 中解构获取
+    // showAllQuotas is already destructured from useConfigStore
 
-    // 配置拖拽传感器
+    // Configure the drag sensor
     const sensors = useSensors(
         useSensor(PointerSensor, {
-            activationConstraint: { distance: 8 }, // 需要移动 8px 才触发拖拽
+            activationConstraint: { distance: 8 }, // Requires moving 8px to trigger the drag
         }),
         useSensor(KeyboardSensor, {
             coordinateGetter: sortableKeyboardCoordinates,
@@ -796,7 +796,7 @@ function AccountTable({
                             </th>
                             <th className="px-2 py-1 text-left rtl:text-right text-xs font-medium text-gray-500 dark:text-gray-400 uppercase tracking-wider w-[300px] whitespace-nowrap">{t('accounts.table.email')}</th>
                             <th className="px-2 py-1 text-left rtl:text-right text-xs font-medium text-gray-500 dark:text-gray-400 uppercase tracking-wider min-w-[340px] whitespace-nowrap">
-                                {quotaWindow === 'weekly' ? t('accounts.table.weekly_quota', '周配额') : t('accounts.table.quota')}
+                                {quotaWindow === 'weekly' ? t('accounts.table.weekly_quota', 'Weekly Quota') : t('accounts.table.quota')}
                             </th>
                             <th className="px-2 py-1 text-left rtl:text-right text-xs font-medium text-gray-500 dark:text-gray-400 uppercase tracking-wider w-[90px] whitespace-nowrap">{t('accounts.table.last_used')}</th>
                             <th className="px-2 py-1 text-xs font-medium text-gray-500 dark:text-gray-400 uppercase tracking-wider whitespace-nowrap sticky right-0 w-[220px] bg-gray-50 dark:bg-base-200 z-20 shadow-[-12px_0_12px_-12px_rgba(0,0,0,0.1)] dark:shadow-[-12px_0_12px_-12px_rgba(255,255,255,0.05)] text-center">{t('accounts.table.actions')}</th>
@@ -832,7 +832,7 @@ function AccountTable({
                 </table >
             </div >
 
-            {/* 拖拽悬浮预览层 */}
+            {/* Drag overlay preview layer */}
             <DragOverlay>
                 {
                     activeAccount ? (

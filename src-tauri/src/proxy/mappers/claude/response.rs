@@ -1,5 +1,5 @@
-// Claude 非流式响应转换 (Gemini → Claude)
-// 对应 NonStreamingProcessor
+// Claude non-streaming response transformation (Gemini → Claude)
+// Corresponds to NonStreamingProcessor
 
 use super::models::*;
 use super::utils::to_claude_usage;
@@ -145,7 +145,7 @@ fn remap_function_call_args(tool_name: &str, args: &mut serde_json::Value) {
     }
 }
 
-/// 非流式响应处理器
+/// Non-streaming response processor
 pub struct NonStreamingProcessor {
     content_blocks: Vec<ContentBlock>,
     text_builder: String,
@@ -177,7 +177,7 @@ impl NonStreamingProcessor {
         }
     }
 
-    /// 处理 Gemini 响应并转换为 Claude 响应
+    /// Process a Gemini response and convert it into a Claude response
     pub fn process(
         &mut self,
         gemini_response: &GeminiResponse,
@@ -186,7 +186,7 @@ impl NonStreamingProcessor {
     ) -> ClaudeResponse {
         self.scaling_enabled = scaling_enabled;
         self.context_limit = context_limit;
-        // 获取 parts
+        // Get parts
         let empty_parts = vec![];
         let parts = gemini_response
             .candidates
@@ -196,23 +196,23 @@ impl NonStreamingProcessor {
             .map(|content| &content.parts)
             .unwrap_or(&empty_parts);
 
-        // 处理所有 parts
+        // Process all parts
         for part in parts {
             self.process_part(part);
         }
 
-        // 处理 grounding(web search) -> 转换为 server_tool_use / web_search_tool_result
+        // Handle grounding (web search) -> convert into server_tool_use / web_search_tool_result
         if let Some(candidate) = gemini_response.candidates.as_ref().and_then(|c| c.get(0)) {
             if let Some(grounding) = &candidate.grounding_metadata {
                 self.process_grounding(grounding);
             }
         }
 
-        // 刷新剩余内容
+        // Flush the remaining content
         self.flush_thinking();
         self.flush_text();
 
-        // 处理 trailingSignature (空 text 带签名)
+        // Handle trailingSignature (empty text with a signature)
         if let Some(signature) = self.trailing_signature.take() {
             self.content_blocks.push(ContentBlock::Thinking {
                 thinking: String::new(),
@@ -221,11 +221,11 @@ impl NonStreamingProcessor {
             });
         }
 
-        // 构建响应
+        // Build the response
         self.build_response(gemini_response)
     }
 
-    /// 处理单个 part
+    /// Process a single part
     fn process_part(&mut self, part: &GeminiPart) {
         let signature = part.thought_signature.as_ref().map(|sig| {
             use base64::Engine;
@@ -265,12 +265,12 @@ impl NonStreamingProcessor {
             }
         }
 
-        // 1. FunctionCall 处理
+        // 1. Handle FunctionCall
         if let Some(fc) = &part.function_call {
             self.flush_thinking();
             self.flush_text();
 
-            // 处理 trailingSignature (B4/C3 场景)
+            // Handle trailingSignature (B4/C3 scenario)
             if let Some(trailing_sig) = self.trailing_signature.take() {
                 self.content_blocks.push(ContentBlock::Thinking {
                     thinking: String::new(),
@@ -281,7 +281,7 @@ impl NonStreamingProcessor {
 
             self.has_tool_call = true;
 
-            // 生成 tool_use id
+            // Generate the tool_use id
             let tool_id = fc.id.clone().unwrap_or_else(|| {
                 format!(
                     "{}-{}",
@@ -309,7 +309,7 @@ impl NonStreamingProcessor {
                 cache_control: None,
             };
 
-            // 只使用 FC 自己的签名
+            // Only use the FC's own signature
             if let ContentBlock::ToolUse { signature: sig, .. } = &mut tool_use {
                 *sig = signature;
             }
@@ -318,13 +318,13 @@ impl NonStreamingProcessor {
             return;
         }
 
-        // 2. Text 处理
+        // 2. Handle Text
         if let Some(text) = &part.text {
             if part.thought.unwrap_or(false) {
                 // Thinking part
                 self.flush_text();
 
-                // 处理 trailingSignature
+                // Handle trailingSignature
                 if let Some(trailing_sig) = self.trailing_signature.take() {
                     self.flush_thinking();
                     self.content_blocks.push(ContentBlock::Thinking {
@@ -339,9 +339,9 @@ impl NonStreamingProcessor {
                     self.thinking_signature = signature;
                 }
             } else {
-                // 普通 Text
+                // Ordinary Text
                 if text.is_empty() {
-                    // 空 text 带签名 - 暂存到 trailingSignature
+                    // Empty text with a signature - buffer it in trailingSignature
                     if signature.is_some() {
                         self.trailing_signature = signature;
                     }
@@ -350,7 +350,7 @@ impl NonStreamingProcessor {
 
                 self.flush_thinking();
 
-                // 处理之前的 trailingSignature
+                // Handle the previous trailingSignature
                 if let Some(trailing_sig) = self.trailing_signature.take() {
                     self.flush_text();
                     self.content_blocks.push(ContentBlock::Thinking {
@@ -362,7 +362,7 @@ impl NonStreamingProcessor {
 
                 self.text_builder.push_str(text);
 
-                // 非空 text 带签名 - 立即刷新并输出空 thinking 块
+                // Non-empty text with a signature - flush immediately and emit an empty thinking block
                 if let Some(sig) = signature {
                     self.flush_text();
                     self.content_blocks.push(ContentBlock::Thinking {
@@ -374,7 +374,7 @@ impl NonStreamingProcessor {
             }
         }
 
-        // 3. InlineData (Image) 处理
+        // 3. Handle InlineData (Image)
         if let Some(img) = &part.inline_data {
             self.flush_thinking();
 
@@ -388,37 +388,37 @@ impl NonStreamingProcessor {
         }
     }
 
-    /// 处理 Grounding 元数据 (Web Search 结果)
+    /// Process Grounding metadata (Web Search results)
     fn process_grounding(&mut self, grounding: &GroundingMetadata) {
         let mut grounding_text = String::new();
 
-        // 1. 处理搜索词
+        // 1. Handle the search query
         if let Some(queries) = &grounding.web_search_queries {
             if !queries.is_empty() {
-                grounding_text.push_str("\n\n---\n**🔍 已为您搜索：** ");
+                grounding_text.push_str("\n\n---\n**🔍 Searched for you:** ");
                 grounding_text.push_str(&queries.join(", "));
             }
         }
 
-        // 2. 处理来源链接 (Chunks)
+        // 2. Handle source links (Chunks)
         if let Some(chunks) = &grounding.grounding_chunks {
             let mut links = Vec::new();
             for (i, chunk) in chunks.iter().enumerate() {
                 if let Some(web) = &chunk.web {
-                    let title = web.title.as_deref().unwrap_or("网页来源");
+                    let title = web.title.as_deref().unwrap_or("Web source");
                     let uri = web.uri.as_deref().unwrap_or("#");
                     links.push(format!("[{}] [{}]({})", i + 1, title, uri));
                 }
             }
 
             if !links.is_empty() {
-                grounding_text.push_str("\n\n**🌐 来源引文：**\n");
+                grounding_text.push_str("\n\n**🌐 Source citations:**\n");
                 grounding_text.push_str(&links.join("\n"));
             }
         }
 
         if !grounding_text.is_empty() {
-            // 在常规内容前后刷新并插入文本
+            // Flush before and after the regular content and insert the text
             self.flush_thinking();
             self.flush_text();
             self.text_builder.push_str(&grounding_text);
@@ -426,7 +426,7 @@ impl NonStreamingProcessor {
         }
     }
 
-    /// 刷新 text builder
+    /// Flush the text builder
     fn flush_text(&mut self) {
         if self.text_builder.is_empty() {
             return;
@@ -435,7 +435,7 @@ impl NonStreamingProcessor {
         let mut current_text = self.text_builder.clone();
         self.text_builder.clear();
 
-        // [NEW] MCP XML Bridge: 循环解析文本中可能存在的 XML 标签
+        // [NEW] MCP XML Bridge: loop-parse any XML tags that may exist in the text
         while let Some(start_idx) = current_text.find("<mcp__") {
             if let Some(tag_end_idx) = current_text[start_idx..].find('>') {
                 let actual_tag_end = start_idx + tag_end_idx;
@@ -443,14 +443,14 @@ impl NonStreamingProcessor {
                 let end_tag = format!("</{}>", tool_name);
 
                 if let Some(close_idx) = current_text.find(&end_tag) {
-                    // 1. 处理标签前的文本
+                    // 1. Handle the text before the tag
                     if start_idx > 0 {
                         self.content_blocks.push(ContentBlock::Text {
                             text: current_text[..start_idx].to_string(),
                         });
                     }
 
-                    // 2. 解析 XML 内容并转换为 ToolUse
+                    // 2. Parse the XML content and convert it into a ToolUse
                     let input_str = &current_text[actual_tag_end + 1..close_idx];
                     let input_json: serde_json::Value = serde_json::from_str(input_str.trim())
                         .unwrap_or_else(|_| serde_json::json!({ "input": input_str.trim() }));
@@ -464,12 +464,12 @@ impl NonStreamingProcessor {
                     });
                     self.has_tool_call = true;
 
-                    // 3. 继续处理剩余文本
+                    // 3. Continue processing the remaining text
                     current_text = current_text[close_idx + end_tag.len()..].to_string();
                     continue;
                 }
             }
-            // 如果 XML 格式不完整, 退出循环并按普通文本处理
+            // If the XML format is incomplete, exit the loop and treat it as ordinary text
             break;
         }
 
@@ -479,9 +479,9 @@ impl NonStreamingProcessor {
         }
     }
 
-    /// 刷新 thinking builder
+    /// Flush the thinking builder
     fn flush_thinking(&mut self) {
-        // 如果既没有内容也没有签名，直接返回
+        // If there is neither content nor a signature, return immediately
         if self.thinking_builder.is_empty() && self.thinking_signature.is_none() {
             return;
         }
@@ -497,7 +497,7 @@ impl NonStreamingProcessor {
         self.thinking_builder.clear();
     }
 
-    /// 构建最终响应
+    /// Build the final response
     fn build_response(&self, gemini_response: &GeminiResponse) -> ClaudeResponse {
         let finish_reason = gemini_response
             .candidates

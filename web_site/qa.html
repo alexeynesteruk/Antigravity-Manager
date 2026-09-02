@@ -4,7 +4,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title data-i18n="pageTitle">常见问题 - Antigravity Tools</title>
+    <title data-i18n="pageTitle">FAQ - Antigravity Tools</title>
     <script src="https://cdn.tailwindcss.com"></script>
     <script src="https://unpkg.com/lucide@latest"></script>
     <style>
@@ -61,7 +61,7 @@
 </head>
 
 <body class="pb-20">
-    <!-- 导航栏 -->
+    <!-- Navigation bar -->
     <nav
         class="sticky top-0 w-full z-50 glass border-b border-emerald-900/30 px-6 py-4 flex justify-between items-center">
         <div class="flex items-center space-x-3 cursor-pointer" onclick="location.href='index.html'">
@@ -70,10 +70,10 @@
         </div>
         <div class="flex items-center space-x-4 md:space-x-8">
             <div class="hidden md:flex space-x-8 text-sm font-medium">
-                <a href="index.html" class="hover:text-emerald-400 transition-colors" data-i18n="navHome">首页</a>
-                <a href="#" class="text-emerald-400 transition-colors font-bold" data-i18n="navFaq">常见问题</a>
+                <a href="index.html" class="hover:text-emerald-400 transition-colors" data-i18n="navHome">Home</a>
+                <a href="#" class="text-emerald-400 transition-colors font-bold" data-i18n="navFaq">FAQ</a>
             </div>
-            <!-- 语言切换器 -->
+            <!-- Language switcher -->
             <button id="lang-toggle" onclick="toggleLanguage()"
                 class="glass px-3 py-1 rounded-lg text-xs font-bold border border-emerald-500/30 hover:bg-emerald-500/10 transition-all uppercase">
                 EN
@@ -81,41 +81,41 @@
         </div>
     </nav>
 
-    <!-- 页头 -->
+    <!-- Header -->
     <header class="py-20 px-6 text-center max-w-4xl mx-auto">
         <h1 class="text-4xl md:text-5xl font-bold mb-6 text-white uppercase tracking-tight">
-            <span data-i18n="headerTitlePre">QA 专题页</span> / <span class="emerald-gradient"
-                data-i18n="headerTitlePost">常见问题</span>
+            <span data-i18n="headerTitlePre">QA Portal</span> / <span class="emerald-gradient"
+                data-i18n="headerTitlePost">FAQ</span>
         </h1>
-        <p class="text-gray-500 text-lg mb-10" data-i18n="headerSub">在这里查找您在使用过程中遇到的各类问题及解决方案。</p>
+        <p class="text-gray-500 text-lg mb-10" data-i18n="headerSub">Find answers and solutions to common questions here.</p>
 
-        <!-- 搜索框 -->
+        <!-- Search box -->
         <div
             class="search-bar max-w-2xl mx-auto flex items-center glass rounded-2xl p-2 border border-emerald-900/30 transition-all">
             <i data-lucide="search" class="w-5 h-5 ml-4 text-emerald-500/50"></i>
-            <input type="text" id="faq-search" placeholder="搜索问题关键字..." data-i18n-placeholder="searchPlaceholder"
+            <input type="text" id="faq-search" placeholder="Search for keywords..." data-i18n-placeholder="searchPlaceholder"
                 class="bg-transparent border-none focus:ring-0 text-white w-full px-4 py-3 placeholder-gray-600 outline-none">
         </div>
     </header>
 
-    <!-- 问题列表容器 -->
+    <!-- FAQ list container -->
     <main class="max-w-4xl mx-auto px-6">
         <div class="space-y-4" id="faq-container">
-            <!-- 动态渲染内容 -->
+            <!-- Dynamically rendered content -->
         </div>
 
-        <!-- 空状态展示 -->
+        <!-- Empty state -->
         <div id="no-results" class="hidden py-20 text-center text-gray-600">
             <i data-lucide="circle-dashed" class="w-12 h-12 mx-auto mb-4 opacity-20"></i>
-            <p data-i18n="noResults">未找到相关问题，请尝试更换关键词。</p>
+            <p data-i18n="noResults">No results found. Try different keywords.</p>
         </div>
     </main>
 
     <footer class="mt-20 py-12 border-t border-emerald-900/30 px-6 text-center">
         <p class="text-gray-600 text-sm">
-            <span data-i18n="footerHelp">需要更多帮助？</span>
+            <span data-i18n="footerHelp">Need more help?</span>
             <a href="https://github.com/lbjlaq/Antigravity-Manager/issues" class="text-emerald-500 hover:underline ml-1"
-                data-i18n="footerIssue">前往 GitHub 提交 Issue</a>
+                data-i18n="footerIssue">Open an Issue on GitHub</a>
         </p>
     </footer>
 
@@ -342,7 +342,7 @@
         }
 
         function updateUI() {
-            // 更新静态文本
+            // Update static text
             document.querySelectorAll('[data-i18n]').forEach(el => {
                 const key = el.getAttribute('data-i18n');
                 el.innerText = translations[currentLang][key];
@@ -369,7 +369,7 @@
                 const title = item.title[currentLang];
                 const answer = item.answer[currentLang];
 
-                // 搜索过滤
+                // Search filter
                 if (title.toLowerCase().includes(searchTerm) || answer.toLowerCase().includes(searchTerm)) {
                     hasResults = true;
                     const el = document.createElement('div');
@@ -400,7 +400,7 @@
 
         document.getElementById('faq-search').addEventListener('input', renderFaqs);
 
-        // 初始化
+        // Initialize
         initLanguage();
     </script>
 </body>

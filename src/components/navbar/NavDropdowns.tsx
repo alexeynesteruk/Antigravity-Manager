@@ -24,7 +24,7 @@ export function useClickOutside(
     }, [ref, handler]);
 }
 
-// 语言下拉菜单组件
+// Language dropdown menu component
 interface LanguageDropdownProps {
     currentLanguage: string;
     languages: Language[];
@@ -61,7 +61,7 @@ export function LanguageDropdown({
                 </span>
             </button>
 
-            {/* 下拉菜单 */}
+            {/* Dropdown menu */}
             {isOpen && (
                 <div className="absolute ltr:right-0 rtl:left-0 mt-2 w-32 bg-white dark:bg-base-200 rounded-xl shadow-lg border border-gray-100 dark:border-base-100 py-1 overflow-hidden animate-in fade-in zoom-in-95 duration-200 ltr:origin-top-right rtl:origin-top-left">
                     {languages.map((lang) => (
@@ -88,13 +88,13 @@ export function LanguageDropdown({
     );
 }
 
-// 导航下拉菜单组件 (< 375px)
+// Nav dropdown menu component (< 375px)
 interface NavigationDropdownProps {
     navItems: NavItem[];
     isActive: (path: string) => boolean;
     getCurrentNavItem: () => NavItem | undefined;
     onNavigate: () => void;
-    showLabel?: boolean; // 是否显示文字标签
+    showLabel?: boolean; // Whether to show the text label
 }
 
 export function NavigationDropdown({
@@ -102,7 +102,7 @@ export function NavigationDropdown({
     isActive,
     getCurrentNavItem,
     onNavigate,
-    showLabel = true // 默认显示文字
+    showLabel = true // Show text by default
 }: NavigationDropdownProps) {
     const [isOpen, setIsOpen] = useState(false);
     const menuRef = useRef<HTMLDivElement>(null);
@@ -117,7 +117,7 @@ export function NavigationDropdown({
     const currentItem = getCurrentNavItem();
     const CurrentIcon = currentItem?.icon;
 
-    // 如果没有当前项,不渲染
+    // Don't render if there's no current item
     if (!currentItem || !CurrentIcon) return null;
 
     return (
@@ -127,7 +127,7 @@ export function NavigationDropdown({
                 className="flex items-center gap-2 px-3 py-2 rounded-full bg-gray-100 dark:bg-base-200 hover:bg-gray-200 dark:hover:bg-base-100 transition-colors"
             >
                 <CurrentIcon className="w-4 h-4 text-gray-700 dark:text-gray-300" />
-                {/* 根据 showLabel 控制文字显示 */}
+                {/* Control text display based on showLabel */}
                 {showLabel && (
                     <span className="text-sm font-medium text-gray-700 dark:text-gray-300">
                         {currentItem.label}
@@ -136,7 +136,7 @@ export function NavigationDropdown({
                 <ChevronDown className={`w-3 h-3 text-gray-700 dark:text-gray-300 transition-transform ${isOpen ? 'rotate-180' : ''}`} />
             </button>
 
-            {/* 下拉菜单 */}
+            {/* Dropdown menu */}
             {isOpen && (
                 <div className="absolute left-1/2 -translate-x-1/2 mt-2 w-48 bg-white dark:bg-[#1a1a1a] rounded-xl shadow-xl border-2 border-gray-200 dark:border-gray-700 py-1 overflow-hidden animate-in fade-in zoom-in-95 duration-200 origin-top">
                     {navItems.map((item) => (
@@ -160,7 +160,7 @@ export function NavigationDropdown({
     );
 }
 
-// 更多菜单组件 (< 480px)
+// More menu component (< 480px)
 interface MoreDropdownProps {
     theme: 'light' | 'dark';
     currentLanguage: string;
@@ -204,15 +204,15 @@ export function MoreDropdown({
             <button
                 onClick={() => setIsOpen(!isOpen)}
                 className="w-10 h-10 rounded-full bg-gray-100 dark:bg-base-200 hover:bg-gray-200 dark:hover:bg-base-100 flex items-center justify-center transition-colors"
-                title={t('nav.more', '更多')}
+                title={t('nav.more', 'More')}
             >
                 <MoreVertical className="w-5 h-5 text-gray-700 dark:text-gray-300" />
             </button>
 
-            {/* 下拉菜单 */}
+            {/* Dropdown menu */}
             {isOpen && (
                 <div className="absolute ltr:right-0 rtl:left-0 mt-2 w-40 bg-white dark:bg-base-200 rounded-xl shadow-lg border border-gray-100 dark:border-base-100 py-1 overflow-hidden animate-in fade-in zoom-in-95 duration-200 ltr:origin-top-right rtl:origin-top-left">
-                    {/* 迷你视图 */}
+                    {/* Mini view */}
                     <button
                         onClick={() => {
                             setMiniView(true);
@@ -224,7 +224,7 @@ export function MoreDropdown({
                         <span>{t('nav.mini_view', 'Mini View')}</span>
                     </button>
 
-                    {/* 主题切换 */}
+                    {/* Theme toggle */}
                     <button
                         onClick={handleThemeToggle}
                         className="w-full px-4 py-2.5 text-left text-sm flex items-center gap-3 hover:bg-gray-50 dark:hover:bg-base-100 transition-colors text-gray-700 dark:text-gray-300"
@@ -237,10 +237,10 @@ export function MoreDropdown({
                         <span>{theme === 'light' ? t('nav.theme_to_dark') : t('nav.theme_to_light')}</span>
                     </button>
 
-                    {/* 分隔线 */}
+                    {/* Divider */}
                     <div className="my-1 border-t border-gray-100 dark:border-base-100"></div>
 
-                    {/* 语言选择 */}
+                    {/* Language selection */}
                     {languages.map((lang) => (
                         <button
                             key={lang.code}
@@ -260,7 +260,7 @@ export function MoreDropdown({
                         </button>
                     ))}
 
-                    {/* 登出按钮 - 仅 Web 模式显示 */}
+                    {/* Logout button - shown in Web mode only */}
                     {!isTauri() && (
                         <>
                             <div className="my-1 border-t border-gray-100 dark:border-base-100"></div>
@@ -269,7 +269,7 @@ export function MoreDropdown({
                                 className="w-full px-4 py-2.5 text-left text-sm flex items-center gap-3 hover:bg-red-50 dark:hover:bg-red-900/20 transition-colors text-red-600 dark:text-red-400"
                             >
                                 <LogOut className="w-4 h-4" />
-                                <span>{t('nav.logout', '登出')}</span>
+                                <span>{t('nav.logout', 'Logout')}</span>
                             </button>
                         </>
                     )}

@@ -57,13 +57,13 @@ export function getTimeRemainingColor(dateStr: string | undefined): string {
     const now = new Date();
     const diffMs = targetDate.getTime() - now.getTime();
 
-    if (diffMs <= 0) return 'success'; // 已经过期的也算成功（即将重置或已重置）
+    if (diffMs <= 0) return 'success'; // Already-expired also counts as success (about to reset or already reset)
 
     const diffHrs = diffMs / (1000 * 60 * 60);
 
-    if (diffHrs < 1) return 'success';   // < 1h: 绿色 (快重置了)
-    if (diffHrs < 6) return 'warning';   // 1-6h: 琥珀色 (等待中)
-    return 'neutral';                   // > 6h: 灰色 (长等待)
+    if (diffHrs < 1) return 'success';   // < 1h: green (resetting soon)
+    if (diffHrs < 6) return 'warning';   // 1-6h: amber (waiting)
+    return 'neutral';                   // > 6h: gray (long wait)
 }
 
 export function formatDate(timestamp: string | number | undefined | null): string | null {

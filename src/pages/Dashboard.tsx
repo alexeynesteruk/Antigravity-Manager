@@ -33,7 +33,7 @@ function Dashboard() {
         fetchCurrentAccount();
     }, []);
 
-    // 计算统计数据
+    // Calculate statistics
     const stats = useMemo(() => {
         const getGeminiProQuota = (a: Account) =>
             findQuotaModel(a.quota?.models, 'gemini-pro')?.percentage || 0;
@@ -83,7 +83,7 @@ function Dashboard() {
             await switchAccount(accountId);
             showToast(t('dashboard.toast.switch_success'), 'success');
         } catch (error) {
-            console.error('切换账号失败:', error);
+            console.error('Failed to switch account:', error);
             showToast(`${t('dashboard.toast.switch_error')}: ${error}`, 'error');
         } finally {
             setTimeout(() => {
@@ -94,7 +94,7 @@ function Dashboard() {
 
     const handleAddAccount = async (email: string, refreshToken: string) => {
         await addAccount(email, refreshToken);
-        await fetchAccounts(); // 刷新列表
+        await fetchAccounts(); // Refresh the list
     };
 
     const [isRefreshing, setIsRefreshing] = useState(false);
@@ -105,7 +105,7 @@ function Dashboard() {
         setIsRefreshing(true);
         try {
             await refreshQuota(currentAccount.id);
-            // 刷新成功后重新获取最新数据
+            // Refetch the latest data after a successful refresh
             await fetchCurrentAccount();
             showToast(t('dashboard.toast.refresh_success'), 'success');
         } catch (error) {
@@ -150,7 +150,7 @@ function Dashboard() {
                 await invoke('save_text_file', { path, content });
                 showToast(t('dashboard.toast.export_success', { path }), 'success');
             } else {
-                // Web 模式：使用浏览器下载
+                // Web mode: use browser download
                 const blob = new Blob([content], { type: 'application/json' });
                 const url = URL.createObjectURL(blob);
                 const a = document.createElement('a');
@@ -179,13 +179,18 @@ function Dashboard() {
                 onMouseMove={() => console.log('Mouse moving over Dashboard')}
                 style={{ position: 'relative', zIndex: 1 }}
             >
-                {/* 问候语和操作按钮 */}
+                {/* Greeting and action buttons */}
                 <div
                     className="flex justify-between items-center"
                 >
                     <div>
                         <h1 className="text-2xl font-bold text-gray-900 dark:text-base-content">
                             {currentAccount
+                                // NOTE: the '用户' literal below matches the placeholder word inside the Chinese
+                                // locale string for dashboard.hello (zh.json). This .replace() only works when the
+                                // active locale is zh; in every other language the greeting key has no such
+                                // placeholder, so the personalized name is silently dropped. Pre-existing i18n bug,
+                                // left as-is per translation task scope - do not translate this literal.
                                 ? t('dashboard.hello').replace('用户', currentAccount.name || currentAccount.email.split('@')[0])
                                 : t('dashboard.hello')
                             }
@@ -205,7 +210,7 @@ function Dashboard() {
                     </div>
                 </div>
 
-                {/* 统计卡片 - 5 columns on medium screens and up */}
+                {/* Stat cards - 5 columns on medium screens and up */}
                 <div className="grid grid-cols-2 md:grid-cols-5 gap-3">
                     <div className="bg-white dark:bg-base-100 rounded-xl p-4 shadow-sm border border-gray-100 dark:border-base-200">
                         <div className="flex items-center justify-between mb-2">
@@ -274,7 +279,7 @@ function Dashboard() {
                     </div>
                 </div>
 
-                {/* 双栏布局 */}
+                {/* Two-column layout */}
                 <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
                     <CurrentAccount
                         account={currentAccount}
@@ -287,7 +292,7 @@ function Dashboard() {
                     />
                 </div>
 
-                {/* 快速链接 */}
+                {/* Quick links */}
                 <div className="grid grid-cols-2 gap-3">
                     <button
                         className="bg-indigo-50 dark:bg-indigo-900/20 rounded-lg p-3 shadow-sm border border-indigo-100 dark:border-indigo-900/30 hover:border-indigo-300 dark:hover:border-indigo-700 hover:shadow-md transition-all flex items-center justify-between group"

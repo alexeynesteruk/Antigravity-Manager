@@ -1,5 +1,5 @@
-// Claude 流式响应转换 (Gemini SSE → Claude SSE)
-// 对应 StreamingState + PartProcessor
+// Claude streaming response transformation (Gemini SSE → Claude SSE)
+// Corresponds to StreamingState + PartProcessor
 
 use super::models::*;
 use super::utils::to_claude_usage;
@@ -18,8 +18,8 @@ pub fn remap_function_call_args(name: &str, args: &mut Value) {
         tracing::debug!("[Streaming] Tool Call: '{}' Args: {:?}", name, obj);
     }
 
-    // [IMPORTANT] Claude Code CLI 的 EnterPlanMode 工具禁止携带任何参数
-    // 代理层注入的 reason 参数会导致 InputValidationError
+    // [IMPORTANT] Claude Code CLI's EnterPlanMode tool must not carry any arguments
+    // A reason parameter injected by the proxy layer would cause InputValidationError
     if name == "EnterPlanMode" {
         if let Some(obj) = args.as_object_mut() {
             obj.clear();
@@ -164,7 +164,7 @@ pub fn remap_function_call_args(name: &str, args: &mut Value) {
     }
 }
 
-/// 块类型枚举
+/// Block type enum
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BlockType {
     None,
@@ -173,7 +173,7 @@ pub enum BlockType {
     Function,
 }
 
-/// 签名管理器
+/// Signature manager
 pub struct SignatureManager {
     pending: Option<String>,
 }
@@ -198,7 +198,7 @@ impl SignatureManager {
     }
 }
 
-/// 流式状态机
+/// Streaming state machine
 pub struct StreamingState {
     block_type: BlockType,
     pub block_index: usize,
@@ -209,7 +209,7 @@ pub struct StreamingState {
     trailing_signature: Option<String>,
     pub web_search_query: Option<String>,
     pub grounding_chunks: Option<Vec<serde_json::Value>>,
-    // [IMPROVED] Error recovery 状态追踪 (prepared for future use)
+    // [IMPROVED] Error recovery state tracking (prepared for future use)
     #[allow(dead_code)]
     parse_error_count: usize,
     #[allow(dead_code)]
@@ -222,7 +222,7 @@ pub struct StreamingState {
     pub scaling_enabled: bool,
     // [NEW] Context limit for smart threshold recovery (default to 1M)
     pub context_limit: u32,
-    // [NEW] MCP XML Bridge 缓冲区
+    // [NEW] MCP XML Bridge buffer
     pub mcp_xml_buffer: String,
     pub in_mcp_xml: bool,
     // [FIX] Estimated prompt tokens for calibrator learning
@@ -248,7 +248,7 @@ impl StreamingState {
             trailing_signature: None,
             web_search_query: None,
             grounding_chunks: None,
-            // [IMPROVED] 初始化 error recovery 字段
+            // [IMPROVED] Initialize error recovery fields
             parse_error_count: 0,
             last_valid_state: None,
             model_name: None,
@@ -276,7 +276,7 @@ impl StreamingState {
         self.registered_tool_names = names;
     }
 
-    /// 发送 SSE 事件
+    /// Send an SSE event
     pub fn emit(&self, event_type: &str, data: serde_json::Value) -> Bytes {
         let sse = format!(
             "event: {}\ndata: {}\n\n",
@@ -286,7 +286,7 @@ impl StreamingState {
         Bytes::from(sse)
     }
 
-    /// 发送 message_start 事件
+    /// Send the message_start event
     pub fn emit_message_start(&mut self, raw_json: &serde_json::Value) -> Bytes {
         if self.message_start_sent {
             return Bytes::new();
@@ -332,7 +332,7 @@ impl StreamingState {
         result
     }
 
-    /// 开始新的内容块
+    /// Start a new content block
     pub fn start_block(
         &mut self,
         block_type: BlockType,
@@ -356,7 +356,7 @@ impl StreamingState {
         chunks
     }
 
-    /// 结束当前内容块
+    /// End the current content block
     pub fn end_block(&mut self) -> Vec<Bytes> {
         if self.block_type == BlockType::None {
             return vec![];
@@ -364,7 +364,7 @@ impl StreamingState {
 
         let mut chunks = Vec::new();
 
-        // Thinking 块结束时发送暂存的签名
+        // Send the buffered signature when a Thinking block ends
         if self.block_type == BlockType::Thinking && self.signatures.has_pending() {
             if let Some(signature) = self.signatures.consume() {
                 chunks.push(self.emit_delta("signature_delta", json!({ "signature": signature })));
@@ -385,7 +385,7 @@ impl StreamingState {
         chunks
     }
 
-    /// 发送 delta 事件
+    /// Send a delta event
     pub fn emit_delta(&self, delta_type: &str, delta_content: serde_json::Value) -> Bytes {
         let mut delta = json!({ "type": delta_type });
         if let serde_json::Value::Object(map) = delta_content {
@@ -404,7 +404,7 @@ impl StreamingState {
         )
     }
 
-    /// 发送结束事件
+    /// Send the finish event
     pub fn emit_finish(
         &mut self,
         finish_reason: Option<&str>,
@@ -412,36 +412,36 @@ impl StreamingState {
     ) -> Vec<Bytes> {
         let mut chunks = Vec::new();
 
-        // 关闭最后一个块
+        // Close the last block
         chunks.extend(self.end_block());
 
-        // 处理 trailingSignature (B4/C3 场景)
-        // [FIX] 只有当还没有发送过任何块时, 才能以 thinking 块结束(作为消息的开头)
-        // 实际上, 对于 Claude 协议, 如果已经发送过 Text, 就不能在此追加 Thinking。
-        // 这里的解决方案是: 只存储签名, 不再发送非法的末尾 Thinking 块。
-        // 签名会通过 SignatureCache 在下一轮请求中自动恢复。
+        // Handle trailingSignature (B4/C3 scenario)
+        // [FIX] Only when no block has been sent yet can we end with a thinking block (as the start of the message)
+        // In practice, for the Claude protocol, if Text has already been sent, Thinking cannot be appended here.
+        // The solution here is: only store the signature, and no longer send an invalid trailing Thinking block.
+        // The signature will be automatically recovered via SignatureCache in the next request.
         if let Some(signature) = self.trailing_signature.take() {
             tracing::info!(
                 "[Streaming] Captured trailing signature (len: {}), caching for session.",
                 signature.len()
             );
             self.signatures.store(Some(signature));
-            // 不再追加 chunks.push(self.emit("content_block_start", ...))
+            // No longer appending chunks.push(self.emit("content_block_start", ...))
         }
 
-        // 处理 grounding(web search) -> 转换为 Markdown 文本块
+        // Handle grounding (web search) -> convert to a Markdown text block
         if self.web_search_query.is_some() || self.grounding_chunks.is_some() {
             let mut grounding_text = String::new();
 
-            // 1. 处理搜索词
+            // 1. Handle the search query
             if let Some(query) = &self.web_search_query {
                 if !query.is_empty() {
-                    grounding_text.push_str("\n\n---\n**🔍 已为您搜索：** ");
+                    grounding_text.push_str("\n\n---\n**🔍 Searched for you:** ");
                     grounding_text.push_str(query);
                 }
             }
 
-            // 2. 处理来源链接
+            // 2. Handle source links
             if let Some(chunks) = &self.grounding_chunks {
                 let mut links = Vec::new();
                 for (i, chunk) in chunks.iter().enumerate() {
@@ -449,21 +449,21 @@ impl StreamingState {
                         let title = web
                             .get("title")
                             .and_then(|v| v.as_str())
-                            .unwrap_or("网页来源");
+                            .unwrap_or("Web source");
                         let uri = web.get("uri").and_then(|v| v.as_str()).unwrap_or("#");
                         links.push(format!("[{}] [{}]({})", i + 1, title, uri));
                     }
                 }
 
                 if !links.is_empty() {
-                    grounding_text.push_str("\n\n**🌐 来源引文：**\n");
+                    grounding_text.push_str("\n\n**🌐 Source citations:**\n");
                     grounding_text.push_str(&links.join("\n"));
                 }
             }
 
             let trimmed_grounding = grounding_text.trim();
             if !trimmed_grounding.is_empty() {
-                // 发送一个新的 text 块
+                // Send a new text block
                 chunks.push(self.emit(
                     "content_block_start",
                     json!({
@@ -481,7 +481,7 @@ impl StreamingState {
             }
         }
 
-        // 确定 stop_reason
+        // Determine stop_reason
         let stop_reason = if self.used_tool {
             "tool_use"
         } else if finish_reason == Some("MAX_TOKENS") {
@@ -536,42 +536,42 @@ impl StreamingState {
         chunks
     }
 
-    /// 标记使用了工具
+    /// Mark that a tool was used
     pub fn mark_tool_used(&mut self) {
         self.used_tool = true;
     }
 
-    /// 获取当前块类型
+    /// Get the current block type
     pub fn current_block_type(&self) -> BlockType {
         self.block_type
     }
 
-    /// 获取当前块索引
+    /// Get the current block index
     pub fn current_block_index(&self) -> usize {
         self.block_index
     }
 
-    /// 存储签名
+    /// Store the signature
     pub fn store_signature(&mut self, signature: Option<String>) {
         self.signatures.store(signature);
     }
 
-    /// 设置 trailing signature
+    /// Set the trailing signature
     pub fn set_trailing_signature(&mut self, signature: Option<String>) {
         self.trailing_signature = signature;
     }
 
-    /// 获取 trailing signature (仅用于检查)
+    /// Get the trailing signature (for inspection only)
     pub fn has_trailing_signature(&self) -> bool {
         self.trailing_signature.is_some()
     }
 
-    /// 处理 SSE 解析错误，实现优雅降级
+    /// Handle SSE parse errors, implementing graceful degradation
     ///
-    /// 当 SSE stream 中发生解析错误时:
-    /// 1. 安全关闭当前 block
-    /// 2. 递增错误计数器
-    /// 3. 在 debug 模式下输出错误信息
+    /// When a parse error occurs in the SSE stream:
+    /// 1. Safely close the current block
+    /// 2. Increment the error counter
+    /// 3. Output error information in debug mode
     #[allow(dead_code)] // Prepared for future error recovery implementation
     pub fn handle_parse_error(&mut self, raw_data: &str) -> Vec<Bytes> {
         let mut chunks = Vec::new();
@@ -584,13 +584,13 @@ impl StreamingState {
             raw_data.len()
         );
 
-        // 安全关闭当前 block
+        // Safely close the current block
         if self.block_type != BlockType::None {
             self.last_valid_state = Some(self.block_type);
             chunks.extend(self.end_block());
         }
 
-        // Debug 模式下输出详细错误信息
+        // Output detailed error information in Debug mode
         #[cfg(debug_assertions)]
         {
             let preview = if raw_data.len() > 100 {
@@ -601,9 +601,9 @@ impl StreamingState {
             tracing::debug!("[SSE-Parser] Failed chunk preview: {}", preview);
         }
 
-        // 错误率过高时发出警告并尝试发送错误信号
+        // Warn and attempt to send an error signal when the error rate is too high
         if self.parse_error_count > 3 {
-            // 降低阈值,更早通知用户
+            // Lower the threshold, notify the user earlier
             tracing::error!(
                 "[SSE-Parser] High error rate detected ({} errors). Stream may be corrupted.",
                 self.parse_error_count
@@ -618,7 +618,7 @@ impl StreamingState {
                     "type": "error",
                     "error": {
                         "type": "overloaded_error", // Use standard type
-                        "message": "网络连接不稳定，请检查您的网络或代理设置。",
+                        "message": "Network connection is unstable. Please check your network or proxy settings.",
                     }
                 }),
             ));
@@ -627,21 +627,21 @@ impl StreamingState {
         chunks
     }
 
-    /// 重置错误状态 (recovery 后调用)
+    /// Reset the error state (called after recovery)
     #[allow(dead_code)]
     pub fn reset_error_state(&mut self) {
         self.parse_error_count = 0;
         self.last_valid_state = None;
     }
 
-    /// 获取错误计数 (用于监控)
+    /// Get the error count (for monitoring)
     #[allow(dead_code)]
     pub fn get_error_count(&self) -> usize {
         self.parse_error_count
     }
 }
 
-/// Part 处理器
+/// Part processor
 pub struct PartProcessor<'a> {
     state: &'a mut StreamingState,
 }
@@ -651,7 +651,7 @@ impl<'a> PartProcessor<'a> {
         Self { state }
     }
 
-    /// 处理单个 part
+    /// Process a single part
     pub fn process(&mut self, part: &GeminiPart) -> Vec<Bytes> {
         let mut chunks = Vec::new();
         // [FIX #545] Decode Base64 signature if present (Gemini sends Base64, Claude expects Raw)
@@ -676,9 +676,9 @@ impl<'a> PartProcessor<'a> {
             }
         });
 
-        // 1. FunctionCall 处理
+        // 1. Handle FunctionCall
         if let Some(fc) = &part.function_call {
-            // 先处理 trailingSignature (B4/C3 场景)
+            // Handle trailingSignature first (B4/C3 scenario)
             if self.state.has_trailing_signature() {
                 chunks.extend(self.state.end_block());
                 if let Some(trailing_sig) = self.state.trailing_signature.take() {
@@ -708,18 +708,18 @@ impl<'a> PartProcessor<'a> {
             return chunks;
         }
 
-        // 2. Text 处理
+        // 2. Handle Text
         if let Some(text) = &part.text {
             if part.thought.unwrap_or(false) {
                 // Thinking
                 chunks.extend(self.process_thinking(text, signature));
             } else {
-                // 普通 Text
+                // Ordinary Text
                 chunks.extend(self.process_text(text, signature));
             }
         }
 
-        // 3. InlineData (Image) 处理
+        // 3. Handle InlineData (Image)
         if let Some(img) = &part.inline_data {
             let mime_type = &img.mime_type;
             let data = &img.data;
@@ -732,11 +732,11 @@ impl<'a> PartProcessor<'a> {
         chunks
     }
 
-    /// 处理 Thinking
+    /// Handle Thinking
     fn process_thinking(&mut self, text: &str, signature: Option<String>) -> Vec<Bytes> {
         let mut chunks = Vec::new();
 
-        // 处理之前的 trailingSignature
+        // Handle the previous trailingSignature
         if self.state.has_trailing_signature() {
             chunks.extend(self.state.end_block());
             if let Some(trailing_sig) = self.state.trailing_signature.take() {
@@ -760,7 +760,7 @@ impl<'a> PartProcessor<'a> {
             }
         }
 
-        // 开始或继续 thinking 块
+        // Start or continue the thinking block
         if self.state.current_block_type() != BlockType::Thinking {
             chunks.extend(self.state.start_block(
                 BlockType::Thinking,
@@ -819,7 +819,7 @@ impl<'a> PartProcessor<'a> {
             );
         }
 
-        // 暂存签名 (for local block handling)
+        // Buffer the signature (for local block handling)
         // If FIFO, we strictly follow the sequence. The default logic is effectively LIFO for a single turn
         // (store latest, consume at end).
         // For opencode, we just want to ensure we capture IT.
@@ -828,11 +828,11 @@ impl<'a> PartProcessor<'a> {
         chunks
     }
 
-    /// 处理普通 Text
+    /// Handle ordinary Text
     fn process_text(&mut self, text: &str, signature: Option<String>) -> Vec<Bytes> {
         let mut chunks = Vec::new();
 
-        // 空 text 带签名 - 暂存
+        // Empty text with a signature - buffer it
         if text.is_empty() {
             if signature.is_some() {
                 self.state.set_trailing_signature(signature);
@@ -843,7 +843,7 @@ impl<'a> PartProcessor<'a> {
         // [FIX #859] Mark that we have received actual content (text)
         self.state.has_content = true;
 
-        // 处理之前的 trailingSignature
+        // Handle the previous trailingSignature
         if self.state.has_trailing_signature() {
             chunks.extend(self.state.end_block());
             if let Some(trailing_sig) = self.state.trailing_signature.take() {
@@ -867,11 +867,11 @@ impl<'a> PartProcessor<'a> {
             }
         }
 
-        // 非空 text 带签名 - 立即处理
+        // Non-empty text with a signature - handle it immediately
         if signature.is_some() {
-            // [FIX] 为保护签名, 签名所在的 Text 块直接发送
-            // 注意: 不得在此开启 thinking 块, 因为之前可能已有非 thinking 内容。
-            // 这种情况下, 我们只需确签被缓存在状态中。
+            // [FIX] To protect the signature, the Text block carrying it is sent directly
+            // Note: a thinking block must not be opened here, because non-thinking content may already exist before it.
+            // In this case, we only need to ensure the signature is cached in the state.
             self.state.store_signature(signature);
 
             chunks.extend(
@@ -908,7 +908,7 @@ impl<'a> PartProcessor<'a> {
                                 serde_json::from_str(input_str.trim())
                                     .unwrap_or_else(|_| json!({ "input": input_str.trim() }));
 
-                            // 构造并发送 tool_use
+                            // Construct and send tool_use
                             let fc = FunctionCall {
                                 name: tool_name.to_string(),
                                 args: Some(input_json),
@@ -917,14 +917,14 @@ impl<'a> PartProcessor<'a> {
 
                             let tool_chunks = self.process_function_call(&fc, None);
 
-                            // 清理缓冲区并重置状态
+                            // Clear the buffer and reset the state
                             self.state.mcp_xml_buffer.clear();
                             self.state.in_mcp_xml = false;
 
-                            // 处理标签之前可能存在的非 XML 文本
+                            // Handle any non-XML text that may exist before the tag
                             if start_idx > 0 {
                                 let prefix_text = &buffer[..start_idx];
-                                // 这里不能递归。直接 emit 之前的 text 块。
+                                // Cannot recurse here. Emit the preceding text block directly.
                                 if self.state.current_block_type() != BlockType::Text {
                                     chunks.extend(self.state.start_block(
                                         BlockType::Text,
@@ -939,10 +939,10 @@ impl<'a> PartProcessor<'a> {
 
                             chunks.extend(tool_chunks);
 
-                            // 处理标签之后可能存在的非 XML 文本
+                            // Handle any non-XML text that may exist after the tag
                             let suffix = &buffer[close_idx + end_tag.len()..];
                             if !suffix.is_empty() {
-                                // 递归处理后缀内容
+                                // Recursively process the suffix content
                                 chunks.extend(self.process_text(suffix, None));
                             }
 
@@ -1015,12 +1015,12 @@ impl<'a> PartProcessor<'a> {
             }
         }
 
-        // 1. 发送 content_block_start (input 为空对象)
+        // 1. Send content_block_start (input is an empty object)
         let mut tool_use = json!({
             "type": "tool_use",
             "id": tool_id,
             "name": tool_name,
-            "input": {} // 必须为空，参数通过 delta 发送
+            "input": {} // Must be empty; arguments are sent via delta
         });
 
         if let Some(ref sig) = signature {
@@ -1046,7 +1046,7 @@ impl<'a> PartProcessor<'a> {
 
         chunks.extend(self.state.start_block(BlockType::Function, tool_use));
 
-        // 2. 发送 input_json_delta (完整的参数 JSON 字符串)
+        // 2. Send input_json_delta (the complete arguments JSON string)
         // [FIX] Remap args before serialization for Gemini → Claude compatibility
         if let Some(args) = &fc.args {
             let mut remapped_args = args.clone();
@@ -1069,7 +1069,7 @@ impl<'a> PartProcessor<'a> {
             );
         }
 
-        // 3. 结束块
+        // 3. End the block
         chunks.extend(self.state.end_block());
 
         chunks

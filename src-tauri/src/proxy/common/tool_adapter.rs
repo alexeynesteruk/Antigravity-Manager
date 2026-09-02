@@ -1,47 +1,47 @@
 use serde_json::Value;
 
-/// MCP 工具适配器 trait
+/// The MCP tool adapter trait
 ///
-/// 为不同的 MCP 工具提供定制化的 Schema 处理策略。
-/// 每个工具可以实现自己的适配器来处理特定的需求。
+/// Provides customized Schema-processing strategies for different MCP tools.
+/// Each tool can implement its own adapter to handle its specific needs.
 pub trait ToolAdapter: Send + Sync {
-    /// 判断该适配器是否匹配给定的工具名称
+    /// Determines whether this adapter matches the given tool name
     ///
     /// # Arguments
-    /// * `tool_name` - 工具名称,通常格式为 "mcp__provider__function"
+    /// * `tool_name` - the tool name, usually in the form "mcp__provider__function"
     ///
     /// # Returns
-    /// 如果匹配返回 true,否则返回 false
+    /// true if it matches, false otherwise
     fn matches(&self, tool_name: &str) -> bool;
 
-    /// 在通用清洗前执行的预处理
+    /// Pre-processing run before the common cleaning pass
     ///
-    /// 可以在这里添加工具特定的字段处理、提示添加等
+    /// Tool-specific field handling, hint additions, etc. can be added here
     ///
     /// # Arguments
-    /// * `schema` - 待处理的 JSON Schema
+    /// * `schema` - the JSON Schema to process
     ///
     /// # Returns
-    /// 成功返回 Ok(()), 失败返回错误信息
+    /// Ok(()) on success, an error message on failure
     fn pre_process(&self, _schema: &mut Value) -> Result<(), String> {
         Ok(())
     }
 
-    /// 在通用清洗后执行的后处理
+    /// Post-processing run after the common cleaning pass
     ///
-    /// 可以在这里进行最终的调整和优化
+    /// Final adjustments and optimizations can be made here
     ///
     /// # Arguments
-    /// * `schema` - 已清洗的 JSON Schema
+    /// * `schema` - the already-cleaned JSON Schema
     ///
     /// # Returns
-    /// 成功返回 Ok(()), 失败返回错误信息
+    /// Ok(()) on success, an error message on failure
     fn post_process(&self, _schema: &mut Value) -> Result<(), String> {
         Ok(())
     }
 }
 
-/// 辅助函数: 向 Schema 的 description 字段追加提示
+/// Helper function: appends a hint to a Schema's description field
 pub fn append_hint_to_schema(schema: &mut Value, hint: &str) {
     if let Value::Object(map) = schema {
         let desc_val = map

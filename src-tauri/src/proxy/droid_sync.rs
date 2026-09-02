@@ -176,7 +176,7 @@ pub fn check_droid_installed() -> (bool, Option<String>) {
     }
 }
 
-/// 统计已有 customModels 中有多少由 Antigravity 添加的（id 以 custom:AG- 开头）
+/// Count how many entries in the existing customModels were added by Antigravity (id starts with custom:AG-)
 fn count_synced_models(json: &Value) -> (usize, Option<String>) {
     let mut count = 0;
     let mut first_url = None;
@@ -239,7 +239,7 @@ fn create_backup(path: &PathBuf) -> Result<(), String> {
     Ok(())
 }
 
-/// 接收前端 preview 里完整的 customModels 数组，直接替换写入
+/// Receive the full customModels array from the frontend preview and write it directly as a replacement
 pub fn sync_droid_config(full_custom_models: Vec<Value>) -> Result<usize, String> {
     let config_path =
         get_config_path().ok_or_else(|| "Failed to get Droid config directory".to_string())?;

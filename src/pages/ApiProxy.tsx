@@ -168,7 +168,7 @@ export default function ApiProxy() {
     const [, setZaiModelsError] = useState<string | null>(null);
     const [zaiNewMappingFrom, setZaiNewMappingFrom] = useState('');
     const [zaiNewMappingTo, setZaiNewMappingTo] = useState('');
-    const [customMappingValue, setCustomMappingValue] = useState(''); // 自定义映射表单的选中值
+    const [customMappingValue, setCustomMappingValue] = useState(''); // Selected value for the custom mapping form
     const [editingKey, setEditingKey] = useState<string | null>(null);
     const [editingValue, setEditingValue] = useState<string>('');
 
@@ -197,7 +197,7 @@ export default function ApiProxy() {
     const [preferredAccountId, setPreferredAccountId] = useState<string | null>(null);
     const [availableAccounts, setAvailableAccounts] = useState<Array<{ id: string; email: string }>>([]);
 
-    // Cloudflared (CF隧道) states
+    // Cloudflared (CF tunnel) states
     const [cfStatus, setCfStatus] = useState<{ installed: boolean; version?: string; running: boolean; url?: string; error?: string }>({
         installed: false,
         running: false,
@@ -205,7 +205,7 @@ export default function ApiProxy() {
     const [cfLoading, setCfLoading] = useState(false);
     const [cfMode, setCfMode] = useState<'quick' | 'auth'>('quick');
     const [cfToken, setCfToken] = useState('');
-    const [cfUseHttp2, setCfUseHttp2] = useState(true); // 默认启用HTTP/2，更稳定
+    const [cfUseHttp2, setCfUseHttp2] = useState(true); // HTTP/2 enabled by default, more stable
 
     const zaiModelOptions = useMemo(() => {
         const unique = new Set(zaiAvailableModels);
@@ -217,7 +217,7 @@ export default function ApiProxy() {
     }, [appConfig?.proxy.zai?.model_mapping]);
 
 
-    // 生成自定义映射表单的选项 (从 models 动态生成)
+    // Generate options for the custom mapping form (dynamically generated from models)
     const customMappingOptions: SelectOption[] = useMemo(() => {
         return models.map(model => ({
             value: model.id,
@@ -226,7 +226,7 @@ export default function ApiProxy() {
         }));
     }, [models]);
 
-    // 初始化加载
+    // Initial load
     useEffect(() => {
         loadConfig();
         loadStatus();
@@ -254,17 +254,17 @@ export default function ApiProxy() {
         }
     };
 
-    // Cloudflared: 检查状态
+    // Cloudflared: check status
     const loadCfStatus = async () => {
         try {
             const status = await invoke<typeof cfStatus>('cloudflared_get_status');
             setCfStatus(status);
         } catch (error) {
-            // 忽略错误，可能是manager未初始化
+            // Ignore error, manager may not be initialized
         }
     };
 
-    // Cloudflared: 安装
+    // Cloudflared: install
     const handleCfInstall = async () => {
         console.log('[Cloudflared] Install button clicked');
         setCfLoading(true);
@@ -282,7 +282,7 @@ export default function ApiProxy() {
         }
     };
 
-    // Cloudflared: 启动/停止
+    // Cloudflared: start/stop
     const handleCfToggle = async (enable: boolean) => {
         if (enable && !status.running) {
             showToast(
@@ -314,7 +314,7 @@ export default function ApiProxy() {
                 setCfStatus(status);
                 showToast(t('proxy.cloudflared.started', { defaultValue: 'Tunnel started' }), 'success');
 
-                // 持久化“启用”状态
+                // Persist "enabled" state
                 if (appConfig) {
                     const newConfig = {
                         ...appConfig,
@@ -334,7 +334,7 @@ export default function ApiProxy() {
                 setCfStatus(status);
                 showToast(t('proxy.cloudflared.stopped', { defaultValue: 'Tunnel stopped' }), 'success');
 
-                // 持久化“禁用”状态
+                // Persist "disabled" state
                 if (appConfig) {
                     const newConfig = {
                         ...appConfig,
@@ -353,7 +353,7 @@ export default function ApiProxy() {
         }
     };
 
-    // Cloudflared: 复制URL
+    // Cloudflared: copy URL
     const handleCfCopyUrl = async () => {
         if (cfStatus.url) {
             const success = await copyToClipboard(cfStatus.url);
@@ -410,21 +410,21 @@ export default function ApiProxy() {
             const config = await invoke<AppConfig>('load_config');
             setAppConfig(config);
 
-            // 恢复 Cloudflared 持久化状态
+            // Restore Cloudflared persisted state
             if (config.cloudflared) {
                 setCfMode(config.cloudflared.mode || 'quick');
                 setCfToken(config.cloudflared.token || '');
-                setCfUseHttp2(config.cloudflared.use_http2 !== false); // 默认开启 HTTP/2
+                setCfUseHttp2(config.cloudflared.use_http2 !== false); // HTTP/2 enabled by default
             }
 
-            // 恢复 Cloudflared 状态并实现持久化同步
+            // Restore Cloudflared state and sync persistence
             if (config.cloudflared) {
                 setCfMode(config.cloudflared.mode || 'quick');
                 setCfToken(config.cloudflared.token || '');
-                setCfUseHttp2(config.cloudflared.use_http2 !== false); // 默认 true
+                setCfUseHttp2(config.cloudflared.use_http2 !== false); // Default true
             }
         } catch (error) {
-            console.error('加载配置失败:', error);
+            console.error('Failed to load config:', error);
             setConfigError(String(error));
         } finally {
             setConfigLoading(false);
@@ -434,31 +434,31 @@ export default function ApiProxy() {
     const loadStatus = async () => {
         try {
             const s = await invoke<ProxyStatus>('get_proxy_status');
-            // 如果后端返回 starting 或 busy，则在 UI 上表现为加载中
+            // If the backend returns starting or busy, show loading in the UI
             if (s.base_url === 'starting' || s.base_url === 'busy') {
-                // 如果当前已经是运行状态，不要被覆盖为 false
+                // If already running, don't overwrite with false
                 setStatus(prev => ({ ...s, running: prev.running }));
             } else {
                 setStatus(s);
             }
         } catch (error) {
-            console.error('获取状态失败:', error);
+            console.error('Failed to get status:', error);
         }
     };
 
 
     const saveConfig = async (newConfig: AppConfig) => {
-        // 1. 立即更新 UI 状态，确保流畅
+        // 1. Immediately update UI state for smoothness
         setAppConfig(newConfig);
         try {
             await invoke('save_config', { config: newConfig });
         } catch (error) {
-            console.error('保存配置失败:', error);
+            console.error('Failed to save config:', error);
             showToast(`${t('common.error')}: ${error}`, 'error');
         }
     };
 
-    // 专门处理模型映射的热更新 (全量)
+    // Dedicated handler for hot-updating model mapping (full)
     const handleMappingUpdate = async (type: 'custom', key: string, value: string) => {
         if (!appConfig) return;
 
@@ -487,7 +487,7 @@ export default function ApiProxy() {
         if (!appConfig) return;
         setIsResetConfirmOpen(false);
 
-        // 恢复到默认映射值 (空映射)
+        // Restore to default mapping value (empty mapping)
         const newConfig = {
             ...appConfig.proxy,
             custom_mapping: {}
@@ -504,7 +504,7 @@ export default function ApiProxy() {
     };
 
 
-    // 定义多个预设方案
+    // Define multiple preset schemes
     const defaultPresets = useMemo(() => [
         {
             id: 'default',
@@ -637,37 +637,37 @@ export default function ApiProxy() {
         }
     };
 
-    // 应用预设映射 (通配符)
+    // Apply preset mapping (wildcard)
     const handleApplyPresets = async () => {
         if (!appConfig) return;
 
         const selectedPresetData = presetOptions.find(p => p.id === selectedPreset);
         if (!selectedPresetData) return;
 
-        // 构造新配置
+        // Construct new config
         const newConfig = {
             ...appConfig.proxy,
-            // 策略:覆盖同名 key,保留其他自定义 key
+            // Strategy: overwrite keys with the same name, keep other custom keys
             // [FIX #1738] Type assertion to ensure Record<string, string> compatibility
             custom_mapping: { ...appConfig.proxy.custom_mapping, ...selectedPresetData.mappings } as Record<string, string>
         };
 
-        // 备份旧配置用于回滚
+        // Back up old config for rollback
         const oldConfig = { ...appConfig };
 
         try {
-            // 1. 乐观更新：立即更新 UI
+            // 1. Optimistic update: update UI immediately
             setAppConfig({ ...appConfig, proxy: newConfig });
             showToast(t('proxy.router.presets_applied') + ` (${selectedPresetData.name})`, 'success');
 
-            // 2. 后台异步保存
+            // 2. Save asynchronously in the background
             await invoke('update_model_mapping', { config: newConfig });
 
-            // 3. 重新加载配置以确保一致性
+            // 3. Reload config to ensure consistency
             await loadConfig();
         } catch (error) {
             console.error('Failed to apply presets:', error);
-            // 3. 失败回滚
+            // 3. Roll back on failure
             setAppConfig(oldConfig);
             showToast(`${t('common.error')}: ${error}`, 'error');
         }
@@ -865,7 +865,7 @@ export default function ApiProxy() {
             if (status.running) {
                 await invoke('stop_proxy_service');
             } else {
-                // 使用当前的 appConfig.proxy 启动
+                // Start using the current appConfig.proxy
                 await invoke('start_proxy_service', { config: appConfig.proxy });
             }
             await loadStatus();
@@ -887,7 +887,7 @@ export default function ApiProxy() {
             updateProxyConfig({ api_key: newKey });
             showToast(t('common.success'), 'success');
         } catch (error: any) {
-            console.error('生成 API Key 失败:', error);
+            console.error('Failed to generate API key:', error);
             showToast(t('proxy.dialog.operate_failed', { error: error.toString() }), 'error');
         }
     };
@@ -952,7 +952,7 @@ export default function ApiProxy() {
 
     const getPythonExample = (modelId: string) => {
         const port = status.running ? status.port : (appConfig?.proxy.port || 8045);
-        // 推荐使用 127.0.0.1 以避免部分环境 IPv6 解析延迟问题
+        // Recommend using 127.0.0.1 to avoid IPv6 resolution delay in some environments
         const baseUrl = `http://127.0.0.1:${port}/v1`;
         const apiKey = appConfig?.proxy.api_key || 'YOUR_API_KEY';
 
@@ -1048,12 +1048,12 @@ response = client.chat.completions.create(
 print(response.choices[0].message.content)`;
     };
 
-    // 在 filter 逻辑中，当选择 openai 协议时，允许显示所有模型
+    // In the filter logic, allow showing all models when the openai protocol is selected
     const filteredModels = models.filter(model => {
         if (selectedProtocol === 'openai') {
             return true;
         }
-        // Anthropic 协议下隐藏不支持的图片模型
+        // Hide unsupported image models under the Anthropic protocol
         if (selectedProtocol === 'anthropic') {
             return !model.id.includes('image');
         }
@@ -1102,7 +1102,7 @@ print(response.choices[0].message.content)`;
                     </div>
                 )}
 
-                {/* 配置区 */}
+                {/* Config section */}
                 {!configLoading && !configError && appConfig && (
                     <div className="bg-white dark:bg-base-100 rounded-xl shadow-sm border border-gray-100 dark:border-base-200">
                         <div className="px-4 py-2.5 border-b border-gray-100 dark:border-base-200 flex items-center justify-between">
@@ -1111,7 +1111,7 @@ print(response.choices[0].message.content)`;
                                     <Settings size={18} />
                                     {t('proxy.config.title')}
                                 </h2>
-                                {/* 状态指示器 */}
+                                {/* Status indicator */}
                                 <div className="flex items-center gap-2 pl-4 border-l border-gray-200 dark:border-base-300">
                                     <div className={`w-2 h-2 rounded-full ${status.running ? 'bg-green-500 animate-pulse' : 'bg-gray-400'}`} />
                                     <span className={`text-xs font-medium ${status.running ? 'text-green-600' : 'text-gray-500'}`}>
@@ -1122,7 +1122,7 @@ print(response.choices[0].message.content)`;
                                 </div>
                             </div>
 
-                            {/* 控制按钮 */}
+                            {/* Control buttons */}
                             <div className="flex items-center gap-2">
                                 <button
                                     onClick={handleToggle}
@@ -1138,7 +1138,7 @@ print(response.choices[0].message.content)`;
                             </div>
                         </div>
                         <div className="p-3 space-y-3">
-                            {/* 监听端口、超时和自启动 */}
+                            {/* Listen port, timeout, and autostart */}
                             <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
                                 <div>
                                     <label className="block text-xs font-medium text-gray-700 dark:text-gray-300 mb-1">
@@ -1213,10 +1213,10 @@ print(response.choices[0].message.content)`;
                             </div>
 
 
-                            {/* 局域网访问 & 访问授权 - 合并到同一行 */}
+                            {/* LAN access & access authorization - merged into the same row */}
                             <div className="border-t border-gray-200 dark:border-base-300 pt-3 mt-3">
                                 <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
-                                    {/* 允许局域网访问 */}
+                                    {/* Allow LAN access */}
                                     <div className="space-y-2">
                                         <div className="flex items-center justify-between">
                                             <span className="text-xs font-medium text-gray-700 dark:text-gray-300 inline-flex items-center gap-1">
@@ -1251,7 +1251,7 @@ print(response.choices[0].message.content)`;
                                         )}
                                     </div>
 
-                                    {/* 访问授权 */}
+                                    {/* Access authorization */}
                                     <div className="space-y-2">
                                         <div className="flex items-center justify-between">
                                             <label className="text-xs font-medium text-gray-700 dark:text-gray-300">
@@ -1318,7 +1318,7 @@ print(response.choices[0].message.content)`;
                                 </div>
                             </div>
 
-                            {/* API 密钥 */}
+                            {/* API key */}
                             <div>
                                 <label className="block text-xs font-medium text-gray-700 dark:text-gray-300 mb-1">
                                     <span className="inline-flex items-center gap-1">
@@ -1393,7 +1393,7 @@ print(response.choices[0].message.content)`;
                                 </p>
                             </div>
 
-                            {/* Web UI 管理密码 */}
+                            {/* Web UI admin password */}
                             <div className="border-t border-gray-200 dark:border-base-300 pt-3 mt-3">
                                 <label className="block text-xs font-medium text-gray-700 dark:text-gray-300 mb-1">
                                     <span className="inline-flex items-center gap-1">
@@ -1938,7 +1938,7 @@ print(response.choices[0].message.content)`;
                                 />
                             </CollapsibleCard>
 
-                            {/* 实验性设置 */}
+                            {/* Experimental settings */}
                             <CollapsibleCard
                                 title={t('proxy.config.experimental.title')}
                                 icon={<Sparkles size={18} className="text-purple-500" />}
@@ -1948,15 +1948,15 @@ print(response.choices[0].message.content)`;
                                         <div className="space-y-1">
                                             <div className="flex items-center gap-2">
                                                 <span className="text-sm font-bold text-gray-900 dark:text-base-content">
-                                                    {t('proxy.config.experimental.compression_level_label', { defaultValue: '智能上下文压缩等级' })}
+                                                    {t('proxy.config.experimental.compression_level_label', { defaultValue: 'Smart context compression level' })}
                                                 </span>
-                                                <HelpTooltip text={t('proxy.config.experimental.compression_level_tooltip', { defaultValue: '选择您希望启用的压缩等级。静态降噪与口语提纯不需要达到 30k 即可常驻生效。' })} />
+                                                <HelpTooltip text={t('proxy.config.experimental.compression_level_tooltip', { defaultValue: 'Choose the compression level you want to enable. Static noise reduction and speech purification take effect persistently without needing to reach 30k.' })} />
                                                 <span className="px-1.5 py-0.5 rounded bg-indigo-100 dark:bg-indigo-900/30 text-[10px] text-indigo-600 dark:text-indigo-400 font-bold border border-indigo-200 dark:border-indigo-800">
                                                     All Protocols
                                                 </span>
                                             </div>
                                             <p className="text-[10px] text-gray-500 dark:text-gray-400 max-w-lg">
-                                                {t('proxy.config.experimental.compression_level_desc', { defaultValue: '选择不同的压缩方案：Low 仅终端日志降噪；Medium 在此基础上增加口语净化；High 额外开启大上下文分阶段防御重置。' })}
+                                                {t('proxy.config.experimental.compression_level_desc', { defaultValue: 'Choose a different compression scheme: Low only reduces terminal log noise; Medium adds speech purification on top of that; High additionally enables staged defensive reset for large contexts.' })}
                                             </p>
                                         </div>
                                         <select
@@ -1970,10 +1970,10 @@ print(response.choices[0].message.content)`;
                                                 });
                                             }}
                                         >
-                                            <option value="disabled" className="text-xs dark:bg-base-300">{t('proxy.config.experimental.level_disabled', { defaultValue: '关闭 (Disabled)' })}</option>
-                                            <option value="low" className="text-xs dark:bg-base-300">{t('proxy.config.experimental.level_low', { defaultValue: '低度 (Low - 日志降噪)' })}</option>
-                                            <option value="medium" className="text-xs dark:bg-base-300">{t('proxy.config.experimental.level_medium', { defaultValue: '中度 (Medium - 日志+口语)' })}</option>
-                                            <option value="high" className="text-xs dark:bg-base-300">{t('proxy.config.experimental.level_high', { defaultValue: '高度 (High - 动态防暴)' })}</option>
+                                            <option value="disabled" className="text-xs dark:bg-base-300">{t('proxy.config.experimental.level_disabled', { defaultValue: 'Off (Disabled)' })}</option>
+                                            <option value="low" className="text-xs dark:bg-base-300">{t('proxy.config.experimental.level_low', { defaultValue: 'Low (Low - log noise reduction)' })}</option>
+                                            <option value="medium" className="text-xs dark:bg-base-300">{t('proxy.config.experimental.level_medium', { defaultValue: 'Medium (Medium - log + speech)' })}</option>
+                                            <option value="high" className="text-xs dark:bg-base-300">{t('proxy.config.experimental.level_high', { defaultValue: 'High (High - dynamic flood protection)' })}</option>
                                         </select>
                                     </div>
 
@@ -2043,7 +2043,7 @@ print(response.choices[0].message.content)`;
                                 </div>
                             </CollapsibleCard>
 
-                            {/* 公网访问 (Cloudflared) - 仅在桌面端显示 */}
+                            {/* Public network access (Cloudflared) - desktop only */}
                             {isTauri() && (
                                 <CollapsibleCard
                                     title={t('proxy.cloudflared.title', { defaultValue: 'Public Access (Cloudflared)' })}
@@ -2066,7 +2066,7 @@ print(response.choices[0].message.content)`;
                                     }
                                 >
                                     <div className="space-y-4">
-                                        {/* 安装状态 */}
+                                        {/* Install status */}
                                         {!cfStatus.installed ? (
                                             <div className="flex items-center justify-between p-4 bg-yellow-50 dark:bg-yellow-900/20 rounded-xl border border-yellow-200 dark:border-yellow-800">
                                                 <div className="space-y-1">
@@ -2088,13 +2088,13 @@ print(response.choices[0].message.content)`;
                                             </div>
                                         ) : (
                                             <>
-                                                {/* 版本信息 */}
+                                                {/* Version info */}
                                                 <div className="flex items-center gap-2 text-xs text-gray-500 dark:text-gray-400">
                                                     <CheckCircle size={14} className="text-green-500" />
                                                     {t('proxy.cloudflared.installed', { defaultValue: 'Installed' })}: {cfStatus.version || 'Unknown'}
                                                 </div>
 
-                                                {/* 隧道模式选择 */}
+                                                {/* Tunnel mode selection */}
                                                 <div className="grid grid-cols-2 gap-3">
                                                     <button
                                                         onClick={() => {
@@ -2150,7 +2150,7 @@ print(response.choices[0].message.content)`;
                                                     </button>
                                                 </div>
 
-                                                {/* Token输入 (仅auth模式) */}
+                                                {/* Token input (auth mode only) */}
                                                 {cfMode === 'auth' && (
                                                     <div className="space-y-2">
                                                         <label className="text-sm font-medium text-gray-700 dark:text-gray-300">
@@ -2175,7 +2175,7 @@ print(response.choices[0].message.content)`;
                                                     </div>
                                                 )}
 
-                                                {/* HTTP2选项 */}
+                                                {/* HTTP2 option */}
                                                 <div className="flex items-center justify-between p-3 bg-gray-50 dark:bg-base-200 rounded-lg">
                                                     <div className="space-y-0.5">
                                                         <span className="text-sm font-medium text-gray-900 dark:text-base-content">
@@ -2207,7 +2207,7 @@ print(response.choices[0].message.content)`;
                                                     />
                                                 </div>
 
-                                                {/* 运行状态和URL */}
+                                                {/* Running status and URL */}
                                                 {cfStatus.running && (
                                                     <div className="p-4 bg-green-50 dark:bg-green-900/20 rounded-xl border border-green-200 dark:border-green-800">
                                                         <div className="flex items-center gap-2 mb-2">
@@ -2232,7 +2232,7 @@ print(response.choices[0].message.content)`;
                                                     </div>
                                                 )}
 
-                                                {/* 错误信息 */}
+                                                {/* Error message */}
                                                 {cfStatus.error && (
                                                     <div className="p-3 bg-red-50 dark:bg-red-900/20 rounded-lg border border-red-200 dark:border-red-800 text-sm text-red-700 dark:text-red-300">
                                                         {cfStatus.error}
@@ -2247,7 +2247,7 @@ print(response.choices[0].message.content)`;
                     )
                 }
 
-                {/* 模型路由中心 */}
+                {/* Model routing center */}
                 {
                     !configLoading && !configError && appConfig && (
                         <div className="bg-white dark:bg-base-100 rounded-xl shadow-sm border border-gray-100 dark:border-base-200 overflow-hidden">
@@ -2263,7 +2263,7 @@ print(response.choices[0].message.content)`;
                                         </p>
                                     </div>
                                     <div className="flex flex-wrap items-center gap-2.5 bg-white dark:bg-base-100 p-1.5 rounded-xl border border-gray-100 dark:border-gray-700/50 shadow-sm">
-                                        {/* 仅暴露真实配额模型开关 */}
+                                        {/* Toggle to only expose real quota models */}
                                         <label
                                             className="flex items-center gap-2 px-3 py-1 rounded-lg border border-gray-200 dark:border-gray-700 bg-gray-50/80 dark:bg-base-200 cursor-pointer hover:bg-gray-100 dark:hover:bg-base-300 transition-colors h-9 select-none"
                                             title={t('proxy.router.only_raw_quota_models_tooltip')}
@@ -2279,7 +2279,7 @@ print(response.choices[0].message.content)`;
                                             />
                                         </label>
 
-                                        {/* 预设选择下拉框 */}
+                                        {/* Preset selection dropdown */}
                                         <div className="relative min-w-[140px]">
                                             <select
                                                 value={selectedPreset}
@@ -2316,7 +2316,7 @@ print(response.choices[0].message.content)`;
 
                                         <div className="w-[1px] h-5 bg-gray-200 dark:bg-gray-700 mx-1"></div>
 
-                                        {/* 添加映射预设 */}
+                                        {/* Add mapping preset */}
                                         <button
                                             onClick={() => setIsPresetManagerOpen(true)}
                                             className="p-2 rounded-lg text-gray-500 hover:text-green-600 hover:bg-green-50 dark:hover:bg-green-900/20 transition-all h-9 w-9 flex items-center justify-center border border-transparent hover:border-green-100 dark:hover:border-green-900/30"
@@ -2325,7 +2325,7 @@ print(response.choices[0].message.content)`;
                                             <Plus size={16} />
                                         </button>
 
-                                        {/* 删除当前预设（仅自定义预设） */}
+                                        {/* Delete current preset (custom presets only) */}
                                         <button
                                             onClick={() => {
                                                 if (selectedPreset.startsWith('custom_')) {
@@ -2360,9 +2360,9 @@ print(response.choices[0].message.content)`;
                             </div>
 
                             <div className="p-3 space-y-3">
-                                {/* 精确映射管理 */}
+                                {/* Exact mapping management */}
                                 <div>
-                                    {/* 后台任务模型配置 (Compact Mode) */}
+                                    {/* Background task model config (Compact Mode) */}
                                     <div className="mb-4 pb-4 border-b border-gray-100 dark:border-base-200">
                                         <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
                                             <div className="flex-1">
@@ -2414,7 +2414,7 @@ print(response.choices[0].message.content)`;
                                         </div>
                                     </div>
                                     <div className="flex flex-col gap-4">
-                                        {/* 当前映射列表 (置顶 2 列) */}
+                                        {/* Current mapping list (top 2 columns) */}
                                         <div className="w-full flex flex-col">
                                             <div className="flex items-center justify-between mb-2">
                                                 <span className="text-[10px] font-bold text-gray-400 dark:text-gray-500 uppercase tracking-wider">
@@ -2498,7 +2498,7 @@ print(response.choices[0].message.content)`;
                                             </div>
                                         </div>
 
-                                        {/* 添加映射表单 (置底单行) */}
+                                        {/* Add mapping form (bottom single row) */}
                                         <div className="w-full bg-gray-50/50 dark:bg-white/5 p-2.5 rounded-xl border border-gray-100 dark:border-white/5 shadow-inner">
                                             <div className="flex flex-col sm:flex-row items-center gap-3">
                                                 <div className="flex items-center gap-1.5 shrink-0">
@@ -2531,7 +2531,7 @@ print(response.choices[0].message.content)`;
                                                         if (k && v) {
                                                             handleMappingUpdate('custom', k, v);
                                                             (document.getElementById('custom-key') as HTMLInputElement).value = '';
-                                                            setCustomMappingValue(''); // 清空选择
+                                                            setCustomMappingValue(''); // Clear selection
                                                         }
                                                     }}
                                                 >
@@ -2547,7 +2547,7 @@ print(response.choices[0].message.content)`;
                     )
                 }
 
-                {/* 多协议支持信息 */}
+                {/* Multi-protocol support info */}
                 {
                     !configLoading && !configError && appConfig && (
                         <div className="bg-white dark:bg-base-100 rounded-xl shadow-sm border border-gray-100 dark:border-base-200 overflow-hidden">
@@ -2662,7 +2662,7 @@ print(response.choices[0].message.content)`;
                 }
 
 
-                {/* 支持模型与集成 */}
+                {/* Supported models & integrations */}
                 {
                     !configLoading && !configError && appConfig && (
                         <div className="bg-white dark:bg-base-100 rounded-xl shadow-sm border border-gray-100 dark:border-base-200 overflow-hidden mt-4">
@@ -2674,7 +2674,7 @@ print(response.choices[0].message.content)`;
                             </div>
 
                             <div className="grid grid-cols-1 lg:grid-cols-3 gap-0 lg:divide-x dark:divide-gray-700">
-                                {/* 左侧：模型列表 */}
+                                {/* Left: model list */}
                                 <div className="col-span-2 p-0">
                                     <div className="overflow-x-auto">
                                         <table className="table w-full">
@@ -2716,12 +2716,12 @@ print(response.choices[0].message.content)`;
                                     </div>
                                 </div>
 
-                                {/* 右侧：代码预览 */}
+                                {/* Right: code preview */}
                                 <div className="col-span-1 bg-gray-900 text-blue-100 flex flex-col h-[400px] lg:h-auto">
                                     <div className="p-3 border-b border-gray-800 flex items-center justify-between">
                                         <span className="text-xs font-bold text-gray-400 uppercase tracking-wider">{t('proxy.multi_protocol.quick_integration')}</span>
                                         <div className="flex gap-2">
-                                            {/* 这里可以放 cURL/Python 切换，或者直接默认显示 Python，根据 selectedProtocol 决定 */}
+                                            {/* Could add a cURL/Python toggle here, or just default to showing Python based on selectedProtocol */}
                                             <span className="text-[10px] px-2 py-0.5 rounded bg-blue-500/20 text-blue-400 border border-blue-500/30">
                                                 {selectedProtocol === 'anthropic' ? 'Python (Anthropic SDK)' : (selectedProtocol === 'gemini' ? 'Python (Google GenAI)' : 'Python (OpenAI SDK)')}
                                             </span>
@@ -2748,11 +2748,11 @@ print(response.choices[0].message.content)`;
                         </div>
                     )
                 }
-                {/* 各种对话框 */}
+                {/* Various dialogs */}
                 <ModalDialog
                     isOpen={isResetConfirmOpen}
-                    title={t('proxy.dialog.reset_mapping_title') || '重置映射'}
-                    message={t('proxy.dialog.reset_mapping_msg') || '确定要重置所有模型映射为系统默认吗？'}
+                    title={t('proxy.dialog.reset_mapping_title') || 'Reset Mapping'}
+                    message={t('proxy.dialog.reset_mapping_msg') || 'Are you sure you want to reset all model mappings to system defaults?'}
                     type="confirm"
                     isDestructive={true}
                     onConfirm={executeResetMapping}
@@ -2771,8 +2771,8 @@ print(response.choices[0].message.content)`;
 
                 <ModalDialog
                     isOpen={isClearBindingsConfirmOpen}
-                    title={t('proxy.dialog.clear_bindings_title') || '清除会话绑定'}
-                    message={t('proxy.dialog.clear_bindings_msg') || '确定要清除所有会话与账号的绑定映射吗？'}
+                    title={t('proxy.dialog.clear_bindings_title') || 'Clear Session Bindings'}
+                    message={t('proxy.dialog.clear_bindings_msg') || 'Are you sure you want to clear all session-to-account binding mappings?'}
                     type="confirm"
                     isDestructive={true}
                     onConfirm={executeClearSessionBindings}
@@ -2781,8 +2781,8 @@ print(response.choices[0].message.content)`;
 
                 <ModalDialog
                     isOpen={isClearRateLimitsConfirmOpen}
-                    title={t('proxy.dialog.clear_rate_limits_title') || '清除限流记录'}
-                    message={t('proxy.dialog.clear_rate_limits_confirm') || '确定要清除所有本地限流记录吗？'}
+                    title={t('proxy.dialog.clear_rate_limits_title') || 'Clear Rate Limit Records'}
+                    message={t('proxy.dialog.clear_rate_limits_confirm') || 'Are you sure you want to clear all local rate limit records?'}
                     type="confirm"
                     isDestructive={true}
                     onConfirm={executeClearRateLimits}

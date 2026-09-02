@@ -11,7 +11,7 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  # 前端构建检查
+  # Frontend build check
   build-frontend:
     name: Build Frontend
     runs-on: ubuntu-latest
@@ -35,7 +35,7 @@ jobs:
       - name: Build frontend
         run: npm run build
 
-  # Rust 代码检查
+  # Rust code check
   check-rust:
     name: Check Rust Code
     runs-on: ${{ matrix.platform }}
@@ -78,7 +78,7 @@ jobs:
           cd src-tauri
           cargo check
 
-  # Tauri 构建测试（不打包）
+  # Tauri build test (no packaging)
   build-tauri:
     name: Build Tauri App
     runs-on: ${{ matrix.platform }}
@@ -118,6 +118,6 @@ jobs:
       - name: Build Tauri app (debug)
         run: npm run tauri build -- --debug
         env:
-          # CI 环境不需要签名
+          # No signing needed in the CI environment
           TAURI_SIGNING_PRIVATE_KEY: ""
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ""

@@ -7,8 +7,8 @@ interface PaginationProps {
     onPageChange: (page: number) => void;
     totalItems: number;
     itemsPerPage: number;
-    onPageSizeChange?: (pageSize: number) => void;  // 新增:分页大小变更回调
-    pageSizeOptions?: number[];  // 新增:可选的分页大小选项
+    onPageSizeChange?: (pageSize: number) => void;  // Added: page-size change callback
+    pageSizeOptions?: number[];  // Added: optional page-size options
 }
 
 function Pagination({
@@ -24,7 +24,7 @@ function Pagination({
 
     if (totalPages <= 1 && !onPageSizeChange) return null;
 
-    // 计算显示的页码范围 (最多显示 5 个页码)
+    // Calculate the displayed page number range (up to 5 page numbers shown)
     let startPage = Math.max(1, currentPage - 2);
     let endPage = Math.min(totalPages, startPage + 4);
 
@@ -73,7 +73,7 @@ function Pagination({
                         {t('common.pagination_info', { start: startIndex, end: endIndex, total: totalItems })}
                     </p>
 
-                    {/* 分页大小选择器 */}
+                    {/* Page size selector */}
                     {onPageSizeChange && (
                         <div className="flex items-center gap-2">
                             <span className="text-sm text-gray-600 dark:text-gray-400">{t('common.per_page')}</span>

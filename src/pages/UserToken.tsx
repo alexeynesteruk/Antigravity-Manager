@@ -87,7 +87,7 @@ const UserToken: React.FC = () => {
             return;
         }
 
-        // 验证自定义时间
+        // Validate the custom time
         if (newExpiresType === 'custom' && !newCustomExpires) {
             showToast(t('user_token.custom_expires_required') || 'Please select a custom expiration time', 'error');
             return;
@@ -95,7 +95,7 @@ const UserToken: React.FC = () => {
 
         setCreating(true);
         try {
-            // 计算自定义过期时间戳
+            // Calculate the custom expiration timestamp
             const customExpiresAt = newExpiresType === 'custom' && newCustomExpires
                 ? Math.floor(new Date(newCustomExpires).getTime() / 1000)
                 : undefined;
@@ -140,11 +140,11 @@ const UserToken: React.FC = () => {
     };
 
     const handleEdit = (token: UserToken) => {
-        console.log('Editing token:', token); // 调试日志
+        console.log('Editing token:', token); // Debug log
         setEditingToken(token);
         setEditUsername(token.username);
         setEditDesc(token.description || '');
-        setEditMaxIps(token.max_ips ?? 0);  // 使用 ?? 确保 null/undefined 变为 0
+        setEditMaxIps(token.max_ips ?? 0);  // Use ?? to ensure null/undefined becomes 0
         setEditCurfewStart(token.curfew_start ?? '');
         setEditCurfewEnd(token.curfew_end ?? '');
         setShowEditModal(true);
@@ -165,7 +165,7 @@ const UserToken: React.FC = () => {
                     username: editUsername,
                     description: editDesc || undefined,
                     max_ips: editMaxIps,
-                    // 使用双层包装: undefined = 不更新, null = 清空, string = 设置值
+                    // Use a two-layer wrapper: undefined = don't update, null = clear, string = set value
                     curfew_start: editCurfewStart === '' ? null : editCurfewStart,
                     curfew_end: editCurfewEnd === '' ? null : editCurfewEnd
                 }

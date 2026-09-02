@@ -1,52 +1,52 @@
-# 🐋 Antigravity Manager 原生 Docker 部署手冊
+# 🐋 Antigravity Manager Native Docker Deployment Guide
 
-本目錄包含 Antigravity Manager 的原生 Headless Docker 部署方案。該方案支持完整的 Web 管理界面、API 反代以及數據持久化，無需複雜的 VNC 或桌面環境。
+This directory contains the native headless Docker deployment for Antigravity Manager. It supports the full Web management UI, API reverse proxy, and data persistence, with no need for a complicated VNC or desktop environment.
 
-## 🆕 本版本部署方案（本地前端構建復用）
-適用於「前端近期不改、後端經常調整」的場景。思路是先在本地生成 `dist/`，Docker 只編譯後端並直接拷貝 `dist/`，大幅縮短構建時間並降低前端構建風險。
+## 🆕 New Deployment Option (Reuse a Locally Built Frontend)
+Suited to scenarios where "the frontend rarely changes, the backend changes often". The idea is to build `dist/` locally first; Docker then only compiles the backend and copies `dist/` directly, greatly shortening build time and reducing frontend build risk.
 
-**步驟**
-1. 本地生成前端靜態資源：
+**Steps**
+1. Generate the frontend static assets locally:
 ```bash
 npm ci --legacy-peer-deps
 npm run build
 ```
-2. 使用本方案構建與啟動（後端-only + 復用 `dist/`）：
+2. Build and start with this option (backend-only + reuse `dist/`):
 ```bash
 docker compose -f docker/docker-compose.yml -f docker/docker-compose.localdist.yml build
 docker compose -f docker/docker-compose.yml -f docker/docker-compose.localdist.yml up -d
 ```
-或合併為單條命令：
+Or combine into a single command:
 ```bash
 docker compose -f docker/docker-compose.yml -f docker/docker-compose.localdist.yml up -d --build
 ```
 
-啟動後動態查看日誌：
+Watch the logs live after starting:
 ```bash
 docker compose -f docker/docker-compose.yml -f docker/docker-compose.localdist.yml logs -f --tail=200
 ```
 
-**更新方式**
-- 後端有改動：重跑上面的 `build` + `up -d`
-- 前端有改動：先在本地重新 `npm run build`，再重跑 `build` + `up -d`
+**How to update**
+- Backend changed: rerun `build` + `up -d` above
+- Frontend changed: run `npm run build` locally again first, then rerun `build` + `up -d`
 
-**Git 部署提醒**
-- 若服務器不在本地構建前端，請確保 `dist/` 已提交到倉庫（本版本已從 `.gitignore` 移除）。
+**Git deployment reminder**
+- If the server does not build the frontend locally, make sure `dist/` has been committed to the repo (it has been removed from `.gitignore` in this version).
 
-## 🚀 快速開始
+## 🚀 Quick Start
 
-### 1. 直接拉取鏡像 (推薦)
-您可以直接從 Docker Hub 拉取已構建好的鏡像並啟动，無需獲取源碼：
+### 1. Pull the Image Directly (Recommended)
+You can pull the pre-built image directly from Docker Hub and start it without fetching the source code:
 
 > [!IMPORTANT]
-> **安全警告**：從 v4.0.3 開始，Docker 版支持 **管理密碼與 API Key 分離**：
-> *   **API Key**：通過 `-e API_KEY=xxx` 設置，用於所有 AI 協議的 API 調用鑒權。
-> *   **Web 管理密碼**：通過 `-e WEB_PASSWORD=xxx` 設置，僅用於 Web UI 登錄。
-> *   **默認行為**：若未設置 `WEB_PASSWORD`，系統會自動回退使用 `API_KEY` 作為登錄密碼。若兩者皆未設置，則生成隨機 Key。
-> *   **查看方式**：執行 `docker logs antigravity-manager` 尋找 `Current API Key` 或 `Web UI Password`，或執行 `grep -E '"api_key"|"admin_password"' ~/.antigravity_tools/gui_config.json` 查看。
+> **Security warning**: starting from v4.0.3, the Docker build supports **separating the admin password from the API Key**:
+> *   **API Key**: set via `-e API_KEY=xxx`, used to authenticate all AI protocol API calls.
+> *   **Web admin password**: set via `-e WEB_PASSWORD=xxx`, used only for Web UI login.
+> *   **Default behavior**: if `WEB_PASSWORD` is not set, the system automatically falls back to using `API_KEY` as the login password. If neither is set, a random key is generated.
+> *   **How to view it**: run `docker logs antigravity-manager` and look for `Current API Key` or `Web UI Password`, or run `grep -E '"api_key"|"admin_password"' ~/.antigravity_tools/gui_config.json` to check.
 
 ```bash
-# 啟動容器 (請替换 your-secret-key 為強密鑰)
+# Start the container (replace your-secret-key with a strong key)
 docker run -d \
   --name antigravity-manager \
   -p 8045:8045 \
@@ -57,74 +57,74 @@ docker run -d \
   lbjlaq/antigravity-manager:latest
 ```
 
-#### 🔐 鑒權邏輯 (Security Scenarios)
-*   **場景 A：僅設置了 `API_KEY`**
-    - **Web 登錄**：使用 `API_KEY` 即可進入後台。
-    - **API 調用**：使用 `API_KEY` 進行 AI 請求鑒權。
-*   **場景 B：同時設置了 `API_KEY` 和 `WEB_PASSWORD` (推薦)**
-    - **Web 登錄**：**必須**使用 `WEB_PASSWORD`。此時輸入 API Key 將被拒絕，確保管理權限與調用權限隔離。
-    - **API 調用**：繼續使用 `API_KEY`。您可以放心地將 API Key 分發給團隊成員，而保留密碼僅供管理員使用。
+#### 🔐 Authentication Logic (Security Scenarios)
+*   **Scenario A: only `API_KEY` is set**
+    - **Web login**: use `API_KEY` to log into the admin panel.
+    - **API calls**: use `API_KEY` to authenticate AI requests.
+*   **Scenario B: both `API_KEY` and `WEB_PASSWORD` are set (recommended)**
+    - **Web login**: `WEB_PASSWORD` **must** be used. Entering the API Key will now be rejected, keeping admin access and API access isolated.
+    - **API calls**: continue using `API_KEY`. You can safely distribute the API Key to team members while keeping the password for admin use only.
 
-#### 🆙 舊版本升級指引
-如果您是從舊版本升級，默認沒有設置 `WEB_PASSWORD`。您可以通過以下方式添加：
-1.  **Web UI (推薦)**：使用原有的 `API_KEY` 登錄，在 **API 反代** 設置頁面中設置新的管理密碼。
-2.  **環境變量**：停止舊容器，啟動新容器時增加 `-e WEB_PASSWORD=您的新密碼`。
+#### 🆙 Upgrading From an Older Version
+If you're upgrading from an older version, `WEB_PASSWORD` is not set by default. You can add it in one of these ways:
+1.  **Web UI (recommended)**: log in with the existing `API_KEY`, then set a new admin password on the **API Reverse Proxy** settings page.
+2.  **Environment variable**: stop the old container and add `-e WEB_PASSWORD=your-new-password` when starting the new one.
 
 > [!TIP]
-> **優先級邏輯 (Priority)**:
-> - **環境變量** (`ABV_WEB_PASSWORD` / `WEB_PASSWORD`) 具有最高優先級。如果設置了環境變量，程序將始終使用它，忽略配置文件中的值。
-> - **配置文件** (`gui_config.json`) 用於持久化存儲。當您通過 Web UI 修改密碼並保存時，新密碼會寫入此文件（JSON 字段名為 `admin_password`）。
-> - **回退機制**: 如果上述兩者皆未設置，則回退使用 `API_KEY`；若連 `API_KEY` 也未設置，則隨機生成。
+> **Priority Logic (Priority)**:
+> - The **environment variable** (`ABV_WEB_PASSWORD` / `WEB_PASSWORD`) has the highest priority. If it is set, the program always uses it, ignoring the value in the config file.
+> - The **config file** (`gui_config.json`) is used for persistent storage. When you change and save the password via the Web UI, the new password is written to this file (the JSON field name is `admin_password`).
+> - **Fallback**: if neither of the above is set, it falls back to `API_KEY`; if even `API_KEY` is not set, one is generated randomly.
 
-### 2. 使用 Docker Compose
-在 `docker` 目錄下執行：
+### 2. Using Docker Compose
+Run this in the `docker` directory:
 ```bash
 docker compose up -d
 ```
 
-### 3. 手動構建鏡像 (開發者)
-如果您需要修改代碼或自定義構建，請在項目根目錄下執行：
+### 3. Building the Image Manually (Developers)
+If you need to modify the code or customize the build, run this in the project root:
 ```bash
-# 默認構建最新標籤
+# Build with the default "latest" tag
 docker build -t antigravity-manager:latest -f docker/Dockerfile .
 ```
 
-#### 💡 構建參數
-本鏡像支持自動鏡像源切換，以提升国内構建速度：
-*   `USE_MIRROR`: 
-    *   `auto` (默認): 自動檢測網絡環境，若無法訪問 Google 則切換至国内镜像（阿里云/NPM Mirror）。
-    *   `true`: 強制使用国内镜像源。
-    *   `false`: 強制使用官方默認源。
+#### 💡 Build Arguments
+This image supports automatic mirror source switching, to speed up builds in mainland China:
+*   `USE_MIRROR`:
+    *   `auto` (default): automatically detects the network environment; if Google is unreachable, switches to a mainland China mirror (Alibaba Cloud / NPM Mirror).
+    *   `true`: force using the mainland China mirror source.
+    *   `false`: force using the official default source.
 
-示例：
+Example:
 ```bash
-# 強制使用国内镜像加速構建
+# Force using the mainland China mirror to speed up the build
 docker build --build-arg USE_MIRROR=true -t antigravity-manager:latest -f docker/Dockerfile .
 ```
 
-## ⚙️ 環境變量配置
+## ⚙️ Environment Variable Configuration
 
-| 變量名 | 默認值 | 說明 |
+| Variable Name | Default | Description |
 | :--- | :--- | :--- |
-| `PORT` | `8045` | 容器內服務監聽端口 |
-| `ABV_API_KEY` | - | **[重要]** 代理 API 密鑰。客戶端（如 Claude Code）訪問時需提供的 Key |
-| `ABV_WEB_PASSWORD` | - | **[安全]** Web 管理後台登錄密碼。若不設置則回退使用 API Key |
-| `ABV_MAX_BODY_SIZE` | `104857600` | **[性能]** 最大請求體限制 (Byte)。默認 100MB，用於解決大圖傳輸 413 錯誤 |
-| `LOG_LEVEL` | `info` | 日志等級 (debug, info, warn, error) |
-| `ABV_DIST_PATH` | `/app/dist` | 前端靜態資源託管路徑 (Dockerfile 已內置) |
-| `ABV_PUBLIC_URL` | - | 用於遠程 OAuth 回調的公網 URL (可選) |
+| `PORT` | `8045` | port the service listens on inside the container |
+| `ABV_API_KEY` | - | **[Important]** the proxy API key. The key clients (e.g. Claude Code) must provide when accessing |
+| `ABV_WEB_PASSWORD` | - | **[Security]** the Web admin panel login password. Falls back to the API Key if not set |
+| `ABV_MAX_BODY_SIZE` | `104857600` | **[Performance]** maximum request body size limit (bytes). Default 100MB, used to resolve 413 errors on large image uploads |
+| `LOG_LEVEL` | `info` | log level (debug, info, warn, error) |
+| `ABV_DIST_PATH` | `/app/dist` | path where frontend static assets are served from (already built into the Dockerfile) |
+| `ABV_PUBLIC_URL` | - | public URL used for remote OAuth callbacks (optional) |
 
-## 📂 數據持久化
-請務必將宿主機目錄掛載至容器內的 `/root/.antigravity_tools`，否則賬號和配置在容器重啟後會丟失。
+## 📂 Data Persistence
+Make sure to mount a host directory to `/root/.antigravity_tools` inside the container, otherwise accounts and configuration will be lost when the container restarts.
 
-## 🌐 訪問位址
-*   **管理界面**: [http://localhost:8045](http://localhost:8045)
+## 🌐 Access URLs
+*   **Admin UI**: [http://localhost:8045](http://localhost:8045)
 *   **API Base**: [http://localhost:8045/v1](http://localhost:8045/v1)
 
-## 📦 Docker Hub 分發 (推薦)
-若要推送至你的倉庫：
+## 📦 Docker Hub Distribution (Recommended)
+To push to your own repository:
 ```bash
-# 打上版本標籤並推送
+# Tag the version and push
 docker tag antigravity-manager:latest lbjlaq/antigravity-manager:latest
 docker tag antigravity-manager:latest lbjlaq/antigravity-manager:4.3.0
 docker push lbjlaq/antigravity-manager:latest

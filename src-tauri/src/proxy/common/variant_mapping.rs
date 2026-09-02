@@ -1,11 +1,11 @@
 //! Canonical model + variant → real model ID + real params.
 //!
-//! OpenCode 配置 canonical 模型（如 `gemini-3.5-flash`）带 variants（low/medium/high）。
-//! 收到请求后，AM 根据 canonical + 档位映射到目标模型 ID
-//! （如 `gemini-3-flash-agent`），并用已校准的 thinkingBudget / maxOutputTokens
-//! 替换客户端传来的值，保证中转请求参数与上游服务一致。
+//! OpenCode configures a canonical model (e.g. `gemini-3.5-flash`) with variants (low/medium/high).
+//! Upon receiving a request, AM maps canonical + tier to the target model ID
+//! (e.g. `gemini-3-flash-agent`), and replaces the client-supplied thinkingBudget /
+//! maxOutputTokens with calibrated values, ensuring the forwarded request parameters match the upstream service.
 //!
-//! 所有数值为已校准的目标模型参数。
+//! All values are calibrated parameters for the target model.
 
 /// Variant tier inferred from the client's `thinking.budget_tokens`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

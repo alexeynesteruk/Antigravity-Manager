@@ -29,7 +29,7 @@ interface AccountCardProps {
     quotaWindow?: '5h' | 'weekly';
 }
 
-// 使用统一的模型配置
+// Use the unified model configuration
 const DEFAULT_MODELS = Object.entries(MODEL_CONFIG).map(([id, config]) => ({
     id,
     label: config.label,
@@ -43,7 +43,7 @@ function AccountCard({ account, selected, onSelect, isCurrent: propIsCurrent, is
     const isDisabled = Boolean(account.disabled);
     const validationBlockedLabel = getValidationBlockedStatusLabel(account.validation_blocked_reason, t);
 
-    // 自定义标签编辑状态
+    // Custom label editing state
     const [isEditingLabel, setIsEditingLabel] = useState(false);
     const [labelInput, setLabelInput] = useState(account.custom_label || '');
 
@@ -76,9 +76,9 @@ function AccountCard({ account, selected, onSelect, isCurrent: propIsCurrent, is
 
         // Get all models from account (source of truth)
         const accountModels = account.quota?.models?.map(m => {
-            // 注意：DEFAULT_MODELS 现在应该包含 shortLabel，我们需要确保它被正确映射
-            // 但 DEFAULT_MODELS 是从 MODEL_CONFIG 生成的，我们需要确保它包含 shortLabel
-            // 这里为了安全，直接从 MODEL_CONFIG 获取
+            // Note: DEFAULT_MODELS should now include shortLabel; we need to make sure it's mapped correctly
+            // But DEFAULT_MODELS is generated from MODEL_CONFIG, so we need to ensure it includes shortLabel
+            // To be safe, fetch it directly from MODEL_CONFIG here
             const fullConfig = MODEL_CONFIG[m.name.toLowerCase()];
             return {
                 id: m.name,
@@ -104,7 +104,7 @@ function AccountCard({ account, selected, onSelect, isCurrent: propIsCurrent, is
                 models = selections
                     .map(sel => sel.model ? accountModels.find(am => am.data === sel.model) : undefined)
                     .filter((m): m is typeof accountModels[number] => m !== undefined);
-                // 也保留无配额数据的 pinned 模型（显示 0%）
+                // Also keep pinned models without quota data (shown as 0%)
                 for (const sel of selections) {
                     if (!sel.model) {
                         const selectorConfig = MODEL_CONFIG[sel.selectorId.toLowerCase()];
@@ -121,16 +121,16 @@ function AccountCard({ account, selected, onSelect, isCurrent: propIsCurrent, is
                 }
             } else {
                 // Default fallback: show known default models, plus we show all dynamic pinned models
-                // 暂时退化：如果没有 config 就不阻拦了？不，没有 pinned 就显示内置+有 display_name 的。
+                // Temporary fallback: if there's no config, don't block it? No - without pinned models, show the built-in ones plus those with a display_name.
                 models = accountModels.filter(m => DEFAULT_MODELS.some(d => d.id === m.id) || m.data.display_name);
             }
         }
 
-        // 应用排序并过滤过期模型
+        // Apply sorting and filter out deprecated models
         return sortModels(models).filter(m => m.id !== 'claude-sonnet-4-6-thinking' && m.id !== 'claude-sonnet-4-5-thinking' && m.id !== 'claude-opus-4-5-thinking');
     }, [config, account, showAllQuotas]);
 
-    // 解析周配额项 (当处于 weekly 视图时)
+    // Parse weekly quota items (when in weekly view)
     const weeklyItems = useMemo(() => {
         if (quotaWindow !== 'weekly') return [];
         return (account.quota?.quota_groups || []).flatMap(group => {
@@ -217,7 +217,7 @@ function AccountCard({ account, selected, onSelect, isCurrent: propIsCurrent, is
                                     {validationBlockedLabel.toUpperCase()}
                                 </span>
                             )}
-                            {/* 订阅类型徽章 */}
+                            {/* Subscription type badge */}
                             {account.quota?.subscription_tier && (() => {
                                 const tier = account.quota.subscription_tier.toLowerCase();
                                 if (tier.includes('ultra')) {
@@ -243,7 +243,7 @@ function AccountCard({ account, selected, onSelect, isCurrent: propIsCurrent, is
                                     );
                                 }
                             })()}
-                            {/* 自定义标签 */}
+                            {/* Custom label */}
                             {account.custom_label && (
                                 <span className="flex items-center gap-1 px-1.5 py-0.5 rounded-md bg-orange-100 dark:bg-orange-900/40 text-orange-700 dark:text-orange-300 text-[9px] font-bold shadow-sm border border-orange-200/50 dark:border-orange-800/50">
                                     <Tag className="w-2.5 h-2.5" />
@@ -259,7 +259,7 @@ function AccountCard({ account, selected, onSelect, isCurrent: propIsCurrent, is
             </div>
 
 
-            {/* 配额展示 */}
+            {/* Quota display */}
             <div className="flex-1 px-2 mb-2 overflow-y-auto scrollbar-none">
                 {isDisabled || account.quota?.is_forbidden || account.proxy_disabled || account.validation_blocked ? (
                     <div className="flex flex-wrap items-center justify-center gap-x-3 gap-y-1 h-full py-4 text-center">
@@ -314,7 +314,7 @@ function AccountCard({ account, selected, onSelect, isCurrent: propIsCurrent, is
 
             {/* Footer: Actions Only */}
             <div className="flex-none flex items-center justify-center pt-2 pb-1 border-t border-gray-100 dark:border-base-200">
-                {/* 标签编辑弹出框 */}
+                {/* Label edit popover */}
                 {isEditingLabel && (
                     <div className="absolute inset-0 bg-white/95 dark:bg-base-100/95 rounded-xl z-10 flex items-center justify-center p-4">
                         <div className="flex items-center gap-2 w-full max-w-xs">
@@ -360,7 +360,7 @@ function AccountCard({ account, selected, onSelect, isCurrent: propIsCurrent, is
                     >
                         <Fingerprint className="w-3.5 h-3.5" />
                     </button>
-                    {/* 自定义标签按钮 */}
+                    {/* Custom label button */}
                     {onUpdateLabel && (
                         <button
                             className={cn(
@@ -378,7 +378,7 @@ function AccountCard({ account, selected, onSelect, isCurrent: propIsCurrent, is
                     <button
                         className={`p-1.5 rounded-lg transition-all ${(isSwitching || isDisabled) ? 'text-blue-600 bg-blue-50 dark:text-blue-400 dark:bg-blue-900/10 cursor-not-allowed' : 'text-gray-400 hover:text-blue-600 dark:hover:text-blue-400 hover:bg-blue-50 dark:hover:bg-blue-900/30'}`}
                         onClick={(e) => { e.stopPropagation(); onSwitch(); }}
-                        title={isDisabled ? t('accounts.disabled_tooltip') : (isSwitching ? t('common.loading') : t('accounts.switch_to_classic', '切换到 Antigravity (经典版)'))}
+                        title={isDisabled ? t('accounts.disabled_tooltip') : (isSwitching ? t('common.loading') : t('accounts.switch_to_classic', 'Switch to Antigravity (Classic)'))}
                         disabled={isSwitching || isDisabled}
                     >
                         <ArrowRightLeft className={`w-3.5 h-3.5 ${isSwitching ? 'animate-spin' : ''}`} />
@@ -386,7 +386,7 @@ function AccountCard({ account, selected, onSelect, isCurrent: propIsCurrent, is
                     <button
                         className={`p-1.5 rounded-lg transition-all ${(isSwitching || isDisabled) ? 'text-blue-600 bg-blue-50 dark:text-blue-400 dark:bg-blue-900/10 cursor-not-allowed' : 'text-gray-400 hover:text-sky-600 dark:hover:text-sky-400 hover:bg-sky-50 dark:hover:bg-sky-900/30'}`}
                         onClick={(e) => { e.stopPropagation(); onSwitch('ide'); }}
-                        title={isDisabled ? t('accounts.disabled_tooltip') : (isSwitching ? t('common.loading') : t('accounts.switch_to_ide', '切换到 Antigravity IDE'))}
+                        title={isDisabled ? t('accounts.disabled_tooltip') : (isSwitching ? t('common.loading') : t('accounts.switch_to_ide', 'Switch to Antigravity IDE'))}
                         disabled={isSwitching || isDisabled}
                     >
                         <Repeat2 className={`w-3.5 h-3.5 ${isSwitching ? 'animate-spin' : ''}`} />
@@ -394,7 +394,7 @@ function AccountCard({ account, selected, onSelect, isCurrent: propIsCurrent, is
                     <button
                         className={`p-1.5 rounded-lg transition-all ${(isSwitching || isDisabled) ? 'text-blue-600 bg-blue-50 dark:text-blue-400 dark:bg-blue-900/10 cursor-not-allowed' : 'text-gray-400 hover:text-emerald-600 dark:hover:text-emerald-400 hover:bg-emerald-50 dark:hover:bg-emerald-900/30'}`}
                         onClick={(e) => { e.stopPropagation(); onSwitch('agy'); }}
-                        title={isDisabled ? t('accounts.disabled_tooltip') : (isSwitching ? t('common.loading') : t('accounts.switch_to_agy', '切换到 Antigravity CLI (agy)'))}
+                        title={isDisabled ? t('accounts.disabled_tooltip') : (isSwitching ? t('common.loading') : t('accounts.switch_to_agy', 'Switch to Antigravity CLI (agy)'))}
                         disabled={isSwitching || isDisabled}
                     >
                         <Terminal className={`w-3.5 h-3.5 ${isSwitching ? 'animate-spin' : ''}`} />
@@ -403,7 +403,7 @@ function AccountCard({ account, selected, onSelect, isCurrent: propIsCurrent, is
                         <button
                             className={`p-1.5 rounded-lg transition-all ${(isRefreshing || isDisabled) ? 'text-orange-600 bg-orange-50 dark:bg-orange-900/10 cursor-not-allowed' : 'text-gray-400 hover:text-orange-500 hover:bg-orange-50 dark:hover:bg-orange-900/30'}`}
                             onClick={(e) => { e.stopPropagation(); onWarmup(); }}
-                            title={isDisabled ? t('accounts.disabled_tooltip') : (isRefreshing ? t('common.loading') : t('accounts.warmup_this', '预热该账号'))}
+                            title={isDisabled ? t('accounts.disabled_tooltip') : (isRefreshing ? t('common.loading') : t('accounts.warmup_this', 'Warm Up This Account'))}
                             disabled={isRefreshing || isDisabled}
                         >
                             <Sparkles className={`w-3.5 h-3.5 ${isRefreshing ? 'animate-pulse' : ''}`} />

@@ -1253,9 +1253,9 @@ fn check_standard_locations(target_ide: Option<&str>) -> Option<std::path::PathB
     None
 }
 
-/// 获取 Antigravity CLI (agy) 的安装/可执行文件路径
+/// Get the install/executable path for the Antigravity CLI (agy)
 pub fn get_antigravity_cli_executable_path() -> Option<std::path::PathBuf> {
-    // 1. 优先从配置查询
+    // 1. First check the configuration
     if let Ok(config) = crate::modules::config::load_app_config() {
         if let Some(ref p) = config.antigravity_cli_executable {
             let path = std::path::PathBuf::from(p);
@@ -1265,7 +1265,7 @@ pub fn get_antigravity_cli_executable_path() -> Option<std::path::PathBuf> {
         }
     }
 
-    // 2. 检查标准用户本地目录 ~/.local/bin/agy 或 ~/.local/bin/agy.exe
+    // 2. Check the standard user local directory ~/.local/bin/agy or ~/.local/bin/agy.exe
     if let Some(home) = dirs::home_dir() {
         let local_bin = home.join(".local").join("bin");
         let path = if cfg!(target_os = "windows") {
@@ -1278,7 +1278,7 @@ pub fn get_antigravity_cli_executable_path() -> Option<std::path::PathBuf> {
         }
     }
 
-    // 3. 在系统环境变量 PATH 中查找
+    // 3. Look in the system PATH environment variable
     let cmd = if cfg!(target_os = "windows") {
         "agy.exe"
     } else {

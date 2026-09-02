@@ -13,7 +13,7 @@ const QuotaProtection = ({ config, onChange }: QuotaProtectionProps) => {
 
     const handleEnabledChange = (enabled: boolean) => {
         let newConfig = { ...config, enabled };
-        // 如果开启保护且勾选列表为空，则默认勾选 claude
+        // If protection is enabled and the checked list is empty, check claude by default
         if (enabled && (!config.monitored_models || config.monitored_models.length === 0)) {
             newConfig.monitored_models = ['claude'];
         }
@@ -31,7 +31,7 @@ const QuotaProtection = ({ config, onChange }: QuotaProtectionProps) => {
         let newModels: string[];
 
         if (currentModels.includes(model)) {
-            // 必须勾选其中一个，不能全取消
+            // At least one must stay checked; can't deselect all
             if (currentModels.length <= 1) return;
             newModels = currentModels.filter(m => m !== model);
         } else {
@@ -55,7 +55,7 @@ const QuotaProtection = ({ config, onChange }: QuotaProtectionProps) => {
             label: config.shortLabel || config.label
         }));
 
-    // 计算示例值
+    // Calculate the example value
     const exampleTotal = 150;
     const exampleThreshold = Math.floor(exampleTotal * config.threshold_percentage / 100);
 
@@ -63,7 +63,7 @@ const QuotaProtection = ({ config, onChange }: QuotaProtectionProps) => {
         <div className="animate-in fade-in duration-500">
             <div className="flex items-center justify-between">
                 <div className="flex items-center gap-4">
-                    {/* 图标部分 - 使用红色/玫瑰色调表示保护/警示 */}
+                    {/* Icon section - uses red/rose tones to indicate protection/warning */}
                     <div className="w-10 h-10 rounded-xl bg-rose-50 dark:bg-rose-900/20 flex items-center justify-center text-rose-500 group-hover:bg-rose-500 group-hover:text-white transition-all duration-300">
                         <Shield size={20} />
                     </div>
@@ -77,7 +77,7 @@ const QuotaProtection = ({ config, onChange }: QuotaProtectionProps) => {
                     </div>
                 </div>
 
-                {/* 开关部分 */}
+                {/* Toggle section */}
                 <label className="relative inline-flex items-center cursor-pointer">
                     <input
                         type="checkbox"
@@ -89,10 +89,10 @@ const QuotaProtection = ({ config, onChange }: QuotaProtectionProps) => {
                 </label>
             </div>
 
-            {/* 展开的详情设置部分 */}
+            {/* Expanded detail settings section */}
             {config.enabled && (
                 <div className="mt-5 pt-5 border-t border-gray-100 dark:border-base-200 space-y-6 animate-in slide-in-from-top-1 duration-200">
-                    {/* 百分比设置 */}
+                    {/* Percentage setting */}
                     <div className="flex items-center gap-4">
                         <label className="text-xs font-bold text-gray-500 dark:text-gray-400 uppercase tracking-wider">
                             {t('settings.quota_protection.threshold_label')}
@@ -110,7 +110,7 @@ const QuotaProtection = ({ config, onChange }: QuotaProtectionProps) => {
                         </div>
                     </div>
 
-                    {/* 监控模型勾选 */}
+                    {/* Monitored model checkboxes */}
                     <div className="space-y-3">
                         <div className="flex flex-col gap-1">
                             <label className="text-xs font-bold text-gray-500 dark:text-gray-400 uppercase tracking-wider">
@@ -149,7 +149,7 @@ const QuotaProtection = ({ config, onChange }: QuotaProtectionProps) => {
                         </div>
                     </div>
 
-                    {/* 示例提示卡片 */}
+                    {/* Example hint card */}
                     <div className="flex items-start gap-3 p-3 bg-blue-50/50 dark:bg-gray-800/50 rounded-xl border border-blue-100/50 dark:border-base-300">
                         <div className="text-blue-500 mt-0.5">
                             <span className="text-sm">💡</span>

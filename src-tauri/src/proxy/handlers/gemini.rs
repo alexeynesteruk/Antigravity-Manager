@@ -64,15 +64,15 @@ mod image_success_tests {
     }
 }
 
-/// 处理 generateContent 和 streamGenerateContent
-/// 路径参数: model_name, method (e.g. "gemini-pro", "generateContent")
+/// Handle generateContent and streamGenerateContent
+/// Path params: model_name, method (e.g. "gemini-pro", "generateContent")
 pub async fn handle_generate(
     State(state): State<AppState>,
     Path(model_action): Path<String>,
     headers: HeaderMap,          // [NEW] Extract headers for adapter detection
-    Json(mut body): Json<Value>, // 改为 mut 以支持修复提示词注入
+    Json(mut body): Json<Value>, // mut so we can inject the fix-up prompt
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
-    // 解析 model:method
+    // Parse model:method
     let (model_name, method) = if let Some((m, action)) = model_action.rsplit_once(':') {
         (m.to_string(), action.to_string())
     } else {
@@ -95,8 +95,8 @@ pub async fn handle_generate(
         debug!("[{}] Client Adapter detected", trace_id);
     }
 
-    // 1. 验证方法
-    // [NEW] :countTokens 冒号语法，直接代理到上游 v1internal:countTokens
+    // 1. Validate the method
+    // [NEW] :countTokens colon syntax, proxy directly to upstream v1internal:countTokens
     if method == "countTokens" {
         return execute_count_tokens(state, model_name, body).await;
     }
@@ -125,7 +125,7 @@ pub async fn handle_generate(
         .await;
     }
     let client_wants_stream = method == "streamGenerateContent";
-    // [AUTO-CONVERSION] 强制内部流式化
+    // [AUTO-CONVERSION] Force internal streaming
     let force_stream_internally = !client_wants_stream;
     let is_stream = client_wants_stream || force_stream_internally;
 
@@ -133,7 +133,7 @@ pub async fn handle_generate(
         // debug!("[AutoConverter] Converting non-stream request to stream");
     }
 
-    // 2. 获取 UpstreamClient 和 TokenManager
+    // 2. Obtain the UpstreamClient and TokenManager
     let upstream = state.upstream.clone();
     let image_scheduler = state.image_scheduler.clone();
     let request_timeout = state.request_timeout;
@@ -155,12 +155,12 @@ pub async fn handle_generate(
         max_attempts,
         retry_credentials.is_some(),
     ) {
-        // 3. 模型路由解析
+        // 3. Model route resolution
         let mapped_model = crate::proxy::common::model_mapping::resolve_model_route(
             &model_name,
             &*state.custom_mapping.read().await,
         );
-        // 提取 tools 列表以进行联网探测 (Gemini 风格可能是嵌套的)
+        // Extract the tools list for web-search probing (Gemini style may be nested)
         let tools_val: Option<Vec<Value>> =
             body.get("tools").and_then(|t| t.as_array()).map(|arr| {
                 let mut flattened = Vec::new();
@@ -187,11 +187,11 @@ pub async fn handle_generate(
             Some(&body), // [NEW] Pass request body for imageConfig parsing
         );
 
-        // 4. 获取 Token (使用准确的 request_type)
-        // 提取 SessionId (粘性指纹)
+        // 4. Obtain a token (using the accurate request_type)
+        // Extract the SessionId (sticky fingerprint)
         let session_id = SessionManager::extract_gemini_session_id(&body, &model_name);
 
-        // 关键：根据 force_rotate 标志决定是否轮换账号（支持 Grace Retry 原地重试）
+        // Key: decide whether to rotate accounts based on the force_rotate flag (supports Grace Retry in-place retry)
         let (access_token, project_id, email, account_id, _wait_ms) =
             if let Some(credentials) = retry_credentials.take() {
                 credentials
@@ -244,9 +244,9 @@ pub async fn handle_generate(
         last_email = Some(email.clone());
         info!("✓ Using account: {} (type: {})", email, config.request_type);
 
-        // 5. 包装请求 (project injection)
+        // 5. Wrap the request (project injection)
         // [FIX #765] Pass session_id to wrap_request for signature injection
-        // [NEW] 获取完整 Token 对象以注入动态规格 (dynamic > static default > 65535)
+        // [NEW] Fetch the full Token object to inject dynamic spec limits (dynamic > static default > 65535)
         let token_obj = token_manager.get_token_by_id(&account_id);
         let wrapped_body = wrap_request_v2(
             &body,
@@ -278,7 +278,7 @@ pub async fn handle_generate(
             .await;
         }
 
-        // 5. 上游调用
+        // 5. Upstream call
         let query_string = if is_stream { Some("alt=sse") } else { None };
         let upstream_method = if is_stream {
             "streamGenerateContent"
@@ -322,7 +322,7 @@ pub async fn handle_generate(
             }
         };
 
-        // [NEW] 记录端点降级日志到 debug 文件
+        // [NEW] Log endpoint fallback to the debug file
         if !call_result.fallback_attempts.is_empty() && debug_logger::is_enabled(&debug_cfg) {
             let fallback_entries: Vec<serde_json::Value> = call_result
                 .fallback_attempts
@@ -355,11 +355,11 @@ pub async fn handle_generate(
         }
 
         let response = call_result.response;
-        // [NEW] 提取实际请求的上游端点 URL，用于日志记录和排查
+        // [NEW] Extract the actual upstream endpoint URL that was called, for logging and diagnostics
         let upstream_url = response.url().to_string();
         let status = response.status();
 
-        // [NEW] 提取官方 TraceID
+        // [NEW] Extract the official TraceID
         let cloud_code_trace_id = response
             .headers()
             .get("x-cloudaicompanion-trace-id")
@@ -367,7 +367,7 @@ pub async fn handle_generate(
             .map(|s| s.to_string());
 
         if status.is_success() {
-            // 6. 响应处理
+            // 6. Response processing
             if is_stream {
                 use axum::body::Body;
                 use axum::response::Response;
@@ -398,8 +398,9 @@ pub async fn handle_generate(
                 let mut first_chunk = None;
                 let mut retry_gemini = false;
 
-                // [NEW] 实施双阶段超时：第一阶段为 FirstChunkTimeout (300s / 5min)
-                // 这精准对齐了官方 Worker 在模型冷启动（Initialization）阶段的极度耐心
+                // [NEW] Implement a two-phase timeout: phase one is FirstChunkTimeout (300s / 5min)
+                // This precisely matches the official Worker's extreme patience during the model's
+                // cold-start (Initialization) phase
                 match tokio::time::timeout(
                     std::time::Duration::from_secs(300),
                     response_stream.next(),
@@ -450,8 +451,8 @@ pub async fn handle_generate(
                     let mut stream_failed = false;
 
                     loop {
-                        // [NEW] 阶段 6.2: 补全 __cloudCodeMeta 响应元数据透传
-                        // 官方 Worker 会将 TraceID 作为 SSE 流的第 0 个数据包下发
+                        // [NEW] Phase 6.2: forward the __cloudCodeMeta response metadata
+                        // The official Worker sends the TraceID as the 0th packet in the SSE stream
                         if !meta_sent {
                             if let Some(tid) = &cloud_code_trace_id {
                                 let meta_pkg = serde_json::json!({
@@ -467,7 +468,7 @@ pub async fn handle_generate(
                         let item = if let Some(fd) = first_data.take() {
                             Some(Ok(fd))
                         } else {
-                            // [NEW] 第二阶段为 StreamIdleTimeout (300s / 5min)
+                            // [NEW] Phase two is StreamIdleTimeout (300s / 5min)
                             match tokio::time::timeout(std::time::Duration::from_secs(300), response_stream.next()).await {
                                 Ok(next_item) => next_item,
                                 Err(_) => {
@@ -685,7 +686,7 @@ pub async fn handle_generate(
                 .into_response());
         }
 
-        // 处理错误并重试
+        // Handle the error and retry
         failure_statuses.record(status);
         let status_code = status.as_u16();
         let retry_after = response
@@ -721,7 +722,8 @@ pub async fn handle_generate(
             .await;
         }
 
-        // [FIX] 403 时优先检测 VALIDATION_REQUIRED 并设置 is_forbidden / validation_block 状态，确保及时提取 URL 与更新 UI
+        // [FIX] On 403, check for VALIDATION_REQUIRED first and set the is_forbidden / validation_block
+        // state, to ensure the URL is extracted and the UI updated promptly
         if status_code == 403 {
             if let Some(acc_id) = token_manager.get_account_id_by_email(&email) {
                 if error_text.contains("VALIDATION_REQUIRED")
@@ -744,14 +746,14 @@ pub async fn handle_generate(
                     }
                 }
 
-                // 设置 is_forbidden 状态并持久化
+                // Set the is_forbidden status and persist it
                 if let Err(e) = token_manager.set_forbidden(&acc_id, &error_text).await {
                     tracing::error!("Failed to set forbidden status: {}", e);
                 }
             }
         }
 
-        // 确定重试策略
+        // Determine the retry strategy
         let strategy = retry_state.determine_strategy(
             &account_id,
             status_code,
@@ -782,7 +784,7 @@ pub async fn handle_generate(
         }
         let trace_id = format!("gemini_{}", session_id);
 
-        // 执行退避
+        // Execute the backoff
         if apply_retry_strategy(
             strategy.clone(),
             attempt,
@@ -812,7 +814,7 @@ pub async fn handle_generate(
                 }
             }
 
-            // 判断是否需要轮换账号
+            // Determine whether an account rotation is needed
             if !should_rotate_account(status_code, Some(&strategy)) {
                 debug!(
                 "[{}] Keeping same account for status {} (Gemini server-side issue or Grace Retry)",
@@ -823,7 +825,7 @@ pub async fn handle_generate(
             continue;
         }
 
-        // [NEW] 处理 400 错误 (Thinking 签名失效)
+        // [NEW] Handle a 400 error (Thinking signature invalidated)
         if status_code == 400
             && (error_text.contains("Invalid `signature`")
                 || error_text.contains("thinking.signature")
@@ -835,7 +837,7 @@ pub async fn handle_generate(
                 email
             );
 
-            // 追加修复提示词到请求体的最后一条内容
+            // Append the repair prompt to the last content entry in the request body
             if let Some(contents) = body.get_mut("contents").and_then(|v| v.as_array_mut()) {
                 if let Some(last_content) = contents.last_mut() {
                     if let Some(parts) =
@@ -849,10 +851,11 @@ pub async fn handle_generate(
                 }
             }
 
-            continue; // 重试
+            continue; // Retry
         }
 
-        // 404 等由于模型配置或路径错误的 HTTP 异常，直接报错，不进行无效轮换
+        // HTTP exceptions like 404 caused by model config or path errors are reported directly,
+        // without a pointless account rotation
         error!(
             "Gemini Upstream non-retryable error {}: {}",
             status_code, error_text
@@ -875,7 +878,7 @@ pub async fn handle_generate(
             .into_response());
     }
 
-    // 所有尝试均失败：仅当全部结构化失败状态均为 429 时返回 429
+    // All attempts failed: return 429 only if every structured failure status was 429
     let final_status = failure_statuses.final_status();
 
     if let Some(email) = last_email {
@@ -899,12 +902,12 @@ pub async fn handle_list_models(
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
     use crate::proxy::common::model_mapping::get_all_dynamic_models;
 
-    // 获取所有动态模型列表（与 /v1/models 一致）
+    // Fetch the full dynamic model list (consistent with /v1/models)
     let only_raw = *state.only_raw_quota_models.read().await;
     let model_ids =
         get_all_dynamic_models(&state.custom_mapping, Some(&state.token_manager), only_raw).await;
 
-    // 转换为 Gemini API 格式
+    // Convert to Gemini API format
     let models: Vec<_> = model_ids
         .into_iter()
         .map(|id| {
@@ -933,8 +936,8 @@ pub async fn handle_get_model(Path(model_name): Path<String>) -> impl IntoRespon
     }))
 }
 
-/// 处理 /countTokens 斜杠语法路由
-/// 委托给 execute_count_tokens，与 :countTokens 冒号语法共用同一实现
+/// Handle the /countTokens slash-syntax route
+/// Delegates to execute_count_tokens, sharing the same implementation with the :countTokens colon syntax
 pub async fn handle_count_tokens(
     State(state): State<AppState>,
     Path(model_name): Path<String>,
@@ -946,22 +949,22 @@ pub async fn handle_count_tokens(
     }
 }
 
-/// 核心 countTokens 实现：透明代理到上游 v1internal:countTokens
+/// Core countTokens implementation: transparently proxies to upstream v1internal:countTokens
 ///
-/// 获取有效 OAuth Token，将标准 Gemini 请求体包装为 v1internal 格式后转发，
-/// 返回真实的 token 计数，而不是硬编码的 0
+/// Obtains a valid OAuth token, wraps the standard Gemini request body into v1internal format
+/// before forwarding, and returns the real token count instead of a hardcoded 0
 pub async fn execute_count_tokens(
     state: AppState,
     model_name: String,
     body: Value,
 ) -> Result<Response, (StatusCode, String)> {
-    // 1. 模型路由解析
+    // 1. Model route resolution
     let mapped_model = crate::proxy::common::model_mapping::resolve_model_route(
         &model_name,
         &*state.custom_mapping.read().await,
     );
 
-    // 2. 解析请求配置并获取 Token
+    // 2. Resolve the request config and obtain a token
     let config = crate::proxy::mappers::common_utils::resolve_request_config(
         &model_name,
         &mapped_model,
@@ -990,10 +993,11 @@ pub async fn execute_count_tokens(
             )
         })?;
 
-    // 3. 包装为 v1internal 格式
-    // [已验证] countTokens 与 generateContent 不同: 顶层只允许 "request" 键,
-    // 携带 model/project 会被上游 400 拒绝 (Unknown name "model"/"project");
-    // request 内的 safetySettings 同样不被接受 (对齐 CLIProxyAPI 的处理)
+    // 3. Wrap into v1internal format
+    // [Verified] countTokens differs from generateContent: only the "request" key is allowed at
+    // the top level; carrying model/project gets rejected upstream with a 400 (Unknown name
+    // "model"/"project"); safetySettings inside request is likewise not accepted (matching
+    // CLIProxyAPI's handling)
     let mut inner_body = body;
     if let Some(obj) = inner_body.as_object_mut() {
         obj.remove("safetySettings");
@@ -1002,7 +1006,7 @@ pub async fn execute_count_tokens(
         "request": inner_body,
     });
 
-    // 4. 调用上游 v1internal:countTokens
+    // 4. Call upstream v1internal:countTokens
     let call_result = state
         .upstream
         .call_v1_internal_with_headers(
@@ -1034,7 +1038,7 @@ pub async fn execute_count_tokens(
         .await
         .map_err(|e| (StatusCode::BAD_GATEWAY, format!("Parse error: {}", e)))?;
 
-    // 5. 提取 totalTokens (兼容 wrapped / unwrapped 两种响应格式)
+    // 5. Extract totalTokens (compatible with both wrapped and unwrapped response formats)
     let total_tokens = gemini_resp
         .get("response")
         .and_then(|r| r.get("totalTokens"))
@@ -1042,7 +1046,7 @@ pub async fn execute_count_tokens(
         .and_then(|v| v.as_i64())
         .unwrap_or(0);
 
-    // 6. 返回标准 Gemini REST 响应
+    // 6. Return the standard Gemini REST response
     Ok((
         StatusCode::OK,
         [

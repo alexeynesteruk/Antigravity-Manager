@@ -95,15 +95,15 @@ export const CliSyncCard = ({ proxyUrl, apiKey, className }: CliSyncCardProps) =
         group: m.group || 'General'
     }));
 
-    // 根据不同的 CLI 应用格式化 Proxy URL
+    // Format the proxy URL based on the different CLI apps
     const getFormattedProxyUrl = useCallback((app: CliAppType) => {
         if (!proxyUrl) return '';
         const base = proxyUrl.trimEnd().replace(/\/+$/, '');
-        // Codex & OpenCode (OpenAI 协议) 通常需要带 /v1
+        // Codex & OpenCode (OpenAI protocol) usually need /v1
         if (app === 'Codex' || app === 'OpenCode') {
             return base.endsWith('/v1') ? base : `${base}/v1`;
         }
-        // Claude 和 Gemini 的 SDK 通常会自动处理版本路径或不需要 /v1
+        // Claude and Gemini SDKs usually handle the version path automatically or don't need /v1
         return base.replace(/\/v1$/, '');
     }, [proxyUrl]);
 
@@ -151,7 +151,7 @@ export const CliSyncCard = ({ proxyUrl, apiKey, className }: CliSyncCardProps) =
         setSyncConfirmApp(null);
 
         if (!proxyUrl || !apiKey) {
-            showToast(t('proxy.cli_sync.toast.config_missing', { defaultValue: '请先生成 API Key 并启动服务' }), 'error');
+            showToast(t('proxy.cli_sync.toast.config_missing', { defaultValue: 'Please generate an API key and start the service first' }), 'error');
             return;
         }
 
@@ -300,9 +300,9 @@ export const CliSyncCard = ({ proxyUrl, apiKey, className }: CliSyncCardProps) =
                                 : "bg-amber-100 dark:bg-amber-900/30 text-amber-600 dark:text-amber-500 border border-amber-200/50 dark:border-amber-800/30"
                         )}>
                             {status.is_synced ? (
-                                <><CheckCircle2 size={12} className="shrink-0" /> {t('proxy.cli_sync.status.synced', { defaultValue: '已同步' })}</>
+                                <><CheckCircle2 size={12} className="shrink-0" /> {t('proxy.cli_sync.status.synced', { defaultValue: 'Synced' })}</>
                             ) : (
-                                <><AlertCircle size={12} className="shrink-0" /> {t('proxy.cli_sync.status.not_synced', { defaultValue: '未同步' })}</>
+                                <><AlertCircle size={12} className="shrink-0" /> {t('proxy.cli_sync.status.not_synced', { defaultValue: 'Not Synced' })}</>
                             )}
                         </div>
                     )}
@@ -318,7 +318,7 @@ export const CliSyncCard = ({ proxyUrl, apiKey, className }: CliSyncCardProps) =
                         </div>
                     </div>
 
-                    {/* Claude, Codex, Gemini 的模型选择 */}
+                    {/* Model selection for Claude, Codex, Gemini */}
                     {(status?.installed || app === 'OpenCode') && (app === 'Claude' || app === 'Codex' || app === 'Gemini') && (
                         <div className="space-y-1">
                             <div className="text-[9px] text-gray-400 dark:text-gray-500 uppercase font-bold tracking-wider px-1">
@@ -334,7 +334,7 @@ export const CliSyncCard = ({ proxyUrl, apiKey, className }: CliSyncCardProps) =
                         </div>
                     )}
 
-                    {/* OpenCode 独有的账号同步选项 - Allow even if not installed */}
+                    {/* OpenCode-specific account sync option - Allow even if not installed */}
                     {app === 'OpenCode' && (
                         <div className="flex items-center gap-2 p-2 bg-gray-50/50 dark:bg-gray-900/20 rounded-lg">
                             <input
@@ -353,7 +353,7 @@ export const CliSyncCard = ({ proxyUrl, apiKey, className }: CliSyncCardProps) =
                     <div className="flex items-center gap-2">
                         {(status?.installed || app === 'OpenCode') && (
                             <>
-                                {/* 对于 OpenCode，如果未同步，则不显示查看按钮（因为文件尚未生成，后端会报错） */}
+                                {/* For OpenCode, don't show the view button if not synced yet (the file hasn't been generated, and the backend would error) */}
                                 {(app !== 'OpenCode' || status?.is_synced) && (
                                     <button
                                         onClick={() => handleViewConfig(app)}
@@ -370,7 +370,7 @@ export const CliSyncCard = ({ proxyUrl, apiKey, className }: CliSyncCardProps) =
                                 >
                                     <RotateCcw size={14} />
                                 </button>
-                                {/* OpenCode 独有的 Clear 按钮 */}
+                                {/* OpenCode-specific Clear button */}
                                 {app === 'OpenCode' && (
                                     <button
                                         onClick={() => handleClear(app)}
@@ -484,7 +484,7 @@ export const CliSyncCard = ({ proxyUrl, apiKey, className }: CliSyncCardProps) =
                     </div>
                 </div>
             )}
-            {/* 恢复默认/备份确认弹窗 */}
+            {/* Restore default / backup confirmation dialog */}
             <ModalDialog
                 isOpen={!!restoreConfirmApp}
                 title={statuses[restoreConfirmApp!]?.has_backup
@@ -500,7 +500,7 @@ export const CliSyncCard = ({ proxyUrl, apiKey, className }: CliSyncCardProps) =
                 isDestructive={true}
             />
 
-            {/* 同步配置确认弹窗 (Issue #756) */}
+            {/* Sync config confirmation dialog (Issue #756) */}
             <ModalDialog
                 isOpen={!!syncConfirmApp}
                 title={t('proxy.cli_sync.sync_confirm_title')}
@@ -510,7 +510,7 @@ export const CliSyncCard = ({ proxyUrl, apiKey, className }: CliSyncCardProps) =
                 isDestructive={true}
             />
 
-            {/* Clear 确认弹窗 - 仅 OpenCode */}
+            {/* Clear confirmation dialog - OpenCode only */}
             <ModalDialog
                 isOpen={!!clearConfirmApp}
                 title={t('proxy.opencode_sync.clear_confirm_title', { defaultValue: 'Clear OpenCode Configuration' })}
@@ -520,7 +520,7 @@ export const CliSyncCard = ({ proxyUrl, apiKey, className }: CliSyncCardProps) =
                 isDestructive={true}
             />
 
-            {/* Droid 模型添加弹窗 */}
+            {/* Droid model add dialog */}
             {droidSyncModal && (
                 <DroidSyncModal
                     proxyUrl={proxyUrl}
@@ -531,7 +531,7 @@ export const CliSyncCard = ({ proxyUrl, apiKey, className }: CliSyncCardProps) =
                 />
             )}
 
-            {/* OpenCode 模型选择弹窗 */}
+            {/* OpenCode model selection dialog */}
             {openCodeSyncModal && (
                 <OpenCodeSyncModal
                     proxyUrl={proxyUrl}

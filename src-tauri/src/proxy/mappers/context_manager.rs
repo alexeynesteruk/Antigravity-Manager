@@ -862,7 +862,7 @@ impl ContextManager {
                                     total += estimate_media_tokens_from_url(&audio_url.url);
                                 }
                                 crate::proxy::mappers::openai::models::OpenAIContentBlock::InputAudio { input_audio } => {
-                                    // input_audio 携带裸 base64，直接按 inlineData 估算
+                                    // input_audio carries raw base64; estimate it directly as inlineData
                                     total += estimate_inline_data_tokens(
                                         &input_audio.mime_type(),
                                         input_audio.data.len(),
@@ -1078,7 +1078,7 @@ impl ContextManager {
                 tool_rounds.push(round);
             }
 
-            // 对保留下来的工具消息部分进行 RTK 日志降噪 (就地修改)
+            // Apply RTK log noise reduction to the retained tool message parts (in-place modification)
             for msg in contents.iter_mut() {
                 if let Some(parts) = msg.get_mut("parts").and_then(|p| p.as_array_mut()) {
                     for part in parts {

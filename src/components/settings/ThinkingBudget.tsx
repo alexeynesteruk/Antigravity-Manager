@@ -18,16 +18,16 @@ export default function ThinkingBudget({
 }: ThinkingBudgetProps) {
     const { t } = useTranslation();
 
-    // 使用本地 state 管理输入值，允许临时的无效输入
+    // Use local state to manage the input value, allowing temporarily invalid input
     const [inputValue, setInputValue] = useState(String(config.custom_value));
 
-    // 同步外部 config 变化
+    // Sync external config changes
     useEffect(() => {
         setInputValue(String(config.custom_value));
     }, [config.custom_value]);
 
     const handleModeChange = (mode: ThinkingBudgetMode) => {
-        // 切换到 adaptive 模式时，如果未设置 effort，默认设置为 high
+        // When switching to adaptive mode, default effort to high if it's not set
         if (mode === 'adaptive' && !config.effort) {
             onChange({ ...config, mode, effort: 'high' });
         } else {
@@ -39,12 +39,12 @@ export default function ThinkingBudget({
         onChange({ ...config, effort });
     };
 
-    // 输入时只更新本地 state
+    // Only update local state while typing
     const handleInputChange = (val: string) => {
         setInputValue(val);
     };
 
-    // 失焦时校验并提交
+    // Validate and submit on blur
     const handleInputBlur = () => {
         let num = parseInt(inputValue, 10);
         if (isNaN(num) || num < 1024) num = 1024;
@@ -61,10 +61,10 @@ export default function ThinkingBudget({
             <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 bg-blue-50/30 dark:bg-blue-900/5 border border-blue-100/50 dark:border-blue-800/20 rounded-lg px-4 py-3">
                 <div className="space-y-0.5">
                     <h4 className="font-bold text-sm text-gray-900 dark:text-gray-100">
-                        {t("settings.thinking_budget.title", { defaultValue: "思考预算 (Thinking Budget)" })}
+                        {t("settings.thinking_budget.title", { defaultValue: "Thinking Budget" })}
                     </h4>
                     <p className="text-[10px] text-gray-500 dark:text-gray-400">
-                        {t("settings.thinking_budget.mode_label", { defaultValue: "处理模式" })}
+                        {t("settings.thinking_budget.mode_label", { defaultValue: "Processing Mode" })}
                     </p>
                 </div>
 
@@ -89,7 +89,7 @@ export default function ThinkingBudget({
                 {config.mode === 'auto' && (
                     <p className="text-[10px] text-gray-400 dark:text-gray-500 italic">
                         {t("settings.thinking_budget.auto_hint", {
-                            defaultValue: "自动模式：对 Gemini/Thinking 及联网请求自动限制在 24576 以避免错误。",
+                            defaultValue: "Auto mode: automatically caps Gemini/Thinking and web-connected requests at 24576 to avoid errors.",
                         })}
                     </p>
                 )}
@@ -97,7 +97,7 @@ export default function ThinkingBudget({
                 {config.mode === 'passthrough' && (
                     <p className="text-[10px] text-amber-600 dark:text-amber-500/80">
                         {t("settings.thinking_budget.passthrough_warning", {
-                            defaultValue: "透传：直接使用调用方原始值，不支持高值可能导致失败。",
+                            defaultValue: "Passthrough: uses the caller's original value directly; unsupported high values may cause failures.",
                         })}
                     </p>
                 )}
@@ -106,7 +106,7 @@ export default function ThinkingBudget({
                     <div className="flex flex-col gap-2">
                         <div className="flex items-center gap-3">
                             <span className="text-xs text-gray-500 dark:text-gray-400">
-                                {t("settings.thinking_budget.effort_label", { defaultValue: "思考强度" })}:
+                                {t("settings.thinking_budget.effort_label", { defaultValue: "Thinking Effort" })}:
                             </span>
                             <div className="flex bg-gray-100 dark:bg-gray-800 p-0.5 rounded-lg">
                                 {efforts.map((effort) => (
@@ -125,7 +125,7 @@ export default function ThinkingBudget({
                         </div>
                         <p className="text-[10px] text-purple-600 dark:text-purple-400/80">
                             {t("settings.thinking_budget.adaptive_hint", {
-                                defaultValue: "自适应模式：由模型根据任务复杂度自动调整思考量。Claude 4.6+ 推荐使用此模式。",
+                                defaultValue: "Adaptive mode: the model automatically adjusts the amount of thinking based on task complexity. Recommended for Claude 4.6+.",
                             })}
                         </p>
                     </div>
@@ -149,7 +149,7 @@ export default function ThinkingBudget({
                         </div>
                         <p className="text-[10px] text-gray-500 dark:text-gray-500">
                             {t("settings.thinking_budget.custom_value_hint", {
-                                defaultValue: "推荐：24576 (Flash) 或 51200 (扩展)",
+                                defaultValue: "Recommended: 24576 (Flash) or 51200 (Extended)",
                             })}
                         </p>
                     </div>

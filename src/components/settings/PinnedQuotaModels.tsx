@@ -17,7 +17,7 @@ const PinnedQuotaModels = ({ config, onChange }: PinnedQuotaModelsProps) => {
         let newModels: string[];
 
         if (currentModels.includes(model)) {
-            // 至少保留一个模型
+            // Keep at least one model
             if (currentModels.length <= 1) return;
             newModels = currentModels.filter(m => m !== model);
         } else {
@@ -30,7 +30,7 @@ const PinnedQuotaModels = ({ config, onChange }: PinnedQuotaModelsProps) => {
     const { accounts } = useAccountStore();
     const uniqueIds = new Set<string>();
 
-    // 先收集所有已知模型的 id 和 protectedKey，防止他们作为未知的 "动态抽出模型" 出现
+    // First collect the id and protectedKey of all known models, to prevent them from showing up as unknown "dynamically extracted models"
     Object.entries(MODEL_CONFIG).forEach(([id, cfg]) => {
         uniqueIds.add(id.toLowerCase());
         if (cfg.protectedKey) {
@@ -40,14 +40,14 @@ const PinnedQuotaModels = ({ config, onChange }: PinnedQuotaModelsProps) => {
 
     const addedDisplayLabels = new Set<string>();
 
-    // 基础内置配置模型
+    // Base built-in configured models
     const baseModels = Object.entries(MODEL_CONFIG)
         .filter(([id, cfg]) => {
-            // 隐藏思考变体
+            // Hide thinking variants
             if (id.includes('thinking')) return false;
 
             const labelKey = (cfg.shortLabel || cfg.label).toLowerCase();
-            // 在这一层，如果展示用的 labelKey 已经被加过了，就不要重复加到外派的选项里了
+            // At this level, if the display labelKey has already been added, don't add it again to the exported options
             if (addedDisplayLabels.has(labelKey)) return false;
             addedDisplayLabels.add(labelKey);
             return true;
@@ -58,12 +58,12 @@ const PinnedQuotaModels = ({ config, onChange }: PinnedQuotaModelsProps) => {
             desc: cfg.shortLabel || cfg.label || t(cfg.i18nDescKey || cfg.i18nKey, cfg.label)
         }));
 
-    // 提取所有账号的历史动态模型
+    // Extract the historical dynamic models across all accounts
     const dynamicModels = accounts.flatMap(a => a.quota?.models || [])
         .filter(m => {
             const id = m.name.toLowerCase();
             if (id.includes('thinking')) return false;
-            // 查重：避免内置里已经包含的模型或同名 id 重复
+            // Dedupe: avoid models already included in the built-in list or duplicate id names
             if (uniqueIds.has(id)) return false;
             uniqueIds.add(id);
             return true;
@@ -80,14 +80,14 @@ const PinnedQuotaModels = ({ config, onChange }: PinnedQuotaModelsProps) => {
     const currentChecked = config.models || [];
     currentChecked.forEach(modelId => {
         if (!modelOptions.some(m => m.id === modelId)) {
-            // 尝试在历史配额中找到它的真实名字 (为了应对如 thinking 模型被隐藏但在关注列表里等情况)
+            // Try to find its real name in the historical quota data (to handle cases like a thinking model being hidden but still in the pinned list)
             const quotaModel = accounts.flatMap(a => a.quota?.models || []).find(m => m.name.toLowerCase() === modelId.toLowerCase());
             const cfg = MODEL_CONFIG[modelId.toLowerCase()];
 
             modelOptions.push({
                 id: modelId,
                 label: modelId,
-                desc: quotaModel?.display_name || cfg?.shortLabel || cfg?.label || t('common.unknown', '未知')
+                desc: quotaModel?.display_name || cfg?.shortLabel || cfg?.label || t('common.unknown', 'Unknown')
             });
         }
     });
@@ -95,7 +95,7 @@ const PinnedQuotaModels = ({ config, onChange }: PinnedQuotaModelsProps) => {
     return (
         <div className="animate-in fade-in duration-500">
             <div className="flex items-center gap-4">
-                {/* 图标部分 - 使用蓝紫色调 */}
+                {/* Icon section - uses a blue-purple tone */}
                 <div className="w-10 h-10 rounded-xl bg-indigo-50 dark:bg-indigo-900/20 flex items-center justify-center text-indigo-500 group-hover:bg-indigo-500 group-hover:text-white transition-all duration-300">
                     <Pin size={20} />
                 </div>
@@ -109,7 +109,7 @@ const PinnedQuotaModels = ({ config, onChange }: PinnedQuotaModelsProps) => {
                 </div>
             </div>
 
-            {/* 模型选择区域 */}
+            {/* Model selection area */}
             <div className="mt-5 pt-5 border-t border-gray-100 dark:border-base-200 space-y-4">
                 <div className="grid grid-cols-4 gap-2">
                     {modelOptions.map((model) => {

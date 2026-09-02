@@ -1,11 +1,11 @@
 //! Security Database Module
-//! 安全监控相关的数据库操作
+//! Database operations related to security monitoring
 
 use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
-/// IP 访问日志
+/// IP access log
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IpAccessLog {
     pub id: String,
@@ -23,7 +23,7 @@ pub struct IpAccessLog {
     pub username: Option<String>,
 }
 
-/// IP 黑名单条目
+/// IP blacklist entry
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IpBlacklistEntry {
     pub id: String,
@@ -35,7 +35,7 @@ pub struct IpBlacklistEntry {
     pub hit_count: i64,
 }
 
-/// IP 白名单条目
+/// IP whitelist entry
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IpWhitelistEntry {
     pub id: String,
@@ -44,7 +44,7 @@ pub struct IpWhitelistEntry {
     pub created_at: i64,
 }
 
-/// IP 统计概览
+/// IP statistics overview
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IpStats {
     pub total_requests: u64,
@@ -55,7 +55,7 @@ pub struct IpStats {
     pub whitelist_count: u64,
 }
 
-/// IP 访问排行
+/// IP access ranking
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IpRanking {
     pub client_ip: String,
@@ -64,13 +64,13 @@ pub struct IpRanking {
     pub is_blocked: bool,
 }
 
-/// 获取安全数据库路径
+/// Get the security database path
 pub fn get_security_db_path() -> Result<PathBuf, String> {
     let data_dir = crate::modules::account::get_data_dir()?;
     Ok(data_dir.join("security.db"))
 }
 
-/// 连接数据库
+/// Connect to the database
 fn connect_db() -> Result<Connection, String> {
     let db_path = get_security_db_path()?;
     let conn = Connection::open(db_path).map_err(|e| e.to_string())?;
@@ -89,11 +89,11 @@ fn connect_db() -> Result<Connection, String> {
     Ok(conn)
 }
 
-/// 初始化安全数据库
+/// Initialize the security database
 pub fn init_db() -> Result<(), String> {
     let conn = connect_db()?;
 
-    // IP 访问日志表
+    // IP access log table
     conn.execute(
         "CREATE TABLE IF NOT EXISTS ip_access_logs (
             id TEXT PRIMARY KEY,
@@ -112,7 +112,7 @@ pub fn init_db() -> Result<(), String> {
     )
     .map_err(|e| e.to_string())?;
 
-    // IP 黑名单表
+    // IP blacklist table
     conn.execute(
         "CREATE TABLE IF NOT EXISTS ip_blacklist (
             id TEXT PRIMARY KEY,
@@ -127,7 +127,7 @@ pub fn init_db() -> Result<(), String> {
     )
     .map_err(|e| e.to_string())?;
 
-    // IP 白名单表
+    // IP whitelist table
     conn.execute(
         "CREATE TABLE IF NOT EXISTS ip_whitelist (
             id TEXT PRIMARY KEY,
@@ -139,7 +139,7 @@ pub fn init_db() -> Result<(), String> {
     )
     .map_err(|e| e.to_string())?;
 
-    // 创建索引
+    // Create indexes
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_ip_access_ip ON ip_access_logs (client_ip)",
         [],
@@ -171,10 +171,10 @@ pub fn init_db() -> Result<(), String> {
 }
 
 // ============================================================================
-// IP 访问日志操作
+// IP access log operations
 // ============================================================================
 
-/// 保存 IP 访问日志
+/// Save an IP access log
 pub fn save_ip_access_log(log: &IpAccessLog) -> Result<(), String> {
     let conn = connect_db()?;
 
@@ -201,7 +201,7 @@ pub fn save_ip_access_log(log: &IpAccessLog) -> Result<(), String> {
     Ok(())
 }
 
-/// 获取 IP 访问日志 (分页)
+/// Get IP access logs (paginated)
 pub fn get_ip_access_logs(
     limit: usize,
     offset: usize,
@@ -277,7 +277,7 @@ pub fn get_ip_access_logs(
     Ok(logs)
 }
 
-/// 获取 IP 统计概览
+/// Get the IP statistics overview
 pub fn get_ip_stats() -> Result<IpStats, String> {
     let conn = connect_db()?;
 
@@ -319,7 +319,7 @@ pub fn get_ip_stats() -> Result<IpStats, String> {
     })
 }
 
-/// 获取 TOP N IP 访问排行
+/// Get the top N IP access ranking
 pub fn get_top_ips(limit: usize, hours: i64) -> Result<Vec<IpRanking>, String> {
     let conn = connect_db()?;
 
@@ -342,7 +342,7 @@ pub fn get_top_ips(limit: usize, hours: i64) -> Result<Vec<IpRanking>, String> {
                 client_ip: row.get(0)?,
                 request_count: row.get(1)?,
                 last_seen: row.get(2)?,
-                is_blocked: false, // 稍后填充
+                is_blocked: false, // Filled in later
             })
         })
         .map_err(|e| e.to_string())?;
@@ -350,7 +350,7 @@ pub fn get_top_ips(limit: usize, hours: i64) -> Result<Vec<IpRanking>, String> {
     let mut rankings = Vec::new();
     for r in rankings_iter {
         let mut ranking = r.map_err(|e| e.to_string())?;
-        // 检查是否在黑名单中
+        // Check whether it's in the blacklist
         ranking.is_blocked = is_ip_in_blacklist(&ranking.client_ip)?;
         rankings.push(ranking);
     }
@@ -358,7 +358,7 @@ pub fn get_top_ips(limit: usize, hours: i64) -> Result<Vec<IpRanking>, String> {
     Ok(rankings)
 }
 
-/// 清理旧的 IP 访问日志
+/// Clean up old IP access logs
 #[allow(dead_code)]
 pub fn cleanup_old_ip_logs(days: i64) -> Result<usize, String> {
     let conn = connect_db()?;
@@ -379,10 +379,10 @@ pub fn cleanup_old_ip_logs(days: i64) -> Result<usize, String> {
 }
 
 // ============================================================================
-// 黑名单操作
+// Blacklist operations
 // ============================================================================
 
-/// 添加 IP 到黑名单
+/// Add an IP to the blacklist
 pub fn add_to_blacklist(
     ip_pattern: &str,
     reason: Option<&str>,
@@ -412,7 +412,7 @@ pub fn add_to_blacklist(
     })
 }
 
-/// 从黑名单移除
+/// Remove from the blacklist
 pub fn remove_from_blacklist(id: &str) -> Result<(), String> {
     let conn = connect_db()?;
 
@@ -422,7 +422,7 @@ pub fn remove_from_blacklist(id: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// 获取黑名单列表
+/// Get the blacklist
 pub fn get_blacklist() -> Result<Vec<IpBlacklistEntry>, String> {
     let conn = connect_db()?;
 
@@ -455,23 +455,23 @@ pub fn get_blacklist() -> Result<Vec<IpBlacklistEntry>, String> {
     Ok(entries)
 }
 
-/// 检查 IP 是否在黑名单中
+/// Check whether an IP is in the blacklist
 pub fn is_ip_in_blacklist(ip: &str) -> Result<bool, String> {
     get_blacklist_entry_for_ip(ip).map(|entry| entry.is_some())
 }
 
-/// 获取 IP 对应的黑名单条目（如果存在）
+/// Get the blacklist entry for an IP (if it exists)
 pub fn get_blacklist_entry_for_ip(ip: &str) -> Result<Option<IpBlacklistEntry>, String> {
     let conn = connect_db()?;
     let now = chrono::Utc::now().timestamp();
 
-    // 清理过期的黑名单条目
+    // Clean up expired blacklist entries
     let _ = conn.execute(
         "DELETE FROM ip_blacklist WHERE expires_at IS NOT NULL AND expires_at < ?1",
         [now],
     );
 
-    // 精确匹配
+    // Exact match
     let entry_result = conn.query_row(
         "SELECT id, ip_pattern, reason, created_at, expires_at, created_by, hit_count
          FROM ip_blacklist WHERE ip_pattern = ?1",
@@ -490,7 +490,7 @@ pub fn get_blacklist_entry_for_ip(ip: &str) -> Result<Option<IpBlacklistEntry>, 
     );
 
     if let Ok(entry) = entry_result {
-        // 增加命中计数
+        // Increment the hit count
         let _ = conn.execute(
             "UPDATE ip_blacklist SET hit_count = hit_count + 1 WHERE ip_pattern = ?1",
             [ip],
@@ -498,12 +498,12 @@ pub fn get_blacklist_entry_for_ip(ip: &str) -> Result<Option<IpBlacklistEntry>, 
         return Ok(Some(entry));
     }
 
-    // CIDR 匹配
+    // CIDR match
     let entries = get_blacklist()?;
     for entry in entries {
         if entry.ip_pattern.contains('/') {
             if cidr_match(ip, &entry.ip_pattern) {
-                // 增加命中计数
+                // Increment the hit count
                 let _ = conn.execute(
                     "UPDATE ip_blacklist SET hit_count = hit_count + 1 WHERE id = ?1",
                     [&entry.id],
@@ -516,7 +516,7 @@ pub fn get_blacklist_entry_for_ip(ip: &str) -> Result<Option<IpBlacklistEntry>, 
     Ok(None)
 }
 
-/// 简单的 CIDR 匹配
+/// Simple CIDR matching
 fn cidr_match(ip: &str, cidr: &str) -> bool {
     let parts: Vec<&str> = cidr.split('/').collect();
     if parts.len() != 2 {
@@ -549,10 +549,10 @@ fn cidr_match(ip: &str, cidr: &str) -> bool {
 }
 
 // ============================================================================
-// 白名单操作
+// Whitelist operations
 // ============================================================================
 
-/// 添加 IP 到白名单
+/// Add an IP to the whitelist
 pub fn add_to_whitelist(
     ip_pattern: &str,
     description: Option<&str>,
@@ -577,7 +577,7 @@ pub fn add_to_whitelist(
     })
 }
 
-/// 从白名单移除
+/// Remove from the whitelist
 pub fn remove_from_whitelist(id: &str) -> Result<(), String> {
     let conn = connect_db()?;
 
@@ -587,7 +587,7 @@ pub fn remove_from_whitelist(id: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// 获取白名单列表
+/// Get the whitelist
 pub fn get_whitelist() -> Result<Vec<IpWhitelistEntry>, String> {
     let conn = connect_db()?;
 
@@ -617,11 +617,11 @@ pub fn get_whitelist() -> Result<Vec<IpWhitelistEntry>, String> {
     Ok(entries)
 }
 
-/// 检查 IP 是否在白名单中
+/// Check whether an IP is in the whitelist
 pub fn is_ip_in_whitelist(ip: &str) -> Result<bool, String> {
     let conn = connect_db()?;
 
-    // 精确匹配
+    // Exact match
     let count: i64 = conn
         .query_row(
             "SELECT COUNT(*) FROM ip_whitelist WHERE ip_pattern = ?1",
@@ -634,7 +634,7 @@ pub fn is_ip_in_whitelist(ip: &str) -> Result<bool, String> {
         return Ok(true);
     }
 
-    // CIDR 匹配
+    // CIDR match
     let entries = get_whitelist()?;
     for entry in entries {
         if entry.ip_pattern.contains('/') {
@@ -647,7 +647,7 @@ pub fn is_ip_in_whitelist(ip: &str) -> Result<bool, String> {
     Ok(false)
 }
 
-/// 清空所有 IP 访问日志
+/// Clear all IP access logs
 pub fn clear_ip_access_logs() -> Result<(), String> {
     let conn = connect_db()?;
     conn.execute("DELETE FROM ip_access_logs", [])
@@ -655,7 +655,7 @@ pub fn clear_ip_access_logs() -> Result<(), String> {
     Ok(())
 }
 
-/// 获取 IP 访问日志总数
+/// Get the total count of IP access logs
 #[allow(dead_code)]
 pub fn get_ip_access_logs_count(
     ip_filter: Option<&str>,

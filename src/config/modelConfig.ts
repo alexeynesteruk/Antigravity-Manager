@@ -1,33 +1,33 @@
 import { Gemini, Claude, OpenAI } from '@lobehub/icons';
 
 /**
- * 模型配置接口
+ * Model configuration interface
  */
 export interface ModelConfig {
-    /** 模型完整显示名称 (作为回退或默认展示) */
+    /** Full display name of the model (used as a fallback or default display) */
     label: string;
-    /** 模型简短标签 (用于列表/卡片) */
+    /** Short label for the model (used in lists/cards) */
     shortLabel: string;
-    /** 保护模型的键名 */
+    /** Key name for the protected model */
     protectedKey: string;
-    /** 模型图标组件 */
+    /** Model icon component */
     Icon: React.ComponentType<any>;
-    /** 国际化键名 (用于动态名称) */
+    /** i18n key (used for the dynamic name) */
     i18nKey: string;
-    /** 描述信息键名 (用于详细说明) */
+    /** Description key (used for detailed explanation) */
     i18nDescKey: string;
-    /** 所属系列/分组 */
+    /** Series/group it belongs to */
     group: string;
-    /** 选填标签 (用于筛选) */
+    /** Optional tags (used for filtering) */
     tags?: string[];
 }
 
 /**
- * 模型配置映射
- * 键为模型 ID，值为模型配置
+ * Model configuration map
+ * Key is the model ID, value is the model configuration
  */
 export const MODEL_CONFIG: Record<string, ModelConfig> = {
-    // Gemini 3.x 系列
+    // Gemini 3.x series
     // [Migrate] Gemini 3 Pro High/Low -> Gemini 3.1 Pro High/Low
     'gemini-3.1-pro-high': {
         label: 'Gemini 3.1 Pro High',
@@ -162,7 +162,7 @@ export const MODEL_CONFIG: Record<string, ModelConfig> = {
         tags: ['pro', 'low'],
     },
 
-    // Gemini 2.5 系列
+    // Gemini 2.5 series
     'gemini-2.5-flash': {
         label: 'Gemini 2.5 Flash',
         shortLabel: 'G2.5 Flash',
@@ -204,7 +204,7 @@ export const MODEL_CONFIG: Record<string, ModelConfig> = {
         tags: ['pro'],
     },
 
-    // Claude 系列
+    // Claude series
     'claude-sonnet-4-6': {
         label: 'Claude 4.6',
         shortLabel: 'Claude 4.6',
@@ -260,30 +260,30 @@ export const MODEL_CONFIG: Record<string, ModelConfig> = {
 };
 
 /**
- * 获取所有模型 ID 列表
+ * Get the list of all model IDs
  */
 export const getAllModelIds = (): string[] => Object.keys(MODEL_CONFIG);
 
 /**
- * 根据模型 ID 获取配置
+ * Get the configuration by model ID
  */
 export const getModelConfig = (modelId: string): ModelConfig | undefined => {
     return MODEL_CONFIG[modelId.toLowerCase()];
 };
 
 /**
- * 模型排序权重配置
- * 数字越小，优先级越高
+ * Model sort weight configuration
+ * The smaller the number, the higher the priority
  */
 const MODEL_SORT_WEIGHTS = {
-    // 系列权重 (第一优先级)
+    // Series weight (first priority)
     series: {
         'gemini-3': 100,
         'gemini-2.5': 200,
         'gemini-2': 300,
         'claude': 400,
     },
-    // 性能级别权重 (第二优先级)
+    // Performance tier weight (second priority)
     tier: {
         'pro': 10,
         'flash': 20,
@@ -291,7 +291,7 @@ const MODEL_SORT_WEIGHTS = {
         'opus': 5,
         'sonnet': 10,
     },
-    // 特殊后缀权重 (第三优先级)
+    // Special suffix weight (third priority)
     suffix: {
         'thinking': 1,
         'image': 2,
@@ -301,13 +301,13 @@ const MODEL_SORT_WEIGHTS = {
 };
 
 /**
- * 获取模型的排序权重
+ * Get the sort weight for a model
  */
 function getModelSortWeight(modelId: string): number {
     const id = modelId.toLowerCase();
     let weight = 0;
 
-    // 1. 系列权重 (x1000)
+    // 1. Series weight (x1000)
     if (id.startsWith('gemini-3')) {
         weight += MODEL_SORT_WEIGHTS.series['gemini-3'] * 1000;
     } else if (id.startsWith('gemini-2.5')) {
@@ -318,7 +318,7 @@ function getModelSortWeight(modelId: string): number {
         weight += MODEL_SORT_WEIGHTS.series['claude'] * 1000;
     }
 
-    // 2. 性能级别权重 (x100)
+    // 2. Performance tier weight (x100)
     if (id.includes('pro')) {
         weight += MODEL_SORT_WEIGHTS.tier['pro'] * 100;
     } else if (id.includes('flash')) {
@@ -331,7 +331,7 @@ function getModelSortWeight(modelId: string): number {
         weight += MODEL_SORT_WEIGHTS.tier['sonnet'] * 100;
     }
 
-    // 3. 特殊后缀权重 (x10)
+    // 3. Special suffix weight (x10)
     if (id.includes('thinking')) {
         weight += MODEL_SORT_WEIGHTS.suffix['thinking'] * 10;
     } else if (id.includes('image')) {
@@ -346,26 +346,26 @@ function getModelSortWeight(modelId: string): number {
 }
 
 /**
- * 对模型列表进行排序
- * @param models 模型列表
- * @returns 排序后的模型列表
+ * Sort the model list
+ * @param models the model list
+ * @returns the sorted model list
  */
 export function sortModels<T extends { id: string }>(models: T[]): T[] {
     return [...models].sort((a, b) => {
         const weightA = getModelSortWeight(a.id);
         const weightB = getModelSortWeight(b.id);
 
-        // 按权重升序排序
+        // Sort ascending by weight
         if (weightA !== weightB) {
             return weightA - weightB;
         }
 
-        // 权重相同时，按字母顺序排序
+        // When weights are equal, sort alphabetically
         return a.id.localeCompare(b.id);
     });
 }
 
-// ── 模型分类与保护键（实现在 src/utils/modelCategory.ts，此处只 re-export）───
+// -- Model categorization and protection keys (implemented in src/utils/modelCategory.ts, only re-exported here) --
 
 export {
     categorizeModel,

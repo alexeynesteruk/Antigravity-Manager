@@ -163,7 +163,7 @@ pub fn is_enabled(cfg: &DebugLoggingConfig) -> bool {
     cfg.enabled || crate::modules::log_bridge::is_log_bridge_enabled()
 }
 
-/// 解析 SSE 流式数据，提取 thinking 和正文内容
+/// Parse SSE streaming data, extracting thinking and body content
 fn parse_sse_stream(raw: &str) -> (String, String) {
     let mut thinking_parts: Vec<String> = Vec::new();
     let mut content_parts: Vec<String> = Vec::new();
@@ -173,14 +173,14 @@ fn parse_sse_stream(raw: &str) -> (String, String) {
         if !line.starts_with("data: ") {
             continue;
         }
-        let json_str = &line[6..]; // 去掉 "data: " 前缀
+        let json_str = &line[6..]; // Strip the "data: " prefix
         if json_str.is_empty() || json_str == "[DONE]" {
             continue;
         }
 
-        // 尝试解析 JSON
+        // Try to parse as JSON
         if let Ok(parsed) = serde_json::from_str::<Value>(json_str) {
-            // Gemini/v1internal 格式: response.candidates[0].content.parts[0]
+            // Gemini/v1internal format: response.candidates[0].content.parts[0]
             if let Some(candidates) = parsed
                 .get("response")
                 .and_then(|r| r.get("candidates"))
@@ -210,7 +210,7 @@ fn parse_sse_stream(raw: &str) -> (String, String) {
                     }
                 }
             }
-            // OpenAI 格式兼容: choices[0].delta.content
+            // OpenAI format compatibility: choices[0].delta.content
             else if let Some(choices) = parsed.get("choices").and_then(|c| c.as_array()) {
                 for choice in choices {
                     if let Some(delta) = choice.get("delta") {
@@ -265,7 +265,7 @@ where
             "truncated": capture.truncated(),
         });
 
-        // 只有在有内容时才添加对应字段
+        // Only add the corresponding field when there is content
         if !thinking_content.is_empty() {
             payload["thinking_content"] = serde_json::Value::String(thinking_content);
         }

@@ -1,42 +1,42 @@
-//! 工具结果输出压缩模块
+//! Tool result output compression module
 //!
-//! 提供智能压缩功能:
-//! - 浏览器快照压缩 (头+尾保留)
-//! - 大文件提示压缩 (提取关键信息)
-//! - 通用截断 (200,000 字符限制)
+//! Provides smart compression features:
+//! - Browser snapshot compression (head+tail retention)
+//! - Large-file notice compression (extract key information)
+//! - Generic truncation (200,000 character limit)
 
 use regex::Regex;
 use serde_json::Value;
 use tracing::{debug, info};
 
-/// 最大工具结果字符数 (约 20 万,防止 prompt 超长)
+/// Maximum tool result character count (~200k, to prevent an overlong prompt)
 const MAX_TOOL_RESULT_CHARS: usize = 200_000;
 
-/// 浏览器快照检测阈值
+/// Browser snapshot detection threshold
 const SNAPSHOT_DETECTION_THRESHOLD: usize = 20_000;
 
-/// 浏览器快照压缩后的最大字符数
+/// Maximum character count after browser snapshot compression
 const SNAPSHOT_MAX_CHARS: usize = 16_000;
 
-/// 浏览器快照头部保留比例
+/// Browser snapshot head retention ratio
 const SNAPSHOT_HEAD_RATIO: f64 = 0.7;
 
-/// 浏览器快照尾部保留比例
+/// Browser snapshot tail retention ratio
 #[allow(dead_code)]
 const SNAPSHOT_TAIL_RATIO: f64 = 0.3;
 
-/// 压缩工具结果文本
+/// Compress tool result text
 ///
-/// 根据内容类型自动选择最佳压缩策略:
-/// 1. 大文件提示 → 提取关键信息
-/// 2. 浏览器快照 → 头+尾保留
-/// 3. 其他 → 简单截断
+/// Automatically choose the best compression strategy based on content type:
+/// 1. Large-file notice → extract key information
+/// 2. Browser snapshot → head+tail retention
+/// 3. Other → simple truncation
 pub fn compact_tool_result_text(text: &str, max_chars: usize) -> String {
     if text.is_empty() || text.len() <= max_chars {
         return text.to_string();
     }
 
-    // [NEW] 针对可能的 HTML 内容进行深度预处理
+    // [NEW] Deep-preprocess potential HTML content
     let cleaned_text =
         if text.contains("<html") || text.contains("<body") || text.contains("<!DOCTYPE") {
             let cleaned = deep_clean_html(text);
@@ -54,7 +54,7 @@ pub fn compact_tool_result_text(text: &str, max_chars: usize) -> String {
         return cleaned_text;
     }
 
-    // 1. 检测大文件提示模式
+    // 1. Detect the large-file notice pattern
     if let Some(compacted) = compact_saved_output_notice(&cleaned_text, max_chars) {
         debug!(
             "[ToolCompressor] Detected saved output notice, compacted to {} chars",
@@ -63,7 +63,7 @@ pub fn compact_tool_result_text(text: &str, max_chars: usize) -> String {
         return compacted;
     }
 
-    // 2. 检测浏览器快照模式
+    // 2. Detect the browser snapshot pattern
     if cleaned_text.len() > SNAPSHOT_DETECTION_THRESHOLD {
         if let Some(compacted) = compact_browser_snapshot(&cleaned_text, max_chars) {
             debug!(
@@ -74,7 +74,7 @@ pub fn compact_tool_result_text(text: &str, max_chars: usize) -> String {
         }
     }
 
-    // 3. 结构化截断
+    // 3. Structured truncation
     debug!(
         "[ToolCompressor] Using structured truncation for {} chars",
         cleaned_text.len()
@@ -82,14 +82,14 @@ pub fn compact_tool_result_text(text: &str, max_chars: usize) -> String {
     truncate_text_safe(&cleaned_text, max_chars)
 }
 
-/// 压缩"输出已保存到文件"类型的提示
+/// Compress "output saved to a file" style notices
 ///
-/// 检测模式: "result (N characters) exceeds maximum allowed tokens. Output saved to <path>"
-/// 策略: 提取关键信息(文件路径、字符数、格式说明)
+/// Detection pattern: "result (N characters) exceeds maximum allowed tokens. Output saved to <path>"
+/// Strategy: extract key information (file path, character count, format description)
 ///
-/// 根据提示内容类型自动提取关键信息
+/// Automatically extract key information based on the notice content type
 fn compact_saved_output_notice(text: &str, max_chars: usize) -> Option<String> {
-    // 正则匹配: result (N characters) exceeds maximum allowed tokens. Output saved to <path>
+    // Regex match: result (N characters) exceeds maximum allowed tokens. Output saved to <path>
     let re = Regex::new(
         r"(?i)result\s*\(\s*(?P<count>[\d,]+)\s*characters\s*\)\s*exceeds\s+maximum\s+allowed\s+tokens\.\s*Output\s+(?:has\s+been\s+)?saved\s+to\s+(?P<path>[^\r\n]+)"
     ).ok()?;
@@ -98,26 +98,26 @@ fn compact_saved_output_notice(text: &str, max_chars: usize) -> Option<String> {
     let count = caps.name("count")?.as_str();
     let raw_path = caps.name("path")?.as_str();
 
-    // 清理文件路径 (移除尾部的括号、引号、句号)
+    // Clean up the file path (remove trailing parentheses, quotes, periods)
     let file_path = raw_path
         .trim()
         .trim_end_matches(&[')', ']', '"', '\'', '.'][..])
         .trim();
 
-    // 提取关键行
+    // Extract the key line
     let lines: Vec<&str> = text
         .lines()
         .map(|l| l.trim())
         .filter(|l| !l.is_empty())
         .collect();
 
-    // 查找通知行
+    // Find the notice line
     let notice_line = lines.iter()
         .find(|l| l.to_lowercase().contains("exceeds maximum allowed tokens") && l.to_lowercase().contains("saved to"))
         .map(|s| s.to_string())
         .unwrap_or_else(|| format!("result ({} characters) exceeds maximum allowed tokens. Output has been saved to {}", count, file_path));
 
-    // 查找格式说明行
+    // Find the format description line
     let format_line = lines
         .iter()
         .find(|l| {
@@ -127,7 +127,7 @@ fn compact_saved_output_notice(text: &str, max_chars: usize) -> Option<String> {
         })
         .map(|s| s.to_string());
 
-    // 构建压缩后的输出
+    // Build the compressed output
     let mut compact_lines = vec![notice_line];
     if let Some(fmt) = format_line {
         if !compact_lines.contains(&fmt) {
@@ -143,15 +143,18 @@ fn compact_saved_output_notice(text: &str, max_chars: usize) -> Option<String> {
     Some(truncate_text_safe(&result, max_chars))
 }
 
-/// 压缩浏览器快照 (头+尾保留策略)
+/// Compress a browser snapshot (head+tail retention strategy)
 ///
-/// 检测: "page snapshot" 或 "页面快照" 或大量 "ref=" 引用
-/// 策略: 保留头部 70% + 尾部 30%,中间省略
+/// Detection: "page snapshot" or "页面快照" or a large number of "ref=" references
+/// Strategy: keep the first 70% + last 30%, omit the middle
 ///
-/// 使用头+尾保留策略压缩较长的页面快照数据
+/// Compress long page snapshot data using a head+tail retention strategy
 fn compact_browser_snapshot(text: &str, max_chars: usize) -> Option<String> {
-    // 检测是否是浏览器快照
+    // Detect whether this is a browser snapshot
     let is_snapshot = text.to_lowercase().contains("page snapshot")
+        // PROTECTED: this Chinese literal matches text arriving at runtime from a
+        // browser tool (e.g. a Chinese-locale page snapshot label), not code we
+        // control. Do not translate it - do not change this literal.
         || text.contains("页面快照")
         || text.matches("ref=").count() > 30
         || text.matches("[ref=").count() > 30;
@@ -176,7 +179,7 @@ fn compact_browser_snapshot(text: &str, max_chars: usize) -> Option<String> {
         return None;
     }
 
-    // 计算头部和尾部长度
+    // Compute the head and tail lengths
     let head_len = (budget as f64 * SNAPSHOT_HEAD_RATIO).floor() as usize;
     let head_len = head_len.min(10_000).max(500);
     let tail_len = budget.saturating_sub(head_len).min(3_000);
@@ -206,34 +209,34 @@ fn compact_browser_snapshot(text: &str, max_chars: usize) -> Option<String> {
     Some(truncate_text_safe(&summarized, max_chars))
 }
 
-/// 安全的文本截断 (尽量不在标签中间截断)
+/// Safe text truncation (avoid truncating in the middle of a tag where possible)
 fn truncate_text_safe(text: &str, max_chars: usize) -> String {
     if text.len() <= max_chars {
         return text.to_string();
     }
 
-    // 尝试寻找一个安全的截断点 (不在 < 和 > 之间)
+    // Try to find a safe truncation point (not between < and >)
     let mut split_pos = max_chars;
 
-    // 向前查找是否有未闭合的标签开始符
+    // Look backward for an unclosed tag opening character
     let sub = &text[..max_chars];
     if let Some(last_open) = sub.rfind('<') {
         if let Some(last_close) = sub.rfind('>') {
             if last_open > last_close {
-                // 截断点在标签中间，回退到标签开始前
+                // The truncation point is inside a tag; back off to before the tag starts
                 split_pos = last_open;
             }
         } else {
-            // 只有开始没有结束，回退到标签开始前
+            // There's an opening but no closing; back off to before the tag starts
             split_pos = last_open;
         }
     }
 
-    // 也要避免在 JSON 大括号中间截断
+    // Also avoid truncating in the middle of JSON braces
     if let Some(last_open_brace) = sub.rfind('{') {
         if let Some(last_close_brace) = sub.rfind('}') {
             if last_open_brace > last_close_brace {
-                // 可能在 JSON 中间，如果距离截断点较近，尝试回退
+                // Possibly in the middle of JSON; if close to the truncation point, try backing off
                 if max_chars - last_open_brace < 100 {
                     split_pos = split_pos.min(last_open_brace);
                 }
@@ -246,26 +249,26 @@ fn truncate_text_safe(text: &str, max_chars: usize) -> String {
     format!("{}\n...[truncated {} chars]", truncated, omitted)
 }
 
-/// 深度清理 HTML (移除 style, script, base64 等)
+/// Deep-clean HTML (remove style, script, base64, etc.)
 fn deep_clean_html(html: &str) -> String {
     let mut result = html.to_string();
 
-    // 1. 移除 <style>...</style> 及其内容
+    // 1. Remove <style>...</style> and its content
     if let Ok(re) = Regex::new(r"(?is)<style\b[^>]*>.*?</style>") {
         result = re.replace_all(&result, "[style omitted]").to_string();
     }
 
-    // 2. 移除 <script>...</script> 及其内容
+    // 2. Remove <script>...</script> and its content
     if let Ok(re) = Regex::new(r"(?is)<script\b[^>]*>.*?</script>") {
         result = re.replace_all(&result, "[script omitted]").to_string();
     }
 
-    // 3. 移除 inline Base64 数据 (如 src="data:image/png;base64,...")
+    // 3. Remove inline Base64 data (e.g. src="data:image/png;base64,...")
     if let Ok(re) = Regex::new(r#"(?i)data:[^;/]+/[^;]+;base64,[A-Za-z0-9+/=]+"#) {
         result = re.replace_all(&result, "[base64 omitted]").to_string();
     }
 
-    // 4. 移除冗余的空白字符
+    // 4. Remove redundant whitespace
     if let Ok(re) = Regex::new(r"\n\s*\n") {
         result = re.replace_all(&result, "\n").to_string();
     }
@@ -273,14 +276,14 @@ fn deep_clean_html(html: &str) -> String {
     result
 }
 
-/// 清理工具结果 content blocks
+/// Clean up tool result content blocks
 ///
-/// 处理逻辑:
-/// 1. 移除 base64 图片 (避免体积过大)
-/// 2. 压缩文本内容 (使用智能压缩策略)
-/// 3. 限制总字符数 (默认 200,000)
+/// Processing logic:
+/// 1. Remove base64 images (to avoid excessive size)
+/// 2. Compress text content (using a smart compression strategy)
+/// 3. Limit the total character count (default 200,000)
 ///
-/// 清理并截断工具调用结果内容块
+/// Clean up and truncate tool call result content blocks
 pub fn sanitize_tool_result_blocks(blocks: &mut Vec<Value>) {
     let mut used_chars = 0;
     let mut cleaned_blocks = Vec::new();
@@ -294,7 +297,7 @@ pub fn sanitize_tool_result_blocks(blocks: &mut Vec<Value>) {
     }
 
     for block in blocks.iter() {
-        // 压缩文本内容
+        // Compress the text content
         if let Some(text) = block.get("text").and_then(|v| v.as_str()) {
             let remaining = MAX_TOOL_RESULT_CHARS.saturating_sub(used_chars);
             if remaining == 0 {
@@ -314,9 +317,9 @@ pub fn sanitize_tool_result_blocks(blocks: &mut Vec<Value>) {
                 compacted.len()
             );
         } else {
-            // 保留其他类型的块 (例如图片), 但受总长度块数限制, 此处不单独截断
+            // Keep other block types (e.g. images), but subject to the overall length/block-count limit; not individually truncated here
             cleaned_blocks.push(block.clone());
-            used_chars += 100; // 估算非文本块大小
+            used_chars += 100; // Estimate the size of a non-text block
         }
 
         if used_chars >= MAX_TOOL_RESULT_CHARS {
@@ -342,7 +345,7 @@ mod tests {
     fn test_truncate_text() {
         let text = "a".repeat(300_000);
         let result = truncate_text_safe(&text, 200_000);
-        assert!(result.len() < 210_000); // 包含截断提示
+        assert!(result.len() < 210_000); // Includes the truncation notice
         assert!(result.contains("[truncated"));
         assert!(result.contains("100000 chars]"));
     }
@@ -359,7 +362,7 @@ mod tests {
         let snapshot = format!("page snapshot: {}", "ref=abc ".repeat(10_000));
         let result = compact_tool_result_text(&snapshot, 16_000);
 
-        assert!(result.len() <= 16_500); // 允许一些 overhead
+        assert!(result.len() <= 16_500); // Allow some overhead
         assert!(result.contains("[HEAD]"));
         assert!(result.contains("[TAIL]"));
         assert!(result.contains("page snapshot summarized"));
@@ -402,7 +405,7 @@ Please read the file locally."#;
             }),
         ];
 
-        // 确认工具结果不再剔除图片
+        // Confirm that tool results no longer strip out images
         sanitize_tool_result_blocks(&mut blocks);
         assert_eq!(blocks.len(), 4);
     }

@@ -1,5 +1,5 @@
-// 429 重试策略
-// Duration 解析
+// 429 retry strategy
+// Duration parsing
 
 use once_cell::sync::Lazy;
 use regex::Regex;
@@ -45,7 +45,7 @@ static RETRY_HINT_KEYS: Lazy<std::collections::HashSet<&'static str>> = Lazy::ne
     .collect()
 });
 
-/// 解析 Duration 字符串 (e.g., "1.5s", "200ms", "1h16m0.667s")
+/// Parse a duration string (e.g., "1.5s", "200ms", "1h16m0.667s")
 pub fn parse_duration_ms(duration_str: &str) -> Option<u64> {
     let mut total_ms: f64 = 0.0;
     let mut matched = false;
@@ -99,7 +99,7 @@ impl ParsedRetryDelay {
     }
 }
 
-/// 从 Retry-After 或 429 错误中提取原始 retry delay (深度递归解析)
+/// Extract the raw retry delay from Retry-After or a 429 error (deep recursive parsing)
 pub fn parse_retry_delay(error_text: &str, retry_after: Option<&str>) -> Option<u64> {
     parse_retry_delay_with_source(error_text, retry_after).map(|delay| delay.raw_ms)
 }
@@ -108,7 +108,7 @@ pub fn parse_retry_delay_with_source(
     error_text: &str,
     retry_after: Option<&str>,
 ) -> Option<ParsedRetryDelay> {
-    // 1. Retry-After delta-seconds，也兼容已有的 duration 字符串来源
+    // 1. Retry-After delta-seconds; also accepts the existing duration-string sources
     if let Some(value) = retry_after.map(str::trim).filter(|value| !value.is_empty()) {
         if let Ok(seconds) = value.parse::<u64>() {
             return seconds.checked_mul(1000).map(|raw_ms| ParsedRetryDelay {
@@ -124,7 +124,7 @@ pub fn parse_retry_delay_with_source(
         }
     }
 
-    // 2. 结构化 JSON 字段优先，避免把 JSON 中的 retryDelay 当作响应文字。
+    // 2. Prefer structured JSON fields, so a retryDelay inside JSON is not treated as response text.
     if let Ok(json) = serde_json::from_str(error_text) {
         if let Some(raw_ms) = extract_structured_delay_recursive(&json, 0, false) {
             return Some(ParsedRetryDelay {
@@ -134,7 +134,7 @@ pub fn parse_retry_delay_with_source(
         }
     }
 
-    // 3. 仅从响应文字中提取自然语言时长。
+    // 3. Extract a natural-language duration from the response text only.
     for re in RE_TEXT_DELAY_PATTERNS.iter() {
         if let Some(cap) = re.captures(error_text) {
             if let Some(delay) = parse_duration_ms(&cap[1]) {
@@ -167,7 +167,7 @@ pub(crate) fn parse_legacy_retry_delay(error_text: &str) -> Option<u64> {
     delay.map(|delay_ms| delay_ms.saturating_add(1500))
 }
 
-/// 递归提取结构化延迟
+/// Recursively extract a structured delay
 fn extract_structured_delay_recursive(
     value: &serde_json::Value,
     depth: usize,
@@ -179,22 +179,22 @@ fn extract_structured_delay_recursive(
 
     match value {
         serde_json::Value::Object(map) => {
-            // 检查当前对象是否本身就是一个 Duration 对象 (seconds/nanos)
+            // Check whether this object is itself a Duration object (seconds/nanos)
             if let Some(d) = parse_structured_duration_object(value) {
                 return Some(d);
             }
 
-            // 递归扫描子字段
+            // Recursively scan child fields
             for (key, val) in map {
-                // 模糊 Key 匹配 (转小写, 去除分隔符)
+                // Fuzzy key match (lowercased, separators stripped)
                 let normalized_key = key.to_lowercase().replace('-', "").replace('_', "");
                 if RETRY_HINT_KEYS.contains(normalized_key.as_str()) {
-                    // 如果命中了 Hint Key，直接尝试解析其内容
+                    // On a hint-key hit, try parsing its content directly
                     if let Some(d) = parse_structured_duration_value(val) {
                         return Some(d);
                     }
                 }
-                // 继续深度搜索
+                // Continue searching deeper
                 if let Some(d) =
                     extract_structured_delay_recursive(val, depth + 1, parse_unkeyed_strings)
                 {
@@ -218,7 +218,7 @@ fn extract_structured_delay_recursive(
     None
 }
 
-/// 解析强类型的 Duration 对象 (Google 格式: {seconds: 1, nanos: 0})
+/// Parse a strongly typed Duration object (Google format: {seconds: 1, nanos: 0})
 fn parse_structured_duration_object(value: &serde_json::Value) -> Option<u64> {
     let obj = value.as_object()?;
     let seconds = obj
@@ -239,7 +239,7 @@ fn parse_structured_duration_object(value: &serde_json::Value) -> Option<u64> {
     None
 }
 
-/// 解析各种可能包含时长信息的 Value
+/// Parse any Value that may carry duration information
 fn parse_structured_duration_value(value: &serde_json::Value) -> Option<u64> {
     match value {
         serde_json::Value::String(s) => parse_duration_ms(s),
@@ -249,8 +249,8 @@ fn parse_structured_duration_value(value: &serde_json::Value) -> Option<u64> {
     }
 }
 
-/// [NEW] 判断是否应当执行 Grace Retry (原地重试)
-/// 当 429 报错提示的重置时间在 5s 内，则原地重试比切换账号更有利。
+/// [NEW] Decide whether to perform a grace retry (retry in place)
+/// When the reset time reported by a 429 is within 5s, retrying in place beats rotating accounts.
 pub fn should_grace_retry(duration_ms: u64) -> bool {
     duration_ms > 0 && duration_ms <= 5000
 }

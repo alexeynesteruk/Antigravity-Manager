@@ -16,7 +16,7 @@ export function NavLogo() {
                 />
             </div>
 
-            {/* 父容器宽度 < 200px 隐藏 */}
+            {/* Hidden when parent container width < 200px */}
             <span className="hidden @[200px]/logo:inline text-nowrap">{t('common.app_name', 'Antigravity Tools')}</span>
         </Link>
     );

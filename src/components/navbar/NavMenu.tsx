@@ -8,25 +8,25 @@ interface NavMenuProps {
 }
 
 /**
- * 导航菜单组件 - 独立处理响应式
+ * Navigation menu component - handles responsiveness independently
  * 
- * 响应式策略:
- * - ≥ 768px (md): 文字胶囊
- * - 640px - 768px: 图标胶囊 (Logo 显示文字)
- * - 480px - 640px: 图标胶囊 (Logo 隐藏文字)
- * - 375px - 480px: 图标+文字下拉
- * - < 375px: 图标下拉
+ * Responsive strategy:
+ * - >= 768px (md): text pills
+ * - 640px - 768px: icon pills (Logo shows text)
+ * - 480px - 640px: icon pills (Logo hides text)
+ * - 375px - 480px: icon+text dropdown
+ * - < 375px: icon dropdown
  */
 export function NavMenu({ navItems }: NavMenuProps) {
     const location = useLocation();
     const { isMenuItemHidden } = useConfigStore();
 
-    // 过滤隐藏的菜单项
+    // Filter out hidden menu items
     const visibleNavItems = navItems.filter(item => !isMenuItemHidden(item.path));
 
     return (
         <>
-            {/* 文字胶囊 (≥ 1120px) */}
+            {/* Text pills (>= 1120px) */}
             <nav className="max-[1119px]:hidden flex items-center gap-1 bg-gray-100 dark:bg-base-200 rounded-full p-1">
                 {visibleNavItems.map((item) => (
                     <Link
@@ -52,7 +52,7 @@ export function NavMenu({ navItems }: NavMenuProps) {
                 ))}
             </nav>
 
-            {/* 图标胶囊 (880px - 1120px) - Logo 显示文字 */}
+            {/* Icon pills (880px - 1120px) - Logo shows text */}
             <nav className="max-[879px]:hidden min-[1120px]:hidden flex items-center gap-1 bg-gray-100 dark:bg-base-200 rounded-full p-1">
                 {visibleNavItems.map((item) => (
                     <Link
@@ -75,7 +75,7 @@ export function NavMenu({ navItems }: NavMenuProps) {
                 ))}
             </nav>
 
-            {/* 图标胶囊 (640px - 880px) - Logo 隐藏文字 */}
+            {/* Icon pills (640px - 880px) - Logo hides text */}
             <nav className="max-[639px]:hidden min-[880px]:hidden flex items-center gap-1 bg-gray-100 dark:bg-base-200 rounded-full p-1">
                 {visibleNavItems.map((item) => (
                     <Link
@@ -98,7 +98,7 @@ export function NavMenu({ navItems }: NavMenuProps) {
                 ))}
             </nav>
 
-            {/* 图标胶囊 (480px - 640px) */}
+            {/* Icon pills (480px - 640px) */}
             <nav className="max-[479px]:hidden min-[640px]:hidden flex items-center gap-1 bg-gray-100 dark:bg-base-200 rounded-full p-1">
                 {visibleNavItems.map((item) => (
                     <Link
@@ -121,7 +121,7 @@ export function NavMenu({ navItems }: NavMenuProps) {
                 ))}
             </nav>
 
-            {/* 图标+文字下拉 (375px - 480px) */}
+            {/* Icon+text dropdown (375px - 480px) */}
             <div className="max-[374px]:hidden min-[480px]:hidden block">
                 <NavigationDropdown
                     navItems={visibleNavItems}
@@ -132,7 +132,7 @@ export function NavMenu({ navItems }: NavMenuProps) {
                 />
             </div>
 
-            {/* 图标下拉 (< 375px) */}
+            {/* Icon dropdown (< 375px) */}
             <div className="min-[375px]:hidden">
                 <NavigationDropdown
                     navItems={visibleNavItems}

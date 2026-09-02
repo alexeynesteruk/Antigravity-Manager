@@ -1,44 +1,44 @@
-# 模型重映射逻辑（当前实现）
+# Model Remapping Logic (Current Implementation)
 
-最后更新：2026-03-02
+Last updated: 2026-03-02
 
-本文描述当前代理中的模型重映射链路（含 Gemini 3/3.1 Pro 调整后的行为）。
+This document describes the current model remapping chain in the proxy (including the adjusted behavior for Gemini 3/3.1 Pro).
 
-## 1）整体流程
+## 1) Overall Flow
 
-无论是 OpenAI 协议还是 Gemini 原生协议，请求模型都会经过两段处理：
+Regardless of whether the OpenAI protocol or the native Gemini protocol is used, the requested model goes through two stages of processing:
 
-1. 静态路由解析（全局规则）：
-   - 在选账号前执行一次。
-   - 代码：`src-tauri/src/proxy/common/model_mapping.rs` 的 `resolve_model_route`。
-2. 动态账号感知改写（条件回退）：
-   - 在选中账号后执行。
-   - 代码：`src-tauri/src/proxy/token_manager.rs` 的 `resolve_dynamic_model_for_account`。
+1. Static route resolution (global rules):
+   - Runs once, before account selection.
+   - Code: `resolve_model_route` in `src-tauri/src/proxy/common/model_mapping.rs`.
+2. Dynamic account-aware rewrite (conditional fallback):
+   - Runs after an account has been selected.
+   - Code: `resolve_dynamic_model_for_account` in `src-tauri/src/proxy/token_manager.rs`.
 
-使用该流程的入口：
+Entry points that use this flow:
 - `src-tauri/src/proxy/handlers/openai.rs`
 - `src-tauri/src/proxy/handlers/gemini.rs`
 
-## 2）静态路由优先级
+## 2) Static Route Priority
 
-`resolve_model_route(original_model, custom_mapping)` 的优先级从高到低为：
+`resolve_model_route(original_model, custom_mapping)` resolves in priority order, from highest to lowest:
 
-1. 官方动态淘汰转发规则：
+1. Official dynamic deprecation forwarding rules:
    - `DYNAMIC_MODEL_FORWARDING_RULES`
-2. 用户自定义精确映射：
+2. User-defined exact mapping:
    - `custom_mapping[original_model]`
-3. 用户自定义通配符映射：
-   - 按“非 `*` 字符数”比较，越具体优先级越高
-4. 系统内置默认映射：
+3. User-defined wildcard mapping:
+   - compared by "number of non-`*` characters"; the more specific one wins
+4. Built-in system default mapping:
    - `map_claude_model_to_gemini`
 
-都不命中时，模型名原样透传。
+If none of these match, the model name is passed through unchanged.
 
-## 3）当前 Gemini Pro 内置映射策略
+## 3) Current Built-in Gemini Pro Mapping Strategy
 
-当前策略是：具体模型 ID 直接透传；只有泛别名会归一化。
+The current strategy is: concrete model IDs are passed through directly; only generic aliases get normalized.
 
-具体 ID（不做跨版本强制改写）：
+Concrete IDs (no forced cross-version rewrite):
 - `gemini-3-pro-high -> gemini-3-pro-high`
 - `gemini-3-pro-low -> gemini-3-pro-low`
 - `gemini-3-pro-preview -> gemini-3-pro-preview`
@@ -46,69 +46,69 @@
 - `gemini-3.1-pro-low -> gemini-3.1-pro-low`
 - `gemini-3.1-pro-preview -> gemini-3.1-pro-preview`
 
-泛别名（仍映射到 preview 入口）：
+Generic aliases (still mapped to the preview entry):
 - `gemini-3-pro -> gemini-3-pro-preview`
 - `gemini-3.1-pro -> gemini-3.1-pro-preview`
 
-代码位置：
+Code location:
 - `src-tauri/src/proxy/common/model_mapping.rs`
 
-## 4）动态账号感知改写（仅在需要时触发）
+## 4) Dynamic Account-Aware Rewrite (Triggered Only When Needed)
 
-选中账号后，系统会读取该账号本地 quota 里的可用模型，判断当前模型是否可用。
+Once an account is selected, the system reads the models available in that account's local quota to determine whether the current model is usable.
 
-行为如下：
+Behavior:
 
-1. 读取账号 JSON：`quota.models[*].name`。
-2. 仅针对 Gemini 3/3.1 Pro 家族构造候选回退列表。
-3. 候选顺序：
-   - 先尝试当前模型
-   - 再按预设顺序尝试同家族其他兼容模型
-4. 选中第一个在账号可用集合里存在的模型。
-5. 若都不命中，则保持当前模型不变。
+1. Read the account JSON: `quota.models[*].name`.
+2. Build a fallback candidate list only for the Gemini 3/3.1 Pro family.
+3. Candidate order:
+   - try the current model first
+   - then try other compatible models in the same family, in a preset order
+4. Select the first model that exists in the account's available set.
+5. If none match, keep the current model unchanged.
 
-关键点：
-- 如果请求模型本身可用，不会发生重映射。
-- 只有请求模型不可用且存在兼容候选时，才会重映射。
+Key points:
+- If the requested model is itself available, no remapping happens.
+- Remapping only happens when the requested model is unavailable and a compatible candidate exists.
 
-代码位置：
+Code location:
 - `src-tauri/src/proxy/token_manager.rs`
   - `get_available_models_from_json`
   - `build_dynamic_model_candidates`
   - `resolve_dynamic_model_for_account`
 
-## 5）日志观测点
+## 5) Log Observation Points
 
-可通过日志判断每一步是否触发：
+You can tell whether each step was triggered from the logs:
 
-- 静态映射日志：
-  - `[Router] 系统默认映射: <original> -> <mapped>`
-- 动态改写日志：
+- Static mapping log:
+  - `[Router] System default mapping: <original> -> <mapped>`
+- Dynamic rewrite log:
   - `[Dynamic-Model-Rewrite] account=<id> <from> -> <to>`
 
-如果某次请求没有出现 `Dynamic-Model-Rewrite`，说明该账号直接使用了当前模型。
+If `Dynamic-Model-Rewrite` does not appear for a given request, it means that account used the current model directly.
 
-## 6）示例
+## 6) Examples
 
-示例 A（不改写）：
-- 请求：`gemini-3-pro-high`
-- 账号可用模型包含：`gemini-3-pro-high`
-- 最终上游模型：`gemini-3-pro-high`
+Example A (no rewrite):
+- Request: `gemini-3-pro-high`
+- Account's available models include: `gemini-3-pro-high`
+- Final upstream model: `gemini-3-pro-high`
 
-示例 B（发生回退改写）：
-- 请求：`gemini-3-pro-high`
-- 账号不可用：`gemini-3-pro-high`
-- 账号可用：`gemini-3.1-pro-high`
-- 最终上游模型：`gemini-3.1-pro-high`
+Example B (fallback rewrite happens):
+- Request: `gemini-3-pro-high`
+- Unavailable on the account: `gemini-3-pro-high`
+- Available on the account: `gemini-3.1-pro-high`
+- Final upstream model: `gemini-3.1-pro-high`
 
-示例 C（泛别名）：
-- 请求：`gemini-3-pro`
-- 静态阶段先映射为：`gemini-3-pro-preview`
-- 动态阶段再根据账号可用模型决定是否继续回退。
+Example C (generic alias):
+- Request: `gemini-3-pro`
+- Mapped in the static stage first to: `gemini-3-pro-preview`
+- The dynamic stage then decides whether to continue falling back, based on the account's available models.
 
-## 7）设计目标
+## 7) Design Goals
 
-该设计同时满足三点：
-- 具体模型优先保持用户原始意图。
-- 泛别名保留历史兼容能力。
-- 多账号能力不一致时，通过动态回退提升可用性。
+This design satisfies three goals at once:
+- Concrete models preserve the user's original intent as the top priority.
+- Generic aliases retain historical compatibility.
+- When account capabilities are inconsistent, dynamic fallback improves availability.

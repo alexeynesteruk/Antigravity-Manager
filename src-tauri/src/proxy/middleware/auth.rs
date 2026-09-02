@@ -1,4 +1,4 @@
-// API Key 认证中间件
+// API Key auth middleware
 use axum::{
     extract::Request,
     extract::State,
@@ -11,7 +11,7 @@ use tokio::sync::RwLock;
 
 use crate::proxy::{ProxyAuthMode, ProxySecurityConfig};
 
-/// API Key 认证中间件 (代理接口使用，遵循 auth_mode)
+/// API Key auth middleware (used by proxy endpoints, follows auth_mode)
 pub async fn auth_middleware(
     state: State<Arc<RwLock<ProxySecurityConfig>>>,
     request: Request,
@@ -20,7 +20,7 @@ pub async fn auth_middleware(
     auth_middleware_internal(state, request, next, false).await
 }
 
-/// 管理接口认证中间件 (管理接口使用，强制严格鉴权)
+/// Admin endpoint auth middleware (used by admin endpoints, forces strict auth)
 pub async fn admin_auth_middleware(
     state: State<Arc<RwLock<ProxySecurityConfig>>>,
     request: Request,
@@ -29,7 +29,7 @@ pub async fn admin_auth_middleware(
     auth_middleware_internal(state, request, next, true).await
 }
 
-/// 内部认证逻辑
+/// Internal auth logic
 async fn auth_middleware_internal(
     State(security): State<Arc<RwLock<ProxySecurityConfig>>>,
     request: Request,
@@ -39,7 +39,7 @@ async fn auth_middleware_internal(
     let method = request.method().clone();
     let path = request.uri().path().to_string();
 
-    // 过滤心跳和健康检查请求,避免日志噪音
+    // Filter out heartbeat and health-check requests to avoid log noise
     let is_health_check = path == "/healthz" || path == "/api/health" || path == "/health";
     let is_internal_endpoint = path.starts_with("/internal/");
     if !path.contains("event_logging") && !is_health_check {
@@ -56,12 +56,12 @@ async fn auth_middleware_internal(
     let security = security.read().await.clone();
     let effective_mode = security.effective_auth_mode();
 
-    // 权限检查逻辑
+    // Permission-check logic
     if !force_strict {
-        // AI 代理接口 (v1/chat/completions 等)
+        // AI proxy endpoints (v1/chat/completions, etc.)
         if matches!(effective_mode, ProxyAuthMode::Off) {
-            // [FIX] 即使 auth_mode=Off，也需要尝试识别 User Token 以记录使用情况
-            // 先检查是否携带了 User Token
+            // [FIX] Even when auth_mode=Off, still try to identify a User Token so usage can be logged
+            // First check whether a User Token was supplied
             let api_key = request
                 .headers()
                 .get(header::AUTHORIZATION)
@@ -75,7 +75,7 @@ async fn auth_middleware_internal(
                 });
 
             if let Some(token) = api_key {
-                // 尝试验证是否为 User Token（不阻止请求，只记录）
+                // Try to verify whether this is a User Token (does not block the request, just logs it)
                 if let Ok(Some(user_token)) =
                     crate::modules::user_token_db::get_token_by_value(token)
                 {
@@ -84,7 +84,7 @@ async fn auth_middleware_internal(
                         token: user_token.token,
                         username: user_token.username,
                     };
-                    // 注入 identity 到请求
+                    // Inject identity into the request
                     let (mut parts, body) = request.into_parts();
                     parts.extensions.insert(identity);
                     let request = Request::from_parts(parts, body);
@@ -99,7 +99,7 @@ async fn auth_middleware_internal(
             return Ok(next.run(request).await);
         }
 
-        // 内部端点 (/internal/*) 豁免鉴权 - 用于 warmup 等内部功能
+        // Internal endpoints (/internal/*) are exempt from auth - used for warmup and other internal features
         if is_internal_endpoint {
             tracing::debug!("Internal endpoint bypassed auth: {}", path);
             return Ok(next.run(request).await);
@@ -111,7 +111,7 @@ async fn auth_middleware_internal(
         }
     }
 
-    // 从 header 中提取 API key
+    // Extract the API key from the header
     let api_key = request
         .headers()
         .get(header::AUTHORIZATION)
@@ -142,28 +142,28 @@ async fn auth_middleware_internal(
         return Err(StatusCode::UNAUTHORIZED);
     }
 
-    // 认证逻辑
+    // Auth logic
     let authorized = if force_strict {
-        // 管理接口：优先使用独立的 admin_password，如果没有则回退使用 api_key
+        // Admin endpoints: prefer the dedicated admin_password, falling back to api_key if not set
         match &security.admin_password {
             Some(pwd) if !pwd.is_empty() => api_key.map(|k| k == pwd).unwrap_or(false),
             _ => {
-                // 回退使用 api_key
+                // Fall back to api_key
                 api_key.map(|k| k == security.api_key).unwrap_or(false)
             }
         }
     } else {
-        // AI 代理接口：仅允许使用 api_key
+        // AI proxy endpoints: only api_key is allowed
         api_key.map(|k| k == security.api_key).unwrap_or(false)
     };
 
     if authorized {
         Ok(next.run(request).await)
     } else if !force_strict && api_key.is_some() {
-        // 尝试验证 UserToken
+        // Try to validate the UserToken
         let token = api_key.unwrap();
 
-        // 提取 IP (复用逻辑)
+        // Extract the IP (shared logic)
         let client_ip = request
             .headers()
             .get("x-forwarded-for")
@@ -178,10 +178,10 @@ async fn auth_middleware_internal(
             })
             .unwrap_or_else(|| "127.0.0.1".to_string()); // Default fallback
 
-        // 验证 Token
+        // Validate the token
         match crate::modules::user_token_db::validate_token(token, &client_ip) {
             Ok((true, _)) => {
-                // Token 有效，查询信息以便传递
+                // Token is valid, look up its info so it can be passed along
                 if let Ok(Some(user_token)) =
                     crate::modules::user_token_db::get_token_by_value(token)
                 {
@@ -191,16 +191,16 @@ async fn auth_middleware_internal(
                         username: user_token.username,
                     };
 
-                    // [FIX] 将身份信息注入到请求 extensions 中，而不是响应
-                    // 这样 monitor_middleware 在处理请求时就能获取到 identity
-                    // 因为中间件执行顺序：auth (外层) -> monitor (内层) -> handler
-                    // 响应返回时：handler -> monitor -> auth
-                    // 如果注入到 response，monitor 执行时 identity 还不存在
+                    // [FIX] Inject identity into the request extensions rather than the response
+                    // This way monitor_middleware can access identity while processing the request
+                    // because middleware execution order is: auth (outer) -> monitor (inner) -> handler
+                    // and on the way back: handler -> monitor -> auth
+                    // if injected into the response, identity wouldn't exist yet when monitor runs
                     let (mut parts, body) = request.into_parts();
                     parts.extensions.insert(identity);
                     let request = Request::from_parts(parts, body);
 
-                    // 执行请求
+                    // Run the request
                     let response = next.run(request).await;
 
                     Ok(response)
@@ -237,11 +237,11 @@ async fn auth_middleware_internal(
     }
 }
 
-/// 用户令牌身份信息 (传递给 Monitor 使用)
+/// User token identity info (passed through for Monitor to use)
 #[derive(Clone, Debug)]
 pub struct UserTokenIdentity {
     pub token_id: String,
-    #[allow(dead_code)] // 保留原始 token 便于审计/调试
+    #[allow(dead_code)] // Keep the raw token around for auditing/debugging
     pub token: String,
     pub username: String,
 }
@@ -262,15 +262,15 @@ mod tests {
             security_monitor: crate::proxy::config::SecurityMonitorConfig::default(),
         }));
 
-        // 模拟请求 - 管理接口使用正确的管理密码
+        // Simulate a request - admin endpoint using the correct admin password
         let req = Request::builder()
             .header("Authorization", "Bearer admin123")
             .uri("/admin/stats")
             .body(axum::body::Body::empty())
             .unwrap();
 
-        // 此测试由于涉及 Next 中间件调用比较复杂,主要验证核心逻辑
-        // 我们在 auth_middleware_internal 基础上做了逻辑校验即可
+        // This test is fairly complex because it involves calling the Next middleware, so it mainly verifies the core logic
+        // We've already done the logic validation on top of auth_middleware_internal
     }
 
     #[test]

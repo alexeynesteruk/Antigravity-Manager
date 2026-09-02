@@ -1,22 +1,22 @@
 //! Context Cache Manager — Multi-Layer Split Cache
 //!
-//! 维护三层独立缓存，遵循 Antigravity SignatureCache 的多层级模式。
-//! 每层独立 TTL、容限、LRU 淘汰、统计 — 一层变化不影响其他层的命中。
+//! Maintains three independent cache layers, following Antigravity SignatureCache's multi-tier pattern.
+//! Each layer has its own TTL, capacity, LRU eviction, and stats - a change in one layer does not affect the hit rate of the others.
 //!
-//! 架构:
-//!   Layer 1 (SI Cache):        raw_instructions → sanitized_text
-//!     跨 session 复用：相同 system prompt 的不同对话共享 sanitized 结果
-//!   Layer 2 (Tools Cache):     raw_tools_json → processed_tools
-//!     跨 session 复用：相同 tool schema 的不同对话共享处理结果
-//!   Layer 3 (Prefix Tracker):  combined_key → PrefixTrackingEntry
-//!     追踪 (Layer1 + Layer2) 组合的生命周期，用于 cachedContent 注入和命中统计
+//! Architecture:
+//!   Layer 1 (SI Cache):        raw_instructions -> sanitized_text
+//!     Cross-session reuse: different conversations with the same system prompt share the sanitized result
+//!   Layer 2 (Tools Cache):     raw_tools_json -> processed_tools
+//!     Cross-session reuse: different conversations with the same tool schema share the processed result
+//!   Layer 3 (Prefix Tracker):  combined_key -> PrefixTrackingEntry
+//!     Tracks the lifecycle of the (Layer1 + Layer2) combination, used for cachedContent injection and hit stats
 //!
-//! 缓存生命周期:
-//! 1. 请求到达 → 计算 Layer 1 key → 查找或 sanitize systemInstruction
-//! 2. 计算 Layer 2 key → 查找或构建 tools
-//! 3. 计算 Layer 3 key → 查找是否已有 cache_name → 注入 cachedContent
-//! 4. 响应到达 → 若 cachedContentTokenCount > 0 → 更新 Layer 3 统计
-//! 5. 过期条目在 insert 时被动淘汰 (LRU on limit breach)
+//! Cache lifecycle:
+//! 1. Request arrives -> compute Layer 1 key -> look up or sanitize systemInstruction
+//! 2. Compute Layer 2 key -> look up or build tools
+//! 3. Compute Layer 3 key -> check whether a cache_name already exists -> inject cachedContent
+//! 4. Response arrives -> if cachedContentTokenCount > 0 -> update Layer 3 stats
+//! 5. Expired entries are passively evicted on insert (LRU on limit breach)
 
 use dashmap::DashMap;
 use sha2::{Digest, Sha256};
@@ -28,82 +28,82 @@ const TOOLS_CACHE_LIMIT: usize = 100;
 const PREFIX_TRACKER_LIMIT: usize = 500;
 
 // ===== TTL Constants =====
-/// Layer 1 & 2 TTL: 30 min — 比最终内容缓存更长，因为不随 session 变化
+/// Layer 1 & 2 TTL: 30 min - longer than the final content cache, since it does not vary by session
 const LAYER_12_TTL: Duration = Duration::from_secs(30 * 60);
-/// Layer 3 TTL: 1 hour — 对齐 Gemini 显式缓存默认 TTL
+/// Layer 3 TTL: 1 hour - aligned with Gemini's default explicit-cache TTL
 const LAYER_3_TTL: Duration = Duration::from_secs(3600);
 
 // ===== Layer 1: System Instruction Cache =====
 
-/// Layer 1 条目: raw system instructions → sanitized text
+/// Layer 1 entry: raw system instructions -> sanitized text
 #[derive(Debug, Clone)]
 struct SiCacheEntry {
-    /// 清洗后的 system instruction 文本
+    /// Sanitized system instruction text
     sanitized_text: String,
-    /// 创建/更新时间
+    /// Creation/update time
     timestamp: Instant,
-    /// 命中次数
+    /// Hit count
     hit_count: u64,
 }
 
 // ===== Layer 2: Tools Cache =====
 
-/// Layer 2 条目: raw tools JSON → processed tools
+/// Layer 2 entry: raw tools JSON -> processed tools
 #[derive(Debug, Clone)]
 struct ToolsCacheEntry {
-    /// 处理后的 tools JSON (序列化为字符串，使用时反序列化)
+    /// Processed tools JSON (serialized as a string, deserialized when used)
     tools_json: String,
-    /// 创建/更新时间
+    /// Creation/update time
     timestamp: Instant,
-    /// 命中次数
+    /// Hit count
     hit_count: u64,
 }
 
 // ===== Layer 3: Prefix Tracker =====
 
-/// Layer 3 条目: 追踪 (Layer1_hash + Layer2_hash) 组合
+/// Layer 3 entry: tracks the (Layer1_hash + Layer2_hash) combination
 #[derive(Debug, Clone)]
 struct PrefixTrackingEntry {
-    /// Layer 1 的 hash (用于关联)
+    /// Layer 1's hash (used for association)
     si_hash: String,
-    /// Layer 2 的 hash (用于关联)
+    /// Layer 2's hash (used for association)
     tools_hash: String,
-    /// Gemini 缓存的资源名 (cachedContents/xxx)
+    /// Gemini's cache resource name (cachedContents/xxx)
     cache_name: String,
-    /// 创建时间
+    /// Creation time
     created_at: Instant,
-    /// 过期时间
+    /// Expiration time
     expires_at: Instant,
-    /// 隐式缓存命中次数 (cachedContentTokenCount > 0)
+    /// Implicit cache hit count (cachedContentTokenCount > 0)
     implicit_hit_count: u64,
-    /// 显式缓存命中次数 (成功注入 cachedContent)
+    /// Explicit cache hit count (cachedContent successfully injected)
     explicit_hit_count: u64,
-    /// 模型名
+    /// Model name
     model: String,
 }
 
 // ===== Stats =====
 
-/// 分层统计信息
+/// Per-layer statistics
 #[derive(Debug, Clone, Default)]
 pub struct LayerStats {
-    /// Layer 1: SI 缓存统计
+    /// Layer 1: SI cache stats
     pub si_total: u64,
     pub si_hits: u64,
     pub si_misses: u64,
-    /// Layer 2: Tools 缓存统计
+    /// Layer 2: Tools cache stats
     pub tools_total: u64,
     pub tools_hits: u64,
     pub tools_misses: u64,
-    /// Layer 3: Prefix 跟踪统计
+    /// Layer 3: Prefix tracker stats
     pub prefix_total: u64,
     pub prefix_hits: u64,
     pub prefix_misses: u64,
-    /// 总隐式缓存命中次数
+    /// Total implicit cache hit count
     pub total_implicit_hits: u64,
-    /// 总显式缓存命中次数
+    /// Total explicit cache hit count
     pub total_explicit_hits: u64,
-    /// 当前活跃条目数
+    /// Current number of active entries
     pub active_si_entries: usize,
     pub active_tools_entries: usize,
     pub active_prefix_entries: usize,
@@ -111,26 +111,26 @@ pub struct LayerStats {
 
 // ===== CacheManager =====
 
-/// Context Cache Manager — 多层级缓存单例
+/// Context Cache Manager - multi-tier cache singleton
 pub struct CacheManager {
-    /// Layer 1: raw SI hash → sanitized text
+    /// Layer 1: raw SI hash -> sanitized text
     si_cache: DashMap<String, SiCacheEntry>,
-    /// Layer 1 统计
+    /// Layer 1 stats
     si_stats: std::sync::RwLock<(u64, u64, u64)>, // (total, hits, misses)
 
-    /// Layer 2: raw tools hash → processed tools JSON
+    /// Layer 2: raw tools hash -> processed tools JSON
     tools_cache: DashMap<String, ToolsCacheEntry>,
-    /// Layer 2 统计
+    /// Layer 2 stats
     tools_stats: std::sync::RwLock<(u64, u64, u64)>,
 
-    /// Layer 3: combined hash → tracking entry
+    /// Layer 3: combined hash -> tracking entry
     prefix_tracker: DashMap<String, PrefixTrackingEntry>,
-    /// Layer 3 统计
+    /// Layer 3 stats
     prefix_stats: std::sync::RwLock<(u64, u64, u64)>,
 }
 
 impl CacheManager {
-    /// 创建新的 CacheManager
+    /// Create a new CacheManager
     pub fn new() -> Self {
         Self {
             si_cache: DashMap::new(),
@@ -144,23 +144,23 @@ impl CacheManager {
 
     // ===== Shared Utilities =====
 
-    /// SHA256 快速哈希
+    /// Quick SHA256 hash
     fn sha256_hex(data: &[u8]) -> String {
         let mut hasher = Sha256::new();
         hasher.update(data);
         format!("{:x}", hasher.finalize())
     }
 
-    /// 检查 Instant 是否已过期
+    /// Check whether an Instant has expired
     fn is_expired(timestamp: Instant, ttl: Duration) -> bool {
         timestamp.elapsed() > ttl
     }
 
     // ===== Layer 1: System Instruction Cache =====
 
-    /// 查找已缓存的 sanitized system instruction
+    /// Look up the cached sanitized system instruction
     ///
-    /// 返回 Some(sanitized_text) 如果缓存有效，否则 None
+    /// Returns Some(sanitized_text) if the cache is valid, otherwise None
     pub fn lookup_si(&self, raw_hash: &str) -> Option<String> {
         if let Ok(mut stats) = self.si_stats.write() {
             stats.0 += 1; // total
@@ -220,7 +220,7 @@ impl CacheManager {
         None
     }
 
-    /// 存入 Layer 1: raw → sanitized
+    /// Store into Layer 1: raw -> sanitized
     pub fn cache_si(&self, raw_hash: String, sanitized_text: String) {
         let entry = SiCacheEntry {
             sanitized_text,
@@ -234,7 +234,7 @@ impl CacheManager {
             &raw_hash[..raw_hash.len().min(16)]
         );
 
-        // LRU 淘汰: 超出限制时清除过期条目
+        // LRU eviction: clear expired entries when over the limit
         if self.si_cache.len() > SI_CACHE_LIMIT {
             let before = self.si_cache.len();
             self.si_cache
@@ -251,16 +251,16 @@ impl CacheManager {
         }
     }
 
-    /// 计算 Layer 1 key: SHA256(raw instructions text)
+    /// Compute the Layer 1 key: SHA256(raw instructions text)
     pub fn compute_si_key(raw_instructions: &str) -> String {
         Self::sha256_hex(raw_instructions.as_bytes())
     }
 
     // ===== Layer 2: Tools Cache =====
 
-    /// 查找已缓存的 processed tools
+    /// Look up the cached processed tools
     ///
-    /// 返回 Some(tools_json_string) 如果缓存有效，否则 None
+    /// Returns Some(tools_json_string) if the cache is valid, otherwise None
     pub fn lookup_tools(&self, raw_hash: &str) -> Option<String> {
         if let Ok(mut stats) = self.tools_stats.write() {
             stats.0 += 1;
@@ -317,7 +317,7 @@ impl CacheManager {
         None
     }
 
-    /// 存入 Layer 2: raw → processed tools JSON
+    /// Store into Layer 2: raw -> processed tools JSON
     pub fn cache_tools(&self, raw_hash: String, tools_json: String) {
         let entry = ToolsCacheEntry {
             tools_json,
@@ -347,17 +347,17 @@ impl CacheManager {
         }
     }
 
-    /// 计算 Layer 2 key: SHA256(raw tools JSON string)
+    /// Compute the Layer 2 key: SHA256(raw tools JSON string)
     pub fn compute_tools_key(raw_tools_json: &str) -> String {
         Self::sha256_hex(raw_tools_json.as_bytes())
     }
 
     // ===== Layer 3: Prefix Tracker =====
 
-    /// 计算稳定的组合前缀哈希
+    /// Compute a stable combined prefix hash
     ///
-    /// 输入: systemInstruction 和 tools 的 JSON 字符串
-    /// 使用 Layer 1 + Layer 2 的独立 hash 组合，而非原始数据
+    /// Input: JSON strings of systemInstruction and tools
+    /// Uses the combination of Layer 1 + Layer 2's independent hashes, rather than the raw data
     pub fn compute_prefix_hash(si_json: &str, tools_json: &str) -> String {
         let si_hash = Self::sha256_hex(si_json.as_bytes());
         let tools_hash = if tools_json.is_empty() {
@@ -365,13 +365,13 @@ impl CacheManager {
         } else {
             Self::sha256_hex(tools_json.as_bytes())
         };
-        // 组合: SHA256(si_hash + "::" + tools_hash)
+        // Combine: SHA256(si_hash + "::" + tools_hash)
         Self::sha256_hex(format!("{}::{}", si_hash, tools_hash).as_bytes())
     }
 
-    /// 查找前缀跟踪条目中的 cache_name
+    /// Look up the cache_name in a prefix tracking entry
     ///
-    /// 返回 Some(cache_name) 如果存在有效缓存，否则 None
+    /// Returns Some(cache_name) if a valid cache exists, otherwise None
     pub fn lookup_prefix(&self, hash: &str) -> Option<String> {
         if let Ok(mut stats) = self.prefix_stats.write() {
             stats.0 += 1;
@@ -427,10 +427,10 @@ impl CacheManager {
         None
     }
 
-    /// 插入或更新 Layer 3 条目
+    /// Insert or update a Layer 3 entry
     ///
-    /// cache_name: Gemini 返回的缓存资源名。目前使用 hash 本身作为 fallback。
-    /// si_hash / tools_hash: 关联的 Layer 1/2 key，用于追踪
+    /// cache_name: the cache resource name returned by Gemini. Currently uses the hash itself as a fallback.
+    /// si_hash / tools_hash: the associated Layer 1/2 keys, used for tracking
     pub fn insert_prefix(
         &self,
         hash: String,
@@ -475,7 +475,7 @@ impl CacheManager {
         }
     }
 
-    /// 记录一次隐式缓存命中（来自响应的 cachedContentTokenCount > 0）
+    /// Record one implicit cache hit (from a response's cachedContentTokenCount > 0)
     pub fn record_implicit_hit(&self, hash: &str) {
         if let Some(mut entry) = self.prefix_tracker.get_mut(hash) {
             entry.implicit_hit_count += 1;
@@ -487,22 +487,22 @@ impl CacheManager {
         }
     }
 
-    /// 记录一次显式缓存命中
+    /// Record one explicit cache hit
     pub fn record_explicit_hit(&self, hash: &str) {
         if let Some(mut entry) = self.prefix_tracker.get_mut(hash) {
             entry.explicit_hit_count += 1;
         }
     }
 
-    // ===== 向后兼容 API =====
+    // ===== Backward-compatible API =====
 
-    /// 查找前缀: 兼容旧 API，等同于 lookup_prefix
+    /// Look up a prefix: compatible with the legacy API, equivalent to lookup_prefix
     #[inline]
     pub fn lookup(&self, hash: &str) -> Option<String> {
         self.lookup_prefix(hash)
     }
 
-    /// 插入前缀: 兼容旧 API
+    /// Insert a prefix: compatible with the legacy API
     #[inline]
     pub fn insert(&self, hash: String, cache_name: String, ttl_secs: Option<u64>) {
         self.insert_prefix(
@@ -517,7 +517,7 @@ impl CacheManager {
 
     // ===== Stats & Management =====
 
-    /// 获取分层统计
+    /// Get per-layer stats
     pub fn get_layer_stats(&self) -> LayerStats {
         let si = self.si_stats.read().unwrap();
         let tools = self.tools_stats.read().unwrap();
@@ -552,7 +552,7 @@ impl CacheManager {
         }
     }
 
-    /// 淘汰所有过期条目
+    /// Evict all expired entries
     pub fn evict_expired(&self) -> usize {
         let si_before = self.si_cache.len();
         self.si_cache
@@ -577,7 +577,7 @@ impl CacheManager {
         total
     }
 
-    /// 清空所有层缓存和统计
+    /// Clear all layer caches and stats
     pub fn clear(&self) {
         self.si_cache.clear();
         self.tools_cache.clear();
@@ -600,7 +600,7 @@ impl CacheManager {
 use std::sync::LazyLock;
 static GLOBAL_CACHE_MANAGER: LazyLock<CacheManager> = LazyLock::new(CacheManager::new);
 
-/// 获取全局 CacheManager 单例
+/// Get the global CacheManager singleton
 pub fn global_cache_manager() -> &'static CacheManager {
     &GLOBAL_CACHE_MANAGER
 }
@@ -797,7 +797,7 @@ mod tests {
             "si".to_string(),
             "tools".to_string(),
             "model".to_string(),
-            Some(0), // TTL=0 立即过期
+            Some(0), // TTL=0 expires immediately
         );
 
         thread::sleep(Duration::from_millis(10));

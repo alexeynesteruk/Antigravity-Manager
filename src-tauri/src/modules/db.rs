@@ -112,8 +112,8 @@ pub fn inject_token(
 ) -> Result<String, String> {
     crate::modules::logger::log_info("Starting Token injection...");
 
-    // 如果使用的是本项目的内置 Client ID (antigravity_enterprise 实际上是标准版)
-    // 则强制关闭 GCP TOS 标志，以确保 IDE 使用标准 Client ID 进行刷新
+    // If using this project's built-in Client ID (antigravity_enterprise is actually the standard edition)
+    // then forcibly turn off the GCP TOS flag, to ensure the IDE uses the standard Client ID for refresh
     if let Some(key) = oauth_client_key {
         if key == "antigravity_enterprise" {
             if is_gcp_tos {
@@ -257,7 +257,7 @@ fn clear_enterprise_project_preference(conn: &Connection) -> Result<(), String> 
     Ok(())
 }
 
-/// 注入 Service Machine ID 到数据库，解决 VS Code 缓存指纹不匹配导致 Token 失效的问题
+/// Inject the Service Machine ID into the database, to fix Token invalidation caused by a VS Code cached fingerprint mismatch
 pub fn write_service_machine_id(
     db_path: &std::path::Path,
     service_machine_id: &str,

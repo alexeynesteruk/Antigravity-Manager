@@ -1,13 +1,13 @@
-// Claude 辅助函数
-// JSON Schema 清理、签名处理等
+// Claude helper functions
+// JSON Schema cleanup, signature handling, etc.
 
-// 已移除未使用的 Value 导入
+// Removed the unused Value import
 
-/// 将 JSON Schema 中的类型名称转为大写 (Gemini 要求)
-/// 例如: "string" -> "STRING", "integer" -> "INTEGER"
-// 已移除未使用的 uppercase_schema_types 函数
+/// Convert type names in a JSON Schema to uppercase (required by Gemini)
+/// Example: "string" -> "STRING", "integer" -> "INTEGER"
+// Removed the unused uppercase_schema_types function
 
-/// 根据模型名称获取上下文 Token 限制
+/// Get the context token limit based on the model name
 pub fn get_context_limit_for_model(model: &str) -> u32 {
     if model.contains("pro") {
         2_097_152 // 2M for Pro
@@ -26,45 +26,45 @@ pub fn to_claude_usage(
     let prompt_tokens = usage_metadata.prompt_token_count.unwrap_or(0);
     let cached_tokens = usage_metadata.cached_content_token_count.unwrap_or(0);
 
-    // 【改进的智能阈值回归算法】
-    // 目标：既利用 Gemini 大窗口，又能在高用量时让 Claude Code 正确触发 compact 提示
+    // [Improved smart threshold regression algorithm]
+    // Goal: take advantage of Gemini's large window while still letting Claude Code correctly trigger the compact prompt at high usage
     //
-    // 分阶段策略：
-    // - 0-50%:  激进压缩，享受大上下文
-    // - 50-70%: 开始加速回升
-    // - 70-85%: 快速回升到显示 70%+
-    // - 85%+:   接近 1:1 显示，确保触发 Claude Code 的 compact 提示
+    // Staged strategy:
+    // - 0-50%:  Aggressive compression, enjoy the large context
+    // - 50-70%: Start accelerating the ramp-up
+    // - 70-85%: Ramp up quickly to a displayed 70%+
+    // - 85%+:   Near 1:1 display, ensuring Claude Code's compact prompt is triggered
     let total_raw = prompt_tokens;
 
     // [FIX] Restore low token threshold - don't scale if under 30k tokens
     const SCALING_THRESHOLD: u32 = 30_000;
 
     let scaled_total = if scaling_enabled && total_raw > SCALING_THRESHOLD {
-        const TARGET_MAX: f64 = 195_000.0; // 接近 Claude 的 200k 限制
+        const TARGET_MAX: f64 = 195_000.0; // Close to Claude's 200k limit
 
         let ratio = total_raw as f64 / context_limit as f64;
 
         if ratio <= 0.5 {
-            // 阶段1 (0-50%): 激进压缩，享受大上下文
-            // 真实 50% → 显示 ~30%
+            // Stage 1 (0-50%): aggressive compression, enjoy the large context
+            // Real 50% → displayed ~30%
             let display_ratio = ratio * 0.6;
             (display_ratio * TARGET_MAX) as u32
         } else if ratio <= 0.7 {
-            // 阶段2 (50-70%): 开始加速回升
-            // 线性从 30% 回升到 50%
+            // Stage 2 (50-70%): start accelerating the ramp-up
+            // Ramp up linearly from 30% to 50%
             let progress = (ratio - 0.5) / 0.2;
             let display_ratio = 0.3 + progress * 0.2;
             (display_ratio * TARGET_MAX) as u32
         } else if ratio <= 0.85 {
-            // 阶段3 (70-85%): 快速回升到显示 70%
-            // 这个阶段让用户开始注意到上下文在增长
+            // Stage 3 (70-85%): ramp up quickly to a displayed 70%
+            // This stage lets the user start noticing the context growing
             let progress = (ratio - 0.7) / 0.15;
             let display_ratio = 0.5 + progress * 0.2;
             (display_ratio * TARGET_MAX) as u32
         } else {
-            // 阶段4 (85%+): 接近 1:1 显示，触发 Claude Code 的 compact 提示
-            // 85% 真实 → 70% 显示
-            // 100% 真实 → 97% 显示
+            // Stage 4 (85%+): near 1:1 display, triggers Claude Code's compact prompt
+            // 85% real → 70% displayed
+            // 100% real → 97% displayed
             let progress = (ratio - 0.85) / 0.15;
             let display_ratio = 0.7 + progress * 0.27;
             (display_ratio.min(0.97) * TARGET_MAX) as u32
@@ -73,7 +73,7 @@ pub fn to_claude_usage(
         total_raw
     };
 
-    // 【调试日志】方便手动验证
+    // [Debug logging] For convenient manual verification
     if scaling_enabled && total_raw > 30_000 {
         let ratio = total_raw as f64 / context_limit as f64;
         let display_ratio = scaled_total as f64 / 195_000.0;
@@ -87,7 +87,7 @@ pub fn to_claude_usage(
         );
     }
 
-    // 按比例分配缩放后的总量到 input 和 cache_read
+    // Proportionally distribute the scaled total between input and cache_read
     let (reported_input, reported_cache) = if total_raw > 0 {
         let cache_ratio = (cached_tokens as f64) / (total_raw as f64);
         let sc_cache = (scaled_total as f64 * cache_ratio) as u32;
@@ -105,8 +105,8 @@ pub fn to_claude_usage(
     }
 }
 
-/// 提取 thoughtSignature
-// 已移除未使用的 extract_thought_signature 函数
+/// Extract thoughtSignature
+// Removed the unused extract_thought_signature function
 
 #[cfg(test)]
 mod tests {
@@ -128,7 +128,7 @@ mod tests {
         assert!(claude_usage.input_tokens < 200);
         assert_eq!(claude_usage.output_tokens, 50);
 
-        // 测试 50% 负载 (500k) - 应该显示 ~30%
+        // Test a 50% load (500k) - should display ~30%
         let usage_50 = UsageMetadata {
             prompt_token_count: Some(500_000),
             candidates_token_count: Some(10),
@@ -139,7 +139,7 @@ mod tests {
         // 50% * 0.6 = 30% of 195k = 58,500
         assert!(res_50.input_tokens > 55_000 && res_50.input_tokens < 62_000);
 
-        // 测试 70% 负载 (700k) - 应该显示 ~50%
+        // Test a 70% load (700k) - should display ~50%
         let usage_70 = UsageMetadata {
             prompt_token_count: Some(700_000),
             candidates_token_count: Some(10),
@@ -150,7 +150,7 @@ mod tests {
         // 50% of 195k = 97,500
         assert!(res_70.input_tokens > 90_000 && res_70.input_tokens < 105_000);
 
-        // 测试 85% 负载 (850k) - 应该显示 ~70%
+        // Test an 85% load (850k) - should display ~70%
         let usage_85 = UsageMetadata {
             prompt_token_count: Some(850_000),
             candidates_token_count: Some(10),
@@ -161,7 +161,7 @@ mod tests {
         // 70% of 195k = 136,500
         assert!(res_85.input_tokens > 130_000 && res_85.input_tokens < 145_000);
 
-        // 测试 100% 负载 (1M) - 应该显示 ~97%
+        // Test a 100% load (1M) - should display ~97%
         let usage_100 = UsageMetadata {
             prompt_token_count: Some(1_000_000),
             candidates_token_count: Some(10),

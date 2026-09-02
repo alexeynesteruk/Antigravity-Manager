@@ -1,12 +1,12 @@
 use super::super::tool_adapter::{append_hint_to_schema, ToolAdapter};
 use serde_json::Value;
 
-/// Pencil MCP 工具适配器
+/// The Pencil MCP tool adapter
 ///
-/// 为 Pencil 绘图工具提供特定的 Schema 优化:
-/// 1. 处理非标准的视觉属性字段 (cornerRadius, strokeWidth 等)
-/// 2. 优化文件路径参数的描述
-/// 3. 添加 Pencil 特定的使用提示
+/// Provides Schema optimizations specific to the Pencil drawing tool:
+/// 1. Handles non-standard visual property fields (cornerRadius, strokeWidth, etc.)
+/// 2. Improves the description of file-path parameters
+/// 3. Adds Pencil-specific usage hints
 pub struct PencilAdapter;
 
 impl ToolAdapter for PencilAdapter {
@@ -16,10 +16,10 @@ impl ToolAdapter for PencilAdapter {
 
     fn pre_process(&self, schema: &mut Value) -> Result<(), String> {
         if let Value::Object(map) = schema {
-            // 1. 处理视觉属性字段
+            // 1. Handle visual property fields
             self.handle_visual_properties(map);
 
-            // 2. 优化文件路径参数
+            // 2. Improve file-path parameters
             self.optimize_path_parameters(map);
         }
         Ok(())
@@ -27,9 +27,9 @@ impl ToolAdapter for PencilAdapter {
 }
 
 impl PencilAdapter {
-    /// 处理 Pencil 特有的视觉属性字段
+    /// Handles Pencil-specific visual property fields
     fn handle_visual_properties(&self, map: &mut serde_json::Map<String, Value>) {
-        // Pencil 使用的非标准视觉属性
+        // Non-standard visual properties used by Pencil
         let visual_props = ["cornerRadius", "strokeWidth", "opacity", "rotation"];
 
         for prop in visual_props {
@@ -39,7 +39,7 @@ impl PencilAdapter {
             }
         }
 
-        // 处理 properties 中的视觉属性
+        // Handle visual properties inside properties
         if let Some(Value::Object(props)) = map.get_mut("properties") {
             for (key, value) in props.iter_mut() {
                 if visual_props.contains(&key.as_str()) {
@@ -62,11 +62,11 @@ impl PencilAdapter {
         }
     }
 
-    /// 优化文件路径相关参数的描述
+    /// Improves the description of file-path-related parameters
     fn optimize_path_parameters(&self, map: &mut serde_json::Map<String, Value>) {
         if let Some(Value::Object(props)) = map.get_mut("properties") {
             for (key, value) in props.iter_mut() {
-                // 识别路径相关参数
+                // Identify path-related parameters
                 let is_path_param = key.contains("path")
                     || key.contains("file")
                     || key.contains("File")
@@ -126,7 +126,7 @@ mod tests {
 
         adapter.pre_process(&mut schema).unwrap();
 
-        // 验证 cornerRadius 的 description 被添加
+        // Verify a description was added for cornerRadius
         assert!(schema["properties"]["cornerRadius"]["description"].is_string());
         let desc = schema["properties"]["cornerRadius"]["description"]
             .as_str()

@@ -1,6 +1,6 @@
-// HTTP 会话历史存储
-// 为 /v1/responses POST 提供 previous_response_id 链式历史支持
-// 这样即使客户端用 HTTP 而不是 WebSocket，也能实现多轮对话
+// HTTP session history store
+// Provides previous_response_id chained history support for /v1/responses POST
+// This way multi-turn conversations work even when the client uses HTTP instead of WebSocket
 
 use crate::proxy::handlers::openai::get_cached_tool_call;
 use serde_json::Value;
@@ -9,17 +9,17 @@ use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
 
-const SESSION_TTL_SECS: u64 = 3600; // 1小时过期
+const SESSION_TTL_SECS: u64 = 3600; // Expires after 1 hour
 
 #[derive(Debug, Clone)]
 pub struct HttpSessionEntry {
-    /// 对话历史：instructions + 所有 input items（包括历史response输出）
+    /// Conversation history: instructions + all input items (including historical response output)
     pub input_items: Vec<Value>,
-    /// 系统指令
+    /// System instructions
     pub instructions: String,
-    /// 模型名
+    /// Model name
     pub model: String,
-    /// 上次访问时间（用于TTL淘汰）
+    /// Last access time (used for TTL eviction)
     pub last_accessed: Instant,
 }
 
@@ -99,7 +99,7 @@ impl HttpSessionStore {
                 last_accessed: Instant::now(),
             },
         );
-        // 顺便淘汰过期 session（惰性清理）
+        // Also evict expired sessions (lazy cleanup)
         self.evict_expired();
     }
 
@@ -136,7 +136,7 @@ fn store() -> &'static Mutex<HttpSessionStore> {
     STORE.get_or_init(|| Mutex::new(HttpSessionStore::new()))
 }
 
-/// 根据 previous_response_id 查找历史会话
+/// Look up the historical session by previous_response_id
 pub async fn get_session(previous_response_id: &str) -> Option<HttpSessionEntry> {
     store()
         .lock()
@@ -151,12 +151,12 @@ pub async fn get_session_with_parent(
     store().lock().await.get(previous_response_id)
 }
 
-/// 保存新的会话状态（以 response_id 为 key）
+/// Save the new session state (keyed by response_id)
 pub async fn save_session(response_id: String, entry: HttpSessionEntry) {
     store().lock().await.insert(response_id, entry);
 }
 
-/// 保存 Responses 本轮增量；父节点的 Arc 强引用保证分支共享祖先。
+/// Save this round's Responses delta; the parent's strong Arc reference ensures branches share ancestors.
 pub async fn save_session_delta(
     response_id: String,
     parent: Option<SessionParent>,
@@ -181,7 +181,7 @@ pub struct PreparedSessionInput {
     pub reset_parent: bool,
 }
 
-/// 合并请求历史，并在客户端回放完整历史时仅提取新增项。
+/// Merge request history, extracting only the newly added items when the client replays the full history.
 pub fn prepare_session_input(
     history: Vec<Value>,
     new_input: Vec<Value>,
@@ -231,16 +231,16 @@ pub fn prepare_session_input(
     }
 }
 
-/// 把上一轮的 response output items 转成 input items 追加到历史中
-/// 同时把新的 user input items 追加进去
-/// 返回合并后的 input items
+/// Convert the previous round's response output items into input items and append them to history
+/// Also append the new user input items
+/// Returns the merged input items
 pub fn merge_history_with_new_input(
     mut history: Vec<Value>,
     response_output: &[Value],
     new_input: Vec<Value>,
     tool_call_cache: &HashMap<String, Value>,
 ) -> Vec<Value> {
-    // 检测新输入中是否包含 compaction / compaction_summary，如果包含，说明客户端正在发送压缩后的全新完整历史
+    // Detect whether the new input contains compaction / compaction_summary; if so, the client is sending a compacted brand-new full history
     let has_compaction = new_input.iter().any(|item| {
         let t = item.get("type").and_then(|v| v.as_str()).unwrap_or("");
         t == "compaction" || t == "compaction_summary"
@@ -251,7 +251,7 @@ pub fn merge_history_with_new_input(
             "[Session] Compaction detected in new input. Overwriting stale history (new items: {})",
             new_input.len()
         );
-        // 过滤掉 compaction 本身
+        // Filter out the compaction item itself
         let mut filtered = Vec::new();
         for item in new_input {
             let t = item.get("type").and_then(|v| v.as_str()).unwrap_or("");
@@ -264,12 +264,12 @@ pub fn merge_history_with_new_input(
         return dedupe_input_items(filtered);
     }
 
-    // 追加上一轮 response output（assistant消息、工具调用等）
+    // Append the previous round's response output (assistant messages, tool calls, etc.)
     for item in response_output {
         history.push(item.clone());
     }
 
-    // 追加新的 input items
+    // Append the new input items
     for item in new_input {
         let t = item.get("type").and_then(|v| v.as_str()).unwrap_or("");
         if t == "compaction" || t == "compaction_summary" {
@@ -278,10 +278,10 @@ pub fn merge_history_with_new_input(
         history.push(item);
     }
 
-    // 修复工具调用（确保function_call_output前有对应的function_call）
+    // Repair tool calls (ensure each function_call_output has a matching function_call before it)
     repair_tool_calls(&mut history, tool_call_cache);
 
-    // 去重
+    // Deduplicate
     dedupe_input_items(history)
 }
 

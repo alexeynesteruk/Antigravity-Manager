@@ -1,4 +1,4 @@
-// Autostart 命令
+// Autostart commands
 use tauri_plugin_autostart::ManagerExt;
 
 #[tauri::command]
@@ -8,21 +8,25 @@ pub async fn toggle_auto_launch(app: tauri::AppHandle, enable: bool) -> Result<(
     if enable {
         manager
             .enable()
-            .map_err(|e| format!("启用自动启动失败: {}", e))?;
-        crate::modules::logger::log_info("已启用开机自动启动");
+            .map_err(|e| format!("Failed to enable autostart: {}", e))?;
+        crate::modules::logger::log_info("Autostart on login enabled");
     } else {
         match manager.disable() {
             Ok(_) => {
-                crate::modules::logger::log_info("已禁用开机自动启动");
+                crate::modules::logger::log_info("Autostart on login disabled");
             }
             Err(e) => {
                 let err_msg = e.to_string();
-                // 在 Windows 上，如果注册表项不存在，disable() 会返回 "系统找不到指定的文件" (os error 2)
-                // 这种情况应该视为成功，因为目标（禁用）已经达成
+                // On Windows, if the registry key doesn't exist, disable() returns "系统找不到指定的文件" (os error 2)
+                // This case should be treated as success, since the goal (disabled) has already been achieved
                 if err_msg.contains("os error 2") || err_msg.contains("找不到指定的文件") {
-                    crate::modules::logger::log_info("开机自启项已不存在，视为禁用成功");
+                    // NOTE: "找不到指定的文件" is a literal fragment of the Windows OS error message
+                    // (part of "系统找不到指定的文件"). It must stay byte-identical in Chinese because
+                    // it is matched against the actual OS-provided error text at runtime, which is not
+                    // localized by this app.
+                    crate::modules::logger::log_info("Autostart entry no longer exists, treating as disabled successfully");
                 } else {
-                    return Err(format!("禁用自动启动失败: {}", e));
+                    return Err(format!("Failed to disable autostart: {}", e));
                 }
             }
         }

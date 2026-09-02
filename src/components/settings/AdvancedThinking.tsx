@@ -25,16 +25,16 @@ export default function AdvancedThinking({
                     </div>
                     <div>
                         <h3 className="text-base font-bold text-gray-900 dark:text-gray-100 leading-none">
-                            {t("settings.advanced_thinking.title", { defaultValue: "高级思维与全局配置" })}
+                            {t("settings.advanced_thinking.title", { defaultValue: "Advanced Thinking & Global Configuration" })}
                         </h3>
                         <p className="text-[11px] text-gray-500 dark:text-gray-400 mt-1">
-                            {t("settings.advanced_thinking.description", { defaultValue: "集中管理思考能力、图像模式及全局指令。" })}
+                            {t("settings.advanced_thinking.description", { defaultValue: "Centrally manage thinking capability, image mode, and global instructions." })}
                         </p>
                     </div>
                 </div>
 
                 <div className="space-y-4 divide-y divide-gray-100 dark:divide-gray-800">
-                    {/* 1. 思考预算 (Thinking Budget) */}
+                    {/* 1. Thinking Budget */}
                     <div className="pt-0">
                         <ThinkingBudget
                             config={config.thinking_budget || { mode: 'auto', custom_value: 24576 }}
@@ -42,7 +42,7 @@ export default function AdvancedThinking({
                         />
                     </div>
 
-                    {/* 2. 图像思维模式 (Image Thinking Mode) */}
+                    {/* 2. Image Thinking Mode */}
                     <div className="pt-4">
                         <ImageThinkingMode
                             value={config.image_thinking_mode || 'enabled'}
@@ -50,7 +50,7 @@ export default function AdvancedThinking({
                         />
                     </div>
 
-                    {/* 3. 全局系统提示词 (Global System Prompt) */}
+                    {/* 3. Global System Prompt */}
                     <div className="pt-4">
                         <GlobalSystemPrompt
                             config={config.global_system_prompt || { enabled: false, content: '' }}

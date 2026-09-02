@@ -1,7 +1,7 @@
 use crate::models::{Account, TokenData};
 use crate::modules;
 
-/// 账号服务层 - 彻底解除对 Tauri 运行时的依赖
+/// Account service layer - fully decoupled from the Tauri runtime
 pub struct AccountService {
     pub integration: crate::modules::integration::SystemManager,
 }
@@ -11,25 +11,25 @@ impl AccountService {
         Self { integration }
     }
 
-    /// 添加账号逻辑
+    /// Add account logic
     pub async fn add_account(&self, refresh_token: &str) -> Result<Account, String> {
-        // [FIX #1583] 生成临时 UUID 作为账号上下文，避免传递 None 导致代理选择异常
+        // [FIX #1583] Generate a temporary UUID as the account context, to avoid passing None causing abnormal proxy selection
         let temp_account_id = uuid::Uuid::new_v4().to_string();
 
-        // 1. 获取 Token (使用临时 ID 确保代理选择有明确上下文)
+        // 1. Get the Token (use the temporary ID to ensure proxy selection has a clear context)
         let token_res =
             modules::oauth::refresh_access_token(refresh_token, Some(&temp_account_id)).await?;
 
-        // 2. 获取用户信息
+        // 2. Get user information
         let user_info =
             modules::oauth::get_user_info(&token_res.access_token, Some(&temp_account_id)).await?;
 
-        // 3. 获取项目 ID (尝试)
+        // 3. Get project ID (attempt)
         let project_id = crate::proxy::project_resolver::fetch_project_id(&token_res.access_token)
             .await
             .ok();
 
-        // 4. 构造 TokenData
+        // 4. Construct TokenData
         let token = TokenData::new(
             token_res.access_token.clone(),
             refresh_token.to_string(),
@@ -37,16 +37,16 @@ impl AccountService {
             Some(user_info.email.clone()),
             project_id,
             None,
-            false, // 个人账号默认不开启 GCP TOS
+            false, // Personal accounts don't enable GCP TOS by default
             token_res.id_token.clone(),
         )
         .with_oauth_client_key(token_res.oauth_client_key.clone());
 
-        // 5. 持久化
+        // 5. Persist
         let mut account =
             modules::upsert_account(user_info.email.clone(), user_info.get_display_name(), token)?;
 
-        // 6. [NEW] 自动获取配额信息（用于刷新时间排序）
+        // 6. [NEW] Automatically fetch quota information (used for sorting by refresh time)
         let email_for_log = account.email.clone();
         let access_token = token_res.access_token.clone();
         match modules::quota::fetch_quota(&access_token, &email_for_log, Some(&account.id)).await {
@@ -55,7 +55,7 @@ impl AccountService {
                 if let Some(pid) = new_project_id {
                     account.token.project_id = Some(pid);
                 }
-                // 保存更新后的账号信息
+                // Save the updated account information
                 if let Err(e) = modules::account::save_account(&account) {
                     modules::logger::log_warn(&format!(
                         "[Service] Failed to save quota for {}: {}",
@@ -83,14 +83,14 @@ impl AccountService {
         Ok(account)
     }
 
-    /// 删除账号逻辑
+    /// Delete account logic
     pub fn delete_account(&self, account_id: &str) -> Result<(), String> {
         modules::delete_account(account_id)?;
         self.integration.update_tray();
         Ok(())
     }
 
-    /// 切换账号逻辑
+    /// Switch account logic
     pub async fn switch_account(
         &self,
         account_id: &str,
@@ -99,17 +99,17 @@ impl AccountService {
         modules::account::switch_account(account_id, target_ide, &self.integration).await
     }
 
-    /// 列表获取
+    /// Get the list
     pub fn list_accounts(&self) -> Result<Vec<Account>, String> {
         modules::list_accounts()
     }
 
-    /// 获取当前 ID
+    /// Get the current ID
     pub fn get_current_id(&self) -> Result<Option<String>, String> {
         modules::get_current_account_id()
     }
 
-    // --- OAuth 逻辑 ---
+    // --- OAuth logic ---
 
     pub async fn prepare_oauth_url(
         &self,
@@ -161,9 +161,9 @@ impl AccountService {
     ) -> Result<Account, String> {
         let refresh_token = token_res
             .refresh_token
-            .ok_or_else(|| "未获取到 Refresh Token。请撤销权限后重试。".to_string())?;
+            .ok_or_else(|| "Refresh Token not obtained. Please revoke permissions and try again.".to_string())?;
 
-        // [FIX #1583] 生成临时 UUID 作为账号上下文
+        // [FIX #1583] Generate a temporary UUID as the account context
         let temp_account_id = uuid::Uuid::new_v4().to_string();
 
         let user_info =
@@ -179,7 +179,7 @@ impl AccountService {
             Some(user_info.email.clone()),
             project_id,
             None,
-            false, // 默认不开启，由后续逻辑或用户手动调整
+            false, // Not enabled by default, adjusted by subsequent logic or the user manually
             token_res.id_token,
         )
         .with_oauth_client_key(token_res.oauth_client_key.clone());
@@ -190,7 +190,7 @@ impl AccountService {
             token_data,
         )?;
 
-        // 发送 UI 更新通知 (通过 integration)
+        // Send UI update notification (via integration)
         self.integration.update_tray();
 
         Ok(account)

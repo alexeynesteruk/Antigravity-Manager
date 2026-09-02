@@ -1,4 +1,4 @@
-// OpenAI 流式转换
+// OpenAI streaming transformation
 use bytes::{Bytes, BytesMut};
 use chrono::Utc;
 use futures::{Stream, StreamExt};
@@ -8,13 +8,13 @@ use std::pin::Pin;
 use tracing::debug;
 use uuid::Uuid;
 
-/// 保存 thoughtSignature 到会话缓存
+/// Save the thoughtSignature to the session cache
 pub fn store_thought_signature(sig: &str, session_id: &str, message_count: usize) {
     if sig.is_empty() {
         return;
     }
 
-    // 2. [CRITICAL] 存储到 Session 隔离缓存 (对齐 Claude 协议)
+    // 2. [CRITICAL] Store into the session-isolated cache (aligned with the Claude protocol)
     crate::proxy::SignatureCache::global().cache_session_signature(
         session_id,
         sig.to_string(),
@@ -22,7 +22,7 @@ pub fn store_thought_signature(sig: &str, session_id: &str, message_count: usize
     );
 
     tracing::debug!(
-        "[ThoughtSig] 存储 Session 签名 (sid: {}, len: {}, msg_count: {})",
+        "[ThoughtSig] Stored session signature (sid: {}, len: {}, msg_count: {})",
         session_id,
         sig.len(),
         message_count
@@ -39,7 +39,7 @@ pub fn store_thought_signature(sig: &str, session_id: &str, message_count: usize
 fn extract_usage_metadata(u: &Value) -> Option<super::models::OpenAIUsage> {
     use super::models::{CompletionTokensDetails, OpenAIUsage, PromptTokensDetails};
 
-    // 优先使用新格式字段，fallback 到旧格式
+    // Prefer the new format fields, falling back to the old format
     let prompt_tokens = u
         .get("total_input_tokens")
         .or_else(|| u.get("promptTokenCount"))
@@ -73,7 +73,7 @@ fn extract_usage_metadata(u: &Value) -> Option<super::models::OpenAIUsage> {
         .map(|v| v as u32);
     let input_tokens_by_modality = u.get("input_tokens_by_modality").cloned();
 
-    // 新格式下 output_tokens 不含 thought/tool-use, 需要加回来。旧格式 candidatesTokenCount 已经包含它们
+    // In the new format, output_tokens excludes thought/tool-use tokens and they need to be added back. The old format's candidatesTokenCount already includes them
     let has_new_format = u.get("total_output_tokens").is_some();
     let completion_tokens = if has_new_format {
         raw_output_tokens + reasoning_tokens.unwrap_or(0) + tool_use_tokens.unwrap_or(0)
@@ -151,7 +151,7 @@ where
                                             }
 
                                             if let Some(candidates) = actual_data.get("candidates").and_then(|c| c.as_array()) {
-                                                // [DEBUG] 打印原始 candidate 以排查空回复问题
+                                                // [DEBUG] Print the raw candidate to troubleshoot empty-reply issues
                                                 if candidates.len() > 0 {
                                                      tracing::debug!("[Stream-Debug] Raw Candidate: {:?}", candidates[0]);
                                                 }
@@ -166,7 +166,7 @@ where
                                                             if let Some(text) = part.get("text").and_then(|t| t.as_str()) {
                                                                 let clean_text = text.replace("<think>\n", "").replace("<think>", "").replace("\n</think>", "").replace("</think>", "");
                                                                 if is_thought_part {
-                                                                    // thought 内容只写入 thought_out（给支持 reasoning_content 的客户端），防止客户端重复显示思维过程
+                                                                    // thought content is written only to thought_out (for clients that support reasoning_content), to prevent the client from displaying the thinking process twice
                                                                     thought_out.push_str(&clean_text);
                                                                 }
                                                                 else { content_out.push_str(&clean_text); }
@@ -188,8 +188,8 @@ where
                                                                     let name = func_call.get("name").and_then(|v| v.as_str()).unwrap_or("unknown");
                                                                     let mut args = func_call.get("args").unwrap_or(&json!({})).clone();
 
-                                                                    // [FIX #1575] 标准化 shell 工具参数名称
-                                                                    // Gemini 可能使用 cmd/code/script 等替代参数名，统一为 command
+                                                                    // [FIX #1575] Normalize shell tool parameter names
+                                                                    // Gemini may use alternate parameter names like cmd/code/script; normalize them to command
                                                                     if name == "shell" || name == "bash" || name == "local_shell" {
                                                                         if let Some(obj) = args.as_object_mut() {
                                                                             if !obj.contains_key("command") {
@@ -245,7 +245,7 @@ where
                                                         if let Some(queries) = grounding.get("webSearchQueries").and_then(|q| q.as_array()) {
                                                             let query_list: Vec<&str> = queries.iter().filter_map(|v| v.as_str()).collect();
                                                             if !query_list.is_empty() {
-                                                                grounding_text.push_str("\n\n---\n**🔍 已为您搜索：** ");
+                                                                grounding_text.push_str("\n\n---\n**🔍 Searched for you:** ");
                                                                 grounding_text.push_str(&query_list.join(", "));
                                                             }
                                                         }
@@ -253,13 +253,13 @@ where
                                                             let mut links = Vec::new();
                                                             for (i, chunk) in chunks.iter().enumerate() {
                                                                 if let Some(web) = chunk.get("web") {
-                                                                    let title = web.get("title").and_then(|v| v.as_str()).unwrap_or("网页来源");
+                                                                    let title = web.get("title").and_then(|v| v.as_str()).unwrap_or("Web source");
                                                                     let uri = web.get("uri").and_then(|v| v.as_str()).unwrap_or("#");
                                                                     links.push(format!("[{}] [{}]({})", i + 1, title, uri));
                                                                 }
                                                             }
                                                             if !links.is_empty() {
-                                                                grounding_text.push_str("\n\n**🌐 来源引文：**\n");
+                                                                grounding_text.push_str("\n\n**🌐 Source citations:**\n");
                                                                 grounding_text.push_str(&links.join("\n"));
                                                             }
                                                         }
@@ -274,8 +274,8 @@ where
                                                         _ => f,
                                                     });
 
-                                                    // [FIX #1575] 如果发射了工具调用，强制设置为 tool_calls
-                                                    // 解决 Gemini 返回 STOP 但有工具调用时，OpenAI 客户端认为对话已结束的问题
+                                                    // [FIX #1575] If a tool call was emitted, force finish_reason to tool_calls
+                                                    // Fixes the issue where OpenAI clients think the conversation has ended when Gemini returns STOP despite there being a tool call
                                                     let finish_reason = if !emitted_tool_calls.is_empty() && gemini_finish_reason.is_some() {
                                                         Some("tool_calls")
                                                     } else {
@@ -863,7 +863,7 @@ where
                                                                     );
                                                                     if accumulated_text.is_empty() {
                                                                         accumulated_text = format!(
-                                                                            "apply_patch 格式非法，已停止执行以避免重复失败。第 {line} 行：{message}"
+                                                                            "apply_patch format is invalid; execution has been stopped to avoid repeated failures. Line {line}: {message}"
                                                                         );
                                                                     }
                                                                     continue;
@@ -946,13 +946,13 @@ where
                                                     }
                                                 }
 
-                                                // 处理 groundingMetadata (搜索引文)
+                                                // Handle groundingMetadata (search citations)
                                                 if let Some(grounding) = candidate.get("groundingMetadata") {
                                                     let mut grounding_text = String::new();
                                                     if let Some(queries) = grounding.get("webSearchQueries").and_then(|q| q.as_array()) {
                                                         let query_list: Vec<&str> = queries.iter().filter_map(|v| v.as_str()).collect();
                                                         if !query_list.is_empty() {
-                                                            grounding_text.push_str("\n\n---\n**🔍 已为您搜索：** ");
+                                                            grounding_text.push_str("\n\n---\n**🔍 Searched for you:** ");
                                                             grounding_text.push_str(&query_list.join(", "));
                                                         }
                                                     }
@@ -960,13 +960,13 @@ where
                                                         let mut links = Vec::new();
                                                         for (i, chunk) in chunks.iter().enumerate() {
                                                             if let Some(web) = chunk.get("web") {
-                                                                let title = web.get("title").and_then(|v| v.as_str()).unwrap_or("网页来源");
+                                                                let title = web.get("title").and_then(|v| v.as_str()).unwrap_or("Web source");
                                                                 let uri = web.get("uri").and_then(|v| v.as_str()).unwrap_or("#");
                                                                 links.push(format!("[{}] [{}]({})", i + 1, title, uri));
                                                             }
                                                         }
                                                         if !links.is_empty() {
-                                                            grounding_text.push_str("\n\n**🌐 来源引文：**\n");
+                                                            grounding_text.push_str("\n\n**🌐 Source citations:**\n");
                                                             grounding_text.push_str(&links.join("\n"));
                                                         }
                                                     }
@@ -1010,7 +1010,7 @@ where
             }
         }
 
-        // 最终收尾时，若可见思考 commentary 还开着，则先物化为完整 message。
+        // At final wrap-up, if a visible thinking commentary block is still open, materialize it into a complete message first.
         if reasoning_open {
             let text_done = json!({
                 "type": "response.output_text.done",

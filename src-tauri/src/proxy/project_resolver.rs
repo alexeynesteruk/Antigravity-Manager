@@ -1,9 +1,9 @@
 use serde_json::Value;
 
-/// 使用 Antigravity 的 loadCodeAssist API 获取 project_id
-/// 这是获取 cloudaicompanionProject 的正确方式
+/// Use Antigravity's loadCodeAssist API to get the project_id
+/// This is the correct way to obtain cloudaicompanionProject
 pub async fn fetch_project_id(access_token: &str) -> Result<String, String> {
-    // 使用 Sandbox 环境，避免 Prod 环境的 429 错误
+    // Use the Sandbox environment to avoid 429 errors from the Prod environment
     let url = "https://daily-cloudcode-pa.sandbox.googleapis.com/v1internal:loadCodeAssist";
 
     let request_body = serde_json::json!({
@@ -16,30 +16,30 @@ pub async fn fetch_project_id(access_token: &str) -> Result<String, String> {
     let response = client
         .post(url)
         .bearer_auth(access_token)
-        // .header("Host", "cloudcode-pa.googleapis.com") // 移除 Host header，因为已切换域名
+        // .header("Host", "cloudcode-pa.googleapis.com") // Host header removed since the domain has been switched
         .header("User-Agent", crate::constants::USER_AGENT.as_str())
         .header("Content-Type", "application/json")
         .json(&request_body)
         .send()
         .await
-        .map_err(|e| format!("loadCodeAssist 请求失败: {}", e))?;
+        .map_err(|e| format!("loadCodeAssist request failed: {}", e))?;
 
     if !response.status().is_success() {
         let status = response.status();
         let body = response.text().await.unwrap_or_default();
-        return Err(format!("loadCodeAssist 返回错误 {}: {}", status, body));
+        return Err(format!("loadCodeAssist returned an error {}: {}", status, body));
     }
 
     let data: Value = response
         .json()
         .await
-        .map_err(|e| format!("解析响应失败: {}", e))?;
+        .map_err(|e| format!("Failed to parse response: {}", e))?;
 
-    // 提取 cloudaicompanionProject
+    // Extract cloudaicompanionProject
     if let Some(project_id) = data.get("cloudaicompanionProject").and_then(|v| v.as_str()) {
         return Ok(project_id.to_string());
     }
 
-    // 如果没有返回 project_id，说明账号无资格，返回错误以触发 token_manager 的稳定兜底逻辑
-    Err("账号无资格获取官方 cloudaicompanionProject".to_string())
+    // If project_id was not returned, the account is ineligible; return an error to trigger token_manager's stable fallback logic
+    Err("Account is not eligible for the official cloudaicompanionProject".to_string())
 }

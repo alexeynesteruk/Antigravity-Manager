@@ -60,14 +60,14 @@ export const WhitelistManager: React.FC<Props> = ({ refreshKey }) => {
     };
 
     const handleRemove = async (ipPattern: string) => {
-        // 乐观更新：立即从UI中移除
+        // Optimistic update: remove from the UI immediately
         setEntries(prev => prev.filter(e => e.ip_pattern !== ipPattern));
 
         try {
             await invoke('remove_ip_from_whitelist', { ipPattern: ipPattern });
         } catch (e) {
             console.error('Failed to remove from whitelist', e);
-            // 如果删除失败，重新加载数据恢复UI
+            // If deletion fails, reload the data to restore the UI
             loadWhitelist();
         }
     };
