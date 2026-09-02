@@ -1799,9 +1799,6 @@ pub async fn handle_messages(
                     "[{}] Keeping same account for status {} (Grace Retry or Server Issue)",
                     trace_id, status_code
                 );
-                force_rotate = false;
-            } else {
-                force_rotate = true;
             }
             continue;
         } else {

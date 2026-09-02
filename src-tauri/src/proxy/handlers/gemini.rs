@@ -818,9 +818,6 @@ pub async fn handle_generate(
                 "[{}] Keeping same account for status {} (Gemini server-side issue or Grace Retry)",
                 trace_id, status_code
             );
-                force_rotate = false;
-            } else {
-                force_rotate = true;
             }
 
             continue;
