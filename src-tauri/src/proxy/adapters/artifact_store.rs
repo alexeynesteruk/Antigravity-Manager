@@ -24,10 +24,13 @@ pub struct StoredToolArtifact {
     pub kind: String,
     pub original_chars: usize,
     pub original_lines: usize,
-    /// 是否已**持久化到共享 `tool_artifacts.db`**(而非仅落 proxy 进程内存的降级 fallback)。
-    /// 跨进程的 `read_tool_artifact`(`--mcp-serve-webfetch` 进程)只能读 DB,读不到内存档 ——
-    /// 故仅当 `persisted=true` 时压缩摘要才告知模型「可调 read_tool_artifact 取回」,否则会给一个
-    /// reader 看不到的 id、把回取变成 miss/重跑(MOC-235 review #4)。
+    /// Whether this has been **persisted to the shared `tool_artifacts.db`** (as opposed to
+    /// only falling back to the proxy process's in-memory store).
+    /// The cross-process `read_tool_artifact` (`--mcp-serve-webfetch` process) can only read
+    /// the DB, not the in-memory store -- so the compressed summary only tells the model
+    /// "you can call read_tool_artifact to retrieve this" when `persisted=true`, otherwise it
+    /// would hand out an id the reader can't see, turning retrieval into a miss/rerun
+    /// (MOC-235 review #4).
     pub persisted: bool,
 }
 
@@ -99,7 +102,7 @@ impl ToolArtifactStore {
                 None
             }
             Err(e) => Some(format!(
-                "tool_artifacts.db init failed at {}: {e} — falling back to in-memory only",
+                "tool_artifacts.db init failed at {}: {e} - falling back to in-memory only",
                 db_path.display()
             )),
         };
@@ -124,8 +127,9 @@ impl ToolArtifactStore {
         };
         let mut stored = record.to_stored();
 
-        // persisted = 真的写进了共享 DB。false(无 DB / INSERT 失败)→ 落 proxy 进程内存兜底,
-        // 但跨进程 read_tool_artifact 读不到 → 摘要据此不告知可回取(MOC-235 review #4)。
+        // persisted = actually written to the shared DB. false (no DB / INSERT failed) falls
+        // back to the proxy process's in-memory store, but cross-process read_tool_artifact
+        // can't read that -- so the summary won't claim it's retrievable (MOC-235 review #4).
         stored.persisted = match self.persist_save(&record) {
             Ok(persisted) => {
                 if !persisted {
@@ -162,10 +166,13 @@ impl ToolArtifactStore {
         }
     }
 
-    /// 同 [`get`] 但**保留 DB 读错误**(不吞成 `None`)。跨进程回取(MOC-235)用它区分
-    /// 「真不存在 / 已过期」(`Ok(None)`)与「瞬时读失败:锁超时 / 损坏 / 权限」(`Err`)——
-    /// 让 read_tool_artifact 对后者提示「稍后用同一 id 重试」, 而非误导模型「重跑原工具」
-    /// (重跑正是本功能要消除的成本)。`get` 仍吞错返 `None`(保留旧调用方语义)。
+    /// Same as [`get`] but **preserves DB read errors** (doesn't swallow them into `None`).
+    /// Cross-process retrieval (MOC-235) uses this to distinguish "genuinely doesn't exist /
+    /// expired" (`Ok(None)`) from "transient read failure: lock timeout / corruption /
+    /// permissions" (`Err`) -- so read_tool_artifact can tell the caller to "retry with the
+    /// same id later" for the latter, instead of misleading the model into "rerun the original
+    /// tool" (rerunning is exactly the cost this feature exists to eliminate). `get` still
+    /// swallows errors into `None` (preserving the old caller semantics).
     pub fn get_result(&self, artifact_id: &str) -> Result<Option<ToolArtifactRecord>, String> {
         if artifact_id.trim().is_empty() {
             return Ok(None);
@@ -238,8 +245,9 @@ impl ToolArtifactStore {
         );
     }
 
-    /// 把 record 写进共享 DB。`Ok(true)` = 已持久化;`Ok(false)` = 无 DB(未持久化, 由 caller
-    /// 落内存兜底);`Err` = INSERT 失败(同样由 caller 落内存)。返回值供 [`save`] 标 `persisted`。
+    /// Write the record into the shared DB. `Ok(true)` = persisted; `Ok(false)` = no DB (not
+    /// persisted, caller falls back to in-memory); `Err` = INSERT failed (caller also falls
+    /// back to in-memory). The return value tells [`save`] whether to mark `persisted`.
     fn persist_save(&self, record: &ToolArtifactRecord) -> rusqlite::Result<bool> {
         let mut guard = self.db.lock().expect("artifact store db mutex poisoned");
         let Some(conn) = guard.as_mut() else {
@@ -334,7 +342,7 @@ impl ToolArtifactRecord {
             kind: self.kind.clone(),
             original_chars: self.original_chars,
             original_lines: self.original_lines,
-            persisted: false, // 由 save() 按 persist_save 结果覆盖
+            persisted: false, // overwritten by save() based on the persist_save result
         }
     }
 }
@@ -361,10 +369,12 @@ fn init_db(db_path: &Path) -> rusqlite::Result<Connection> {
             format!("pragma synchronous=NORMAL failed: {e}"),
         );
     }
-    // 跨进程并发(MOC-235): proxy 进程写(INSERT/touch)+ `--mcp-serve-webfetch` 进程读
-    // (read_tool_artifact 回取)同时访问本 db。WAL 允许多读单写, 但两进程并发写(proxy
-    // persist_save 与 MCP get() 的 last_access touch)会撞 SQLITE_BUSY。设 busy_timeout 让其
-    // 短暂自旋重试而非立即失败(touch 失败本就 graceful, 但 INSERT 重试能少丢 artifact)。
+    // Cross-process concurrency (MOC-235): the proxy process writes (INSERT/touch) while the
+    // `--mcp-serve-webfetch` process reads (read_tool_artifact retrieval), both hitting this
+    // db at once. WAL allows multiple readers with a single writer, but concurrent writes from
+    // two processes (proxy's persist_save vs. MCP get()'s last_access touch) can collide on
+    // SQLITE_BUSY. Set busy_timeout so it briefly spin-retries instead of failing immediately
+    // (a failed touch is already graceful, but retrying INSERT loses fewer artifacts).
     if let Err(e) = conn.busy_timeout(Duration::from_secs(5)) {
         log_artifact_warning(
             "TOOL_ARTIFACT_DB_BUSY_TIMEOUT_FAILED",
@@ -461,11 +471,15 @@ pub fn global_tool_artifact_store() -> &'static ToolArtifactStore {
     })
 }
 
-/// 按 `artifact_id` 取回被压缩外置的工具输出**全文**(不截断)。供 `--mcp-serve-webfetch`
-/// 进程的 `read_tool_artifact` 工具跨进程读 —— 全文存在共享 `tool_artifacts.db`(WAL),
-/// 由 proxy 侧 [`build_bounded_tool_output_summary`](request.rs)压缩时 `save` 落盘。
-/// 返回:`Ok(Some(全文))` 命中 / `Ok(None)` 真不存在或已过期 / `Err` 瞬时读失败(锁超时
-/// / 损坏)—— 调用方据此对「真没有」与「临时错误」给不同提示(后者建议重试同一调用)。MOC-235。
+/// Retrieve the **full, untruncated** tool output that was compressed out to external storage,
+/// by `artifact_id`. Used by the `--mcp-serve-webfetch` process's `read_tool_artifact` tool for
+/// cross-process reads -- the full text lives in the shared `tool_artifacts.db` (WAL), written
+/// by `save` when the proxy side's [`build_bounded_tool_output_summary`](request.rs) compresses
+/// it.
+/// Returns: `Ok(Some(full text))` on hit / `Ok(None)` if it genuinely doesn't exist or has
+/// expired / `Err` on transient read failure (lock timeout / corruption) -- callers use this to
+/// give a different hint for "truly missing" vs. "temporary error" (the latter suggests
+/// retrying the same call). MOC-235.
 pub fn read_tool_artifact_raw(artifact_id: &str) -> Result<Option<String>, String> {
     global_tool_artifact_store()
         .get_result(artifact_id)
@@ -491,7 +505,8 @@ mod tests {
 
     #[test]
     fn read_tool_artifact_raw_round_trips_via_global() {
-        // MOC-235: 通用回取走 global store(test 下为内存档),save 后按 artifact_id 取回不截断全文。
+        // MOC-235: generic retrieval goes through the global store (in-memory under test);
+        // after save, retrieval by artifact_id returns the full untruncated text.
         let stored = global_tool_artifact_store().save(
             Some("call_moc235"),
             "command_output",
@@ -503,7 +518,7 @@ mod tests {
                 .as_deref(),
             Some("FULL UNTRUNCATED PAYLOAD moc235")
         );
-        // 真不存在 / 空 id → Ok(None)(非 Err);Err 仅留给瞬时 DB 读失败。
+        // Genuinely missing / blank id -> Ok(None) (not Err); Err is reserved for transient DB read failures.
         assert!(read_tool_artifact_raw("nonexistent_moc235")
             .expect("miss is not an error")
             .is_none());
@@ -514,12 +529,14 @@ mod tests {
 
     #[test]
     fn save_marks_persisted_only_when_db_backed() {
-        // MOC-235 review #4: persisted 必须如实反映「是否进了共享 DB」—— 跨进程 reader 只能读 DB,
-        // 摘要据此决定要不要告知模型可回取(内存档不告知, 否则给一个 reader 看不到的 id)。
+        // MOC-235 review #4: persisted must accurately reflect "did this actually make it into
+        // the shared DB" -- cross-process readers can only read the DB, and the summary uses
+        // this to decide whether to tell the model it's retrievable (the in-memory store does
+        // not, otherwise it would hand out an id the reader can't see).
         let mem = ToolArtifactStore::new(8, Duration::from_secs(60));
         assert!(
             !mem.save(Some("c"), "command_output", "raw").persisted,
-            "无 DB 的内存档不应标 persisted"
+            "in-memory store with no DB should not be marked persisted"
         );
 
         let dir = tempfile::tempdir().unwrap();
@@ -531,7 +548,7 @@ mod tests {
         );
         assert!(
             db.save(Some("c"), "command_output", "raw").persisted,
-            "写入共享 DB 成功应标 persisted"
+            "a successful write to the shared DB should be marked persisted"
         );
     }
 

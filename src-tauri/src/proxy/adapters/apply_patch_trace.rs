@@ -1,44 +1,53 @@
-//! apply_patch 转换决策埋点(诊断流量查看器「apply-patch」页的数据源)。
+//! apply_patch conversion decision tracing (data source for the diagnostics traffic viewer's "apply-patch" page).
 //!
-//! ## 为什么需要它(与 forward-trace 的区别)
+//! ## Why this exists (vs. forward-trace)
 //!
-//! forward-trace 抓的是 **raw 协议体**(Codex 原始请求 / 转换后发上游 / 上游回包),
-//! 看不到 adapter 内部把上游 `apply_patch` 工具调用重打包成 Codex `custom_tool_call`
-//! wire 时的**中间决策**:原始 function args 长啥样、提取出的 V4A 文本、信封修复改了啥、
-//! JSON/V4A 截断检测结果、V4A 后验语法校验 verdict、最终 completed/incomplete 决策。
-//! 这些恰是精修 apply_patch 模块(extract / repair / validate 反复迭代)最需要盯的环节,
-//! 故单列一个 [`crate::responses`] / [`crate::gemini_native`] 共用的埋点出口。
+//! forward-trace captures the **raw protocol body** (Codex's original request / converted
+//! request sent upstream / upstream response), but can't see the adapter's **intermediate
+//! decisions** when it repackages an upstream `apply_patch` tool call into the Codex
+//! `custom_tool_call` wire format: what the original function args looked like, the extracted
+//! V4A text, what the envelope repair changed, the JSON/V4A truncation detection result, the
+//! post-hoc V4A syntax validation verdict, the final completed/incomplete decision.
+//! These are exactly the steps that matter most when iterating on the apply_patch module
+//! (extract / repair / validate), so this is a dedicated trace outlet shared by
+//! [`crate::responses`] / [`crate::gemini_native`].
 //!
-//! ## 为什么用 sink 注入而非直接调 trace_store
+//! ## Why a sink hook instead of calling trace_store directly
 //!
-//! `trace_store` 在 `crates/proxy`,而本 crate(`adapters`)被 proxy 依赖 —— 反向 `use`
-//! 会造成**循环依赖**。故这里只定义一个进程级 sink hook:proxy 启动时(`build_router`)
-//! 注册一个闭包,把本模块构造的诊断 `Value` 补 `seq`/`captured_at` 后 push 进
-//! `trace_store`(`TraceKind::ApplyPatch`)。沿用 cat-webfetch 子进程 `POST /api/ingest`
-//! 的「外层补 seq」思路,只是这里是进程内闭包、无需跨进程。
+//! `trace_store` lives in `crates/proxy`, while this crate (`adapters`) is a dependency of
+//! proxy -- a reverse `use` would create a **circular dependency**. So this module only defines
+//! a process-level sink hook: at proxy startup (`build_router`) a closure is registered that
+//! takes the diagnostic `Value` built here, fills in `seq`/`captured_at`, and pushes it into
+//! `trace_store` (`TraceKind::ApplyPatch`). This follows the same "outer layer fills in seq"
+//! approach as the cat-webfetch subprocess's `POST /api/ingest`, just as an in-process closure
+//! with no cross-process hop needed.
 //!
-//! ## 开销 / 默认关
+//! ## Overhead / off by default
 //!
-//! gate 指向 `proxy::diagnostics::forward_trace_enabled`(env `CAS_DIAG_TRACE` 或 app 内
-//! 「诊断模式」开关,默认关)。未注册 / 关时 [`emit`] 是一次 `OnceLock` load + 一次原子读,
-//! **不构造任何 Value**(闭包 `build` 仅在开启时调用),与 forward-trace 同「关时零开销」契约。
-//! 与 forward-trace 同定位:开发者本地诊断,patch 正文(代码)按原文记录、不脱敏,仅 loopback、
-//! 默认关,绝不随 release 给终端用户开。
+//! The gate points at `proxy::diagnostics::forward_trace_enabled` (env `CAS_DIAG_TRACE` or the
+//! in-app "diagnostics mode" toggle, off by default). When unregistered / off, [`emit`] costs
+//! one `OnceLock` load plus one atomic read, **and builds no `Value` at all** (the `build`
+//! closure only runs when enabled) -- the same "zero cost when off" contract as forward-trace.
+//! Same positioning as forward-trace: local developer diagnostics, patch bodies (code) are
+//! recorded verbatim and not redacted, loopback only, off by default, never enabled for
+//! end users in a release.
 
 use std::collections::VecDeque;
 use std::sync::{Mutex, OnceLock};
 
 use serde_json::{json, Value};
 
-/// 单条 args/input 文本落盘上限(防个别巨型 patch 把一条诊断撑爆)。超出截断 + 标注 `truncated_bytes`。
+/// Per-record cap on args/input text size on disk (guards against one giant patch blowing up a single trace record). Truncated beyond this, with `truncated_bytes` noted.
 const MAX_FIELD_BYTES: usize = 256 * 1024;
 
-/// 「已发出、等结果回灌」的 apply_patch call_id 上限(防泄漏:若某 call 永远等不到结果,
-/// 超额淘汰最旧)。稳态在飞 apply_patch 很少,512 远够。
+/// Cap on "sent, awaiting result" apply_patch call_ids (leak guard: if some call never gets a
+/// result, the oldest is evicted once over the cap). Steady-state in-flight apply_patch calls
+/// are rare, 512 is comfortably enough.
 const PENDING_CAP: usize = 512;
 
-/// 进程级埋点 hook。`gate` 决定是否采集(指向 proxy 的诊断总开关),`sink` 把构造好的
-/// 诊断 `Value` 落到 trace_store(由 proxy 注册的闭包补 seq 再 push)。
+/// Process-level trace hook. `gate` decides whether to collect (points at proxy's diagnostics
+/// master switch), `sink` delivers the constructed diagnostic `Value` to trace_store (the
+/// closure registered by proxy fills in seq before pushing).
 struct Hook {
     gate: fn() -> bool,
     sink: Box<dyn Fn(Value) + Send + Sync>,
@@ -46,53 +55,54 @@ struct Hook {
 
 static HOOK: OnceLock<Hook> = OnceLock::new();
 
-/// proxy 启动时注册一次(`OnceLock`,二次调用静默忽略 —— 进程级单例)。
-/// - `gate`:返回「当前是否采集诊断」,传 `proxy::diagnostics::forward_trace_enabled`。
-/// - `sink`:收一条已构造的 apply_patch 诊断 `Value`(尚无 `seq`/`captured_at`),由 proxy
-///   补全后 push 进 `trace_store`(`TraceKind::ApplyPatch`)。
+/// Registered once at proxy startup (`OnceLock`, a second call is silently ignored -- process-level singleton).
+/// - `gate`: returns "is diagnostics collection currently on", pass `proxy::diagnostics::forward_trace_enabled`.
+/// - `sink`: receives one constructed apply_patch diagnostic `Value` (no `seq`/`captured_at`
+///   yet), which proxy fills in before pushing into `trace_store` (`TraceKind::ApplyPatch`).
 pub fn install(gate: fn() -> bool, sink: Box<dyn Fn(Value) + Send + Sync>) {
     let _ = HOOK.set(Hook { gate, sink });
 }
 
-/// 当前是否采集 apply_patch 埋点(未注册 → false)。调用方可在构造昂贵字段前先 gate。
+/// Whether apply_patch tracing is currently on (unregistered -> false). Callers can check the gate before building expensive fields.
 pub fn enabled() -> bool {
     HOOK.get().map(|h| (h.gate)()).unwrap_or(false)
 }
 
-/// 一条 apply_patch 转换决策的输入(全引用,仅在采集开启时才序列化成 `Value`)。
+/// Input for one apply_patch conversion decision (all references, only serialized into a `Value` when collection is on).
 pub struct ApplyPatchTrace<'a> {
-    /// 转换来源路径:`"chat"`(responses/converter.rs)/ `"gemini_native"`。
+    /// Conversion source path: `"chat"` (responses/converter.rs) / `"gemini_native"`.
     pub source: &'a str,
-    /// 上游模型名(converter `self.model` / gemini `self.model`),apply_patch 行为按模型分布。
+    /// Upstream model name (converter's `self.model` / gemini's `self.model`), since apply_patch behavior varies by model.
     pub model: &'a str,
-    /// Codex wire 的 `call_id`(关联工具结果回灌)。
+    /// Codex wire `call_id` (correlates with the tool result being fed back).
     pub call_id: &'a str,
-    /// Codex wire 的 item id(`fc_*`)。
+    /// Codex wire item id (`fc_*`).
     pub fc_id: &'a str,
-    /// 上游回的**原始** function arguments(标准形态 `{"input":"*** Begin Patch…"}`,
-    /// 也可能是裸 V4A / 别名 key / 截断残片)。
+    /// The **raw** function arguments returned by upstream (standard shape is
+    /// `{"input":"*** Begin Patch..."}`, but may also be bare V4A / an alias key / a truncated fragment).
     pub args_raw: &'a str,
-    /// `extract_apply_patch_input` 提取 + `repair_v4a_envelope` 修复后、真正发给 Codex 的 V4A 文本。
+    /// The V4A text actually sent to Codex, after `extract_apply_patch_input` extraction plus `repair_v4a_envelope` repair.
     pub input: &'a str,
-    /// 流是否中断(chat:无 finish_reason 且非 `[DONE]`;gemini 不增量,恒 false)。
+    /// Whether the stream was interrupted (chat: no finish_reason and not `[DONE]`; gemini is non-incremental, always false).
     pub interrupted: bool,
-    /// JSON 结构截断检测结果(`detect_json_truncation`;gemini 路径不适用,传 None)。
+    /// JSON structural truncation detection result (`detect_json_truncation`; not applicable to the gemini path, pass None).
     pub json_truncation: Option<&'a str>,
-    /// V4A 信封截断检测结果(`detect_v4a_truncation`;gemini 路径不适用,传 None)。
+    /// V4A envelope truncation detection result (`detect_v4a_truncation`; not applicable to the gemini path, pass None).
     pub v4a_truncation: Option<&'a str>,
-    /// V4A 后验语法校验失败(`validate_v4a_syntax`):`(行号, 人类可读消息)`。
+    /// Post-hoc V4A syntax validation failure (`validate_v4a_syntax`): `(line number, human-readable message)`.
     pub v4a_validation: Option<(usize, &'a str)>,
-    /// 最终决策:`"completed"`(emit input.delta+done,写 cache)或 `"incomplete"`
-    /// (emit status=incomplete,跳过 input.done,不写 cache,防破坏性半应用)。
+    /// Final decision: `"completed"` (emit input.delta+done, write to cache) or `"incomplete"`
+    /// (emit status=incomplete, skip input.done, don't write to cache, to avoid a destructive half-apply).
     pub decision: &'a str,
-    /// pre-flight 自动修复记录(`apply_patch_preflight::repairs_to_value` 的产物):每个
-    /// `Update File` 读盘比对的结果(repaired / clean / skipped)。无修复时传 `None`。
+    /// Pre-flight auto-repair record (the output of `apply_patch_preflight::repairs_to_value`): the result of the on-disk
+    /// comparison for each `Update File` (repaired / clean / skipped). Pass `None` when there were no repairs.
     pub repairs: Option<&'a Value>,
 }
 
-/// 采集开启时构造诊断 `Value`(phase=`call`)并经 sink 落库;关时零开销返回。
-/// completed 的 call 会**登记 call_id 到 pending**,等下一轮请求回灌结果时由 [`emit_result`]
-/// 配对发射(incomplete 的 call Codex 不会执行、不会有结果,不登记)。
+/// When collection is on, builds the diagnostic `Value` (phase=`call`) and delivers it via sink; zero-cost return when off.
+/// A completed call **registers its call_id in pending**, to be paired up when its result comes
+/// back in a later request round via [`emit_result`] (an incomplete call is never executed by
+/// Codex and never gets a result, so it isn't registered).
 pub fn emit(trace: &ApplyPatchTrace) {
     let Some(hook) = HOOK.get() else { return };
     if !(hook.gate)() {
@@ -104,13 +114,15 @@ pub fn emit(trace: &ApplyPatchTrace) {
     }
 }
 
-/// 采集开启时,为一条 apply_patch **结果回灌**(Codex apply 后塞回模型的 `custom_tool_call_output`)
-/// 发射 phase=`result` 诊断。`output` 是回灌原值(string 或 content_items array)。
+/// When collection is on, emits a phase=`result` diagnostic for one apply_patch **result being fed back**
+/// (the `custom_tool_call_output` Codex stuffs back to the model after applying). `output` is the raw fed-back value (string or content_items array).
 ///
-/// **去重 + 精准**:请求侧每轮都重放完整历史(同一 call_id 的结果会在后续每轮请求里再次出现),
-/// 故只在 call_id **首次**命中 pending(= 我们发过的 completed apply_patch call)时发射并移除;
-/// 历史重放的重复结果、以及非 apply_patch 的 custom 工具结果都不会命中 → 跳过。重试是新 call_id,
-/// 各自独立配对。关 / 未注册 sink 时零开销(先 gate 再查 pending)。
+/// **Dedup + precision**: the request side replays the full history every round (the same
+/// call_id's result reappears in every subsequent request round), so this only emits and
+/// removes on the call_id's **first** hit against pending (= a completed apply_patch call we
+/// previously emitted); duplicate results from history replay, and results for non-apply_patch
+/// custom tools, never hit -> skipped. A retry gets a new call_id, paired independently.
+/// Zero-cost when sink is off / unregistered (gate checked before the pending lookup).
 pub fn emit_result(call_id: &str, output: &Value) {
     let Some(hook) = HOOK.get() else { return };
     if !(hook.gate)() {
@@ -127,14 +139,17 @@ pub fn emit_result(call_id: &str, output: &Value) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// MOC-263 P3:shell 写盘诊断埋点。模型可能用 `exec_command`(shell)跑 sed -i / cat> / echo> /
-// python write / `apply_patch <<EOF` 等**直接改文件**,绕过结构化 apply_patch(因此既不过 preflight
-// 双重兜底、也不进上面的 apply_patch 埋点)。这里在转换器处理 exec_command 类工具调用时识别写盘命令
-// 并 emit 一条 `trace_kind:"shell_edit"` 诊断(走同一 sink/gate),让诊断页 / jsonl 能看见"多少编辑
-// 绕过了 apply_patch",支撑 phase-2 对 shell 改文件行为的深入分析。**纯观测,不拦截、不改命令。**
+// MOC-263 P3: shell write-to-disk trace. A model may use `exec_command` (shell) to run
+// sed -i / cat> / echo> / python write / `apply_patch <<EOF` etc. to **edit files directly**,
+// bypassing structured apply_patch (so it goes through neither the preflight double-check nor
+// the apply_patch trace above). This module recognizes write-to-disk commands when the
+// converter handles an exec_command-class tool call and emits a `trace_kind:"shell_edit"`
+// diagnostic (through the same sink/gate), so the diagnostics page / jsonl can see "how many
+// edits bypassed apply_patch", supporting a deeper phase-2 analysis of shell file-editing
+// behavior. **Observation only, does not intercept or modify the command.**
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// 被视作 shell 执行的工具名(其参数里可能含改文件命令)。
+/// Tool names treated as shell execution (their args may contain a file-editing command).
 pub fn is_shell_exec_tool(name: &str) -> bool {
     matches!(
         name,
@@ -142,8 +157,8 @@ pub fn is_shell_exec_tool(name: &str) -> bool {
     )
 }
 
-/// 从 shell 串里剔除 fd→/dev 噪音重定向(`2>/dev/null` / `>/dev/null` / `2>&1` / `&>/dev/null`),
-/// 避免把它们的 `>` 误判成写盘。
+/// Strips fd->/dev noise redirects (`2>/dev/null` / `>/dev/null` / `2>&1` / `&>/dev/null`) out
+/// of a shell string, so they aren't mistaken for a write-to-disk `>`.
 fn strip_dev_redirects(cmd: &str) -> String {
     let mut out = cmd.to_owned();
     for pat in [
@@ -160,8 +175,9 @@ fn strip_dev_redirects(cmd: &str) -> String {
     out
 }
 
-/// 把 shell 串按子命令边界(换行 / `;` / `|` / `&&` / `||` / `&`)粗切。分隔符均 ASCII,
-/// 按字节切片不会切坏 UTF-8(ASCII 字节不可能是多字节序列的一部分)。
+/// Roughly splits a shell string on subcommand boundaries (newline / `;` / `|` / `&&` / `||` /
+/// `&`). All separators are ASCII, so slicing by byte offset never cuts a UTF-8 sequence
+/// (an ASCII byte can never be part of a multi-byte sequence).
 fn split_subcommands(cmd: &str) -> Vec<&str> {
     let b = cmd.as_bytes();
     let mut segs = Vec::new();
@@ -188,12 +204,12 @@ fn split_subcommands(cmd: &str) -> Vec<&str> {
     segs
 }
 
-/// 子命令里命令词 `w` 是否作为独立 token 出现(粗判,容许前导 `cd`/赋值已被切分)。
+/// Whether the command word `w` appears as a standalone token in the subcommand (rough check, tolerates a leading `cd`/assignment already having been split off).
 fn has_word(s: &str, w: &str) -> bool {
     s.split(|c: char| c.is_whitespace()).any(|t| t == w)
 }
 
-/// 是否带「就地编辑」标志(`sed -i` / `perl -pi` / `--in-place`)。
+/// Whether an "edit in place" flag is present (`sed -i` / `perl -pi` / `--in-place`).
 fn has_inplace_flag(s: &str) -> bool {
     s.split(|c: char| c.is_whitespace()).any(|t| {
         t == "--in-place"
@@ -202,12 +218,12 @@ fn has_inplace_flag(s: &str) -> bool {
     })
 }
 
-/// 子命令是否把输出重定向写进**真实文件**(已剔除 /dev 噪音后仍含 `>`)。
+/// Whether the subcommand redirects output into a **real file** (still contains `>` after dev noise has been stripped).
 fn redirects_to_file(s: &str) -> bool {
     s.contains('>')
 }
 
-/// 首 token 是否只读类(awk/grep/rg/find/diff/sort/jq/`sed -n`)—— 用于 generic 重定向写盘排除。
+/// Whether the first token is a read-only-class command (awk/grep/rg/find/diff/sort/jq/`sed -n`) -- used to exclude generic redirect-write false positives.
 fn starts_with_reader(s: &str) -> bool {
     let t = s.trim_start();
     let first = t.split(|c: char| c.is_whitespace()).next().unwrap_or("");
@@ -217,7 +233,7 @@ fn starts_with_reader(s: &str) -> bool {
     ) || (has_word(s, "sed") && t.contains(" -n"))
 }
 
-/// 单个重定向目标是否归档/压缩产物(`*.tar.gz`/`.tgz`/`.zip`/`.gz`/`.bz2`/`.xz`/`.tar`)。
+/// Whether a single redirect target is an archive/compression artifact (`*.tar.gz`/`.tgz`/`.zip`/`.gz`/`.bz2`/`.xz`/`.tar`).
 fn target_is_artifact(target: &str) -> bool {
     let t = target.trim_matches(|c| c == '"' || c == '\'');
     [".tar.gz", ".tgz", ".zip", ".gz", ".bz2", ".xz", ".tar"]
@@ -225,11 +241,14 @@ fn target_is_artifact(target: &str) -> bool {
         .any(|ext| t.ends_with(ext))
 }
 
-/// 子命令里**所有**重定向目标是否都是归档/压缩产物(且至少有一个重定向)。用于 `redirect_write` 豁免:
-/// 只有「全部写的是下载/打包产物」才豁免;**任一**重定向目标是非归档的真 workspace 文件就**不豁免**
-/// (保留审计信号)。**按目标判定、不按命令**:`curl … > x.tar.gz` 豁免,但 `curl … > src/generated.rs`
-/// 仍计;且**逐个**重定向都看 —— `tool 2>err.gz > src.rs` 不能因首个 `2>err.gz` 像归档就豁免、漏掉
-/// 真 `> src.rs`(chatgpt-codex-connector review:inspect every redirection)。
+/// Whether **every** redirect target in the subcommand is an archive/compression artifact (and there is at least one redirect). Used for the `redirect_write` exemption:
+/// exempt only when "everything written is a download/packaging artifact"; if **any**
+/// redirect target is a real, non-archive workspace file, it is **not** exempt (the audit
+/// signal is preserved). **Judged per target, not per command**: `curl … > x.tar.gz` is
+/// exempt, but `curl … > src/generated.rs` still counts; and **every** redirect is checked
+/// individually -- `tool 2>err.gz > src.rs` can't be exempted just because the first
+/// `2>err.gz` looks like an archive, missing the real `> src.rs`
+/// (chatgpt-codex-connector review: inspect every redirection).
 fn all_redirect_targets_are_artifacts(s: &str) -> bool {
     let b = s.as_bytes();
     let mut i = 0usize;
@@ -238,7 +257,7 @@ fn all_redirect_targets_are_artifacts(s: &str) -> bool {
         if b[i] == b'>' {
             let mut j = i + 1;
             if j < b.len() && b[j] == b'>' {
-                j += 1; // `>>` 追加
+                j += 1; // `>>` append
             }
             while j < b.len() && (b[j] == b' ' || b[j] == b'\t') {
                 j += 1;
@@ -249,7 +268,7 @@ fn all_redirect_targets_are_artifacts(s: &str) -> bool {
             }
             saw = true;
             if !target_is_artifact(&s[start..j]) {
-                return false; // 有一个非归档真文件目标 → 不豁免
+                return false; // one non-archive real-file target -> not exempt
             }
             i = j;
         } else {
@@ -259,8 +278,8 @@ fn all_redirect_targets_are_artifacts(s: &str) -> bool {
     saw
 }
 
-/// 识别 shell 串里的「写盘 / 改文件」操作(MOC-263 P3 诊断用)。返回命中的种类(可多个);
-/// 纯只读(git/ls/grep/cargo/cat 读 等)返回空。宁可少报不滥报:只认明确的写盘形态。
+/// Recognizes "write to disk / edit file" operations in a shell string (used for MOC-263 P3 diagnostics). Returns the matched kinds (can be several);
+/// purely read-only (git/ls/grep/cargo/cat reads, etc.) returns empty. Better to under-report than over-report: only recognizes clear write-to-disk shapes.
 pub fn classify_shell_write(cmd: &str) -> Vec<&'static str> {
     let mut kinds: Vec<&'static str> = Vec::new();
     let push = |k: &'static str, v: &mut Vec<&'static str>| {
@@ -268,7 +287,7 @@ pub fn classify_shell_write(cmd: &str) -> Vec<&'static str> {
             v.push(k);
         }
     };
-    // 整串级:heredoc / -c 形态(子命令切分会破坏 heredoc 体,故看整串)。
+    // Whole-string level: heredoc / -c shapes (subcommand splitting would break a heredoc body, so check the whole string).
     if cmd.contains("apply_patch") && (cmd.contains("<<") || cmd.contains("*** Begin Patch")) {
         push("apply_patch_via_shell", &mut kinds);
     }
@@ -294,7 +313,7 @@ pub fn classify_shell_write(cmd: &str) -> Vec<&'static str> {
     {
         push("node_write", &mut kinds);
     }
-    // 子命令级:就地编辑 / 重定向写盘。
+    // Subcommand level: in-place edit / redirect write.
     let normalized = strip_dev_redirects(cmd);
     for seg in split_subcommands(&normalized) {
         let s = seg.trim();
@@ -313,17 +332,20 @@ pub fn classify_shell_write(cmd: &str) -> Vec<&'static str> {
             && !starts_with_reader(s)
             && !all_redirect_targets_are_artifacts(s)
         {
-            // echo>/cat>/printf> 及通用 `prog > file`(已排除 awk/grep/sed -n 等只读左侧)。
-            // **按目标豁免、且逐个重定向都看**:仅当**所有**重定向目标都是归档产物(`> x.tar.gz`)才豁免;
-            // 下载/写到真项目文件(`curl … > src/x.rs`)、或多重定向里夹一个真文件(`tool 2>err.gz > src.rs`)
-            // 仍计 —— 真·绕过 apply_patch 改 workspace,审计必须可见(MOC-268,chatgpt-codex-connector review)。
+            // echo>/cat>/printf> and generic `prog > file` (with awk/grep/sed -n etc. read-only left sides already excluded).
+            // **Exempt per target, and check every redirect individually**: exempt only when
+            // **all** redirect targets are archive artifacts (`> x.tar.gz`); downloading/writing
+            // to a real project file (`curl … > src/x.rs`), or a real file mixed into multiple
+            // redirects (`tool 2>err.gz > src.rs`), still counts -- that's a genuine bypass of
+            // apply_patch editing the workspace, and it must stay visible to the audit
+            // (MOC-268, chatgpt-codex-connector review).
             push("redirect_write", &mut kinds);
         }
     }
     kinds
 }
 
-/// 从 exec_command 工具的 args(`{"cmd":"..."}` / 别名)里抽出 shell 命令文本。
+/// Extracts the shell command text from an exec_command tool's args (`{"cmd":"..."}` / aliases).
 fn extract_shell_cmd(args_raw: &str) -> Option<String> {
     let v: Value = serde_json::from_str(args_raw.trim()).ok()?;
     let obj = v.as_object()?;
@@ -346,9 +368,10 @@ fn extract_shell_cmd(args_raw: &str) -> Option<String> {
     None
 }
 
-/// 采集开启 + 该 exec_command 是写盘命令时,emit 一条 `shell_edit` 诊断(模型用 shell 直接改文件、
-/// 绕过结构化 apply_patch)。否则零开销返回(先 gate,再 extract+classify)。`tool` 是工具名、
-/// `args_raw` 是原始工具参数。纯观测。
+/// When collection is on and this exec_command is a write-to-disk command, emits a `shell_edit`
+/// diagnostic (the model used shell to edit files directly, bypassing structured apply_patch).
+/// Otherwise returns at zero cost (gate first, then extract+classify). `tool` is the tool name,
+/// `args_raw` is the raw tool arguments. Observation only.
 pub fn emit_shell_edit(
     source: &str,
     model: &str,
@@ -373,7 +396,7 @@ pub fn emit_shell_edit(
     ));
 }
 
-/// 构造 `shell_edit` 诊断 `Value`(seq/captured_at 由 proxy sink 补)。`pub(crate)` 供测试。
+/// Builds the `shell_edit` diagnostic `Value` (seq/captured_at filled in by the proxy sink). `pub(crate)` for tests.
 pub(crate) fn build_shell_edit_value(
     source: &str,
     model: &str,
@@ -402,8 +425,8 @@ pub(crate) fn build_shell_edit_value(
     })
 }
 
-/// 把一条 [`ApplyPatchTrace`] 构造成诊断 `Value`(viewer / jsonl 用)。`seq`/`captured_at`/
-/// `proxy_version` 由 proxy 注册的 sink 补(那里能拿到 `next_seq` + 版本号)。`pub(crate)` 供测试。
+/// Builds one [`ApplyPatchTrace`] into a diagnostic `Value` (for the viewer / jsonl). `seq`/`captured_at`/
+/// `proxy_version` are filled in by the sink proxy registers (which has access to `next_seq` plus the version number). `pub(crate)` for tests.
 pub(crate) fn build_value(t: &ApplyPatchTrace) -> Value {
     let (args_text, args_trunc) = cap_field(t.args_raw);
     let (input_text, input_trunc) = cap_field(t.input);
@@ -453,7 +476,7 @@ pub(crate) fn build_value(t: &ApplyPatchTrace) -> Value {
     })
 }
 
-/// 把一条 apply_patch **结果回灌**构造成诊断 `Value`(phase=`result`)。`pub(crate)` 供测试。
+/// Builds one apply_patch **result being fed back** into a diagnostic `Value` (phase=`result`). `pub(crate)` for tests.
 pub(crate) fn build_result_value(call_id: &str, output: &str) -> Value {
     let (text, trunc) = cap_field(output);
     json!({
@@ -469,13 +492,15 @@ pub(crate) fn build_result_value(call_id: &str, output: &str) -> Value {
     })
 }
 
-/// apply_patch 结果是否像失败(advisory —— viewer 仍展示全文供人判断)。匹配 Codex apply_patch
-/// handler / parse_patch 常见失败措辞;成功输出通常是变更文件清单或简短 "Success"。
-/// 判断 apply_patch 结果是否失败。**不能**用 `"error"`/`"context"` 等松散子串 —— 会命中
-/// 文件名(`ErrorBoundary.tsx`)、代码(`asynccontextmanager`)而误报(MOC-194 真机 seq977:
-/// `Exit code: 0 … Success … A …ErrorBoundary.tsx` 被误判 is_error=true)。信号优先级:
-/// ① 明确失败短语(apply_patch 校验失败直接报、不带 Exit code 包装)→ ② exec 包装的
-/// `Exit code: N`(非 0 = 失败)→ ③ 默认非错。
+/// Whether the apply_patch result looks like a failure (advisory -- the viewer still shows the full text for humans to judge). Matches common failure wording from the
+/// Codex apply_patch handler / parse_patch; a successful output is usually a list of changed
+/// files or a brief "Success". Determines whether an apply_patch result is a failure. **Must
+/// not** use loose substrings like `"error"`/`"context"` -- they can match filenames
+/// (`ErrorBoundary.tsx`), code (`asynccontextmanager`) and false-positive (MOC-194 live-traffic
+/// seq977: `Exit code: 0 … Success … A …ErrorBoundary.tsx` was misjudged as is_error=true).
+/// Signal priority: (1) explicit failure phrases (apply_patch validation failures reported
+/// directly, without an Exit code wrapper) -> (2) exec-wrapped `Exit code: N` (nonzero =
+/// failure) -> (3) default to not-an-error.
 fn looks_like_error(output: &str) -> bool {
     let l = output.to_ascii_lowercase();
     const FAIL_PHRASES: [&str; 9] = [
@@ -492,14 +517,14 @@ fn looks_like_error(output: &str) -> bool {
     if FAIL_PHRASES.iter().any(|m| l.contains(m)) {
         return true;
     }
-    // exec 包装的 `Exit code: N` 是权威信号(成功 = 0)。
+    // The exec-wrapped `Exit code: N` is the authoritative signal (success = 0).
     if let Some(code) = parse_exit_code(output) {
         return code != 0;
     }
     false
 }
 
-/// 从 exec 包装的 `Exit code: N` 抽退出码(apply_patch 经 shell exec 时带此前缀)。
+/// Extracts the exit code from an exec-wrapped `Exit code: N` (present when apply_patch runs through a shell exec).
 fn parse_exit_code(output: &str) -> Option<i32> {
     let idx = output.find("Exit code:")?;
     output[idx + "Exit code:".len()..]
@@ -509,10 +534,11 @@ fn parse_exit_code(output: &str) -> Option<i32> {
         .ok()
 }
 
-// ── pending apply_patch call_id 注册表(call ↔ result 配对 + 历史重放去重)──────────
+// ── pending apply_patch call_id registry (call <-> result pairing + history-replay dedup) ──────────
 //
-// completed 的 apply_patch call 登记 call_id;结果回灌首次命中即发射并移除。只用
-// `Mutex<VecDeque<String>>`(每次 apply_patch 才动一次,512 内线性扫可忽略),超额淘汰最旧。
+// A completed apply_patch call registers its call_id; the result feed-back emits and removes it
+// on first hit. Just a `Mutex<VecDeque<String>>` (only touched once per apply_patch call, a
+// linear scan within 512 entries is negligible), oldest evicted once over the cap.
 
 static PENDING: OnceLock<Mutex<VecDeque<String>>> = OnceLock::new();
 
@@ -520,13 +546,13 @@ fn pending() -> &'static Mutex<VecDeque<String>> {
     PENDING.get_or_init(|| Mutex::new(VecDeque::new()))
 }
 
-/// 登记一个「等结果」的 call_id(超 [`PENDING_CAP`] 淘汰最旧)。空 id 忽略。
+/// Registers a call_id that is "awaiting a result" (evicts the oldest once past [`PENDING_CAP`]). Ignores an empty id.
 fn register_pending(call_id: &str) {
     if call_id.is_empty() {
         return;
     }
     if let Ok(mut q) = pending().lock() {
-        // 去重:同 call_id 不重复登记(理论上 call_id 唯一,防御)。
+        // Dedup: the same call_id is not registered twice (call_id is theoretically unique; this is defensive).
         if q.iter().any(|x| x == call_id) {
             return;
         }
@@ -537,7 +563,7 @@ fn register_pending(call_id: &str) {
     }
 }
 
-/// 若 call_id 在 pending 中则移除并返回 true(= 这是我们发过的 apply_patch call 的首个结果)。
+/// If call_id is in pending, removes it and returns true (= this is the first result for an apply_patch call we emitted).
 fn take_pending(call_id: &str) -> bool {
     if let Ok(mut q) = pending().lock() {
         if let Some(pos) = q.iter().position(|x| x == call_id) {
@@ -548,12 +574,12 @@ fn take_pending(call_id: &str) -> bool {
     false
 }
 
-/// 截断到 [`MAX_FIELD_BYTES`](按 char 边界,不切坏 UTF-8),返回(文本, 丢弃字节数)。
+/// Truncates to [`MAX_FIELD_BYTES`] (on a char boundary, never cutting a UTF-8 sequence), returns (text, bytes discarded).
 fn cap_field(s: &str) -> (String, usize) {
     if s.len() <= MAX_FIELD_BYTES {
         return (s.to_owned(), 0);
     }
-    // 找 <= cap 的 char 边界,避免切在多字节中间。
+    // Find a char boundary <= cap, to avoid cutting in the middle of a multi-byte sequence.
     let mut end = MAX_FIELD_BYTES;
     while end > 0 && !s.is_char_boundary(end) {
         end -= 1;
@@ -561,12 +587,12 @@ fn cap_field(s: &str) -> (String, usize) {
     (s[..end].to_owned(), s.len() - end)
 }
 
-/// 粗分类「V4A 是怎么从原始 args 里抽出来的」(给 viewer 摘要 / 过滤)。轻量 re-derive,
-/// 与 `extract_apply_patch_input` 的实际分支对齐但不耦合其内部:
-/// - `json_input`:args 是 JSON 且含 `input` 字段(标准形态)。
-/// - `json_alt_key`:args 是 JSON、无 `input` 但 input 文本回收自别名 key(patch/diff/…)。
-/// - `bare_v4a`:args 本身就是裸 V4A(无 JSON 包裹)。
-/// - `raw_fallback`:既非合法 JSON 也不像裸 V4A → 原样透传(多半截断 / schema drift)。
+/// Roughly classifies "how the V4A was extracted from the raw args" (for viewer summary / filtering). A lightweight re-derivation,
+/// aligned with `extract_apply_patch_input`'s actual branches but not coupled to its internals:
+/// - `json_input`: args is JSON and has an `input` field (standard shape).
+/// - `json_alt_key`: args is JSON, has no `input`, but the input text was recovered from an alias key (patch/diff/…).
+/// - `bare_v4a`: args is itself bare V4A (no JSON wrapper).
+/// - `raw_fallback`: neither valid JSON nor bare-V4A-looking -> passed through as-is (usually truncation / schema drift).
 pub(crate) fn classify_extraction(args_raw: &str, _input: &str) -> &'static str {
     let trimmed = args_raw.trim();
     if trimmed.is_empty() {
@@ -661,17 +687,17 @@ mod tests {
         let err = build_result_value("call_y", "error: context does not match at line 12");
         assert_eq!(err["is_error"], true);
 
-        // 真机 seq977 回归:成功结果含文件名 ErrorBoundary.tsx,不能因 "error" 子串误报。
+        // Live-traffic seq977 regression: a successful result contains the filename ErrorBoundary.tsx, must not false-positive on the "error" substring.
         let ok2 = build_result_value(
             "call_z",
             "Exit code: 0\nWall time: 0.1 seconds\nOutput:\nSuccess. Updated the following files:\nA frontend/src/components/common/ErrorBoundary.tsx\n",
         );
         assert_eq!(
             ok2["is_error"], false,
-            "成功结果含 ErrorBoundary 文件名不应误报"
+            "a successful result containing the ErrorBoundary filename should not false-positive"
         );
 
-        // 真实失败短语(不带 Exit code 包装)仍要判 error。
+        // A genuine failure phrase (without an Exit code wrapper) should still be judged as an error.
         let err2 = build_result_value(
             "call_w",
             "apply_patch verification failed: Failed to find context 'uploadImage' in foo.ts",
@@ -681,17 +707,17 @@ mod tests {
 
     #[test]
     fn pending_pairs_once_then_dedupes_replay() {
-        // 唯一 call_id 避免与并行测试/转换器 emit 撞车
+        // A unique call_id to avoid colliding with a parallel test / converter emit
         let id = "call_pending_test_unique_9af3";
-        assert!(!take_pending(id), "未登记时不应命中");
+        assert!(!take_pending(id), "should not hit when not registered");
         register_pending(id);
-        assert!(take_pending(id), "首次结果应配对成功");
-        assert!(!take_pending(id), "历史重放的重复结果应被去重(已移除)");
+        assert!(take_pending(id), "first result should pair successfully");
+        assert!(!take_pending(id), "a duplicate result from history replay should be deduped (already removed)");
     }
 
     #[test]
     fn classify_shell_write_flags_real_writes_only() {
-        // MOC-263 P3:写盘命令 → 命中对应种类。
+        // MOC-263 P3: write-to-disk commands -> hit the corresponding kind.
         assert!(classify_shell_write("sed -i '' '199,282d' f.rs").contains(&"sed_inplace"));
         assert!(classify_shell_write("sed -i 's/a/b/' f.rs").contains(&"sed_inplace"));
         assert!(classify_shell_write("perl -pi -e 's/x/y/' f.rs").contains(&"perl_inplace"));
@@ -706,7 +732,7 @@ mod tests {
             classify_shell_write("apply_patch <<'EOF'\n*** Begin Patch\nEOF")
                 .contains(&"apply_patch_via_shell")
         );
-        // 只读命令 → 空(不滥报):管道/读取/awk NR>=/cargo/find/跑脚本。
+        // Read-only commands -> empty (no false positives): pipes/reads/awk NR>=/cargo/find/running scripts.
         assert!(classify_shell_write("cd x && git log --oneline 2>/dev/null | head").is_empty());
         assert!(classify_shell_write("cat agent/issues.md 2>/dev/null | head -120").is_empty());
         assert!(classify_shell_write("cargo check 2>&1 | tail").is_empty());
@@ -715,38 +741,38 @@ mod tests {
         assert!(classify_shell_write("python3 train.py --epochs 3").is_empty());
         assert!(classify_shell_write("ls -la && find . -type f").is_empty());
         assert!(classify_shell_write("cat file.rs").is_empty());
-        // [MOC-268] **归档产物目标** → 不计 redirect_write(按目标判定,非按命令;phase-2 误报口径修正)。
+        // [MOC-268] **archive artifact target** -> does not count as redirect_write (judged per target, not per command; phase-2 false-positive fix).
         assert!(
             classify_shell_write("cd /tmp && gh api repos/o/r/tarball/main > sda.tar.gz 2>/dev/null && tar xzf sda.tar.gz")
                 .is_empty(),
-            "下载到 tarball 产物不应计 redirect_write"
+            "downloading to a tarball artifact should not count as redirect_write"
         );
         assert!(classify_shell_write("curl -sL https://x/y.zip > y.zip").is_empty());
         assert!(
             classify_shell_write("python3 render.py > /tmp/w/plot.tar.gz").is_empty(),
-            "归档产物目标不计(即便左侧非下载)"
+            "an archive artifact target does not count (even when the left side isn't a download)"
         );
-        // [MOC-268 review] 下载/抓取到**真项目文件**仍计 —— 那是绕过 apply_patch 改 workspace,审计须可见
-        // (chatgpt-codex-connector:不按 gh/curl/wget 命令一刀切豁免)。
+        // [MOC-268 review] downloading/fetching into a **real project file** still counts -- that bypasses apply_patch to edit the workspace, and must stay visible to the audit
+        // (chatgpt-codex-connector: don't blanket-exempt based on the gh/curl/wget command).
         assert!(
             classify_shell_write("curl -sL https://x/gen > src/generated.rs")
                 .contains(&"redirect_write"),
-            "curl 覆盖真项目文件应计 redirect_write"
+            "curl overwriting a real project file should count as redirect_write"
         );
         assert!(
             classify_shell_write("gh api repos/o/r/contents/x > fixtures/data.json")
                 .contains(&"redirect_write"),
-            "gh 写真项目文件应计 redirect_write"
+            "gh writing a real project file should count as redirect_write"
         );
-        // 真源码写盘仍命中(回归保护:别因排除矫枉过正漏掉真编辑)。
+        // A genuine source-code write still hits (regression guard: don't let the exclusion overreach and miss a real edit).
         assert!(classify_shell_write("echo 'x' > src/real.rs").contains(&"redirect_write"));
         assert!(classify_shell_write("printf 'a' > config.toml").contains(&"redirect_write"));
-        // [MOC-268 review] 多重定向:逐个看,早一个像归档(`2>err.gz`)不能豁免真文件目标(`> src.rs`)。
+        // [MOC-268 review] multiple redirects: check each one individually -- an earlier one that looks like an archive (`2>err.gz`) must not exempt a real file target (`> src.rs`).
         assert!(
             classify_shell_write("tool 2>err.gz > src/generated.rs").contains(&"redirect_write"),
-            "早归档 decoy 不应豁免真文件写"
+            "an early archive decoy should not exempt a real file write"
         );
-        // 全部目标都是归档产物才豁免。
+        // Exempt only when every target is an archive artifact.
         assert!(
             classify_shell_write("gh api repos/o/r/tarball/main > out.tar.gz 2>log.gz").is_empty()
         );
@@ -784,7 +810,7 @@ mod tests {
         let (text, trunc) = cap_field(&big);
         assert!(text.len() <= MAX_FIELD_BYTES);
         assert!(trunc > 0);
-        // 没切坏 UTF-8:能完整重新解析
+        // Didn't cut a UTF-8 sequence: can be fully re-parsed
         assert!(text.chars().all(|c| c == 'あ'));
     }
 }

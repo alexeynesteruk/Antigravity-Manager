@@ -33,7 +33,7 @@ function test(description: string, fn: () => void): void {
     } catch (e: unknown) {
         failed++;
         const msg = e instanceof Error ? e.message : String(e);
-        console.error(`  FAIL: ${description}  — ${msg}`);
+        console.error(`  FAIL: ${description}  - ${msg}`);
     }
 }
 

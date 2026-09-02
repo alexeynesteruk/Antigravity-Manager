@@ -1700,7 +1700,7 @@ pub async fn handle_chat_completions(
     // images-generations shim. Native Gemini image models (gemini-3-pro-image*) must
     // flow through the normal pipeline (transform_openai_request -> resolve_request_config),
     // which correctly sets requestType=image_gen, imageConfig (size/aspect ratio), sessionId,
-    // structured requestId and per-account dynamic model resolution — matching the official
+    // structured requestId and per-account dynamic model resolution - matching the official
     // Antigravity client. The old shim dropped `size` and built a divergent upstream body,
     // which caused image generation to silently fail for gemini-3-pro-image.
     if (model_name.contains("image")
@@ -1868,7 +1868,7 @@ pub async fn handle_chat_completions(
         openai_req.model = spec.id.to_string();
         if spec.thinking_budget == 0 {
             // Non-thinking checkpoint model (e.g. gemini-3.1-flash-lite): disable thinking
-            // AND strip tools/tool_choice — per upstream spec §3 checkpoint requests carry
+            // AND strip tools/tool_choice - per upstream spec §3 checkpoint requests carry
             // no tools.
             openai_req.thinking = None;
             openai_req.tools = None;

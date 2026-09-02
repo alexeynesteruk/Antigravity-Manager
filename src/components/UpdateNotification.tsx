@@ -45,7 +45,7 @@ export const UpdateNotification: React.FC<UpdateNotificationProps> = ({ onClose 
 
       setUpdateInfo(info);
 
-      // 2. If not in Tauri — no auto-update possible
+      // 2. If not in Tauri - no auto-update possible
       if (!isTauri()) {
         console.warn('Auto update is only available in Tauri environment');
         onClose();
@@ -98,7 +98,7 @@ export const UpdateNotification: React.FC<UpdateNotificationProps> = ({ onClose 
         }
       });
 
-      // 4. Download complete — show restart prompt
+      // 4. Download complete - show restart prompt
       setUpdateState('ready');
       setDownloadProgress(100);
     } catch (error) {
@@ -297,7 +297,7 @@ export const UpdateNotification: React.FC<UpdateNotificationProps> = ({ onClose 
             </div>
           )}
 
-          {/* Error state — retry button */}
+          {/* Error state - retry button */}
           {updateState === 'error' && (
             <button
               onClick={() => {

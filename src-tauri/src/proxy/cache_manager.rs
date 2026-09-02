@@ -1,4 +1,4 @@
-//! Context Cache Manager — Multi-Layer Split Cache
+//! Context Cache Manager - Multi-Layer Split Cache
 //!
 //! Maintains three independent cache layers, following Antigravity SignatureCache's multi-tier pattern.
 //! Each layer has its own TTL, capacity, LRU eviction, and stats - a change in one layer does not affect the hit rate of the others.

@@ -61,7 +61,7 @@ struct VersionConfig {
 
 /// Try to fetch the latest Antigravity version from the remote update server.
 /// Runs in a dedicated OS thread to avoid blocking Tokio's async runtime.
-/// Returns None on any network/parse failure — always non-fatal, 5s timeout.
+/// Returns None on any network/parse failure - always non-fatal, 5s timeout.
 fn try_fetch_remote_version() -> Option<String> {
     // Spawn a dedicated OS thread so that `reqwest::blocking` never touches
     // the Tokio thread-pool and cannot trigger the "Cannot block the current
@@ -126,7 +126,7 @@ fn resolve_version_config() -> (VersionConfig, VersionSource) {
 
         if let Some(local_v) = local_parsed {
             if compare_semver(&local_v, &best_version) > std::cmp::Ordering::Equal {
-                // Local is newer than the floor — use it
+                // Local is newer than the floor - use it
                 tracing::debug!(
                     local_version = %local_v,
                     "Local installation version is newer than known-stable floor; using local"
@@ -141,7 +141,7 @@ fn resolve_version_config() -> (VersionConfig, VersionSource) {
                     "Local Antigravity version is older than known-stable floor; \
                      using floor to avoid upstream model rejection"
                 );
-                // source stays KnownStableFallback — the local version is intentionally ignored
+                // source stays KnownStableFallback - the local version is intentionally ignored
             }
         }
     }

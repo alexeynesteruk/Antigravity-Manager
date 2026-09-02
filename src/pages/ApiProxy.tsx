@@ -994,7 +994,7 @@ response = model.generate_content("Hello")
 print(response.text)`;
         }
 
-        // 3. OpenAI Protocol — image generation models (any *-image model)
+        // 3. OpenAI Protocol - image generation models (any *-image model)
         if (modelId.toLowerCase().includes('-image')) {
             return `from openai import OpenAI
 
@@ -1003,7 +1003,7 @@ client = OpenAI(
     api_key="${apiKey}"
 )
 
-# IMPORTANT — model availability:
+# IMPORTANT - model availability:
 #   "${modelId}" must be an image model your selected account actually has.
 #   Check the model list on the left: not every account exposes every image model
 #   (e.g. some accounts only have gemini-3.1-flash-image, not gemini-3-pro-image).
@@ -1014,12 +1014,12 @@ client = OpenAI(
 response = client.chat.completions.create(
     model="${modelId}",
 
-    # Aspect ratio — Option 1: the size parameter (recommended)
+    # Aspect ratio - Option 1: the size parameter (recommended)
     #   "1024x1024" = 1:1   |   "1280x720" = 16:9
     #   "720x1280"  = 9:16  |   "1216x896" = 4:3
     extra_body={ "size": "1024x1024" },
 
-    # Aspect ratio — Option 2: a model-name suffix instead of size
+    # Aspect ratio - Option 2: a model-name suffix instead of size
     #   model="${modelId}-16-9"   (also: -9-16, -4-3, -3-4)
     messages=[{
         "role": "user",

@@ -384,7 +384,7 @@ fn write_to_system_keyring(account: &crate::models::Account) -> Result<(), Strin
                     .args(["-9", &child_pid.to_string()])
                     .output();
                 crate::modules::logger::log_error(
-                    "[Desktop] secret-tool store blocked for >10s — D-Bus session bus unreachable. \
+                    "[Desktop] secret-tool store blocked for >10s - D-Bus session bus unreachable. \
                      Ensure gnome-keyring/kwallet is running and DBUS_SESSION_BUS_ADDRESS is exported.",
                 );
                 return Err(

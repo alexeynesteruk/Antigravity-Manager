@@ -958,7 +958,7 @@ impl TokenManager {
         // Image models: drift ONLY across versions within the SAME tier
         // (pro-image ↔ pro-image, flash-image ↔ flash-image). Never silently downgrade
         // pro→flash. If the account has no model in the requested tier, the name is left
-        // unchanged and upstream returns 404 — which is honest (the account lacks that model).
+        // unchanged and upstream returns 404 - which is honest (the account lacks that model).
         // To alias e.g. gemini-3-pro-image to a flash model, use the app's Model Routing Center.
         let pro_image = ["gemini-3-pro-image", "gemini-3.1-pro-image"];
         let flash_image = ["gemini-3-flash-image", "gemini-3.1-flash-image"];

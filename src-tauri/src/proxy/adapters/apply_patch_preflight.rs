@@ -1,18 +1,25 @@
-//! apply_patch **pre-flight 自动修复**:在把 V4A patch 发给 Codex apply 之前,读目标文件比对,
-//! 自动对齐**安全**的上下文失配(尾随空格 / 首尾空白差异),消灭 V4A 头号失败
-//! `apply_patch verification failed: Failed to find expected lines`。
+//! apply_patch **pre-flight auto-repair**: before sending a V4A patch to Codex for apply,
+//! reads the target file and compares it, automatically aligning **safe** context mismatches
+//! (trailing whitespace / leading-trailing whitespace differences), eliminating V4A's #1
+//! failure mode: `apply_patch verification failed: Failed to find expected lines`.
 //!
-//! ## 为什么需要
-//! 弱一点的 chat 模型(非 OpenAI)在大文件上常无法逐字节复刻 `Update File` 的 context/删除行
-//! (尾随空格、缩进、记忆偏差)→ Codex 找不到锚点 → apply 失败 → 模型整文件重写,浪费时间和 token。
-//! 实测真机报错(rollout 地面真相)正是这类。
+//! ## Why this is needed
+//! Weaker chat models (non-OpenAI) often can't byte-for-byte reproduce the context/deletion
+//! lines of an `Update File` on a large file (trailing whitespace, indentation, memory drift)
+//! -> Codex can't find the anchor -> apply fails -> the model rewrites the whole file, wasting
+//! time and tokens. This is exactly what live-traffic errors (rollout ground truth) showed.
 //!
-//! ## 安全边界(绝不损坏文件 —— 对齐用户「不做破坏性降级」硬规则)
-//! - **只动锚点**:`Update File` 里的 context(空格前缀)/ 删除(`-`)行。`+新增` 行**绝不改动**。
-//! - **只在唯一匹配时修**:锚点块在文件里按「忽略尾随空格 / 首尾空白」找候选,**恰好一个**位置才对齐;
-//!   0 个(模型真改错内容)或 ≥2 个(歧义)一律**原样放行**,交给 Codex parse_patch 暴露真坏,绝不靠猜。
-//! - **Add File / Delete File 不碰**(无锚点,不涉及匹配)。读不到文件 / 无 cwd → 原样放行。
-//! - 每条修复 / 放行都记进 apply-patch 诊断页,可审计。
+//! ## Safety boundary (never corrupt a file -- aligned with the user's hard rule of "no destructive downgrades")
+//! - **Only touches anchors**: the context (space-prefixed) / deletion (`-`) lines inside
+//!   `Update File`. `+added` lines are **never touched**.
+//! - **Only repairs on a unique match**: the anchor block is searched for in the file ignoring
+//!   trailing whitespace / leading-trailing whitespace, and it's aligned only when **exactly
+//!   one** location matches; 0 matches (the model genuinely got the content wrong) or >=2
+//!   matches (ambiguous) are always **passed through as-is**, leaving Codex's parse_patch to
+//!   expose the real breakage rather than guessing.
+//! - **Add File / Delete File are untouched** (no anchors, no matching involved). If the file
+//!   can't be read / there's no cwd, it's passed through as-is.
+//! - Every repair / pass-through is recorded on the apply-patch diagnostics page, for auditing.
 
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
@@ -20,14 +27,14 @@ use std::sync::{Mutex, OnceLock};
 
 use serde_json::{json, Value};
 
-/// 一条 pre-flight 处理记录(给诊断页 / 日志)。
+/// One pre-flight processing record (for the diagnostics page / logs).
 #[derive(Debug, Clone, PartialEq)]
 pub struct Repair {
-    /// patch 里的文件路径(相对,原样)。
+    /// The file path from the patch (relative, as-is).
     pub file: String,
-    /// `repaired`(对齐了锚点)/ `clean`(本就精确匹配,未改)/ `skipped:<原因>`(放行未修)。
+    /// `repaired` (anchor was aligned) / `clean` (already matched exactly, unchanged) / `skipped:<reason>` (passed through unrepaired).
     pub kind: String,
-    /// 人类可读详情(改了几行 / 为何放行)。
+    /// Human-readable detail (how many lines changed / why it was passed through).
     pub detail: String,
 }
 
@@ -37,20 +44,26 @@ impl Repair {
     }
 }
 
-/// 把一组 [`Repair`] 转成诊断 `Value` 数组(给 ApplyPatchTrace 的 `repairs` 字段)。
+/// Converts a set of [`Repair`]s into a diagnostics `Value` array (for ApplyPatchTrace's `repairs` field).
 pub fn repairs_to_value(repairs: &[Repair]) -> Value {
     Value::Array(repairs.iter().map(Repair::to_value).collect())
 }
 
-/// [MOC-194/MOC-263] 进程级「最近见过的 cwd」候选历史(most-recent-first,去重,容量上限)。
+/// [MOC-194/MOC-263] Process-level "recently seen cwd" candidate history (most-recent-first, deduplicated, capped).
 ///
-/// **为什么从单槽改成候选列表(MOC-263 P1)**:Codex 只在 turn-start 请求发 `<cwd>`,apply_patch
-/// 工具循环后续请求不带 cwd → 靠跨请求记忆。旧实现是**进程级单槽**,多个 Codex 会话并发时(真机
-/// 常态:同时开 N 个对话改不同项目)单槽被**别的会话**的 turn-start cwd 持续覆盖 → apply_patch
-/// 请求回退到的是**别项目的 stale cwd** → Tier B 读盘规则解析到错目录 → 全程 `skipped:unreadable`
-/// (实测 phase-1:5/5 段兜底全废)。改成**最近 N 个不同 cwd 的候选列表**:读盘时对每个候选试
-/// `cwd/相对路径` 是否存在,选**第一个存在**的(真项目 cwd 才有该文件,stale cwd 没有 → 自动选对)。
-/// 命中错 cwd 的同名文件最坏让后续锚点匹配失败 → 安全 skip,绝不误改(保持「不猜不丢」)。
+/// **Why this changed from a single slot to a candidate list (MOC-263 P1)**: Codex only sends
+/// `<cwd>` on the turn-start request; the apply_patch tool loop's subsequent requests carry no
+/// cwd -> so we rely on cross-request memory. The old implementation was a **process-level
+/// single slot**, and when multiple Codex sessions run concurrently (the live-traffic norm:
+/// N conversations open at once editing different projects) the single slot kept getting
+/// overwritten by **another session's** turn-start cwd -> apply_patch requests fell back to
+/// **a stale cwd from a different project** -> the Tier B read-from-disk rule resolved to the
+/// wrong directory -> everything ended up `skipped:unreadable` (measured in phase-1: 5/5
+/// fallback segments all wasted). Changed to **a candidate list of the last N distinct cwds**:
+/// on read, each candidate is tried for whether `cwd/relative_path` exists, and we pick the
+/// **first one that exists** (only the real project cwd has that file; a stale cwd doesn't ->
+/// this auto-selects correctly). At worst, hitting a same-named file under the wrong cwd makes
+/// the subsequent anchor match fail -> a safe skip, never a wrong edit (preserving "never guess, never drop").
 const CWD_CANDIDATES_CAP: usize = 12;
 static CWD_HISTORY: OnceLock<Mutex<VecDeque<String>>> = OnceLock::new();
 
@@ -58,7 +71,7 @@ fn cwd_history() -> &'static Mutex<VecDeque<String>> {
     CWD_HISTORY.get_or_init(|| Mutex::new(VecDeque::new()))
 }
 
-/// 记一个最近见到的 cwd(去重置顶,超 [`CWD_CANDIDATES_CAP`] 淘汰最旧)。空串忽略。
+/// Records a recently seen cwd (dedup-and-move-to-front, evicts the oldest once over [`CWD_CANDIDATES_CAP`]). Ignores an empty string.
 fn remember_cwd(cwd: &str) {
     if cwd.is_empty() {
         return;
@@ -74,7 +87,7 @@ fn remember_cwd(cwd: &str) {
     }
 }
 
-/// 最近见过的 cwd 候选(most-recent-first)。
+/// Recently seen cwd candidates (most-recent-first).
 fn recall_cwd_candidates() -> Vec<String> {
     cwd_history()
         .lock()
@@ -82,22 +95,26 @@ fn recall_cwd_candidates() -> Vec<String> {
         .unwrap_or_default()
 }
 
-/// 是否有任何可用 cwd(当前请求的 `primary` 或历史候选)。byte-exact 规则据此短路。
+/// Whether any usable cwd exists (the current request's `primary`, or a historical candidate). The byte-exact rule short-circuits on this.
 fn has_cwd_candidate(primary: Option<&str>) -> bool {
     primary.map(|c| !c.is_empty()).unwrap_or(false) || !recall_cwd_candidates().is_empty()
 }
 
-/// patch section 的「锚点 probe」,每项 `(is_header, 文本)`:
-/// - context(` `)/ 删除(`-`)行去前缀 → `(false, 行内容)`,在候选文件里按**整行 exact**(trim)比对;
-/// - `@@ <header>` 的 header 文本 → `(true, header)`,按**子串**比对(残缺头是真实整行的子串,如
-///   `系统架构建议` ⊂ `## 6. 系统架构建议`)。两类分开评分:exact 头若被 stale 的同名整行命中会误选,
-///   故 header 不进 exact(chatgpt-codex-connector review)。供 [`read_patch_file`] 在同名候选间挑目标文件。
+/// The "anchor probe" for a patch section, each item `(is_header, text)`:
+/// - context (` `) / deletion (`-`) lines with the prefix stripped -> `(false, line content)`,
+///   compared against candidate files by **exact full-line match** (trim);
+/// - the header text of `@@ <header>` -> `(true, header)`, compared by **substring** (a
+///   truncated header is a substring of the real full line, e.g. `Architecture Overview` is a
+///   substring of `## 6. Architecture Overview`). The two kinds are scored separately: an exact
+///   header could be wrongly matched by a stale full line with the same text, so headers never
+///   go through exact matching (chatgpt-codex-connector review). Used by [`read_patch_file`] to
+///   pick the target file among same-named candidates.
 fn anchor_probe<'a>(body: &[&'a str]) -> Vec<(bool, &'a str)> {
     let mut probe = Vec::new();
     for l in body {
         match l.chars().next() {
             Some(' ') | Some('-') => probe.push((false, &l[1..])),
-            Some('+') => {} // 新增行 —— 不在目标文件,不作 probe
+            Some('+') => {} // added line -- not in the target file, not a probe
             _ => {
                 if let Some(h) = l.strip_prefix("@@ ") {
                     let h = h.trim();
@@ -105,9 +122,11 @@ fn anchor_probe<'a>(body: &[&'a str]) -> Vec<(bool, &'a str)> {
                         probe.push((true, h));
                     }
                 } else if !l.is_empty() && !l.starts_with("@@") && !l.starts_with("*** ") {
-                    // 无前缀行(模型漏写前缀,fix_unprefixed_lines 要按文件整行 exact 匹配来修)→ 整行作
-                    // exact probe,使空-probe 路径(漏前缀是唯一锚点时)也能在同名候选间挑对文件
-                    // (chatgpt-codex-connector review)。
+                    // An unprefixed line (the model forgot the prefix; fix_unprefixed_lines
+                    // repairs it by matching the full line exactly against the file) -> use the
+                    // full line as an exact probe, so the empty-probe path (when the missing
+                    // prefix is the only anchor) can still pick the right file among same-named
+                    // candidates (chatgpt-codex-connector review).
                     probe.push((false, l));
                 }
             }
@@ -116,13 +135,17 @@ fn anchor_probe<'a>(body: &[&'a str]) -> Vec<(bool, &'a str)> {
     probe
 }
 
-/// 按候选 cwd 解析并读取 patch 目标文件(MOC-263 P1 + P2)。`primary`(当前请求 cwd,apply_patch
-/// 请求通常 None)优先,再按最近 cwd 历史逐个试。`probe` = patch 的 context/删除锚点行内容
-/// ([`anchor_probe`]):多个候选 cwd 都存在同名相对文件时(并发会话共享 `README.md`/`package.json`
-/// 等),**选内容里命中最多 probe 锚点行的候选**(= patch 真正针对的文件),而非取第一个可读的
-/// (chatgpt-codex-connector review P2:取第一个会对错文件对齐)。所有候选 probe 命中均为 0 → 没有
-/// 候选是目标 → 返回 None(skip,安全)。`probe` 为空(纯新增 patch 无锚点)→ 退回第一个可读
-/// (无从判别、最好努力)。绝对路径直接读。
+/// Resolves and reads the patch's target file against candidate cwds (MOC-263 P1 + P2).
+/// `primary` (the current request's cwd, usually None for apply_patch requests) is tried
+/// first, then each cwd in the recent history in turn. `probe` = the patch's context/deletion
+/// anchor line content ([`anchor_probe`]): when multiple candidate cwds all have a same-named
+/// relative file (concurrent sessions sharing `README.md`/`package.json` etc.), **pick the
+/// candidate whose content hits the most probe anchor lines** (= the file the patch is actually
+/// targeting), rather than just the first readable one (chatgpt-codex-connector review P2:
+/// taking the first one would align against the wrong file). If every candidate scores 0 probe
+/// hits -> none of them is the target -> return None (skip, safe). If `probe` is empty (a pure
+/// add-file patch with no anchors) -> fall back to the first readable one (no way to tell, best
+/// effort). An absolute path is read directly.
 fn read_patch_file(
     relpath: &str,
     primary: Option<&str>,
@@ -134,9 +157,12 @@ fn read_patch_file(
             .ok()
             .map(|c| (p.to_path_buf(), c));
     }
-    // ① fresh primary 权威:当前请求自带 cwd 且文件可读 → 直接用,交下游决定匹配(含 align_at_headers
-    //    的 partial `@@` 子串修复)。**probe 只在多个同名候选间做 tie-breaker,绝不当 gate** —— 否则
-    //    残缺 `@@` 头 / 单一候选会因 probe 0 命中被误判 unreadable(chatgpt-codex-connector review P2 二轮)。
+    // (1) A fresh primary is authoritative: if the current request has its own cwd and the file
+    //    is readable -> use it directly, letting downstream decide the match (including
+    //    align_at_headers' partial `@@` substring repair). **probe is only a tie-breaker among
+    //    multiple same-named candidates, never a gate** -- otherwise a truncated `@@` header /
+    //    a single candidate would be wrongly judged unreadable due to 0 probe hits
+    //    (chatgpt-codex-connector review P2, round two).
     if let Some(c) = primary {
         if !c.is_empty() {
             let abs = Path::new(c).join(p);
@@ -145,7 +171,7 @@ fn read_patch_file(
             }
         }
     }
-    // ② 否则用最近 cwd 候选历史(most-recent-first),读出所有存在的同名文件。
+    // (2) Otherwise use the recent cwd candidate history (most-recent-first), reading every same-named file that exists.
     let mut readable: Vec<(PathBuf, String)> = Vec::new();
     for c in recall_cwd_candidates() {
         let abs = Path::new(&c).join(p);
@@ -155,22 +181,29 @@ fn read_patch_file(
     }
     match readable.len() {
         0 => return None,
-        // 单候选 → 直接用(下游决定匹配,partial header 子串修复才有机会);不因 probe 0 命中而 skip。
+        // A single candidate -> use it directly (downstream decides the match, giving partial
+        // header substring repair a chance); not skipped just because probe hit 0.
         1 => return readable.into_iter().next(),
         _ => {}
     }
-    // ③ 多个同名候选(并发会话共享 README.md/package.json 等)→ 按锚点 probe 挑 patch 真正针对的文件。
-    //    评分:context/删除行(非 header)按**整行 exact**(trim)命中;`@@` 头(header)按**子串**命中
-    //    真实整行(残缺头是整行子串,如 `系统架构建议` ⊂ `## 6. 系统架构建议`)。两类合并计分,**唯一
-    //    最高分**才选;并列 / 全 0 → None(歧义不猜,违反"不猜不丢"则会对 stale 文件对齐)。
-    //    header 不进 exact:否则 stale 的同名整行(恰=残缺头)会以 exact 胜过 real 的子串(review)。
+    // (3) Multiple same-named candidates (concurrent sessions sharing README.md/package.json
+    //    etc.) -> pick the file the patch is actually targeting by anchor probe.
+    //    Scoring: context/deletion lines (non-header) hit by **exact full-line match** (trim);
+    //    `@@` headers hit the real full line by **substring** (a truncated header is a
+    //    substring of the full line, e.g. `Architecture Overview` is a substring of
+    //    `## 6. Architecture Overview`). Both kinds are combined into one score, and only the
+    //    **unique highest score** is picked; a tie / all-0 -> None (ambiguity is never guessed,
+    //    since guessing wrong would align against a stale file, violating "never guess, never
+    //    drop"). Headers are excluded from exact matching: otherwise a stale full line that
+    //    happens to equal the truncated header would beat the real file's substring match via
+    //    exact (review).
     let probe: Vec<(bool, &str)> = probe
         .iter()
         .map(|&(h, t)| (h, t.trim()))
         .filter(|(_, t)| !t.is_empty())
         .collect();
     if probe.is_empty() {
-        return readable.into_iter().next(); // 无锚点(纯新增 patch)→ 最 recent(无需对齐,下游 no-op)
+        return readable.into_iter().next(); // no anchors (a pure add-file patch) -> most recent (no alignment needed, downstream is a no-op)
     }
     let scores: Vec<usize> = readable
         .iter()
@@ -190,22 +223,25 @@ fn read_patch_file(
         .collect();
     let max = scores.iter().copied().max().unwrap_or(0);
     if max == 0 {
-        return None; // 没有候选含任何锚点 → 都不是目标 → skip(安全)
+        return None; // no candidate contains any anchor -> none is the target -> skip (safe)
     }
     if scores.iter().filter(|s| **s == max).count() != 1 {
-        return None; // 并列最高 = 歧义 → 不猜
+        return None; // a tie for highest = ambiguous -> don't guess
     }
     let best_idx = scores.iter().position(|s| *s == max).unwrap();
     Some(readable.swap_remove(best_idx))
 }
 
-/// 从 Codex Responses 请求里抽 `<cwd>...</cwd>`(Codex 注入的 environment_context 块,
-/// 形如 `<environment_context>\n  <cwd>/abs/path</cwd>\n  <shell>zsh</shell>...`)。
+/// Extracts `<cwd>...</cwd>` from a Codex Responses request (the environment_context block
+/// Codex injects, shaped like `<environment_context>\n  <cwd>/abs/path</cwd>\n  <shell>zsh</shell>...`).
 ///
-/// **遍历 Value 树**找含 `<cwd>` 的字符串节点(其值已是 serde 反转义后的原文)再抽取 —— **不能**
-/// 先 `serde_json::to_string(整个请求)` 再搜:那会把字符串值**重新 JSON 转义**,Windows 路径
-/// `C:\Users\...` 的反斜杠被翻倍成 `C:\\Users\\...`,resolve_path 拿到错路径(codex-connector #435 P2)。
-/// 不依赖 `<cwd>` 落在 instructions 还是某条 input message(任意层级的 string 节点都扫)。
+/// **Walks the Value tree** to find a string node containing `<cwd>` (its value is already the
+/// serde-unescaped original text) and extracts from that -- it **must not** first
+/// `serde_json::to_string(the whole request)` and search that: that would **re-escape** the
+/// string values as JSON, doubling the backslashes in a Windows path `C:\Users\...` into
+/// `C:\\Users\\...`, so resolve_path would get the wrong path (codex-connector #435 P2). Does
+/// not depend on whether `<cwd>` lands in instructions or some input message (scans string
+/// nodes at any depth).
 pub fn extract_cwd(request: Option<&Value>) -> Option<String> {
     fn find_in_value(v: &Value) -> Option<String> {
         match v {
@@ -218,7 +254,7 @@ pub fn extract_cwd(request: Option<&Value>) -> Option<String> {
     find_in_value(request?)
 }
 
-/// 从单个(已反转义的)字符串里抽 `<cwd>...</cwd>`。
+/// Extracts `<cwd>...</cwd>` from a single (already unescaped) string.
 fn extract_cwd_from_str(s: &str) -> Option<String> {
     let start = s.find("<cwd>")? + "<cwd>".len();
     let rest = &s[start..];
@@ -231,11 +267,14 @@ fn extract_cwd_from_str(s: &str) -> Option<String> {
     }
 }
 
-/// [MOC-194 关键] 把请求里的 `<cwd>` 记入进程级缓存。**必须对每个请求调用**(不止 apply_patch):
-/// 带 `<cwd>` 的是 **turn-start 请求**(不产生 apply_patch、不调 [`optimize_patch`]),而 apply_patch
-/// 出现在**不带 cwd 的工具循环后续请求**里。只在 `optimize_patch` 里记忆 → 永远学不到 cwd(实测:
-/// `LAST_CWD` 一直 None、所有 Tier B 读盘规则全程 no-op)。故记忆点必须在每请求都经过的地方
-/// (转换器 `with_original_request`),turn-start 的 cwd 才能被后续 apply_patch 请求回退到。
+/// [MOC-194 critical] Records the request's `<cwd>` into the process-level cache. **Must be
+/// called for every request** (not just apply_patch): the request carrying `<cwd>` is the
+/// **turn-start request** (which produces no apply_patch and never calls [`optimize_patch`]),
+/// while apply_patch shows up in **later tool-loop requests that carry no cwd**. Recording only
+/// inside `optimize_patch` would mean the cwd is never learned (measured: `LAST_CWD` stayed
+/// None forever, and every Tier B read-from-disk rule was a permanent no-op). So the recording
+/// point must be somewhere every request passes through (the converter's
+/// `with_original_request`), so the turn-start cwd can be fallen back to by later apply_patch requests.
 pub fn remember_cwd_from_request(request: Option<&Value>) {
     if let Some(cwd) = extract_cwd(request) {
         remember_cwd(&cwd);
@@ -250,45 +289,63 @@ pub fn remember_cwd_from_text(text: &str) -> bool {
     true
 }
 
-/// apply_patch **中间层总入口**:按白名单规则**逐条恢复已知格式错误**,使模型不遵循 prompt 时
-/// 产出的畸形 patch 仍能被 Codex 正确 apply。**只动确定的已知坑;未知一律原样放行(不猜不丢)。**
+/// apply_patch's **middleware top-level entry point**: **restores known format errors one by
+/// one** by whitelisted rule, so a malformed patch produced when the model doesn't follow the
+/// prompt can still be correctly applied by Codex. **Only touches confirmed known pitfalls;
+/// anything unknown is always passed through as-is (never guess, never drop).**
 ///
-/// 两层结构(对齐 [[MOC-194]] 方案):
+/// A two-tier structure (aligned with the [[MOC-194]] design):
 ///
-/// **Tier A 语法规整**(镜像 Codex 给 GPT 的 lark 语法,纯字符串、不读盘 —— 把 GPT 靠语法约束生成
-/// 保证的合法性,在第三方 chat 路径事后保证):
-/// - [`strip_trailing_at`] — 双边 `@@ … @@` → 单边(grammar `change_context: "@@" | "@@ " /(.+)/`;实测 18×)。
-/// - [`convert_unified_file_headers`] — `--- old` / `+++ new` 或 `file: path` → `*** Update File: path`。
-/// - [`ensure_add_file_plus`] — Add File 内容行漏 `+` → 补全(grammar `add_line: "+" /(.*)/`,Add File 无歧义)。
-/// - [`ensure_v4a_envelope`] — 缺 `*** Begin/End Patch` → 补全(grammar `start: begin_patch hunk+ end_patch`;
-///   gotcha #6 + 真机 seq230)。**仅 `json_complete`(非流式截断)时做**,且**放最后**以包裹 Tier B 产物。
+/// **Tier A: syntax normalization** (mirrors the lark grammar Codex gives GPT, pure string
+/// work, no disk reads -- retroactively guarantees, on the third-party chat path, the validity
+/// that GPT's grammar constraints would otherwise guarantee):
+/// - [`strip_trailing_at`] -- both-sided `@@ … @@` -> single-sided (grammar
+///   `change_context: "@@" | "@@ " /(.+)/`; measured 18x).
+/// - [`convert_unified_file_headers`] -- `--- old` / `+++ new` or `file: path` -> `*** Update File: path`.
+/// - [`ensure_add_file_plus`] -- an Add File content line missing its `+` -> filled in (grammar
+///   `add_line: "+" /(.*)/`, unambiguous for Add File).
+/// - [`ensure_v4a_envelope`] -- missing `*** Begin/End Patch` -> filled in (grammar
+///   `start: begin_patch hunk+ end_patch`; gotcha #6 + live-traffic seq230). **Only done when
+///   `json_complete`** (not a streaming truncation), and **placed last** so it wraps whatever Tier B produced.
 ///
-/// **Tier B 语义恢复**(grammar 管不到的文件状态/内容层,需 `cwd` 读盘):
-/// - [`recover_update_empty_file`] — Update 空文件 → Delete+Add(实测 50×,无损)。
-/// - [`align_at_headers`] — `@@ <header>` 残缺锚点 → 对齐文件真实整行(`Failed to find context`)。
-/// - [`fix_unprefixed_lines`] — Update 内无前缀行 → 按文件判定补 context 空格 / 删重复废行(seq235)。
-/// - [`recover_empty_move`] — 空 Update+Move(rename-only)→ Delete+Add 复制原内容(实测 76×)。
-/// - [`preflight_repair`] — Update 上下文 byte-exact 失配 → 读盘对齐(实测 134×)。
+/// **Tier B: semantic recovery** (the file-state/content layer the grammar can't reach, needs a `cwd` disk read):
+/// - [`recover_update_empty_file`] -- Update of an empty file -> Delete+Add (measured 50x, lossless).
+/// - [`align_at_headers`] -- a truncated `@@ <header>` anchor -> aligned to the file's real full
+///   line (`Failed to find context`).
+/// - [`fix_unprefixed_lines`] -- an unprefixed line inside Update -> fills in a context space or
+///   drops a duplicate stale line, decided against the file (seq235).
+/// - [`recover_empty_move`] -- an empty Update+Move (rename-only) -> Delete+Add copying the original content (measured 76x).
+/// - [`preflight_repair`] -- a byte-exact context mismatch in Update -> aligned by reading the disk (measured 134x).
 ///
-/// 未覆盖的错点:**原样透过**,交 Codex applier 报错(不猜不丢)。
-/// `json_complete`:调用方传 `detect_json_truncation(args).is_none()`(chat);gemini args 一次性完整传 `true`。
+/// Error shapes not covered here: **passed through as-is**, left for the Codex applier to error
+/// on (never guess, never drop).
+/// `json_complete`: the caller passes `detect_json_truncation(args).is_none()` (chat); gemini
+/// args are always passed complete in one shot, so `true`.
 pub fn optimize_patch(v4a: &str, cwd: Option<&str>, json_complete: bool) -> (String, Vec<Repair>) {
-    // [MOC-194/MOC-263] **两类 cwd,分流使用**:
-    // - `fresh_cwd` = 当前请求自带的 `<cwd>`(apply_patch 请求通常 None)。**判定文件 == Codex 应用
-    //   文件**,可信。
-    // - 候选历史 = 跨请求记忆的最近 N 个不同 cwd([`recall_cwd_candidates`])。Codex 只在 turn-start
-    //   请求发 `<cwd>`,apply_patch 工具循环后续请求不带 → 靠它回退。MOC-263:从单槽改候选列表,
-    //   并发多会话不再被别项目 stale cwd 覆盖(读盘按候选逐个试、选第一个存在的)。
+    // [MOC-194/MOC-263] **Two kinds of cwd, used for different purposes**:
+    // - `fresh_cwd` = the current request's own `<cwd>` (usually None for apply_patch
+    //   requests). **The file it resolves to == the file Codex actually applies to**, so it's
+    //   trustworthy.
+    // - The candidate history = the last N distinct cwds remembered across requests
+    //   ([`recall_cwd_candidates`]). Codex only sends `<cwd>` on the turn-start request; later
+    //   apply_patch tool-loop requests carry none -> we fall back to this. MOC-263: changed
+    //   from a single slot to a candidate list, so concurrent multi-session use no longer gets
+    //   overwritten by another project's stale cwd (disk reads try each candidate in turn and pick the first that exists).
     //
-    // **状态改写规则**(`recover_update_empty_file` / `recover_empty_move`:把 Update 转成 Delete+Add)
-    // 的判定文件与应用文件(Codex 用 patch 相对路径在真实 cwd 应用)**可能不是同一个** → 错 cwd 下会
-    // 删错项目的同名文件(破坏性)。故这两条**只用 fresh_cwd**(判定==应用才安全),**不查候选历史**;
-    // apply_patch 请求无 fresh cwd → 自动跳过透过(安全)。
-    // **byte-exact 对齐规则**(align/preflight/fix_unprefixed)传 `fresh_cwd` 作 primary,内部经
-    // [`read_patch_file`] 再查候选历史:最坏命中错文件也只是「不唯一匹配 / byte 不符」→ 安全 no-op。
+    // For the **state-rewriting rules** (`recover_update_empty_file` / `recover_empty_move`:
+    // turning an Update into Delete+Add), the file used to decide and the file actually applied
+    // to (Codex applies using the patch's relative path against the real cwd) **may not be the
+    // same file** -> under the wrong cwd this could delete the wrong project's same-named file
+    // (destructive). So these two rules **only use fresh_cwd** (safe only when decide==apply),
+    // **never the candidate history**; an apply_patch request with no fresh cwd automatically
+    // skips through (safe).
+    // The **byte-exact alignment rules** (align/preflight/fix_unprefixed) pass `fresh_cwd` as
+    // primary, then internally consult the candidate history via [`read_patch_file`]: at worst,
+    // hitting the wrong file just means "no unique match / bytes don't match" -> a safe no-op.
     let fresh_cwd = cwd;
-    // 当前请求若带 cwd,记入候选历史(turn-start 的 cwd 主要由转换器 `remember_cwd_from_request`
-    // 在每请求记入;这里兜底:万一 apply_patch 请求自带 cwd 也纳入)。
+    // If the current request carries a cwd, record it into the candidate history (the
+    // turn-start cwd is mainly recorded per-request by the converter's
+    // `remember_cwd_from_request`; this is a fallback in case an apply_patch request happens to carry its own cwd too).
     if let Some(c) = cwd {
         remember_cwd(c);
     }
@@ -296,7 +353,7 @@ pub fn optimize_patch(v4a: &str, cwd: Option<&str>, json_complete: bool) -> (Str
     let mut s = v4a.to_owned();
     repairs.extend(diagnose_absolute_paths(&s, fresh_cwd));
 
-    // ── Tier A 语法规整(纯字符串)──
+    // -- Tier A syntax normalization (pure string work) --
     let (s1, r1) = strip_trailing_at(&s);
     s = s1;
     repairs.extend(r1);
@@ -313,12 +370,14 @@ pub fn optimize_patch(v4a: &str, cwd: Option<&str>, json_complete: bool) -> (Str
     s = s_g;
     repairs.extend(r_g);
 
-    // ── Tier B 语义恢复 ──
-    // 注:`Add File 已存在 → Delete+Add 覆盖` 规则**已撤销**(2026-06-09)。它会覆盖已有文件、
-    // 可能丢失 Add 内容里没有的现存内容(破坏性降级);且会抢走模型收到 `already exists` 后
-    // 自纠为**针对性 Update**(无损)的机会。改为原样透过、交 Codex 报 `already exists` 让模型自纠。
+    // -- Tier B semantic recovery --
+    // Note: the `Add File already exists -> overwrite with Delete+Add` rule has **been revoked**
+    // (2026-06-09). It would overwrite an existing file and could lose existing content not
+    // present in the Add content (a destructive downgrade); it also robbed the model of the
+    // chance to self-correct into a **targeted Update** (lossless) after seeing `already
+    // exists`. Changed to pass through as-is, letting Codex report `already exists` so the model can self-correct.
     //
-    // 状态改写规则 → **fresh_cwd**(防 stale 删错文件,见上)。
+    // State-rewriting rules -> **fresh_cwd** (guards against deleting the wrong file under a stale cwd, see above).
     let (s_f, r_f) = recover_update_empty_file(&s, fresh_cwd);
     s = s_f;
     repairs.extend(r_f);
@@ -327,7 +386,7 @@ pub fn optimize_patch(v4a: &str, cwd: Option<&str>, json_complete: bool) -> (Str
     s = s3;
     repairs.extend(r3);
 
-    // byte-exact 对齐规则 → 传 fresh_cwd 作 primary,内部 read_patch_file 再查候选历史(最坏安全 no-op)。
+    // Byte-exact alignment rules -> pass fresh_cwd as primary, internally read_patch_file also checks the candidate history (worst case a safe no-op).
     let (s_h, r_h) = align_at_headers(&s, fresh_cwd);
     s = s_h;
     repairs.extend(r_h);
@@ -340,7 +399,7 @@ pub fn optimize_patch(v4a: &str, cwd: Option<&str>, json_complete: bool) -> (Str
     s = s2;
     repairs.extend(r2);
 
-    // ── 信封补全放最后:包裹 Tier B 可能新增的 Delete+Add 等结构 ──
+    // -- Envelope completion goes last: it wraps structures like Delete+Add that Tier B may have added --
     if json_complete {
         let (s4, r4) = ensure_v4a_envelope(&s);
         s = s4;
@@ -396,10 +455,12 @@ fn diagnose_absolute_paths(v4a: &str, primary: Option<&str>) -> Vec<Repair> {
     repairs
 }
 
-/// **规则:双边 `@@ … @@` → 单边 `@@ …`**(prompt gotcha #1 / chat-path #1)。V4A 的 `@@` 是
-/// **单边** anchor(`@@ <header>`);模型常写成双边 `@@ <header> @@`,Codex 把尾部 `@@` 当字面文本
-/// → `Failed to find context '... @@'`。仅处理**列 0 的 `@@` 头行**(正文行有 `+`/`-`/空格 前缀,不碰),
-/// 去掉尾部 `@@` 及其前导空白;**裸 `@@`(section 分隔)不动**。
+/// **Rule: both-sided `@@ … @@` -> single-sided `@@ …`** (prompt gotcha #1 / chat-path #1).
+/// V4A's `@@` is a **single-sided** anchor (`@@ <header>`); the model often writes a
+/// both-sided `@@ <header> @@`, and Codex treats the trailing `@@` as literal text ->
+/// `Failed to find context '... @@'`. Only handles **column-0 `@@` header lines** (body lines
+/// have a `+`/`-`/space prefix and are untouched), stripping the trailing `@@` and its leading
+/// whitespace; a **bare `@@`** (section separator) is left alone.
 fn strip_trailing_at(v4a: &str) -> (String, Vec<Repair>) {
     let mut changed = 0usize;
     let out: Vec<String> = v4a
@@ -407,7 +468,7 @@ fn strip_trailing_at(v4a: &str) -> (String, Vec<Repair>) {
         .map(|l| {
             if l.starts_with("@@") {
                 let t = l.trim_end();
-                // 裸 `@@`(len==2)是合法 section 分隔,跳过;`@@ x @@` 才去尾。
+                // A bare `@@` (len==2) is a valid section separator, skip it; only `@@ x @@` gets its tail stripped.
                 if t.len() > 2 && t.ends_with("@@") {
                     let body = t[..t.len() - 2].trim_end();
                     if !body.is_empty() && body != "@@" {
@@ -427,7 +488,7 @@ fn strip_trailing_at(v4a: &str) -> (String, Vec<Repair>) {
         vec![Repair {
             file: "(@@ header)".to_owned(),
             kind: "repaired".to_owned(),
-            detail: format!("双边 @@ → 单边: {changed} 行(prompt gotcha #1)"),
+            detail: format!("both-sided @@ -> single-sided: {changed} line(s) (prompt gotcha #1)"),
         }]
     } else {
         Vec::new()
@@ -446,9 +507,9 @@ fn normalized_diff_path(path: &str) -> Option<String> {
     Some(p.to_string())
 }
 
-/// Gemini 在非原生 OpenAI apply_patch tool 上常把补丁写成 unified diff:
-/// `--- path` / `+++ path` / `@@ -a,+b`。Codex V4A 需要文件操作头
-/// `*** Update File: path`,所以这里只做无语义损失的头部转换。
+/// Gemini often writes patches as a unified diff on the non-native OpenAI apply_patch tool:
+/// `--- path` / `+++ path` / `@@ -a,+b`. Codex V4A needs the file-operation header
+/// `*** Update File: path`, so this only does a lossless header conversion.
 fn convert_unified_file_headers(v4a: &str) -> (String, Vec<Repair>) {
     let lines: Vec<&str> = v4a.lines().collect();
     let mut out: Vec<String> = Vec::with_capacity(lines.len());
@@ -550,8 +611,8 @@ fn is_unified_hunk_range_header(line: &str) -> bool {
         && is_unified_range_token(new_range, '+')
 }
 
-/// unified diff 的 `@@ -1,2 +1,3` 行号头不是 V4A anchor。Codex 会把 `@@ <text>`
-/// 当成要查找的文本上下文,所以这里将纯行号范围规整为裸 `@@`。
+/// A unified diff's `@@ -1,2 +1,3` line-number header is not a V4A anchor. Codex treats
+/// `@@ <text>` as text context to search for, so a pure line-number range is normalized here into a bare `@@`.
 fn strip_unified_hunk_ranges(v4a: &str) -> (String, Vec<Repair>) {
     let mut changed = 0usize;
     let out: Vec<String> = v4a
@@ -573,7 +634,7 @@ fn strip_unified_hunk_ranges(v4a: &str) -> (String, Vec<Repair>) {
         vec![Repair {
             file: "(@@ range header)".to_owned(),
             kind: "repaired".to_owned(),
-            detail: format!("unified @@ 行号范围 -> V4A 裸 @@: {changed} 行"),
+            detail: format!("unified @@ line-number range -> V4A bare @@: {changed} line(s)"),
         }]
     } else {
         Vec::new()
@@ -581,8 +642,9 @@ fn strip_unified_hunk_ranges(v4a: &str) -> (String, Vec<Repair>) {
     (joined, repairs)
 }
 
-/// 发送给 Codex 自定义 apply_patch 前的后验校验。发现明确非法的 V4A 时,调用方应把该工具项
-/// 标成 incomplete,避免 Codex 执行后再把失败历史喂回模型形成循环。
+/// Post-hoc validation before sending to Codex's custom apply_patch. When a clearly invalid V4A
+/// is found, the caller should mark that tool item as incomplete, avoiding a loop where Codex
+/// executes it and the failure history gets fed back to the model.
 pub fn validate_v4a_for_codex(v4a: &str) -> Option<(usize, String)> {
     let meaningful: Vec<(usize, &str)> = v4a
         .lines()
@@ -680,10 +742,12 @@ pub fn validate_v4a_for_codex(v4a: &str) -> Option<(usize, String)> {
     None
 }
 
-/// **规则 G:Add File 内容行漏 `+` 前缀 → 补全**(grammar `add_hunk: … add_line+`、
-/// `add_line: "+" /(.*)/`)。Add File 语义 = 后续每行都是新文件的**字面内容**、必须 `+` 前缀;
-/// 模型偶尔漏写 `+` → Codex 不认作内容。Add File section 内**无歧义**(全是新增),给非 `+` 行
-/// 统一补 `+`(空行 → 裸 `+`);已是 `+` 的不动(不重复成 `++`)。纯字符串、不读盘。
+/// **Rule G: an Add File content line missing its `+` prefix -> filled in** (grammar
+/// `add_hunk: … add_line+`, `add_line: "+" /(.*)/`). Add File semantics = every following line
+/// is the new file's **literal content**, and must have a `+` prefix; the model occasionally
+/// forgets the `+` -> Codex doesn't recognize it as content. There is **no ambiguity** inside an
+/// Add File section (everything is added), so every non-`+` line uniformly gets a `+` prefix
+/// (a blank line -> a bare `+`); a line that already has `+` is left alone (never doubled into `++`). Pure string work, no disk reads.
 fn ensure_add_file_plus(v4a: &str) -> (String, Vec<Repair>) {
     if !v4a.contains("*** Add File:") {
         return (v4a.to_owned(), Vec::new());
@@ -697,7 +761,7 @@ fn ensure_add_file_plus(v4a: &str) -> (String, Vec<Repair>) {
             out.push(lines[i].to_owned()); // header
             i += 1;
             let mut fixed = 0usize;
-            // body 到下一个 `*** ` 控制行 / EOF;Add File body 全是 `+` 内容行。
+            // body up to the next `*** ` control line / EOF; the Add File body is entirely `+` content lines.
             while i < lines.len() && !lines[i].starts_with("*** ") {
                 if lines[i].starts_with('+') {
                     out.push(lines[i].to_owned());
@@ -711,7 +775,7 @@ fn ensure_add_file_plus(v4a: &str) -> (String, Vec<Repair>) {
                 repairs.push(Repair {
                     file: path.trim().to_owned(),
                     kind: "repaired".to_owned(),
-                    detail: format!("Add File {fixed} 行漏 `+` 前缀 → 补全(lark add_line)"),
+                    detail: format!("Add File: {fixed} line(s) missing `+` prefix -> filled in (lark add_line)"),
                 });
             }
         } else {
@@ -726,11 +790,14 @@ fn ensure_add_file_plus(v4a: &str) -> (String, Vec<Repair>) {
     (joined, repairs)
 }
 
-/// **规则:`@@ <header>` 锚点对齐文件真实行**(真机 seq181:`Failed to find context 'X'`)。
-/// V4A 的 `@@ <header>` 是单边锚点,Codex 按**精确整行**匹配文件里的 section 行;模型常写**残缺**
-/// 头(如 `@@ 系统架构建议`,而文件真实行是 `## 6. 系统架构建议`)→ 找不到锚点。当 `<header>` 不是
-/// 文件里任何**整行**、但**恰好唯一包含于**某一文件行时,把 `@@ <header>` 对齐成 `@@ <该文件整行>`;
-/// 0 个 / 多个包含 → 歧义,原样放行(不猜)。裸 `@@`(无 header)不动。需 `cwd`。
+/// **Rule: align a `@@ <header>` anchor to the file's real line** (live-traffic seq181:
+/// `Failed to find context 'X'`). V4A's `@@ <header>` is a single-sided anchor, and Codex
+/// matches it against a section line in the file by **exact full line**; the model often writes
+/// a **truncated** header (e.g. `@@ Architecture Overview` when the file's real line is
+/// `## 6. Architecture Overview`) -> the anchor can't be found. When `<header>` doesn't match
+/// any **full line** in the file, but is **contained in exactly one** file line, `@@ <header>`
+/// is aligned to `@@ <that file's full line>`; 0 or multiple matches -> ambiguous, passed
+/// through as-is (never guessed). A bare `@@` (no header) is untouched. Needs `cwd`.
 fn align_at_headers(v4a: &str, cwd: Option<&str>) -> (String, Vec<Repair>) {
     if !has_cwd_candidate(cwd) {
         return (v4a.to_owned(), Vec::new());
@@ -747,7 +814,7 @@ fn align_at_headers(v4a: &str, cwd: Option<&str>) -> (String, Vec<Repair>) {
     let mut i = 0;
     while i < lines.len() {
         if let Some(path) = lines[i].strip_prefix("*** Update File: ") {
-            // 切到新 Update File section → 按候选 cwd + 锚点 probe 解析目标文件(MOC-263 P1/P2)
+            // Switching to a new Update File section -> resolve the target file by candidate cwd + anchor probe (MOC-263 P1/P2)
             let mut se = i + 1;
             while se < lines.len() && !lines[se].starts_with("*** ") {
                 se += 1;
@@ -761,7 +828,7 @@ fn align_at_headers(v4a: &str, cwd: Option<&str>) -> (String, Vec<Repair>) {
             i += 1;
             continue;
         }
-        // `@@ <header>` 锚点(非裸 `@@`),且文件已载入
+        // A `@@ <header>` anchor (not a bare `@@`), and the file has been loaded
         if have_file {
             if let Some(header) = lines[i].strip_prefix("@@ ") {
                 let h = header.trim();
@@ -784,7 +851,7 @@ fn align_at_headers(v4a: &str, cwd: Option<&str>) -> (String, Vec<Repair>) {
         repairs.push(Repair {
             file: "(@@ anchor)".to_owned(),
             kind: "repaired".to_owned(),
-            detail: format!("@@ 锚点残缺 → 对齐文件真实整行: {fixed} 处(Failed to find context)"),
+            detail: format!("@@ anchor truncated -> aligned to file's real full line: {fixed} occurrence(s) (Failed to find context)"),
         });
     }
     let mut joined = out.join("\n");
@@ -794,11 +861,14 @@ fn align_at_headers(v4a: &str, cwd: Option<&str>) -> (String, Vec<Repair>) {
     (joined, repairs)
 }
 
-/// **规则:`Update File` 目标是空文件 → `Delete File + Add File`**(prompt gotcha #3,无损)。
-/// `*** Update File:` 无法作用于空文件(Codex 报 `cannot operate on a completely empty file`)。
-/// 当目标文件存在且**为空**(真正 0 字节,非纯空白)、且 Update body 是**纯 `+` 行**(纯写内容,无 `-`/context 可
-/// 匹配)时,转成 `*** Delete File: X` + `*** Add File: X` + 原 `+` body(空文件无内容可丢 → 无损)。
-/// body 含 `-`/context(模型在空文件上写了匹配行,本就矛盾)/ 含 Move(交给 empty-move 规则)→ 不动。需 `cwd`。
+/// **Rule: an `Update File` target that is an empty file -> `Delete File + Add File`** (prompt
+/// gotcha #3, lossless). `*** Update File:` can't operate on an empty file (Codex reports
+/// `cannot operate on a completely empty file`). When the target file exists and **is empty**
+/// (genuinely 0 bytes, not just whitespace) and the Update body is **pure `+` lines** (pure
+/// content, no `-`/context to match), it's converted into `*** Delete File: X` +
+/// `*** Add File: X` + the original `+` body (an empty file has no content to lose ->
+/// lossless). If the body contains `-`/context (the model wrote match lines against an empty
+/// file, which is already contradictory) or a Move (left to the empty-move rule) -> untouched. Needs `cwd`.
 fn recover_update_empty_file(v4a: &str, cwd: Option<&str>) -> (String, Vec<Repair>) {
     let Some(cwd) = cwd else {
         return (v4a.to_owned(), Vec::new());
@@ -813,9 +883,10 @@ fn recover_update_empty_file(v4a: &str, cwd: Option<&str>) -> (String, Vec<Repai
     while i < lines.len() {
         if let Some(path) = lines[i].strip_prefix("*** Update File: ") {
             let p = path.trim();
-            // 只认**真正 0 字节**(Codex 仅对 `completely empty file` 报错;纯空白文件仍是可读内容、
-            // 能正常 Update)。用 `c.trim().is_empty()` 会把纯空白文件也转 Delete+Add → 丢掉那些
-            // 空白字节(破坏性,codex-connector #435 P2)。
+            // Only recognizes **genuinely 0 bytes** (Codex only errors on a `completely empty
+            // file`; a whitespace-only file is still readable content and Updates normally).
+            // Using `c.trim().is_empty()` would also convert whitespace-only files to
+            // Delete+Add -> losing those whitespace bytes (destructive, codex-connector #435 P2).
             let is_empty = std::fs::read_to_string(resolve_path(p, cwd))
                 .map(|c| c.is_empty())
                 .unwrap_or(false);
@@ -846,7 +917,7 @@ fn recover_update_empty_file(v4a: &str, cwd: Option<&str>) -> (String, Vec<Repai
                     repairs.push(Repair {
                         file: p.to_owned(),
                         kind: "repaired".to_owned(),
-                        detail: "Update 空文件 → Delete+Add 写入(prompt gotcha #3)".to_owned(),
+                        detail: "Update of an empty file -> written as Delete+Add (prompt gotcha #3)".to_owned(),
                     });
                     i = j;
                     continue;
@@ -863,10 +934,11 @@ fn recover_update_empty_file(v4a: &str, cwd: Option<&str>) -> (String, Vec<Repai
     (joined, repairs)
 }
 
-/// **规则:空 `Update File + Move to`(rename-only)→ `Delete File + Add File`**(prompt gotcha #7)。
-/// 模型想纯重命名却写 `*** Update File: X` + `*** Move to: Y` 且**无 hunk** → Codex 报
-/// `Update file hunk for path 'X' is empty`。按 prompt **自身建议**恢复:读 X 原内容,转成
-/// `*** Delete File: X` + `*** Add File: Y` + 逐行 `+` 复制(空行为裸 `+`)。读不到 X → 原样放行。
+/// **Rule: an empty `Update File + Move to` (rename-only) -> `Delete File + Add File`** (prompt
+/// gotcha #7). The model wants a pure rename but writes `*** Update File: X` +
+/// `*** Move to: Y` with **no hunk** -> Codex reports `Update file hunk for path 'X' is empty`.
+/// Recovered per the prompt's **own suggestion**: read X's original content, convert to
+/// `*** Delete File: X` + `*** Add File: Y` + copy line-by-line with `+` (a blank line becomes a bare `+`). If X can't be read -> passed through as-is.
 fn recover_empty_move(v4a: &str, cwd: Option<&str>) -> (String, Vec<Repair>) {
     let Some(cwd) = cwd else {
         return (v4a.to_owned(), Vec::new());
@@ -879,14 +951,17 @@ fn recover_empty_move(v4a: &str, cwd: Option<&str>) -> (String, Vec<Repair>) {
     let mut repairs = Vec::new();
     let mut i = 0;
     while i < lines.len() {
-        // 匹配 `*** Update File: X` 紧跟 `*** Move to: Y`,且 Move 后到下一个 `*** ` 控制行之间无 hunk 行。
+        // Matches `*** Update File: X` immediately followed by `*** Move to: Y`, with no hunk lines between Move and the next `*** ` control line.
         if let Some(old) = lines[i].strip_prefix("*** Update File: ") {
             if i + 1 < lines.len() {
                 if let Some(new) = lines[i + 1].strip_prefix("*** Move to: ") {
-                    // 看 Move 之后、下一个**文件操作**控制行之前有没有 hunk 内容行。
-                    // 注:`*** End of File` 是文档化的 **hunk 内标记**(prompt RENAME/MOVE 段),不是
-                    // section 边界 —— 不能停在它(否则 rename+EOF 追加会被误判成空 rename、转成丢内容的
-                    // Delete+Add,codex-connector #435 P1)。它本身即表示「有 hunk」,继续往后扫。
+                    // Checks whether there's any hunk content line after Move and before the
+                    // next **file operation** control line. Note: `*** End of File` is a
+                    // documented **in-hunk marker** (from the prompt's RENAME/MOVE section), not
+                    // a section boundary -- scanning must not stop there (otherwise a
+                    // rename+EOF-append would be misjudged as an empty rename and converted into
+                    // a content-losing Delete+Add, codex-connector #435 P1). It itself signals
+                    // "there is a hunk", so scanning continues past it.
                     let mut j = i + 2;
                     let mut has_hunk = false;
                     while j < lines.len() {
@@ -897,7 +972,7 @@ fn recover_empty_move(v4a: &str, cwd: Option<&str>) -> (String, Vec<Repair>) {
                             continue;
                         }
                         if t.starts_with("*** ") {
-                            break; // 真正的下一个文件操作 / End Patch 边界
+                            break; // the real next file operation / End Patch boundary
                         }
                         if t.starts_with('+')
                             || t.starts_with('-')
@@ -909,8 +984,10 @@ fn recover_empty_move(v4a: &str, cwd: Option<&str>) -> (String, Vec<Repair>) {
                         j += 1;
                     }
                     if !has_hunk {
-                        // 空 rename-only → 读原文件转 Delete+Add。读不到 / 内容为空 → 不转(空 Add File
-                        // 体可能被 Codex 拒)→ 原样放行交 Codex 处理。
+                        // An empty rename-only -> read the original file and convert to
+                        // Delete+Add. If it can't be read / content is empty -> don't convert
+                        // (an empty Add File body might be rejected by Codex) -> passed through
+                        // as-is for Codex to handle.
                         let abs = resolve_path(old.trim(), cwd);
                         match std::fs::read_to_string(&abs) {
                             Ok(content) if !content.is_empty() => {
@@ -923,18 +1000,18 @@ fn recover_empty_move(v4a: &str, cwd: Option<&str>) -> (String, Vec<Repair>) {
                                     file: old.trim().to_owned(),
                                     kind: "repaired".to_owned(),
                                     detail: format!(
-                                        "空 Update+Move(rename-only)→ Delete+Add 复制原内容 → {}(prompt gotcha #7)",
+                                        "empty Update+Move (rename-only) -> Delete+Add copying original content -> {}(prompt gotcha #7)",
                                         new.trim()
                                     ),
                                 });
-                                i = j; // 跳过原 Update/Move(+空体)
+                                i = j; // skip the original Update/Move (+ empty body)
                                 continue;
                             }
                             _ => {
                                 repairs.push(Repair {
                                     file: old.trim().to_owned(),
                                     kind: "skipped:unreadable_or_empty".to_owned(),
-                                    detail: "空 Update+Move 但原文件读不到 / 为空 → 原样放行"
+                                    detail: "empty Update+Move but the original file couldn't be read / was empty -> passed through as-is"
                                         .to_owned(),
                                 });
                             }
@@ -953,11 +1030,15 @@ fn recover_empty_move(v4a: &str, cwd: Option<&str>) -> (String, Vec<Repair>) {
     (joined, repairs)
 }
 
-/// 末个 patch 操作是否为「`*** Add File:` + 代码/结构化配置文件目标」。用于 [`ensure_v4a_envelope`] 判定
-/// 末行 `+*** End Patch` 可否安全剥成终止符:**仅 Add File**(新建文件,裸 `*** End Patch` 不可能是合法
-/// 源码的**末行** → 必是误前缀终止符)才剥;`*** Update File:` 的 `+*** End Patch` 是**新增行**(可能往
-/// 字符串 / fixture 里加这串字),剥了=丢新增 → 不剥(chatgpt-codex-connector review:限定 Add File)。
-/// 文档 / 文本 / 未知扩展也不剥(可能是正文,留 incomplete 不猜)。allowlist 保守。MOC-268。
+/// Whether the last patch operation is "`*** Add File:` targeting a code / structured config
+/// file". Used by [`ensure_v4a_envelope`] to decide whether the last line `+*** End Patch` can
+/// safely be stripped into a terminator: it's stripped **only for Add File** (a new file, where
+/// a bare `*** End Patch` can never legitimately be the **last line** of real source code -> it
+/// must be a mis-prefixed terminator); for `*** Update File:`, a `+*** End Patch` is an
+/// **added line** (it could genuinely be adding this string into a string literal / fixture),
+/// so stripping it would drop real content -> not stripped (chatgpt-codex-connector review:
+/// restricted to Add File). Docs / text / unknown extensions are also not stripped (could be
+/// real body content, left as incomplete rather than guessed). The allowlist is conservative. MOC-268.
 fn last_op_is_add_file_code(body: &str) -> bool {
     let last_op = body.lines().rev().find(|l| {
         let t = l.trim_end();
@@ -966,7 +1047,7 @@ fn last_op_is_add_file_code(body: &str) -> bool {
             || t.starts_with("*** Delete File: ")
     });
     let Some(path) = last_op.and_then(|l| l.trim_end().strip_prefix("*** Add File: ")) else {
-        return false; // 无操作,或末操作是 Update/Delete(非 Add File)→ 不剥
+        return false; // no operation, or the last operation is Update/Delete (not Add File) -> don't strip
     };
     let ext = std::path::Path::new(path.trim())
         .extension()
@@ -1025,15 +1106,18 @@ fn last_op_is_add_file_code(body: &str) -> bool {
     )
 }
 
-/// **缺信封自动补全**:模型常只写 `*** Add/Update File:` + 内容,漏掉 `*** Begin Patch` /
-/// `*** End Patch` 头尾 → Codex(及本 adapter 的 V4A 校验)判 incomplete → 模型被迫重试。
-/// 当 patch 含至少一个 `*** Add/Update/Delete File:` 操作、JSON 已完整(调用方先 gate
-/// `detect_json_truncation` 为 None 才调本函数,确保不是流式截断)、但缺 Begin/End 信封时,
-/// **纯补标记**(不改一字节内容、不猜),返回 `(补全后, Some(Repair))`;本就完整 / 非 patch 体
-/// 返回 `(原样, None)`。
+/// **Auto-completes a missing envelope**: the model often writes only `*** Add/Update File:` +
+/// content, omitting the `*** Begin Patch` / `*** End Patch` header/footer -> Codex (and this
+/// adapter's V4A validation) judges it incomplete -> the model is forced to retry. When the
+/// patch contains at least one `*** Add/Update/Delete File:` operation, the JSON is already
+/// complete (the caller gates on `detect_json_truncation` being None before calling this
+/// function, ensuring it's not a streaming truncation), but the Begin/End envelope is missing,
+/// this **purely adds the markers** (changes not a single byte of content, never guesses) and
+/// returns `(completed, Some(Repair))`; if it's already complete / not a patch body, returns `(as-is, None)`.
 ///
-/// 安全:缺 Begin 时**仅当首个非空行就是操作行**才在最前补 `*** Begin Patch`(有前导散文则不动,
-/// 交给 `repair_v4a_envelope` / Codex);缺 End 时去尾随空白后补 `*** End Patch`。
+/// Safety: when Begin is missing, `*** Begin Patch` is only prepended **when the first
+/// non-empty line is itself an operation line** (if there's leading prose, it's left untouched,
+/// for `repair_v4a_envelope` / Codex to handle); when End is missing, `*** End Patch` is appended after trimming trailing whitespace.
 pub fn ensure_v4a_envelope(input: &str) -> (String, Option<Repair>) {
     let is_op = |l: &str| {
         let t = l.trim_end();
@@ -1042,7 +1126,7 @@ pub fn ensure_v4a_envelope(input: &str) -> (String, Option<Repair>) {
             || t.starts_with("*** Delete File:")
     };
     if !input.lines().any(is_op) {
-        return (input.to_owned(), None); // 不是可识别的 patch 体,不碰
+        return (input.to_owned(), None); // not a recognizable patch body, leave it untouched
     }
     let has_begin = input.lines().any(|l| l.trim_end() == "*** Begin Patch");
     let has_end = input.lines().any(|l| l.trim_end() == "*** End Patch");
@@ -1052,7 +1136,7 @@ pub fn ensure_v4a_envelope(input: &str) -> (String, Option<Repair>) {
     let mut body = input.to_owned();
     let mut added: Vec<&str> = Vec::new();
     if !has_begin {
-        // 仅当首个非空行就是操作行才安全(无前导散文混入信封内)。
+        // Only safe when the first non-empty line is itself an operation line (no leading prose mixed into the envelope).
         let first_nonempty = input.lines().find(|l| !l.trim().is_empty()).unwrap_or("");
         if !is_op(first_nonempty) {
             return (input.to_owned(), None);
@@ -1063,21 +1147,27 @@ pub fn ensure_v4a_envelope(input: &str) -> (String, Option<Repair>) {
     if !has_end {
         let trimmed = body.trim_end();
         let last = trimmed.lines().last().unwrap_or("");
-        // [MOC-268] **只有 `+*** End Patch`(Add 行前缀)** 才是「模型给终止符误加前缀」的形态。
-        // ` *** End Patch`(context)/ `-*** End Patch`(deletion)是**合法 Update hunk 行**——例如模型
-        // 用 Update **删除**文件里之前残留的 `*** End Patch`(`-*** End Patch`),或用它当 context 锚点;
-        // 把它们当终止符剥会**静默丢弃删除 / 破坏锚点**(chatgpt-codex-connector review)→ 故 ` `/`-` 一律
-        // 走下面正常 append(补真终止符,hunk 行原样保留)。
-        // 对 `+*** End Patch` 再**按文件类型消歧**(用户拍板):
-        //   · 代码 / 结构化配置文件(裸 `*** End Patch` 不可能是合法源码末行)→ 必是误前缀终止符 → **剥前缀**
-        //     (`head` 切到末行起点、保留其前换行;末行 ASCII,边界安全)。
-        //   · 文档 / 文本 / 未知(可能是正文末行)→ **不猜**:不剥(免删正文)、不追加(免残留),留 incomplete
-        //     交下游判截断、模型按 guidance 规则2 重发。prompt 才是根治,中间层只在确定安全时介入。
+        // [MOC-268] **Only `+*** End Patch`** (an Add-line-prefixed terminator) is the shape of
+        // "the model mis-prefixed the terminator". ` *** End Patch` (context) / `-*** End Patch`
+        // (deletion) are **legitimate Update hunk lines** -- for example the model using Update
+        // to **delete** a `*** End Patch` left over in the file (`-*** End Patch`), or using it
+        // as a context anchor; treating them as a terminator and stripping them would **silently
+        // drop the deletion / break the anchor** (chatgpt-codex-connector review) -> so ` `/`-`
+        // always go through the normal append path below (a real terminator is added, hunk lines are kept as-is).
+        // `+*** End Patch` is further **disambiguated by file type** (per the user's decision):
+        //   - Code / structured config files (a bare `*** End Patch` can never legitimately be
+        //     the last line of real source code) -> it must be a mis-prefixed terminator ->
+        //     **strip the prefix** (`head` cuts to the start of the last line, keeping the
+        //     newline before it; the last line is ASCII, so the boundary is safe).
+        //   - Docs / text / unknown (could be a real body line) -> **never guess**: don't strip
+        //     (avoids deleting real content), don't append (avoids leaving a residual line),
+        //     leave it incomplete for downstream truncation handling, letting the model resend
+        //     per guidance rule 2. The prompt is the real fix; the middleware only steps in when it's certain it's safe.
         if last == "+*** End Patch" {
             if last_op_is_add_file_code(&body) {
                 let head = &trimmed[..trimmed.len() - last.len()];
                 body = format!("{head}*** End Patch");
-                added.push("End Patch(代码文件·剥误加前缀终止符)");
+                added.push("End Patch (code file: stripped mis-added prefix terminator)");
             } else {
                 return (
                     body,
@@ -1085,13 +1175,13 @@ pub fn ensure_v4a_envelope(input: &str) -> (String, Option<Repair>) {
                         file: "(envelope)".to_owned(),
                         kind: "skipped:ambiguous_prefixed_end".to_owned(),
                         detail:
-                            "末行 +*** End Patch 且目标非代码文件(可能是正文)→ 不猜不补全,留 incomplete"
+                            "last line is +*** End Patch and the target is not a code file (could be real content) -> not guessed or completed, left incomplete"
                                 .to_owned(),
                     }),
                 );
             }
         } else {
-            // 含 ` *** End Patch` / `-*** End Patch`(合法 hunk 行)及普通内容末行 → 正常补真终止符。
+            // Contains ` *** End Patch` / `-*** End Patch` (legitimate hunk lines) or an ordinary content last line -> the real terminator is appended normally.
             body = format!("{trimmed}\n*** End Patch");
             added.push("End Patch");
         }
@@ -1101,20 +1191,26 @@ pub fn ensure_v4a_envelope(input: &str) -> (String, Option<Repair>) {
         Some(Repair {
             file: "(envelope)".to_owned(),
             kind: "repaired".to_owned(),
-            detail: format!("模型漏写信封,自动补全: {}", added.join(" + ")),
+            detail: format!("model omitted the envelope, auto-completed: {}", added.join(" + ")),
         }),
     )
 }
 
-/// **规则:Update body 内**无前缀行**按文件判定补全**(真机 seq235:单行漏前缀 → validate 拒 →
-/// 整份 Update 重写浪费)。grammar `change_line: ("+"|"-"|" ") /(.*)/` 要求每行带前缀;模型偶尔
-/// 漏写一行的前缀。**非破坏性**修(只补前缀 / 删可证重复的废行,绝不丢内容):
-/// - 无前缀行**与相邻 `+<同内容>` 行重复**(模型写了两遍)→ 删该废行(内容在 `+` 行里,不丢);
-/// - 否则无前缀**非空**行**在目标文件里有完全相同的整行** → 它是 context 行漏了空格 → 补 ` `
-///   (合法 context 且 byte-exact;最不破坏的解释:行保留。模型若本意是删,顶多没删成、无数据损失);
-/// - 其余(不在文件、非重复、空行)→ 原样透过,交 validate 报错让模型自纠(不猜)。
+/// **Rule: an unprefixed line inside an Update body is completed based on the file** (live
+/// traffic seq235: a single unprefixed line -> validate rejects it -> the whole Update gets
+/// rewritten, wasted effort). The grammar `change_line: ("+"|"-"|" ") /(.*)/` requires every
+/// line to have a prefix; the model occasionally forgets one line's prefix. This is a
+/// **non-destructive** repair (only fills in a prefix / drops a provably duplicate stale line,
+/// never drops content):
+/// - An unprefixed line **duplicating an adjacent `+<same content>` line** (the model wrote it
+///   twice) -> that stale line is dropped (the content lives in the `+` line, nothing is lost);
+/// - Otherwise, an unprefixed **non-empty** line that **matches a full line in the target file
+///   exactly** -> it's a context line missing its space -> a ` ` is filled in (a legitimate,
+///   byte-exact context; the least destructive interpretation: the line is kept. If the model
+///   actually meant to delete it, at worst the deletion just didn't happen, no data is lost);
+/// - Everything else (not in the file, not a duplicate, blank line) -> passed through as-is, letting validate error out so the model self-corrects (never guessed).
 ///
-/// 仅作用于 `*** Update File:` section(Add File 的漏 `+` 由 [`ensure_add_file_plus`] 管)。需 `cwd`。
+/// Only applies inside a `*** Update File:` section (a missing `+` in Add File is handled by [`ensure_add_file_plus`]). Needs `cwd`.
 fn fix_unprefixed_lines(v4a: &str, cwd: Option<&str>) -> (String, Vec<Repair>) {
     if !has_cwd_candidate(cwd) {
         return (v4a.to_owned(), Vec::new());
@@ -1134,7 +1230,7 @@ fn fix_unprefixed_lines(v4a: &str, cwd: Option<&str>) -> (String, Vec<Repair>) {
         let l = lines[i];
         if let Some(path) = l.strip_prefix("*** Update File: ") {
             in_update = true;
-            // 按候选 cwd + 锚点 probe 解析目标文件(MOC-263 P1/P2)。
+            // Resolve the target file by candidate cwd + anchor probe (MOC-263 P1/P2).
             let mut se = i + 1;
             while se < lines.len() && !lines[se].starts_with("*** ") {
                 se += 1;
@@ -1148,7 +1244,7 @@ fn fix_unprefixed_lines(v4a: &str, cwd: Option<&str>) -> (String, Vec<Repair>) {
             continue;
         }
         if l.starts_with("*** ") {
-            in_update = false; // 任何其它控制行结束 Update body
+            in_update = false; // any other control line ends the Update body
             out.push(l.to_owned());
             i += 1;
             continue;
@@ -1158,7 +1254,7 @@ fn fix_unprefixed_lines(v4a: &str, cwd: Option<&str>) -> (String, Vec<Repair>) {
             || l.starts_with("@@")
             || l.is_empty();
         if in_update && !valid {
-            // case1:与相邻 `+<同内容>` 重复的废行 → 删(内容在 + 行里,不丢)
+            // case 1: a stale line duplicating an adjacent `+<same content>` -> drop it (the content lives in the + line, nothing is lost)
             let plus_dup = format!("+{l}");
             let next_dup = lines.get(i + 1).map(|n| *n == plus_dup).unwrap_or(false);
             let prev_dup = out.last().map(|o| o == &plus_dup).unwrap_or(false);
@@ -1167,14 +1263,14 @@ fn fix_unprefixed_lines(v4a: &str, cwd: Option<&str>) -> (String, Vec<Repair>) {
                 i += 1;
                 continue;
             }
-            // case2:文件里有完全相同整行 → context 漏空格 → 补 ` `
+            // case 2: an identical full line exists in the file -> context missing its space -> fill in ` `
             if file_lines.iter().any(|fl| fl == l) {
                 out.push(format!(" {l}"));
                 add_ctx += 1;
                 i += 1;
                 continue;
             }
-            // else:透过(不猜)
+            // else: pass through (never guess)
         }
         out.push(l.to_owned());
         i += 1;
@@ -1184,7 +1280,7 @@ fn fix_unprefixed_lines(v4a: &str, cwd: Option<&str>) -> (String, Vec<Repair>) {
             file: "(unprefixed)".to_owned(),
             kind: "repaired".to_owned(),
             detail: format!(
-                "Update 无前缀行修复: 补 context 空格 {add_ctx} / 删重复废行 {drop_dups}(lark change_line)"
+                "Update unprefixed-line repair: filled in context space {add_ctx} / dropped duplicate stale line {drop_dups} (lark change_line)"
             ),
         });
     }
@@ -1195,13 +1291,13 @@ fn fix_unprefixed_lines(v4a: &str, cwd: Option<&str>) -> (String, Vec<Repair>) {
     (joined, repairs)
 }
 
-/// 对 V4A patch 做 pre-flight 修复。`cwd` 用于把 patch 的相对路径解析到真实文件。
-/// 返回 `(修复后 V4A, 处理记录)`。无 cwd / 无 `Update File` / 读不到文件时 V4A 原样返回。
+/// Does pre-flight repair on a V4A patch. `cwd` is used to resolve the patch's relative paths
+/// to real files. Returns `(repaired V4A, processing records)`. With no cwd / no `Update File` / an unreadable file, the V4A is returned as-is.
 pub fn preflight_repair(v4a: &str, cwd: Option<&str>) -> (String, Vec<Repair>) {
     if !has_cwd_candidate(cwd) {
         return (v4a.to_owned(), Vec::new());
     }
-    // 没有任何 Update File 直接短路(Add/Delete File 不涉及锚点匹配)。
+    // Short-circuit immediately when there's no Update File at all (Add/Delete File don't involve anchor matching).
     if !v4a.contains("*** Update File:") {
         return (v4a.to_owned(), Vec::new());
     }
@@ -1214,7 +1310,7 @@ pub fn preflight_repair(v4a: &str, cwd: Option<&str>) -> (String, Vec<Repair>) {
         if let Some(path) = line.strip_prefix("*** Update File: ") {
             out.push(line.to_owned());
             i += 1;
-            // 收集本 Update File section 的 body(到下一个 `*** ` 控制行为止)。
+            // Collect this Update File section's body (up to the next `*** ` control line).
             let body_start = i;
             while i < lines.len() && !lines[i].starts_with("*** ") {
                 i += 1;
@@ -1228,7 +1324,7 @@ pub fn preflight_repair(v4a: &str, cwd: Option<&str>) -> (String, Vec<Repair>) {
             i += 1;
         }
     }
-    // 保留尾随换行语义:lines() 丢掉末尾换行,join 后若原文以 \n 结尾则补上。
+    // Preserve trailing-newline semantics: lines() drops the trailing newline, so add it back after join if the original text ended with \n.
     let mut joined = out.join("\n");
     if v4a.ends_with('\n') {
         joined.push('\n');
@@ -1236,17 +1332,24 @@ pub fn preflight_repair(v4a: &str, cwd: Option<&str>) -> (String, Vec<Repair>) {
     (joined, repairs)
 }
 
-/// [MOC-263 P0] 在 `file[floor..]` 里找从 `anchors[0]` 起、能**唯一**匹配的最长连续块。
-/// 锚点用「忽略尾随空格」比较(段内字节漂移留给后续 repair_hunk 对齐)。返回 `(块长 = 匹配的锚点数,
-/// 文件起点)`。最长且唯一 → Some;最长的非空匹配若 >1 处(歧义)→ None(更短只会更歧义);全 0 → None。
+/// [MOC-263 P0] Finds the longest contiguous block in `file[floor..]`, starting from
+/// `anchors[0]`, that matches **uniquely**. Anchors are compared "ignoring trailing whitespace"
+/// (in-block byte drift is left for the later repair_hunk alignment). Returns `(block length =
+/// number of anchors matched, file start position)`. Longest and unique -> Some; if the longest
+/// non-empty match occurs at >1 place (ambiguous) -> None (a shorter block would only be more
+/// ambiguous); all 0 -> None.
 fn longest_unique_block(anchors: &[&str], file: &[&str], floor: usize) -> Option<(usize, usize)> {
     if anchors.is_empty() || floor >= file.len() {
         return None;
     }
-    // [MOC-263 P1] 段首锚点必须在 `file[floor..]` **全局唯一**,否则该段起点歧义 —— 同一行在别处也出现时,
-    // 贪心最长块会靠更长块的"唯一性"选中**无关的更早区域**(file 有旧 `A/B/C` 块 + 真实 `A/B…gap…C/D`
-    // 区,body `A/-B/ C/-D` 被切成旧块的 hunk → 从错块删 B),而不切分时本会安全失败。起点不唯一 = 切分
-    // 非唯一确定 → bail,原样透过交模型自纠(chatgpt-codex-connector review;不猜不丢)。
+    // [MOC-263 P1] The segment's first anchor must be **globally unique** in `file[floor..]`,
+    // otherwise the segment's start point is ambiguous -- when the same line also occurs
+    // elsewhere, the greedy-longest-block search can use a longer block's "uniqueness" to pick
+    // an **unrelated, earlier region** (the file has a stale `A/B/C` block plus the real
+    // `A/B…gap…C/D` region; the body `A/-B/ C/-D` gets carved into the stale block's hunk ->
+    // deleting B from the wrong block), whereas without splitting this would have safely
+    // failed. A non-unique start point means the split isn't uniquely determined -> bail out,
+    // passing through as-is for the model to self-correct (chatgpt-codex-connector review; never guess, never drop).
     let first = anchors[0].trim_end();
     if file[floor..]
         .iter()
@@ -1272,20 +1375,25 @@ fn longest_unique_block(anchors: &[&str], file: &[&str], floor: usize) -> Option
         }
         match hits.len() {
             1 => return Some((len, hits[0])),
-            0 => continue,    // 太长(跨越文件里的跳变)→ 缩短再试
-            _ => return None, // 最长非空匹配即歧义 → 放弃(不猜不丢)
+            0 => continue,    // too long (spans a jump in the file) -> shorten and retry
+            _ => return None, // an ambiguous longest non-empty match -> give up (never guess, never drop)
         }
     }
     None
 }
 
-/// [MOC-263 P0] 把**无 `@@`** 的 Update body 按文件真实位置切成多个 hunk。
+/// [MOC-263 P0] Splits an Update body that has **no `@@`** into multiple hunks by the file's real positions.
 ///
-/// 真机最主要 apply 失败因(phase-1 seg1/seg3):模型把多个**不连续**编辑组拼进一个 Update File 块、
-/// 漏写 `@@` 分隔 → applier 把整块当一段连续上下文匹配 → `Failed to find expected lines`。
-/// 这里按锚点(context/delete)序列贪心切成**有序、不重叠、各自唯一匹配**的 N 段(每段 = 从上一段
-/// 之后起、唯一匹配的最长连续锚点块),`+` 新增行随相邻段保留。仅 **N≥2 且每段都能唯一定位**时返回
-/// `Some`;单段 / 任一段歧义或无法定位 → `None`(调用方原样透过,不猜不丢)。调用方用裸 `@@` 串接各段。
+/// The main live-traffic apply failure cause (phase-1 seg1/seg3): the model packs several
+/// **non-contiguous** edit groups into one Update File block, omitting the `@@` separator ->
+/// the applier treats the whole block as one contiguous context match ->
+/// `Failed to find expected lines`. This greedily splits the anchor (context/delete) sequence
+/// into **ordered, non-overlapping, each-uniquely-matching** N segments (each segment = the
+/// longest contiguous anchor block, uniquely matched, starting after the previous segment),
+/// with `+` added lines kept alongside the adjacent segment. Returns `Some` only when **N>=2
+/// and every segment can be uniquely located**; a single segment / any segment being ambiguous
+/// or unlocatable -> `None` (the caller passes it through as-is, never guessing, never
+/// dropping). The caller joins the segments with a bare `@@`.
 fn segment_no_at_body<'a>(body: &[&'a str], file: &[&str]) -> Option<Vec<Vec<&'a str>>> {
     let anchors: Vec<(usize, &str)> = body
         .iter()
@@ -1300,8 +1408,8 @@ fn segment_no_at_body<'a>(body: &[&'a str], file: &[&str]) -> Option<Vec<Vec<&'a
     }
     let anchor_contents: Vec<&str> = anchors.iter().map(|(_, c)| *c).collect();
 
-    // 贪心分段:每段 = 从 floor 起唯一匹配的最长连续锚点块。
-    // 记 (anchor_start, anchor_end_excl, file_start, file_end_excl);floor 单调推进保证有序不重叠。
+    // Greedy segmentation: each segment = the longest contiguous anchor block, uniquely matched, starting from floor.
+    // Recorded as (anchor_start, anchor_end_excl, file_start, file_end_excl); floor advances monotonically, guaranteeing order and no overlap.
     let mut raw: Vec<(usize, usize, usize, usize)> = Vec::new();
     let mut ai = 0usize;
     let mut floor = 0usize;
@@ -1312,9 +1420,11 @@ fn segment_no_at_body<'a>(body: &[&'a str], file: &[&str]) -> Option<Vec<Vec<&'a
         floor = pos + len;
     }
 
-    // 合并相邻段:段间 file 间隙若**全空行**(模型漏写文件里的空行)→ 同一 hunk,不在此切,
-    // 交 repair_hunk 的 EP-1 blank-tolerant 处理(否则会把空行漂移误切成两段,破坏既有行为)。
-    // 只在间隙含**非空行**(真·不连续编辑区域)时才保留为独立段。
+    // Merge adjacent segments: if the file gap between segments is **all blank lines** (the
+    // model omitted blank lines present in the file) -> treat as the same hunk, don't split
+    // here, leave it to repair_hunk's EP-1 blank-tolerant handling (otherwise blank-line drift
+    // would be wrongly split into two segments, breaking existing behavior). Only kept as a
+    // separate segment when the gap contains **non-blank lines** (a genuinely non-contiguous edit region).
     let mut groups: Vec<(usize, usize, usize, usize)> = Vec::new();
     for g in raw {
         if let Some(last) = groups.last_mut() {
@@ -1328,17 +1438,24 @@ fn segment_no_at_body<'a>(body: &[&'a str], file: &[&str]) -> Option<Vec<Vec<&'a
         groups.push(g);
     }
     if groups.len() < 2 {
-        return None; // 单段(或全因空行间隙合并成单段)→ 没必要切,交回常规路径
+        return None; // a single segment (or everything merged into one via blank-line gaps) -> no need to split, hand back to the regular path
     }
 
-    // [MOC-263 P0 安全防护] 段间「浮动 `+` 插入行」落点歧义 → 一律 bail。
-    // 若前段末锚点与后段首锚点之间存在**任何** `+` 新增行,该 `+` 的落点都无法从 V4A 唯一确定 ——
-    // 它可能是前段末尾的插入,也可能是模型写给后段的「引入行」;段间隔着非空内容时两种落点是文件里
-    // 不同位置,猜错就是**静默错误 apply**(违反不猜不丢)。**关键**:即便前段末锚点是 `-` 删除也不安全
-    // (chatgpt-codex-connector review 指出的混合 replace+insert:`-return 1`/`+return 42`/`+@memoize`/
-    // ` def beta():` —— `+return 42` 是替换、`+@memoize` 却是给后段的引入行,二者无法区分)→ 不做
-    // "前段有删除就放行"的豁免,只要 gap 里有 `+` 就放弃整次分段、原样透过(交模型自纠)。
-    // 纯删除 / 纯上下文的多区(gap 无 `+`)仍安全切。
+    // [MOC-263 P0 safety guard] A "floating `+` insertion line" between segments has an
+    // ambiguous landing spot -> always bail. If **any** `+` added line exists between the
+    // previous segment's last anchor and the next segment's first anchor, that `+`'s landing
+    // spot can't be uniquely determined from the V4A -- it could be an insertion at the end of
+    // the previous segment, or it could be a "lead-in line" the model wrote for the next
+    // segment; when non-blank content separates the segments, the two landing spots are
+    // different positions in the file, and guessing wrong is a **silent, incorrect apply**
+    // (violating never-guess-never-drop). **Critically**: this is unsafe even when the previous
+    // segment's last anchor is a `-` deletion (per chatgpt-codex-connector review's mixed
+    // replace+insert example: `-return 1`/`+return 42`/`+@memoize`/` def beta():` -- `+return
+    // 42` is a replacement, but `+@memoize` is a lead-in line for the next segment, and the two
+    // can't be told apart) -> so there's no "previous segment has a deletion, so it's fine"
+    // exemption; as soon as the gap contains a `+`, the whole split attempt is abandoned and
+    // passed through as-is (for the model to self-correct). Multiple regions that are purely
+    // deletion / purely context (no `+` in the gap) are still split safely.
     for gi in 0..groups.len() - 1 {
         let last_anchor_line = anchors[groups[gi].1 - 1].0;
         let next_anchor_line = anchors[groups[gi + 1].0].0;
@@ -1350,8 +1467,9 @@ fn segment_no_at_body<'a>(body: &[&'a str], file: &[&str]) -> Option<Vec<Vec<&'a
         }
     }
 
-    // 段 g 的 body 行区间:首段含开头前导行(body[0..首锚点]);其余段从其首锚点起,
-    // 到下一段首锚点止 → 段内 / 段后的 `+` 行随**前**段保留。
+    // Segment g's body line range: the first segment includes the leading lines at the start
+    // (body[0..first anchor]); other segments run from their first anchor to the next
+    // segment's first anchor -> `+` lines inside / after a segment are kept with the **preceding** segment.
     let mut subhunks: Vec<Vec<&'a str>> = Vec::new();
     for gi in 0..groups.len() {
         let line_start = if gi == 0 { 0 } else { anchors[groups[gi].0].0 };
@@ -1365,8 +1483,9 @@ fn segment_no_at_body<'a>(body: &[&'a str], file: &[&str]) -> Option<Vec<Vec<&'a
     Some(subhunks)
 }
 
-/// 修复一个 `Update File` section 的 body。`path` 是 patch 里的(相对)路径。
-/// `cwd` 是当前请求 cwd(primary hint),读盘经 [`read_patch_file`] 再按候选历史解析(MOC-263)。
+/// Repairs the body of one `Update File` section. `path` is the (relative) path from the
+/// patch. `cwd` is the current request's cwd (a primary hint); the disk read is resolved via
+/// [`read_patch_file`], which then also consults the candidate history (MOC-263).
 fn repair_update_section(path: &str, body: &[&str], cwd: Option<&str>) -> (Vec<String>, Repair) {
     let probe = anchor_probe(body);
     let Some((_abs, content)) = read_patch_file(path, cwd, &probe) else {
@@ -1375,19 +1494,24 @@ fn repair_update_section(path: &str, body: &[&str], cwd: Option<&str>) -> (Vec<S
             Repair {
                 file: path.to_owned(),
                 kind: "skipped:unreadable".to_owned(),
-                detail: format!("读不到文件 {path}(候选 cwd 均无)→ 原样放行"),
+                detail: format!("could not read file {path} (no candidate cwd had it) -> passed through as-is"),
             },
         );
     };
     let file_lines: Vec<&str> = content.lines().collect();
 
-    // [MOC-263 P0] body 无 `@@` 但含多个不连续编辑组(模型漏写 `@@` 分隔)→ 自动按文件位置切段、
-    // 用裸 `@@` 串接,使 applier 把各段当独立 hunk 定位(否则整块当一段连续上下文必失配)。
-    // 仅唯一可分段时才动;单段 / 歧义 → 保持原 body 交常规路径。
+    // [MOC-263 P0] When the body has no `@@` but contains multiple non-contiguous edit groups
+    // (the model omitted the `@@` separator) -> automatically split by the file's real
+    // positions and join with a bare `@@`, so the applier locates each segment as an
+    // independent hunk (otherwise the whole block as one contiguous context is bound to fail
+    // to match). Only acts when the split is unique; a single segment / ambiguity -> keeps the
+    // original body for the regular path.
     let mut split_owned: Vec<&str> = Vec::new();
-    // 用**列 0** `@@`(不 trim_start)判断是否已有 hunk 分隔,与下方实际分割器(`l.starts_with("@@")`)
-    // 一致 —— 否则 context 行 ` @@ ...`(前导空格、内容以 @@ 开头,如 markdown/diff 文本)会被误当分隔符、
-    // 错误禁用自动切分,而分割器又不切它 → 仍失败(chatgpt-codex-connector review)。
+    // Uses `@@` at **column 0** (not trim_start) to decide whether hunk separators already
+    // exist, matching the actual splitter below (`l.starts_with("@@")`) -- otherwise a context
+    // line like ` @@ ...` (leading space, content starting with @@, e.g. markdown/diff text)
+    // would be mistaken for a separator, wrongly disabling auto-split, while the splitter still
+    // wouldn't split it -> still failing (chatgpt-codex-connector review).
     let did_split = if !body.iter().any(|l| l.starts_with("@@")) {
         match segment_no_at_body(body, &file_lines) {
             Some(subhunks) => {
@@ -1406,7 +1530,7 @@ fn repair_update_section(path: &str, body: &[&str], cwd: Option<&str>) -> (Vec<S
     };
     let effective_body: &[&str] = if did_split { &split_owned } else { body };
 
-    // 把 body 切成 hunk(按 `@@` 行分段;`@@` 行本身保留、不参与锚点匹配)。
+    // Split the body into hunks (segmented on `@@` lines; the `@@` line itself is kept and doesn't take part in anchor matching).
     let mut new_body: Vec<String> = Vec::with_capacity(effective_body.len());
     let mut repaired_hunks = 0;
     let mut clean_hunks = 0;
@@ -1467,9 +1591,9 @@ fn repair_update_section(path: &str, body: &[&str], cwd: Option<&str>) -> (Vec<S
         "skipped:no_unique_match"
     };
     let detail = format!(
-        "{}hunk: 修复 {repaired_hunks} / 本就匹配 {clean_hunks} / 放行 {}{}",
+        "{}hunk: repaired {repaired_hunks} / already matched {clean_hunks} / passed through {}{}",
         if did_split {
-            "多 hunk 无 @@ 分隔 → 自动按文件位置切段插裸 @@; "
+            "multiple hunks with no @@ separator -> auto-split by file position and inserted bare @@; "
         } else {
             ""
         },
@@ -1491,71 +1615,78 @@ fn repair_update_section(path: &str, body: &[&str], cwd: Option<&str>) -> (Vec<S
 }
 
 enum HunkOutcome {
-    /// 锚点精确匹配文件,无需改。
+    /// The anchors matched the file exactly, no change needed.
     Clean,
-    /// 锚点对齐成文件真实字节后的整个 hunk(含原样的 `+` 行)。
+    /// The whole hunk (including `+` lines as-is) after aligning anchors to the file's real bytes.
     Repaired(Vec<String>),
-    /// 未修(0 或多个匹配),附原因。
+    /// Not repaired (0 or multiple matches), with the reason attached.
     Skipped(String),
 }
 
-/// 修一个 hunk:锚点 = context(空格前缀)+ 删除(`-`)行的**内容**(去前缀),按序应是文件里的
-/// 连续块。精确匹配→Clean;否则按「忽略尾随空格 / 首尾空白」找候选,唯一→对齐,否则放行。
+/// Repairs one hunk: anchors = the **content** of context (space-prefixed) + deletion (`-`)
+/// lines (prefix stripped), which in order should form a contiguous block in the file. An exact
+/// match -> Clean; otherwise looks for candidates by "ignoring trailing whitespace / leading-trailing whitespace", aligns on a unique candidate, otherwise passes through.
 fn repair_hunk(hunk: &[&str], file_lines: &[&str]) -> HunkOutcome {
-    // 锚点行在 hunk 里的下标 + 内容(去单字符前缀)。
+    // The anchor lines' indices within the hunk, plus their content (single-char prefix stripped).
     let anchors: Vec<(usize, &str)> = hunk
         .iter()
         .enumerate()
         .filter_map(|(idx, l)| match l.chars().next() {
             Some(' ') => Some((idx, &l[1..])),
             Some('-') => Some((idx, &l[1..])),
-            _ => None, // '+' 新增行 / 空行 / 其它不作锚点
+            _ => None, // '+' added line / blank line / anything else is not an anchor
         })
         .collect();
     if anchors.is_empty() {
-        return HunkOutcome::Clean; // 纯新增,无锚点
+        return HunkOutcome::Clean; // pure addition, no anchors
     }
     let anchor_contents: Vec<&str> = anchors.iter().map(|(_, c)| *c).collect();
 
-    // 精确匹配:文件里存在连续块完全等于锚点内容 → 无需修(Codex 自己能找到)。
+    // Exact match: a contiguous block in the file equals the anchor content exactly -> no repair needed (Codex can find it itself).
     if !find_block(file_lines, &anchor_contents, |a, b| a == b).is_empty() {
         return HunkOutcome::Clean;
     }
 
-    // 模糊匹配:逐行「忽略尾随空格」相等;仍 0 个再退「首尾空白都忽略」。
+    // Fuzzy match: equal line-by-line "ignoring trailing whitespace"; if still 0, fall back to "ignoring leading-trailing whitespace entirely".
     let mut matches = find_block(file_lines, &anchor_contents, |a, b| {
         a.trim_end() == b.trim_end()
     });
-    let mut mode = "尾随空格";
+    let mut mode = "trailing whitespace";
     if matches.is_empty() {
         matches = find_block(file_lines, &anchor_contents, |a, b| a.trim() == b.trim());
-        mode = "首尾空白";
+        mode = "leading/trailing whitespace";
     }
     match matches.len() {
         1 => {
             let pos = matches[0];
-            // 把锚点行对齐成文件真实字节(保留 hunk 里 +/- /空格 的交错与 `+` 行)。
+            // Align the anchor lines to the file's real bytes (preserving the hunk's +/-/space interleaving and `+` lines).
             let mut fixed: Vec<String> = hunk.iter().map(|l| (*l).to_owned()).collect();
             for (k, (idx, _)) in anchors.iter().enumerate() {
-                let prefix = hunk[*idx].chars().next().unwrap(); // ' ' 或 '-'
+                let prefix = hunk[*idx].chars().next().unwrap(); // ' ' or '-'
                 let file_line = file_lines[pos + k];
                 fixed[*idx] = format!("{prefix}{file_line}");
             }
             HunkOutcome::Repaired(fixed)
         }
-        n if n > 1 => HunkOutcome::Skipped(format!("{mode}下 {n} 处匹配(歧义)")),
-        // 0 连续匹配 → 试「忽略空行差异」(EP-1:模型漏/多写空行致整块失配)。锚点**非空行**序列
-        // 在文件里唯一定位(允许文件该区间含模型漏写的空行),命中则用文件真实区间(含空行 + 字节)
-        // 重建锚点,`+` 插入行保持原位。0/多处仍放行(不猜)。
+        n if n > 1 => HunkOutcome::Skipped(format!("{n} match(es) under {mode} (ambiguous)")),
+        // 0 contiguous matches -> try "ignoring blank-line differences" (EP-1: the model
+        // omitted/added extra blank lines, causing the whole block to mismatch). The anchor's
+        // **non-blank** line sequence is uniquely located in the file (the file region is
+        // allowed to contain blank lines the model omitted); on a hit, the anchors are rebuilt
+        // from the file's real region (including blank lines + bytes), with `+` insertion lines
+        // kept in their original order. 0 or multiple matches still pass through (never guessed).
         _ => {
-            // blank-tolerant 重建会丢弃空白锚点行、改用文件空行 → 无法忠实表达「删除一个空行」的 `-`
-            // (会被静默转成 context = 该删没删)。若 hunk 含空白行删除,放弃 blank-tolerant、透过(不猜)。
+            // A blank-tolerant rebuild would discard a blank anchor line and use the file's
+            // blank line instead -> it can't faithfully represent a `-` that means "delete a
+            // blank line" (it would be silently turned into context = the deletion never
+            // happened). If the hunk contains a blank-line deletion, blank-tolerant is
+            // abandoned and the hunk is passed through (never guessed).
             let has_blank_deletion = hunk
                 .iter()
                 .any(|l| l.starts_with('-') && l[1..].trim().is_empty());
             if has_blank_deletion {
                 return HunkOutcome::Skipped(
-                    "含空白行删除,blank-tolerant 不安全 → 放行".to_owned(),
+                    "contains a blank-line deletion, blank-tolerant is unsafe -> passed through".to_owned(),
                 );
             }
             let regions = find_regions_blank_tolerant(file_lines, &anchor_contents);
@@ -1564,15 +1695,16 @@ fn repair_hunk(hunk: &[&str], file_lines: &[&str]) -> HunkOutcome {
                     let (s, e) = regions[0];
                     HunkOutcome::Repaired(rebuild_hunk_with_region(hunk, &file_lines[s..e]))
                 }
-                0 => HunkOutcome::Skipped("锚点在文件中 0 匹配(疑模型改错内容)".to_owned()),
-                n => HunkOutcome::Skipped(format!("忽略空行下 {n} 处匹配(歧义)")),
+                0 => HunkOutcome::Skipped("0 matches for the anchors in the file (the model may have changed the wrong content)".to_owned()),
+                n => HunkOutcome::Skipped(format!("{n} match(es) ignoring blank lines (ambiguous)")),
             }
         }
     }
 }
 
-/// EP-1 辅助:在 `file_lines` 里找锚点**非空行**序列能唯一定位的区间(允许文件区间内含模型漏写的
-/// 空行,但不允许有额外的非空行)。返回所有匹配区间 `[start, end)`(end 为最后一个匹配非空行的下一位)。
+/// EP-1 helper: finds regions in `file_lines` that the anchor's **non-blank** line sequence
+/// uniquely locates (the file region may contain blank lines the model omitted, but no extra
+/// non-blank lines are allowed). Returns all matching regions `[start, end)` (end is one past the last matched non-blank line).
 fn find_regions_blank_tolerant(
     file_lines: &[&str],
     anchor_contents: &[&str],
@@ -1600,14 +1732,14 @@ fn find_regions_blank_tolerant(
             }
             let fl = file_lines[fi];
             if fl.trim().is_empty() {
-                fi += 1; // 跳过文件空行(模型可能漏写)
+                fi += 1; // skip a blank file line (the model may have omitted it)
                 continue;
             }
             if fl.trim_end() == nb[ai] {
                 ai += 1;
                 fi += 1;
             } else {
-                ok = false; // 出现额外非空行 → 此 start 不匹配
+                ok = false; // an extra non-blank line appeared -> this start doesn't match
                 break;
             }
         }
@@ -1618,22 +1750,23 @@ fn find_regions_blank_tolerant(
     regions
 }
 
-/// EP-1 辅助:用文件真实区间 `region`(含空行)重建 hunk —— 锚点(context/`-`)对齐成文件字节、
-/// 补回模型漏写的文件空行(作 context),`+` 插入行按 hunk 原序保持。模型自带的空白锚点行丢弃
-/// (改用文件的空行,避免重复)。
+/// EP-1 helper: rebuilds a hunk using the file's real region (including blank lines) --
+/// anchors (context/`-`) are aligned to the file's bytes, blank lines the model omitted are
+/// filled back in (as context), and `+` insertion lines are kept in the hunk's original order.
+/// The model's own blank anchor lines are discarded (the file's blank lines are used instead, to avoid duplication).
 fn rebuild_hunk_with_region(hunk: &[&str], region: &[&str]) -> Vec<String> {
     let mut out = Vec::new();
-    let mut fi = 0usize; // region 游标
+    let mut fi = 0usize; // region cursor
     for &hl in hunk {
         match hl.chars().next() {
-            Some('+') => out.push(hl.to_owned()), // 插入行原样保位
+            Some('+') => out.push(hl.to_owned()), // insertion line kept in place as-is
             Some(' ') | Some('-') => {
                 let prefix = hl.chars().next().unwrap();
                 let content = &hl[1..];
                 if content.trim().is_empty() {
-                    continue; // 模型的空锚点行丢弃,用文件空行
+                    continue; // discard the model's blank anchor line, use the file's blank line instead
                 }
-                // 先补回文件里模型漏写的空行(作 context)
+                // first fill back in blank lines the model omitted from the file (as context)
                 while fi < region.len() && region[fi].trim().is_empty() {
                     out.push(format!(" {}", region[fi]));
                     fi += 1;
@@ -1645,14 +1778,14 @@ fn rebuild_hunk_with_region(hunk: &[&str], region: &[&str]) -> Vec<String> {
                     out.push(hl.to_owned());
                 }
             }
-            _ => {} // 无前缀空行等丢弃,用文件空行
+            _ => {} // unprefixed blank lines etc. are discarded, using the file's blank line instead
         }
     }
     out
 }
 
-/// 在 `file_lines` 里找所有起点 `i`,使 `file_lines[i..i+anchor.len()]` 与 `anchor` 逐行 `eq` 为真。
-/// 返回所有匹配起点。
+/// Finds every start position `i` in `file_lines` such that `file_lines[i..i+anchor.len()]`
+/// satisfies `eq` line-by-line against `anchor`. Returns all matching start positions.
 fn find_block<F: Fn(&str, &str) -> bool>(
     file_lines: &[&str],
     anchor: &[&str],
@@ -1670,7 +1803,7 @@ fn find_block<F: Fn(&str, &str) -> bool>(
     hits
 }
 
-/// 把 patch 路径解析到绝对路径。绝对路径原样;相对路径对 `cwd` 拼接。
+/// Resolves a patch path to an absolute path. An absolute path is left as-is; a relative path is joined against `cwd`.
 fn resolve_path(path: &str, cwd: &str) -> PathBuf {
     let p = Path::new(path);
     if p.is_absolute() {
@@ -1702,8 +1835,9 @@ mod tests {
         assert_eq!(extract_cwd(None), None);
         assert_eq!(extract_cwd(Some(&json!({"input":[]}))), None);
 
-        // codex-connector #435 P2:Windows 路径反斜杠不能被翻倍(遍历 Value 取反转义原文,
-        // 不能先序列化整个请求)。json! 里 "C:\\Users\\me\\repo" = 实际单反斜杠路径。
+        // codex-connector #435 P2: Windows path backslashes must not be doubled (walk the Value
+        // tree to get the unescaped original text, don't serialize the whole request first).
+        // In json!, "C:\\Users\\me\\repo" = the actual single-backslash path.
         let win = json!({
             "input": [{"type":"message","role":"user","content":"<environment_context>\n  <cwd>C:\\Users\\me\\repo</cwd>\n</environment_context>"}]
         });
@@ -1715,19 +1849,19 @@ mod tests {
 
     #[test]
     fn trailing_whitespace_anchor_is_repaired_to_file_bytes() {
-        // 文件 context 行无尾随空格;patch 的 context 行带尾随空格 → 应被对齐成文件真实字节。
+        // The file's context line has no trailing whitespace; the patch's context line has trailing whitespace -> should be aligned to the file's real bytes.
         let (dir, name) = tmp_file("a.txt", "fn main() {\n    let x = 1;\n    let y = 2;\n}\n");
         let cwd = dir.path().to_str().unwrap();
-        // patch: 在 `let x = 1;` 后加一行;context 带尾随空格(模型常见错)。
+        // patch: adds a line after `let x = 1;`; the context has trailing whitespace (a common model mistake).
         let v4a = format!(
             "*** Begin Patch\n*** Update File: {name}\n    let x = 1;   \n+    let z = 9;\n    let y = 2;\n*** End Patch\n"
         );
         let (out, reps) = preflight_repair(&v4a, Some(cwd));
         assert!(
             out.contains("    let x = 1;\n"),
-            "尾随空格应被对齐掉:\n{out}"
+            "trailing whitespace should be aligned away:\n{out}"
         );
-        assert!(out.contains("+    let z = 9;"), "新增行保留");
+        assert!(out.contains("+    let z = 9;"), "the added line is kept");
         assert_eq!(reps[0].kind, "repaired", "{:?}", reps);
     }
 
@@ -1738,19 +1872,19 @@ mod tests {
         let v4a = format!("*** Begin Patch\n*** Update File: {name}\n alpha\n-beta\n+BETA\n gamma\n*** End Patch\n");
         let (out, reps) = preflight_repair(&v4a, Some(cwd));
         assert_eq!(reps[0].kind, "clean");
-        assert_eq!(out, v4a, "精确匹配不改一字节");
+        assert_eq!(out, v4a, "an exact match should not change a single byte");
     }
 
     #[test]
     fn ambiguous_match_is_skipped_not_guessed() {
-        // 锚点 ` x` 在文件里多处出现 → 歧义 → 放行不猜。
+        // The anchor ` x` occurs in multiple places in the file -> ambiguous -> passed through, not guessed.
         let (dir, name) = tmp_file("c.txt", "x\nx\nx\n");
         let cwd = dir.path().to_str().unwrap();
         let v4a =
             format!("*** Begin Patch\n*** Update File: {name}\n x   \n+added\n*** End Patch\n");
         let (out, reps) = preflight_repair(&v4a, Some(cwd));
         assert!(reps[0].kind.starts_with("skipped"), "{:?}", reps);
-        assert_eq!(out, v4a, "歧义不改");
+        assert_eq!(out, v4a, "ambiguous, should not change");
     }
 
     #[test]
@@ -1773,14 +1907,14 @@ mod tests {
 
     #[test]
     fn envelope_added_when_model_omits_begin_end() {
-        // 真机 seq230 形态:只有 Add File + 内容,无 Begin/End。
+        // Live-traffic seq230 shape: only Add File + content, no Begin/End.
         let body = "*** Add File: outputs/x.md\n+# Title\n+body\n";
         let (out, rep) = ensure_v4a_envelope(body);
         assert!(out.starts_with("*** Begin Patch\n"), "{out}");
         assert!(out.trim_end().ends_with("*** End Patch"), "{out}");
         assert!(
             out.contains("+# Title") && out.contains("+body"),
-            "内容不丢"
+            "content is not lost"
         );
         assert!(rep.is_some());
     }
@@ -1789,55 +1923,59 @@ mod tests {
     fn envelope_only_end_added() {
         let body = "*** Begin Patch\n*** Add File: x\n+a\n";
         let (out, rep) = ensure_v4a_envelope(body);
-        assert_eq!(out.matches("*** Begin Patch").count(), 1, "不重复加 Begin");
+        assert_eq!(out.matches("*** Begin Patch").count(), 1, "Begin should not be added twice");
         assert!(out.trim_end().ends_with("*** End Patch"));
         assert!(rep.unwrap().detail.contains("End Patch"));
     }
 
     #[test]
     fn envelope_prefixed_end_stripped_for_code_file() {
-        // MOC-268(用户拍板「按文件类型剥」):**仅 `+*** End Patch`**(Add 行误前缀)在代码/结构化配置文件
-        // 里(裸 `*** End Patch` 不可能是合法源码末行)剥前缀规整成裸终止符,不追加、零残留、零内容丢失。
+        // MOC-268 (per the user's decision to "strip by file type"): **only `+*** End Patch`**
+        // (an Add-line mis-prefixed terminator) is stripped and normalized into a bare
+        // terminator in code / structured config files (a bare `*** End Patch` can never
+        // legitimately be the last line of real source code), with nothing appended, zero residue, zero content loss.
         for path in ["x.rs", "c.json", "s.toml", "w.vue"] {
             let body = format!("*** Begin Patch\n*** Add File: {path}\n+a\n+b\n+*** End Patch");
             let (out, rep) = ensure_v4a_envelope(&body);
             assert!(
                 out.trim_end().ends_with("\n*** End Patch"),
-                "代码文件应剥成裸终止符 ({path}):\n{out}"
+                "a code file should be stripped into a bare terminator ({path}):\n{out}"
             );
             assert!(
                 !out.contains("+*** End Patch"),
-                "不应残留带前缀终止符 ({path}):\n{out}"
+                "no prefixed terminator should remain ({path}):\n{out}"
             );
             assert_eq!(
                 out.matches("*** End Patch").count(),
                 1,
-                "只一个终止符 ({path}):\n{out}"
+                "only one terminator ({path}):\n{out}"
             );
-            assert!(rep.unwrap().detail.contains("剥误加前缀"), "{path}");
+            assert!(rep.unwrap().detail.contains("stripped mis-added prefix"), "{path}");
         }
     }
 
     #[test]
     fn envelope_deletion_or_context_end_line_not_stripped() {
-        // MOC-268(chatgpt-codex-connector review):` *** End Patch`(context)/ `-*** End Patch`(deletion)
-        // 是**合法 Update hunk 行**(如模型用 Update 删文件里残留的 *** End Patch),**绝不能当终止符剥**
-        // (剥 `-` = 静默丢弃删除)。这俩末行 → 正常补真终止符、hunk 行**原样保留**。即便目标是代码文件。
+        // MOC-268 (chatgpt-codex-connector review): ` *** End Patch` (context) / `-*** End Patch`
+        // (deletion) are **legitimate Update hunk lines** (e.g. the model using Update to delete
+        // a `*** End Patch` left over in the file), and must **never** be stripped as a
+        // terminator (stripping a `-` = silently dropping the deletion). These two last lines
+        // -> the real terminator is appended normally, and the hunk line is **kept as-is**. Even when the target is a code file.
         for last in ["-*** End Patch", " *** End Patch"] {
             let body = format!("*** Begin Patch\n*** Update File: src/foo.rs\n keep\n{last}");
             let (out, rep) = ensure_v4a_envelope(&body);
             assert!(
                 out.contains(last),
-                "合法 hunk 行 {last:?} 必须原样保留(不剥=不丢删除):\n{out}"
+                "the legitimate hunk line {last:?} must be kept as-is (not stripped = the deletion is not lost):\n{out}"
             );
             assert!(
                 out.trim_end().ends_with("\n*** End Patch"),
-                "应正常补真终止符 ({last:?}):\n{out}"
+                "a real terminator should be appended normally ({last:?}):\n{out}"
             );
             let r = rep.unwrap();
             assert!(
-                r.detail.contains("End Patch") && !r.detail.contains("剥误加前缀"),
-                "走正常 append、非剥 ({last:?}):{}",
+                r.detail.contains("End Patch") && !r.detail.contains("stripped mis-added prefix"),
+                "goes through the normal append path, not stripping ({last:?}):{}",
                 r.detail
             );
         }
@@ -1845,21 +1983,23 @@ mod tests {
 
     #[test]
     fn envelope_prefixed_end_left_incomplete_for_doc_file() {
-        // MOC-268(silent-failure review):文档/文本/未知类型里裸 `*** End Patch` **可能是正文末行**(本仓
-        // V4A 文档就有这串字)→ 歧义不猜:既不剥(免删正文)也不追加(免残留)→ 不补全留 incomplete。
+        // MOC-268 (silent-failure review): in doc / text / unknown file types, a bare
+        // `*** End Patch` **could be a real body last line** (this very repo's V4A docs contain
+        // this exact string) -> ambiguous, never guessed: neither stripped (avoids deleting real
+        // content) nor appended (avoids leaving a residual line) -> not completed, left incomplete.
         for path in ["notes.md", "readme.txt", "data"] {
             let body = format!(
                 "*** Begin Patch\n*** Add File: {path}\n+How to end a patch:\n+*** End Patch"
             );
             let (out, rep) = ensure_v4a_envelope(&body);
-            assert_eq!(out, body, "文档文件歧义末行应原样保留 ({path}):\n{out}");
+            assert_eq!(out, body, "an ambiguous last line in a doc file should be kept as-is ({path}):\n{out}");
             assert!(
                 out.trim_end().ends_with("+*** End Patch"),
-                "正文行应保留不删 ({path}):\n{out}"
+                "the real content line should be kept, not deleted ({path}):\n{out}"
             );
             assert!(
                 !out.trim_end().ends_with("\n*** End Patch"),
-                "不应追加裸终止符 ({path}):\n{out}"
+                "no bare terminator should be appended ({path}):\n{out}"
             );
             assert_eq!(
                 rep.unwrap().kind,
@@ -1871,20 +2011,21 @@ mod tests {
 
     #[test]
     fn envelope_prefixed_end_not_stripped_for_update_even_code() {
-        // MOC-268(chatgpt-codex-connector review):`*** Update File:` 的 `+*** End Patch` 是**新增行**
-        // (可能往代码文件的字符串/fixture 里加这串字),不是 Add File 的误前缀终止符 → **即便目标是代码
-        // 文件也不剥**(剥了=丢新增),走歧义 → 留 incomplete。剥仅限末操作是 Add File。
+        // MOC-268 (chatgpt-codex-connector review): `*** Update File:`'s `+*** End Patch` is an
+        // **added line** (possibly genuinely adding this string into a code file's string
+        // literal / fixture), not Add File's mis-prefixed terminator -> **not stripped even
+        // when the target is a code file** (stripping it = dropping the addition), goes to ambiguous -> left incomplete. Stripping is limited to when the last operation is Add File.
         let body =
             "*** Begin Patch\n*** Update File: src/foo.rs\n keep\n+*** End Patch".to_string();
         let (out, rep) = ensure_v4a_envelope(&body);
-        assert_eq!(out, body, "Update 的 +*** End Patch 不应被剥/动:\n{out}");
+        assert_eq!(out, body, "Update's +*** End Patch should not be stripped/touched:\n{out}");
         assert!(
             out.trim_end().ends_with("+*** End Patch"),
-            "新增行应保留:\n{out}"
+            "the added line should be kept:\n{out}"
         );
         assert!(
             !out.trim_end().ends_with("\n*** End Patch"),
-            "不应追加裸终止符:\n{out}"
+            "no bare terminator should be appended:\n{out}"
         );
         assert_eq!(rep.unwrap().kind, "skipped:ambiguous_prefixed_end");
     }
@@ -1899,16 +2040,16 @@ mod tests {
 
     #[test]
     fn envelope_not_added_to_nonpatch_or_leading_prose() {
-        // 非 patch 体不碰
+        // A non-patch body is untouched
         let (o1, r1) = ensure_v4a_envelope("just some text\nno ops here\n");
         assert_eq!(o1, "just some text\nno ops here\n");
         assert!(r1.is_none());
-        // 缺 Begin 且首个非空行不是操作行(有前导散文)→ 不安全,不补 Begin
+        // Begin is missing and the first non-empty line is not an operation line (leading prose) -> unsafe, don't add Begin
         let prose = "here is my patch:\n*** Add File: x\n+a\n*** End Patch\n";
         let (o2, _r2) = ensure_v4a_envelope(prose);
         assert!(
             !o2.starts_with("*** Begin Patch"),
-            "有前导散文不应贸然补 Begin"
+            "should not rashly add Begin when there's leading prose"
         );
     }
 
@@ -1916,14 +2057,14 @@ mod tests {
     fn strip_trailing_at_double_sided_to_single() {
         let v4a = "*** Begin Patch\n*** Update File: x\n@@ def f(): @@\n-a\n+b\n*** End Patch\n";
         let (out, reps) = strip_trailing_at(v4a);
-        assert!(out.contains("@@ def f():\n"), "应去尾部 @@:\n{out}");
+        assert!(out.contains("@@ def f():\n"), "should strip the trailing @@:\n{out}");
         assert!(!out.contains("@@ def f(): @@"));
         assert_eq!(reps.len(), 1);
     }
 
     #[test]
     fn strip_trailing_at_keeps_bare_and_single() {
-        // 裸 @@(section 分隔)+ 单边 @@ 都不动
+        // Both a bare @@ (section separator) and a single-sided @@ are left untouched
         let v4a = "*** Update File: x\n@@\n@@ class Foo\n-a\n+b\n";
         let (out, reps) = strip_trailing_at(v4a);
         assert_eq!(out, v4a);
@@ -2025,58 +2166,60 @@ mod tests {
         assert!(out.contains("*** Add File: new.md"), "{out}");
         assert!(
             out.contains("+line1") && out.contains("+line2"),
-            "复制原内容:\n{out}"
+            "copies the original content:\n{out}"
         );
-        assert!(!out.contains("*** Move to:"), "Move 已被替换");
+        assert!(!out.contains("*** Move to:"), "Move has been replaced");
         assert_eq!(reps[0].kind, "repaired");
     }
 
     #[test]
     fn recover_empty_move_with_hunk_untouched() {
-        // Update+Move 但**有** hunk(rename + 内容改)→ 不碰(prompt 允许)。
+        // Update+Move but **with** a hunk (rename + content change) -> left untouched (allowed by the prompt).
         let (dir, name) = tmp_file("old2.md", "a\n");
         let cwd = dir.path().to_str().unwrap();
         let v4a = format!(
             "*** Begin Patch\n*** Update File: {name}\n*** Move to: new2.md\n-a\n+b\n*** End Patch\n"
         );
         let (out, reps) = recover_empty_move(&v4a, Some(cwd));
-        assert_eq!(out, v4a, "有 hunk 的 Move 不动");
+        assert_eq!(out, v4a, "a Move with a hunk is left untouched");
         assert!(reps.is_empty());
     }
 
     #[test]
     fn rename_with_eof_marker_hunk_not_treated_as_empty() {
-        // codex-connector #435 P1:rename + `*** End of File` 追加 hunk 不能被当空 rename(否则转成
-        // 丢内容的 Delete+Add)→ 识别为有 hunk → 透过不转。
+        // codex-connector #435 P1: a rename + `*** End of File` append hunk must not be treated
+        // as an empty rename (otherwise it would convert to a content-losing Delete+Add) ->
+        // recognized as having a hunk -> passed through, not converted.
         let (dir, name) = tmp_file("eof_old.md", "a\n");
         let cwd = dir.path().to_str().unwrap();
         let v4a = format!(
             "*** Begin Patch\n*** Update File: {name}\n*** Move to: eof_new.md\n*** End of File\n+tail\n*** End Patch\n"
         );
         let (out, reps) = recover_empty_move(&v4a, Some(cwd));
-        assert_eq!(out, v4a, "含 EOF hunk 的 rename 应透过不转:\n{out}");
+        assert_eq!(out, v4a, "a rename with an EOF hunk should pass through unconverted:\n{out}");
         assert!(reps.is_empty(), "{:?}", reps);
     }
 
     #[test]
     fn add_on_existing_passes_through_unchanged() {
-        // 规则 #2 已撤:Add 已存在文件**不再**转 Delete+Add(避免覆盖丢数据),原样透过让 Codex
-        // 报 already exists、模型自纠为针对性 Update。
+        // Rule #2 has been revoked: Add on an already-existing file **no longer** converts to
+        // Delete+Add (avoids overwriting and losing data), it's passed through as-is so Codex
+        // reports already exists and the model self-corrects into a targeted Update.
         let (dir, name) = tmp_file("exists.md", "important old content\n");
         let cwd = dir.path().to_str().unwrap();
         let v4a = format!("*** Begin Patch\n*** Add File: {name}\n+new content\n*** End Patch\n");
         let (out, reps) = optimize_patch(&v4a, Some(cwd), true);
         assert!(
             !out.contains("*** Delete File:"),
-            "不应再插 Delete(已撤规则#2):\n{out}"
+            "should no longer insert a Delete (rule #2 has been revoked):\n{out}"
         );
         assert!(
             out.contains(&format!("*** Add File: {name}")),
-            "Add 原样保留"
+            "Add is kept as-is"
         );
         assert!(
-            !reps.iter().any(|r| r.detail.contains("Delete File 覆盖")),
-            "不应有覆盖类修复: {:?}",
+            !reps.iter().any(|r| r.detail.contains("Delete File overwrite")),
+            "there should be no overwrite-style repair: {:?}",
             reps
         );
     }
@@ -2091,18 +2234,19 @@ mod tests {
         assert!(out.contains(&format!("*** Delete File: {name}")), "{out}");
         assert!(out.contains(&format!("*** Add File: {name}")), "{out}");
         assert!(out.contains("+line1") && out.contains("+line2"));
-        assert!(!out.contains("*** Update File:"), "Update 已转换");
+        assert!(!out.contains("*** Update File:"), "Update has been converted");
         assert_eq!(reps[0].kind, "repaired");
     }
 
     #[test]
     fn update_whitespace_only_file_not_converted() {
-        // codex-connector #435 P2:纯空白文件(非 0 字节)不算空 → 不转 Delete+Add(否则丢空白字节)。
+        // codex-connector #435 P2: a whitespace-only file (not 0 bytes) doesn't count as empty
+        // -> not converted to Delete+Add (otherwise the whitespace bytes would be lost).
         let (dir, name) = tmp_file("ws.txt", "  \n\t\n");
         let cwd = dir.path().to_str().unwrap();
         let v4a = format!("*** Begin Patch\n*** Update File: {name}\n+line1\n*** End Patch\n");
         let (out, reps) = recover_update_empty_file(&v4a, Some(cwd));
-        assert_eq!(out, v4a, "纯空白文件 Update 不应转 Delete+Add:\n{out}");
+        assert_eq!(out, v4a, "an Update on a whitespace-only file should not convert to Delete+Add:\n{out}");
         assert!(reps.is_empty());
     }
 
@@ -2114,41 +2258,41 @@ mod tests {
             "*** Begin Patch\n*** Update File: {name}\n-existing\n+changed\n*** End Patch\n"
         );
         let (out, reps) = recover_update_empty_file(&v4a, Some(cwd));
-        assert_eq!(out, v4a, "非空文件 Update 不碰");
+        assert_eq!(out, v4a, "a non-empty file's Update is untouched");
         assert!(reps.is_empty());
     }
 
     #[test]
     fn add_file_missing_plus_prefix_is_filled() {
-        // Add File 里有的行漏 `+`(模型常见)、有空行 → 全补 `+`,已有 `+` 的不动。
+        // An Add File line missing its `+` (a common model mistake), plus a blank line -> both get `+` filled in; a line that already has `+` is untouched.
         let v4a = "*** Begin Patch\n*** Add File: new.md\n+# Title\nplain line no plus\n\n+already plus\n*** End Patch\n";
         let (out, reps) = ensure_add_file_plus(v4a);
         assert!(
             out.contains("\n+plain line no plus\n"),
-            "漏 + 的行应补:\n{out}"
+            "the line missing + should be filled in:\n{out}"
         );
-        assert!(out.contains("\n+\n+already plus"), "空行 → 裸 +:\n{out}");
-        assert!(!out.contains("++already plus"), "已是 + 的不重复");
+        assert!(out.contains("\n+\n+already plus"), "a blank line -> a bare +:\n{out}");
+        assert!(!out.contains("++already plus"), "a line already with + is not duplicated");
         assert_eq!(reps[0].kind, "repaired");
         assert!(
-            reps[0].detail.contains("2 行"),
-            "漏 + 的 plain 行 + 空行 = 2: {:?}",
+            reps[0].detail.contains("2 line"),
+            "the plain line missing + plus the blank line = 2: {:?}",
             reps
         );
     }
 
     #[test]
     fn add_file_all_plus_untouched_and_update_not_affected() {
-        // 全 + 的 Add File 不动;Update section 的非 + 行(context/-)绝不被 G 碰。
+        // An all-`+` Add File is untouched; the Update section's non-`+` lines (context/-) are never touched by G.
         let v4a = "*** Begin Patch\n*** Add File: a\n+x\n+y\n*** Update File: b\n cont\n-old\n+new\n*** End Patch\n";
         let (out, reps) = ensure_add_file_plus(v4a);
-        assert_eq!(out, v4a, "Add 全 + + Update 不动:\n{out}");
+        assert_eq!(out, v4a, "an all-+ Add plus an untouched Update:\n{out}");
         assert!(reps.is_empty());
     }
 
     #[test]
     fn at_header_aligned_to_unique_file_line() {
-        // 真机 seq181:@@ 头残缺(漏 `## 6. `),唯一包含于一个文件行 → 对齐。
+        // Live-traffic seq181: a truncated @@ header (missing `## 6. `), uniquely contained in one file line -> aligned.
         let (dir, name) = tmp_file("doc.md", "intro\n## 6. 系统架构建议\n建议分层\n");
         let cwd = dir.path().to_str().unwrap();
         let v4a = format!(
@@ -2157,22 +2301,22 @@ mod tests {
         let (out, reps) = align_at_headers(&v4a, Some(cwd));
         assert!(
             out.contains("@@ ## 6. 系统架构建议"),
-            "@@ 应对齐成文件真实整行:\n{out}"
+            "@@ should be aligned to the file's real full line:\n{out}"
         );
         assert_eq!(reps[0].kind, "repaired");
     }
 
     #[test]
     fn at_header_exact_or_ambiguous_untouched() {
-        // 已是文件真实整行 → 不动;多处包含(歧义)→ 不动。
+        // Already a real full line in the file -> untouched; contained in multiple places (ambiguous) -> untouched.
         let (dir, name) = tmp_file("doc2.md", "## A\nx\n## A\n");
         let cwd = dir.path().to_str().unwrap();
-        // 精确整行 `## A` 存在,但歧义(两行)→ 不动
+        // The exact full line `## A` exists, but is ambiguous (two lines) -> untouched
         let v4a = format!("*** Update File: {name}\n@@ ## A\n x\n+y\n");
         let (out, reps) = align_at_headers(&v4a, Some(cwd));
         assert_eq!(out, v4a);
         assert!(reps.is_empty());
-        // 子串 `A` 在 `## A` 两行里出现 → 歧义不动
+        // The substring `A` occurs in both `## A` lines -> ambiguous, untouched
         let v4a2 = format!("*** Update File: {name}\n@@ A\n x\n+y\n");
         let (out2, reps2) = align_at_headers(&v4a2, Some(cwd));
         assert_eq!(out2, v4a2);
@@ -2181,54 +2325,55 @@ mod tests {
 
     #[test]
     fn unprefixed_dup_of_plus_line_dropped() {
-        // 真机 seq235:无前缀行 + 紧跟 `+<同内容>` → 删废行(内容在 + 行,不丢)。
+        // Live-traffic seq235: an unprefixed line immediately followed by `+<same content>` -> the stale line is dropped (the content lives in the + line, nothing is lost).
         let (dir, name) = tmp_file("u.md", "other\n");
         let cwd = dir.path().to_str().unwrap();
         let v4a = format!("*** Update File: {name}\n*data source*\n+*data source*\n+more\n");
         let (out, reps) = fix_unprefixed_lines(&v4a, Some(cwd));
-        assert!(!out.contains("\n*data source*\n"), "无前缀废行应删:\n{out}");
-        assert!(out.contains("+*data source*"), "+ 行保留(内容不丢)");
+        assert!(!out.contains("\n*data source*\n"), "the unprefixed stale line should be dropped:\n{out}");
+        assert!(out.contains("+*data source*"), "the + line is kept (content not lost)");
         assert_eq!(reps[0].kind, "repaired");
     }
 
     #[test]
     fn unprefixed_existing_file_line_gets_context_space() {
-        // 无前缀行在文件里有同行 → context 漏空格 → 补 ` `。
+        // An unprefixed line matches a line in the file -> context missing its space -> fill in ` `.
         let (dir, name) = tmp_file("u2.md", "alpha\nkeepme\nbeta\n");
         let cwd = dir.path().to_str().unwrap();
         let v4a = format!("*** Update File: {name}\nkeepme\n+added\n");
         let (out, reps) = fix_unprefixed_lines(&v4a, Some(cwd));
-        assert!(out.contains("\n keepme\n"), "应补空格成 context:\n{out}");
+        assert!(out.contains("\n keepme\n"), "should fill in the space to make it context:\n{out}");
         assert_eq!(reps[0].kind, "repaired");
     }
 
     #[test]
     fn unprefixed_unknown_passes_through() {
-        // 不在文件、非重复 → 透过(不猜)。
+        // Not in the file, not a duplicate -> passed through (never guessed).
         let (dir, name) = tmp_file("u3.md", "real\n");
         let cwd = dir.path().to_str().unwrap();
         let v4a = format!("*** Update File: {name}\nhallucinated garbage line\n+x\n");
         let (out, reps) = fix_unprefixed_lines(&v4a, Some(cwd));
-        assert_eq!(out, v4a, "未知无前缀行原样透过");
+        assert_eq!(out, v4a, "an unknown unprefixed line is passed through as-is");
         assert!(reps.is_empty());
     }
 
     #[test]
     fn cwd_candidates_remember_recall_and_resolve() {
-        // MOC-263 P1:候选历史(deque)+ read_patch_file 按候选解析(全局态,只做非 flaky 断言)。
+        // MOC-263 P1: candidate history (deque) + read_patch_file resolving by candidate (global state, only non-flaky assertions here).
         let (dir, name) = tmp_file("cand_moc263.txt", "x\n");
         let real = dir.path().to_str().unwrap().to_owned();
-        // 模拟并发污染:先记一个不含该文件的 stale cwd,再记真实 cwd(置顶)。
+        // Simulate concurrent pollution: first record a stale cwd that doesn't have this file, then record the real cwd (moving it to the front).
         remember_cwd("/tmp/stale_zzz_moc263_a");
         remember_cwd(&real);
         assert!(recall_cwd_candidates().iter().any(|c| c == &real));
-        assert!(has_cwd_candidate(None), "有候选历史 → true");
-        // primary=None(apply_patch 工具循环请求),真实 cwd 在候选里 → 读到文件
-        // (stale cwd 无此文件,逐个试时自动跳过)。这是 P1 的核心:不再被 stale 单槽废掉。
+        assert!(has_cwd_candidate(None), "with a candidate history -> true");
+        // primary=None (an apply_patch tool-loop request), the real cwd is among the candidates
+        // -> the file is read (the stale cwd has no such file, so it's automatically skipped
+        // when tried in turn). This is P1's core fix: no longer wiped out by a single stale slot.
         let got = read_patch_file(&name, None, &[(false, "x")]);
-        assert!(got.is_some(), "应经候选 cwd 读到文件");
+        assert!(got.is_some(), "should read the file via a candidate cwd");
         assert_eq!(got.unwrap().1, "x\n");
-        // turn-start 请求抽 cwd 入候选(供后续 apply_patch 回退)。
+        // Extract cwd from a turn-start request into the candidates (for later apply_patch requests to fall back to).
         let req = json!({"input":[{"type":"message","role":"user","content":"<environment_context>\n  <cwd>/tmp/ts_proj_b3f9</cwd>\n</environment_context>"}]});
         remember_cwd_from_request(Some(&req));
         assert!(recall_cwd_candidates()
@@ -2238,8 +2383,10 @@ mod tests {
 
     #[test]
     fn read_patch_file_picks_by_probe_not_first_readable() {
-        // MOC-263 P2(chatgpt-codex-connector review):并发会话共享相对路径(README.md 等)、且 stale
-        // 会话更新时,按 patch 锚点 probe 选**真正含锚点的候选**,而非取队首(most-recent=stale)可读的。
+        // MOC-263 P2 (chatgpt-codex-connector review): when concurrent sessions share a
+        // relative path (README.md etc.) and the stale session updates it, the patch anchor
+        // probe should pick the candidate that **actually contains the anchor**, not just the
+        // first readable one at the front of the queue (most-recent = stale).
         let stale = tempfile::tempdir().unwrap();
         let real = tempfile::tempdir().unwrap();
         std::fs::write(stale.path().join("shared_moc263.txt"), "stale_only_line\n").unwrap();
@@ -2248,24 +2395,27 @@ mod tests {
             "real_anchor_line\nmore\n",
         )
         .unwrap();
-        // 真实 cwd 先记、stale 后记 → stale 在候选队首(most-recent),模拟 review 担心的场景。
+        // The real cwd is recorded first, stale second -> stale is at the front of the queue
+        // (most-recent), simulating the scenario the review was concerned about.
         remember_cwd(real.path().to_str().unwrap());
         remember_cwd(stale.path().to_str().unwrap());
-        // probe 命中 real(含 real_anchor_line)、不命中 stale → 应选 real,不取队首 stale。
+        // The probe hits real (contains real_anchor_line), not stale -> real should be picked, not the front-of-queue stale one.
         let got = read_patch_file("shared_moc263.txt", None, &[(false, "real_anchor_line")]);
-        assert!(got.is_some(), "应选到含锚点的候选");
+        assert!(got.is_some(), "should pick the candidate that contains the anchor");
         assert_eq!(
             got.unwrap().1,
             "real_anchor_line\nmore\n",
-            "应选 real(含 probe 锚点)而非队首 stale"
+            "should pick real (contains the probe anchor), not the front-of-queue stale one"
         );
     }
 
     #[test]
     fn read_patch_file_single_candidate_partial_header_not_skipped() {
-        // MOC-263 P2 二轮(chatgpt-codex-connector review):probe 只含残缺 `@@` header(文件里无 exact
-        // 行,真实是 `## 6. 系统架构建议`),**单一候选**不应因 probe 0 命中被判 unreadable —— 仍返回
-        // 文件,让 align_at_headers 做子串修复。probe 是 tie-breaker 不是 gate。
+        // MOC-263 P2, round two (chatgpt-codex-connector review): the probe only has a
+        // truncated `@@` header (no exact line in the file, the real one is
+        // `## 6. 系统架构建议`); a **single candidate** should not be judged unreadable just
+        // because the probe hit 0 -- the file should still be returned, letting
+        // align_at_headers do the substring repair. probe is a tie-breaker, not a gate.
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(
             dir.path().join("doc_moc263.md"),
@@ -2276,15 +2426,17 @@ mod tests {
         let got = read_patch_file("doc_moc263.md", None, &[(true, "系统架构建议")]);
         assert!(
             got.is_some(),
-            "单候选 + 残缺 header probe 不应被判 unreadable"
+            "a single candidate + a truncated header probe should not be judged unreadable"
         );
         assert!(got.unwrap().1.contains("## 6. 系统架构建议"));
     }
 
     #[test]
     fn read_patch_file_partial_header_substring_picks_real_over_stale() {
-        // MOC-263 P2 三轮(chatgpt-codex-connector review):多候选 + 纯残缺 `@@` 头,exact 全 0 → 退
-        // 子串评分,选**子串含该头的 real**,而非盲取队首 stale(否则 align 会对 stale 子串修复)。
+        // MOC-263 P2, round three (chatgpt-codex-connector review): multiple candidates plus a
+        // purely truncated `@@` header, exact match all 0 -> fall back to substring scoring,
+        // picking the **real one whose substring contains the header**, not blindly taking the
+        // front-of-queue stale one (otherwise align would repair against the stale substring).
         let stale = tempfile::tempdir().unwrap();
         let real = tempfile::tempdir().unwrap();
         std::fs::write(
@@ -2298,19 +2450,20 @@ mod tests {
         )
         .unwrap();
         remember_cwd(real.path().to_str().unwrap());
-        remember_cwd(stale.path().to_str().unwrap()); // stale 在队首(most-recent)
+        remember_cwd(stale.path().to_str().unwrap()); // stale is at the front of the queue (most-recent)
         let got = read_patch_file("doc2_moc263.md", None, &[(true, "系统架构建议")]);
         assert!(got.is_some());
         assert!(
             got.unwrap().1.contains("## 6. 系统架构建议"),
-            "子串评分应选含该头的 real,而非队首 stale"
+            "substring scoring should pick the real one containing the header, not the front-of-queue stale one"
         );
     }
 
     #[test]
     fn read_patch_file_tied_score_is_ambiguous_none() {
-        // MOC-263 P2 四轮(chatgpt-codex-connector review):两候选 probe 分数并列(共享相同锚点行)→
-        // 歧义 → None(不猜),而非取队首 stale。下游 skip,patch 透过交 Codex / 模型自纠。
+        // MOC-263 P2, round four (chatgpt-codex-connector review): two candidates tie on probe
+        // score (sharing the same anchor line) -> ambiguous -> None (never guessed), rather than
+        // taking the front-of-queue stale one. Downstream skips, the patch passes through for Codex / the model to self-correct.
         let a = tempfile::tempdir().unwrap();
         let b = tempfile::tempdir().unwrap();
         std::fs::write(a.path().join("tie_moc263.txt"), "SHARED_ANCHOR\naaa\n").unwrap();
@@ -2318,31 +2471,35 @@ mod tests {
         remember_cwd(a.path().to_str().unwrap());
         remember_cwd(b.path().to_str().unwrap());
         let got = read_patch_file("tie_moc263.txt", None, &[(false, "SHARED_ANCHOR")]);
-        assert!(got.is_none(), "并列分数(歧义)应返回 None 不猜");
+        assert!(got.is_none(), "a tied score (ambiguous) should return None, never guessed");
     }
 
     #[test]
     fn read_patch_file_header_probe_not_beaten_by_stale_exact_fragment() {
-        // MOC-263 P2 五轮(chatgpt-codex-connector review):probe 只有残缺 `@@` 头;stale 恰有一整行 =
-        // 该 fragment,real 是其子串(`## 6. X`)。header 按**子串**评分(不进 exact)→ 两候选都子串命中
-        // → 并列 → None,**不会**因 stale 的 exact 整行被误选。
+        // MOC-263 P2, round five (chatgpt-codex-connector review): the probe only has a
+        // truncated `@@` header; stale happens to have a full line equal to that fragment, and
+        // real is a superstring of it (`## 6. X`). Headers are scored by **substring** (never
+        // exact) -> both candidates hit as a substring -> tied -> None, and it is **not**
+        // wrongly picked based on stale's exact full-line match.
         let stale = tempfile::tempdir().unwrap();
         let real = tempfile::tempdir().unwrap();
         std::fs::write(stale.path().join("h_moc263.md"), "系统架构建议\nx\n").unwrap();
         std::fs::write(real.path().join("h_moc263.md"), "## 6. 系统架构建议\ny\n").unwrap();
         remember_cwd(real.path().to_str().unwrap());
-        remember_cwd(stale.path().to_str().unwrap()); // stale 在队首
+        remember_cwd(stale.path().to_str().unwrap()); // stale is at the front of the queue
         let got = read_patch_file("h_moc263.md", None, &[(true, "系统架构建议")]);
         assert!(
             got.is_none(),
-            "header 子串并列应 None,不被 stale 的 exact 整行误选"
+            "a tied header substring should return None, not wrongly picked based on stale's exact full-line match"
         );
     }
 
     #[test]
     fn context_line_starting_with_at_at_does_not_block_split() {
-        // MOC-263 P2 五轮(chatgpt-codex-connector review):context 行内容以 @@ 开头(` @@ ...`,列 0 是
-        // 空格)不应被当 hunk 分隔符而禁用自动切分(分割器只认列 0 @@)。含此类 context 行的多区纯删除仍应切。
+        // MOC-263 P2, round five (chatgpt-codex-connector review): a context line whose content
+        // starts with @@ (` @@ ...`, column 0 is a space) should not be mistaken for a hunk
+        // separator and disable auto-split (the splitter only recognizes @@ at column 0). A
+        // multi-region pure deletion containing such a context line should still split.
         let content = "@@ banner\nkeep_a\nREMOVE_1\nmid1\nmid2\nmid3\nREMOVE_2\nkeep_b\n";
         let (dir, name) = tmp_file("atat_moc263.txt", content);
         let cwd = dir.path().to_str().unwrap();
@@ -2352,14 +2509,16 @@ mod tests {
         let (out, _reps) = preflight_repair(&v4a, Some(cwd));
         assert!(
             out.contains("\n@@\n"),
-            "含 ` @@` context 行的多区删除仍应自动切段(列 0 判定):\n{out}"
+            "a multi-region deletion containing a ` @@` context line should still auto-split (decided by column 0):\n{out}"
         );
     }
 
     #[test]
     fn anchor_probe_includes_unprefixed_lines() {
-        // MOC-263 P2 六轮(chatgpt-codex-connector review):无前缀行(fix_unprefixed_lines 要按文件整行
-        // 匹配修)也要进 probe,否则它是唯一锚点时空-probe 路径会在同名候选间选错文件。`+` / `***` 不进。
+        // MOC-263 P2, round six (chatgpt-codex-connector review): an unprefixed line (which
+        // fix_unprefixed_lines repairs by matching the full line against the file) must also go
+        // into the probe, otherwise when it's the only anchor, the empty-probe path would pick
+        // the wrong file among same-named candidates. `+` / `***` don't go in.
         let body = vec![
             " ctx",
             "-del",
@@ -2369,43 +2528,45 @@ mod tests {
             "*** End Patch",
         ];
         let p = anchor_probe(&body);
-        assert!(p.contains(&(false, "ctx")), "context 行进 probe");
-        assert!(p.contains(&(false, "del")), "删除行进 probe");
-        assert!(p.contains(&(true, "hdr")), "@@ 头进 probe(header)");
+        assert!(p.contains(&(false, "ctx")), "the context line goes into the probe");
+        assert!(p.contains(&(false, "del")), "the deletion line goes into the probe");
+        assert!(p.contains(&(true, "hdr")), "the @@ header goes into the probe (as a header)");
         assert!(
             p.contains(&(false, "unprefixed line")),
-            "无前缀行应作 exact probe"
+            "an unprefixed line should be an exact probe"
         );
-        assert!(!p.iter().any(|(_, t)| *t == "add"), "+ 新增行不进 probe");
+        assert!(!p.iter().any(|(_, t)| *t == "add"), "a + added line does not go into the probe");
         assert!(
             !p.iter().any(|(_, t)| t.starts_with("***")),
-            "*** 控制行不进 probe"
+            "a *** control line does not go into the probe"
         );
     }
 
     #[test]
     fn preflight_aligns_via_candidate_cwd_with_none_primary() {
-        // MOC-263 P1 端到端:apply_patch 请求 cwd=None,真实 cwd 仅在候选历史里 → 仍能读盘对齐。
+        // MOC-263 P1 end-to-end: the apply_patch request has cwd=None, and the real cwd exists
+        // only in the candidate history -> disk-read alignment should still work.
         let (dir, name) = tmp_file("p1_e2e_moc263.txt", "alpha\nbeta\ngamma\n");
         let real = dir.path().to_str().unwrap().to_owned();
         remember_cwd(&real);
-        // context 带尾随空格(需读盘对齐);primary=None,靠候选历史找到真实文件。
+        // The context has trailing whitespace (needs disk-read alignment); primary=None, relying on the candidate history to find the real file.
         let v4a = format!(
             "*** Begin Patch\n*** Update File: {name}\n beta   \n+inserted\n*** End Patch\n"
         );
         let (out, reps) = preflight_repair(&v4a, None);
         assert!(
             out.contains("\n beta\n"),
-            "应经候选 cwd 读盘对齐尾随空格:\n{out}"
+            "should align trailing whitespace via a disk read through the candidate cwd:\n{out}"
         );
-        assert!(out.contains("+inserted"), "新增行保留");
+        assert!(out.contains("+inserted"), "the added line is kept");
         assert_eq!(reps[0].kind, "repaired", "{:?}", reps);
     }
 
     #[test]
     fn multi_hunk_pure_delete_no_at_auto_split() {
-        // MOC-263 P0:多个不连续**纯删除/上下文**区拼一个 Update File 块、无 @@ → 安全自动切段插裸 @@。
-        // (带插入 `+` 的多区因落点歧义不在此切,见 mixed_replace_insert_gap_passthrough)
+        // MOC-263 P0: multiple non-contiguous **pure deletion/context** regions packed into one
+        // Update File block, with no @@ -> safely auto-split and a bare @@ inserted.
+        // (multi-region with an inserted `+` is not split here due to ambiguous landing spot, see mixed_replace_insert_gap_passthrough)
         let content = "keep_top\nREMOVE_1\nmiddle\nmiddle2\nmiddle3\nREMOVE_2\nkeep_bottom\n";
         let (dir, name) = tmp_file("multi_del.txt", content);
         let cwd = dir.path().to_str().unwrap();
@@ -2413,20 +2574,22 @@ mod tests {
             "*** Begin Patch\n*** Update File: {name}\n keep_top\n-REMOVE_1\n middle\n-REMOVE_2\n keep_bottom\n*** End Patch\n"
         );
         let (out, reps) = preflight_repair(&v4a, Some(cwd));
-        assert!(out.contains("\n@@\n"), "两个不连续删除区应插裸 @@:\n{out}");
+        assert!(out.contains("\n@@\n"), "two non-contiguous deletion regions should get a bare @@ inserted:\n{out}");
         assert_eq!(reps[0].kind, "repaired", "{:?}", reps);
-        assert!(reps[0].detail.contains("自动按文件位置切段"), "{:?}", reps);
+        assert!(reps[0].detail.contains("auto-split by file position"), "{:?}", reps);
         assert!(
             out.contains("-REMOVE_1") && out.contains("-REMOVE_2"),
-            "删除行保留:\n{out}"
+            "the deletion lines are kept:\n{out}"
         );
     }
 
     #[test]
     fn mixed_replace_insert_gap_passthrough() {
-        // MOC-263 P0 安全(chatgpt-codex-connector review 指出):段间「替换 + 额外插入」混合 →
-        // `+` 落点歧义(`+return 42` 是替换、`+@memoize` 是给后段 `def beta` 的引入行,无法区分)→
-        // 不切、原样透过,避免把 @memoize 静默插到 return 后(错位)。即便前段末锚点是 `-` 删除也不豁免。
+        // MOC-263 P0 safety (raised by chatgpt-codex-connector review): a mix of "replace +
+        // extra insertion" between segments -> the `+`'s landing spot is ambiguous
+        // (`+return 42` is a replacement, `+@memoize` is a lead-in line for the next segment
+        // `def beta`, and they can't be told apart) -> not split, passed through as-is, to
+        // avoid silently inserting @memoize after return (misplaced). Not exempted even when the previous segment's last anchor is a `-` deletion.
         let content = "alpha\nreturn 1\n# gap\ndef beta():\n";
         let (dir, name) = tmp_file("mixed.py", content);
         let cwd = dir.path().to_str().unwrap();
@@ -2436,43 +2599,47 @@ mod tests {
         let (out, _reps) = preflight_repair(&v4a, Some(cwd));
         assert!(
             !out.contains("\n@@\n"),
-            "混合 replace+insert 落点歧义不应切:\n{out}"
+            "a mixed replace+insert with an ambiguous landing spot should not be split:\n{out}"
         );
         assert!(
             out.contains("+@memoize") && out.contains("+return 42"),
-            "内容不丢"
+            "content is not lost"
         );
     }
 
     #[test]
     fn single_contiguous_hunk_not_split() {
-        // 单段连续 hunk → 不切(group<2 → None),走常规对齐。
+        // A single contiguous hunk -> not split (group<2 -> None), goes through the regular alignment.
         let (dir, name) = tmp_file("single.txt", "a\nb\nc\nd\n");
         let cwd = dir.path().to_str().unwrap();
         let v4a =
             format!("*** Begin Patch\n*** Update File: {name}\n a\n b\n+x\n c\n*** End Patch\n");
         let (out, reps) = preflight_repair(&v4a, Some(cwd));
-        assert!(!out.contains("\n@@\n"), "单段连续 hunk 不应插 @@:\n{out}");
-        assert!(!reps[0].detail.contains("切段"), "{:?}", reps);
+        assert!(!out.contains("\n@@\n"), "a single contiguous hunk should not have @@ inserted:\n{out}");
+        assert!(!reps[0].detail.contains("split"), "{:?}", reps);
     }
 
     #[test]
     fn ambiguous_multi_region_passthrough() {
-        // 锚点内容在文件里重复(歧义)→ longest_unique_block 返回 None → 不切,透过(不猜不丢)。
+        // The anchor content repeats in the file (ambiguous) -> longest_unique_block returns None -> not split, passed through (never guessed, never dropped).
         let (dir, name) = tmp_file("amb.txt", "x\ny\nx\ny\n");
         let cwd = dir.path().to_str().unwrap();
         let v4a =
             format!("*** Begin Patch\n*** Update File: {name}\n-x\n+X\n-y\n+Y\n*** End Patch\n");
         let (out, _reps) = preflight_repair(&v4a, Some(cwd));
-        assert!(!out.contains("\n@@\n"), "歧义不应切:\n{out}");
+        assert!(!out.contains("\n@@\n"), "ambiguous, should not split:\n{out}");
     }
 
     #[test]
     fn greedy_split_bails_when_first_anchor_not_globally_unique() {
-        // MOC-263 P1(chatgpt-codex-connector review):**块唯一但段首非唯一**的隐蔽歧义 —— file 有旧
-        // ALPHA/BETA/GAMMA 块 + 真实 ALPHA/BETA…gap…GAMMA/DELTA 区。body ` ALPHA/-BETA/ GAMMA/-DELTA`
-        // 的 [ALPHA,BETA,GAMMA] 作为连续块只在旧块唯一出现,贪心会选中旧块、从**错块**删 BETA;而段首
-        // ALPHA 在文件里出现 2 次 = 起点歧义。修复后段首非全局唯一即 bail,不切分、原样透过(不猜不丢)。
+        // MOC-263 P1 (chatgpt-codex-connector review): a hidden ambiguity where **the block is
+        // unique but the segment's first anchor is not** -- the file has a stale ALPHA/BETA/GAMMA
+        // block plus the real ALPHA/BETA…gap…GAMMA/DELTA region. The body's
+        // ` ALPHA/-BETA/ GAMMA/-DELTA` has [ALPHA,BETA,GAMMA] uniquely occurring as a contiguous
+        // block only in the stale block, so the greedy algorithm would pick the stale block and
+        // delete BETA from the **wrong block**; meanwhile the segment's first anchor ALPHA
+        // occurs twice in the file = an ambiguous start point. After the fix, a non-globally-unique
+        // first anchor bails out, not splitting, passing through as-is (never guessed, never dropped).
         let content = "ALPHA\nBETA\nGAMMA\nmid_x\nmid_y\nALPHA\nBETA\nsep_gap\nGAMMA\nDELTA\n";
         let (dir, name) = tmp_file("greedy_moc263.txt", content);
         let cwd = dir.path().to_str().unwrap();
@@ -2482,88 +2649,92 @@ mod tests {
         let (out, _reps) = preflight_repair(&v4a, Some(cwd));
         assert!(
             !out.contains("\n@@\n"),
-            "段首锚点非全局唯一(起点歧义)时应 bail 不切分,避免从错块删行:\n{out}"
+            "a non-globally-unique segment start anchor (ambiguous start point) should bail and not split, avoiding deleting from the wrong block:\n{out}"
         );
     }
 
     #[test]
     fn floating_add_after_context_passthrough_not_misplaced() {
-        // MOC-263 P0 安全防护:`+` 浮动在两不连续区域之间、前段末锚点是 context(非 `-` 删除)→ 落点
-        // 歧义(可能属前段尾插、也可能是后段引入行)→ 不切(否则会把 +@memoize 插到错位置、静默错误
-        // apply)。这是 pre-push review 抓到的 BLOCKER 回归点。
+        // MOC-263 P0 safety guard: a `+` floating between two non-contiguous regions, where the
+        // previous segment's last anchor is context (not a `-` deletion) -> the landing spot is
+        // ambiguous (could belong to the previous segment's tail insertion, or be a lead-in line
+        // for the next segment) -> not split (otherwise +@memoize would be inserted at the wrong
+        // spot, a silent incorrect apply). This is the BLOCKER regression the pre-push review caught.
         let content =
             "def alpha():\n    return 1\n# --- section break ---\ndef beta():\n    return 2\n";
         let (dir, name) = tmp_file("deco.py", content);
         let cwd = dir.path().to_str().unwrap();
-        // 模型以为 `return 1` 与 `def beta():` 相邻、在中间加 +@memoize;实际隔着 section break。
+        // The model thinks `return 1` and `def beta():` are adjacent and adds +@memoize between them; in reality a section break separates them.
         let v4a = format!(
             "*** Begin Patch\n*** Update File: {name}\n     return 1\n+@memoize\n def beta():\n*** End Patch\n"
         );
         let (out, _reps) = preflight_repair(&v4a, Some(cwd));
         assert!(
             !out.contains("\n@@\n"),
-            "浮动 + 落点歧义不应切段(防静默错误 apply):\n{out}"
+            "a floating + with an ambiguous landing spot should not be split (guards against a silent incorrect apply):\n{out}"
         );
-        assert!(out.contains("+@memoize"), "内容不丢");
+        assert!(out.contains("+@memoize"), "content is not lost");
     }
 
     #[test]
     fn blank_line_drift_block_realigned() {
-        // EP-1 真机 seq111:模型 context 块漏了文件里的空行 → 整块失配。忽略空行唯一定位 → 重建
-        // (补回文件空行 + 对齐字节),`+` 插入保位。
+        // EP-1 live-traffic seq111: the model's context block omitted a blank line present in
+        // the file -> the whole block mismatched. Uniquely located while ignoring blank lines ->
+        // rebuilt (filling back in the file's blank line + aligning bytes), with `+` insertions kept in place.
         let (dir, name) = tmp_file(
             "main.py",
             "from a import x\nfrom b import y\n\nfrom c import z\nfrom d import w\n",
         );
         let cwd = dir.path().to_str().unwrap();
-        // patch 的 context 漏了 `from b` 与 `from c` 之间的空行,想在 `from d` 后插一行。
+        // The patch's context omits the blank line between `from b` and `from c`, and wants to insert a line after `from d`.
         let v4a = format!(
             "*** Begin Patch\n*** Update File: {name}\n from a import x\n from b import y\n from c import z\n from d import w\n+from e import v\n*** End Patch\n"
         );
         let (out, reps) = preflight_repair(&v4a, Some(cwd));
-        assert!(out.contains("+from e import v"), "插入行保留:\n{out}");
-        // 重建后 context 块应含被补回的空行(裸 ' ')。
-        assert!(out.contains("\n \n"), "应补回文件空行作 context:\n{out}");
+        assert!(out.contains("+from e import v"), "the inserted line is kept:\n{out}");
+        // After rebuilding, the context block should contain the filled-back-in blank line (a bare ' ').
+        assert!(out.contains("\n \n"), "the file's blank line should be filled back in as context:\n{out}");
         assert_eq!(reps[0].kind, "repaired", "{:?}", reps);
     }
 
     #[test]
     fn blank_tolerant_skips_blank_line_deletion() {
-        // 含「删除一个空行」的 `-` → blank-tolerant 重建无法忠实表达 → 放行不改(不静默转 context)。
+        // A `-` that means "delete a blank line" -> a blank-tolerant rebuild can't faithfully represent it -> passed through unchanged (not silently converted to context).
         let (dir, name) = tmp_file("bd.txt", "x\ny\n");
         let cwd = dir.path().to_str().unwrap();
         let v4a = format!("*** Update File: {name}\n x\n-\n y\n+z\n");
         let (out, reps) = preflight_repair(&v4a, Some(cwd));
-        assert_eq!(out, v4a, "含空白行删除应放行不改:\n{out}");
+        assert_eq!(out, v4a, "a blank-line deletion should be passed through unchanged:\n{out}");
         assert!(reps[0].kind.starts_with("skipped"), "{:?}", reps);
     }
 
     #[test]
     fn blank_tolerant_ambiguous_passthrough() {
-        // 精确失配(文件 p/q 间有空行,patch 没写)但忽略空行后**多处**匹配 → 歧义放行不猜。
+        // An exact mismatch (the file has a blank line between p/q that the patch omitted) but
+        // ignoring blank lines gives **multiple** matches -> ambiguous, passed through, never guessed.
         let (dir, name) = tmp_file("dup.txt", "p\n\nq\nX\np\n\nq\n");
         let cwd = dir.path().to_str().unwrap();
         let v4a = format!("*** Update File: {name}\n p\n q\n+r\n");
         let (out, reps) = preflight_repair(&v4a, Some(cwd));
-        assert_eq!(out, v4a, "歧义(忽略空行后多处)不改:\n{out}");
+        assert_eq!(out, v4a, "ambiguous (multiple matches ignoring blank lines), should not change:\n{out}");
         assert!(reps[0].kind.starts_with("skipped"), "{:?}", reps);
     }
 
     #[test]
     fn optimize_pipeline_fixes_multiple_issues() {
-        // 一个 patch 同时:漏信封 + 双边 @@ + 尾随空格上下文 → 全恢复。
+        // A single patch simultaneously: missing envelope + both-sided @@ + trailing-whitespace context -> all fully recovered.
         let (dir, name) = tmp_file("multi.txt", "fn main() {\n    let x = 1;\n}\n");
         let cwd = dir.path().to_str().unwrap();
         let v4a = format!(
             "*** Update File: {name}\n@@ fn main() {{ @@\n    let x = 1;   \n+    let y = 2;\n"
         );
         let (out, reps) = optimize_patch(&v4a, Some(cwd), true);
-        assert!(out.starts_with("*** Begin Patch\n"), "补信封:\n{out}");
-        assert!(out.trim_end().ends_with("*** End Patch"), "补 End:\n{out}");
-        assert!(out.contains("@@ fn main() {\n"), "双边 @@ 转单边:\n{out}");
-        assert!(out.contains("    let x = 1;\n"), "尾随空格对齐:\n{out}");
-        assert!(out.contains("+    let y = 2;"), "新增行保留");
-        // 至少 3 类修复都记录
+        assert!(out.starts_with("*** Begin Patch\n"), "envelope filled in:\n{out}");
+        assert!(out.trim_end().ends_with("*** End Patch"), "End filled in:\n{out}");
+        assert!(out.contains("@@ fn main() {\n"), "both-sided @@ converted to single-sided:\n{out}");
+        assert!(out.contains("    let x = 1;\n"), "trailing whitespace aligned:\n{out}");
+        assert!(out.contains("+    let y = 2;"), "the added line is kept");
+        // At least 3 kinds of repair should all be recorded
         let kinds: Vec<&str> = reps.iter().map(|r| r.kind.as_str()).collect();
         assert!(
             kinds.iter().filter(|k| **k == "repaired").count() >= 2,
@@ -2575,11 +2746,11 @@ mod tests {
     #[test]
     fn add_file_untouched_no_cwd_noop() {
         let v4a = "*** Begin Patch\n*** Add File: new.txt\n+hello\n*** End Patch\n";
-        // 无 Update File → 短路原样返回(即便给 cwd)。
+        // No Update File -> short-circuits and returns as-is (even given a cwd).
         let (out, reps) = preflight_repair(v4a, Some("/tmp"));
         assert_eq!(out, v4a);
         assert!(reps.is_empty());
-        // 无 cwd → 原样
+        // No cwd -> as-is
         let (out2, reps2) = preflight_repair(v4a, None);
         assert_eq!(out2, v4a);
         assert!(reps2.is_empty());

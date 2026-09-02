@@ -433,7 +433,7 @@ fn strip_jsonc_trailing_commas(input: &str) -> String {
         }
 
         // When we hit a comma outside a string, look ahead past whitespace. If the next
-        // significant character closes an object/array, this is a trailing comma — drop
+        // significant character closes an object/array, this is a trailing comma - drop
         // it. Otherwise keep the comma (it separates real elements).
         if c == b',' {
             let mut j = i + 1;
@@ -1195,7 +1195,7 @@ fn series_defaults_for(model_id: &str) -> Option<Value> {
 /// Build a minimal but valid model entry for a model id that is not in the catalog.
 ///
 /// OpenCode's schema only requires a `name` for a model entry, so a model the user
-/// explicitly selected — even one we have no metadata for — should still be written
+/// explicitly selected - even one we have no metadata for - should still be written
 /// rather than silently dropped. If a display name was passed from the frontend we use
 /// it verbatim (so the config matches what the user saw); otherwise we derive one.
 /// When we can infer the model family from the id we also fill in limit/modalities.
@@ -2103,7 +2103,7 @@ mod tests {
         assert_eq!(variants["medium"]["disabled"], true);
         assert_eq!(variants["max"]["disabled"], true);
 
-        // Verify the JSON shape contains only `effort` — no budget fields
+        // Verify the JSON shape contains only `effort` - no budget fields
         let low = &variants["low"];
         assert_eq!(low.as_object().unwrap().len(), 1);
         assert!(low.get("effort").is_some());
@@ -2143,7 +2143,7 @@ mod tests {
         );
         assert_eq!(variants["max"]["disabled"], true);
 
-        // Verify the JSON shape contains only `effort` — no budget fields
+        // Verify the JSON shape contains only `effort` - no budget fields
         let low = &variants["low"];
         assert_eq!(low.as_object().unwrap().len(), 1);
         assert!(low.get("effort").is_some());
@@ -2793,7 +2793,7 @@ mod tests {
     }
 
     /// parse_config_file must read a jsonc file with BOTH comments and trailing commas
-    /// — this is the regression for the user-reported "config destroyed" case where a
+    /// - this is the regression for the user-reported "config destroyed" case where a
     /// trailing comma made serde_json fail and the whole config was replaced with {}.
     #[test]
     fn test_parse_config_file_handles_jsonc_comments_and_trailing_commas() {

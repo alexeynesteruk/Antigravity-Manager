@@ -67,7 +67,7 @@ impl RealModelSpec {
 /// Infer the variant tier from the client-sent `thinking.budget_tokens`.
 ///
 /// OpenCode derives budgetTokens from its model capabilities (max = budget-1,
-/// high = floor(budget/2)), so the exact value is not the real budget —
+/// high = floor(budget/2)), so the exact value is not the real budget:
 /// we only use its magnitude to guess which tier the user selected. When no budget
 /// is present we default to High (the most capable tier).
 pub fn infer_tier(budget_tokens: Option<u32>) -> VariantTier {
@@ -121,7 +121,7 @@ pub fn resolve_real_model(canonical: &str, tier: VariantTier) -> Option<RealMode
     None
 }
 
-/// Resolve a canonical model that has NO variant split — use real ID + params directly.
+/// Resolve a canonical model that has NO variant split - use real ID + params directly.
 ///
 /// Covers models the user may configure without variants (flash-lite, claude, etc.).
 /// Also accepts the real IDs themselves (idempotent passthrough).
@@ -213,7 +213,7 @@ const SPEC_3_FLASH_AGENT: RealModelSpec = RealModelSpec {
     preserve_client_budget: false,
 };
 
-// gemini-3.1-pro family (maxOutputTokens = 65535 — note the off-by-one vs Flash)
+// gemini-3.1-pro family (maxOutputTokens = 65535 - note the off-by-one vs Flash)
 const SPEC_31_PRO_LOW: RealModelSpec = RealModelSpec {
     id: "gemini-3.1-pro-low",
     thinking_budget: 1001,
@@ -523,7 +523,7 @@ mod tests {
     }
 
     // ═════════════════════════════════════════════════════════════════════
-    // baseline tests — capture current resolve() output as equivalence
+    // baseline tests - capture current resolve() output as equivalence
     // anchors for future refactoring.  Do NOT change these assertions;
     // if a refactor breaks them, the refactor is wrong.
     // ═════════════════════════════════════════════════════════════════════
@@ -842,7 +842,7 @@ mod tests {
     }
 
     // ═════════════════════════════════════════════════════════════════════
-    // old catalog id fallback — these legacy top-level ids must keep
+    // old catalog id fallback - these legacy top-level ids must keep
     // resolving through their family aliases.  See task-5-brief.md.
     // ═════════════════════════════════════════════════════════════════════
 

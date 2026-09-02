@@ -8,10 +8,10 @@
 
 ## What we got
 The proxy supports `proxy.auth_mode` with four modes:
-- `off` — no auth required.
-- `strict` — auth required for all routes.
-- `all_except_health` — auth required for all routes except `GET /healthz`.
-- `auto` — derived policy: if `proxy.allow_lan_access=true` then `all_except_health`, otherwise `off`.
+- `off` - no auth required.
+- `strict` - auth required for all routes.
+- `all_except_health` - auth required for all routes except `GET /healthz`.
+- `auto` - derived policy: if `proxy.allow_lan_access=true` then `all_except_health`, otherwise `off`.
 
 Implementation:
 - Config enum and serialization: [`src-tauri/src/proxy/config.rs`](../../src-tauri/src/proxy/config.rs)

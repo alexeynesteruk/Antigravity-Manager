@@ -440,7 +440,7 @@ pub fn inject_google_search_tool(body: &mut Value, _mapped_model: Option<&str>) 
             });
 
             // [FIX] v1internal (cloudcode-pa) does NOT support mixing googleSearch
-            // with functionDeclarations — it lacks includeServerSideToolInvocations.
+            // with functionDeclarations - it lacks includeServerSideToolInvocations.
             // Skip googleSearch injection entirely when function tools are present.
             if has_functions {
                 tracing::debug!(
