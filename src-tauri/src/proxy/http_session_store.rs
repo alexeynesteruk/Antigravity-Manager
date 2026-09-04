@@ -208,18 +208,77 @@ pub fn prepare_session_input(
                 .is_some_and(|id| history_ids.contains(id))
         })
     };
-    let delta_source = if reset_parent || history.is_empty() {
-        new_input.clone()
-    } else if exact_replay {
-        new_input[history.len()..].to_vec()
-    } else if let Some(index) = replayed_through {
-        new_input[index + 1..].to_vec()
-    } else {
-        new_input.clone()
+    // Helper: check whether two input items are semantically equivalent (ignoring volatile
+    // fields such as id).
+    let items_semantically_equal = |a: &Value, b: &Value| -> bool {
+        let role_a = a.get("role").and_then(Value::as_str);
+        let role_b = b.get("role").and_then(Value::as_str);
+        let type_a = a.get("type").and_then(Value::as_str);
+        let type_b = b.get("type").and_then(Value::as_str);
+        let content_a = a.get("content").or_else(|| a.get("text"));
+        let content_b = b.get("content").or_else(|| b.get("text"));
+        role_a == role_b && type_a == type_b && content_a == content_b
     };
+
+    // Semantic prefix match: does new_input start with history, ignoring volatile fields?
+    let semantic_prefix_match = !history.is_empty()
+        && new_input.len() >= history.len()
+        && history
+            .iter()
+            .zip(new_input.iter())
+            .all(|(h, n)| items_semantically_equal(h, n));
+
+    // Semantic suffix find: locate the last history item inside new_input by content.
+    let semantic_suffix_idx = if !history.is_empty()
+        && !reset_parent
+        && !exact_replay
+        && replayed_through.is_none()
+        && !semantic_prefix_match
+    {
+        let last_h = &history[history.len() - 1];
+        new_input
+            .iter()
+            .rposition(|n| items_semantically_equal(last_h, n))
+    } else {
+        None
+    };
+
+    let (delta_source, use_new_input_as_merged) = if reset_parent || history.is_empty() {
+        (new_input.clone(), false)
+    } else if exact_replay {
+        (new_input[history.len()..].to_vec(), false)
+    } else if semantic_prefix_match {
+        (new_input[history.len()..].to_vec(), false)
+    } else if let Some(index) = replayed_through {
+        (new_input[index + 1..].to_vec(), false)
+    } else if let Some(index) = semantic_suffix_idx {
+        (new_input[index + 1..].to_vec(), false)
+    } else if new_input.len() >= history.len() {
+        // [FIX #3382] Fallback protection: the client sent a full conversation history but
+        // formatting/id differences meant no boundary could be identified. Appending all of
+        // new_input onto history here would double (or quadruple, across repeated turns) the
+        // stored history. Instead treat new_input as the authoritative current history and
+        // extract only its last element as the delta.
+        tracing::warn!(
+            "[Session] Match failed but new_input (len: {}) >= history (len: {}). Preventing history duplication.",
+            new_input.len(),
+            history.len()
+        );
+        let delta_slice = if new_input.is_empty() {
+            Vec::new()
+        } else {
+            vec![new_input.last().unwrap().clone()]
+        };
+        (delta_slice, true)
+    } else {
+        (new_input.clone(), false)
+    };
+
     let delta = merge_history_with_new_input(Vec::new(), &[], delta_source, tool_call_cache);
     let merged = if reset_parent || history.is_empty() {
         delta.clone()
+    } else if use_new_input_as_merged {
+        merge_history_with_new_input(Vec::new(), &[], new_input, tool_call_cache)
     } else {
         merge_history_with_new_input(history, &[], delta.clone(), tool_call_cache)
     };
@@ -448,5 +507,45 @@ mod tests {
         let parent_a = store.sessions["resp-a"].node.parent.as_ref().unwrap();
         let parent_b = store.sessions["resp-b"].node.parent.as_ref().unwrap();
         assert!(Arc::ptr_eq(parent_a, parent_b));
+    }
+
+    #[test]
+    fn prepare_session_input_prevents_duplication_on_full_history_replay_without_ids() {
+        // [FIX #3382 regression test] Client resends full history with no "id" field: history
+        // has 2 messages, new_input has the same 2 plus 1 new one.
+        let history = vec![
+            json!({"role": "user", "type": "message", "content": "hello"}),
+            json!({"role": "assistant", "type": "message", "content": "hi there"}),
+        ];
+        let new_input = vec![
+            json!({"role": "user", "type": "message", "content": "hello"}),
+            json!({"role": "assistant", "type": "message", "content": "hi there"}),
+            json!({"role": "user", "type": "message", "content": "next question"}),
+        ];
+
+        let prepared = prepare_session_input(history, new_input, &HashMap::new());
+        // Delta should be the 1 new message, not all 3.
+        assert_eq!(prepared.delta.len(), 1);
+        assert_eq!(prepared.delta[0]["content"], "next question");
+        // Merged history should be 3 messages, not 5 (2 + 3).
+        assert_eq!(prepared.merged.len(), 3);
+    }
+
+    #[test]
+    fn prepare_session_input_fallback_avoids_duplication_when_unmatched() {
+        // [FIX #3382 regression test] Client sends a same-length but unrelated history (no
+        // matching prefix, suffix, or replayed-through id) - the fallback must not append it
+        // onto the stored history and double it.
+        let history = vec![
+            json!({"role": "user", "type": "message", "content": "msg 1"}),
+            json!({"role": "assistant", "type": "message", "content": "msg 2"}),
+        ];
+        let new_input = vec![
+            json!({"role": "user", "type": "message", "content": "different 1"}),
+            json!({"role": "assistant", "type": "message", "content": "different 2"}),
+        ];
+
+        let prepared = prepare_session_input(history, new_input, &HashMap::new());
+        assert_eq!(prepared.merged.len(), 2);
     }
 }
