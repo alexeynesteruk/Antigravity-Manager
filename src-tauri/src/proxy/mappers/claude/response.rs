@@ -158,6 +158,8 @@ pub struct NonStreamingProcessor {
     pub session_id: Option<String>,
     pub model_name: String,
     pub message_count: usize, // [NEW v4.0.0] Message count for rewind detection
+    // [FIX #3379] Registered tool names, used to detect call:default_api:* leakage
+    pub registered_tool_names: Vec<String>,
 }
 
 impl NonStreamingProcessor {
@@ -174,7 +176,13 @@ impl NonStreamingProcessor {
             session_id,
             model_name,
             message_count,
+            registered_tool_names: Vec::new(),
         }
+    }
+
+    // [FIX #3379] Set the registered tool names used for leakage detection
+    pub fn set_registered_tool_names(&mut self, names: Vec<String>) {
+        self.registered_tool_names = names;
     }
 
     /// Process a Gemini response and convert it into a Claude response
@@ -473,6 +481,85 @@ impl NonStreamingProcessor {
             break;
         }
 
+        // [FIX #3379] call:default_api:* leakage detection (non-streaming path).
+        // Occasionally a tool call comes back as plain text instead of a proper tool_use
+        // block (e.g. "call:default_api:Read{file_path:...}"), which silently ends the
+        // client's agent/tool loop. Recover it into a ToolUse block, but only when every
+        // guard passes: a tool with this name is actually registered on the request (G4),
+        // the text is nothing but the call expression with no surrounding prose (G5), and
+        // the arguments parse as a JSON object (G6). A partial/ambiguous match is left as
+        // plain text rather than guessed at.
+        if !self.registered_tool_names.is_empty() {
+            let trimmed = current_text.trim();
+            if trimmed.starts_with("call:default_api:") {
+                const PREFIX: &str = "call:default_api:";
+                let rest = &trimmed[PREFIX.len()..];
+                let tool_end = rest.find(|c| c == '{' || c == '(').unwrap_or(rest.len());
+                let tool_name = rest[..tool_end].trim();
+                let args_str = rest[tool_end..].trim();
+
+                if !tool_name.is_empty() {
+                    // G5: no surrounding prose - the text must be only the call expression.
+                    let after_name = trimmed[PREFIX.len() + tool_name.len()..].trim();
+                    let g5_ok = after_name.is_empty()
+                        || after_name.starts_with('{')
+                        || after_name.starts_with('(');
+
+                    if g5_ok {
+                        // G4: whitelist check against the request's actual registered tools.
+                        let matched = self
+                            .registered_tool_names
+                            .iter()
+                            .find(|n| n.eq_ignore_ascii_case(tool_name))
+                            .cloned();
+
+                        if let Some(matched_name) = matched {
+                            // G6: arguments must parse as a JSON object.
+                            let parsed = if args_str.is_empty() {
+                                Some(serde_json::json!({}))
+                            } else {
+                                serde_json::from_str::<serde_json::Value>(args_str)
+                                    .ok()
+                                    .filter(|v| v.is_object())
+                            };
+
+                            if let Some(parsed_args) = parsed {
+                                tracing::warn!(
+                                    "[#3379-RECOVERY] Non-streaming: recovering call:default_api:{} as tool_use",
+                                    matched_name
+                                );
+                                let tool_id = format!(
+                                    "{}-3379-{}",
+                                    matched_name,
+                                    crate::proxy::common::utils::generate_random_id()
+                                );
+                                self.content_blocks.push(ContentBlock::ToolUse {
+                                    id: tool_id,
+                                    name: matched_name,
+                                    input: parsed_args,
+                                    signature: None,
+                                    cache_control: None,
+                                });
+                                self.has_tool_call = true;
+                                // current_text is fully consumed as a tool_use; nothing else to emit.
+                                return;
+                            } else {
+                                tracing::warn!(
+                                    "[#3379] Non-streaming: call:default_api:{} detected but args parse failed; emitting as text",
+                                    tool_name
+                                );
+                            }
+                        } else {
+                            tracing::warn!(
+                                "[#3379] Non-streaming: call:default_api:{} detected but no matching registered tool; emitting as text",
+                                tool_name
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
         if !current_text.is_empty() {
             self.content_blocks
                 .push(ContentBlock::Text { text: current_text });
@@ -547,8 +634,10 @@ pub fn transform_response(
     session_id: Option<String>,
     model_name: String,
     message_count: usize, // [NEW v4.0.0] Message count for rewind detection
+    registered_tool_names: Vec<String>, // [FIX #3379] For call:default_api leakage recovery
 ) -> Result<ClaudeResponse, String> {
     let mut processor = NonStreamingProcessor::new(session_id, model_name, message_count);
+    processor.set_registered_tool_names(registered_tool_names);
     Ok(processor.process(gemini_response, scaling_enabled, context_limit))
 }
 
@@ -592,6 +681,7 @@ mod tests {
             None,
             "gemini-2.5-flash".to_string(),
             1,
+            Vec::new(),
         );
         assert!(result.is_ok());
 
@@ -649,6 +739,7 @@ mod tests {
             None,
             "gemini-2.5-flash".to_string(),
             1,
+            Vec::new(),
         );
         assert!(result.is_ok());
 
