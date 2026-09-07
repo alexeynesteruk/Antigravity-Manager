@@ -318,6 +318,16 @@ impl StreamingState {
 
         if let Some(u) = usage {
             message["usage"] = json!(u);
+        } else {
+            // [FIX #3397] Some models' first upstream chunk carries no usageMetadata (e.g.
+            // gpt-oss-120b-medium). Strict Anthropic-protocol clients (OpenCode's
+            // @ai-sdk/anthropic) reject a message_start event whose usage field is missing
+            // entirely, so emit a zero-value placeholder rather than omitting it. Later
+            // message_delta events still carry the real, final token counts.
+            message["usage"] = json!({
+                "input_tokens": 0,
+                "output_tokens": 0
+            });
         }
 
         let result = self.emit(
