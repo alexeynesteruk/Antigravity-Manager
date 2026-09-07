@@ -1633,6 +1633,19 @@ pub async fn handle_messages(
                     Some(&request_with_mapped.model),
                 )
                 .await;
+
+            // [FIX #3395] On rate limiting or upstream overload, unbind the session
+            // immediately so the next retry - or a subsequent request in the same session -
+            // doesn't deadlock on the same limited account.
+            if status_code == 429 || status_code == 529 {
+                if let Some(sid) = session_id {
+                    token_manager.clear_session_binding(sid);
+                    debug!(
+                        "[{}] Unbound session {} from account {} due to status {}",
+                        trace_id, sid, email, status_code
+                    );
+                }
+            }
         }
 
         // 4. Handle a 400 error (Thinking signature invalidated or block-order error)

@@ -753,6 +753,16 @@ pub async fn handle_generate(
             }
         }
 
+        // [FIX #3395] On rate limiting or upstream overload, unbind the session immediately so
+        // account rotation and later requests don't deadlock on the same limited account.
+        if status_code == 429 || status_code == 529 {
+            token_manager.clear_session_binding(&session_id);
+            tracing::debug!(
+                "[Gemini] Unbound session {} from account {} due to status {}",
+                session_id, email, status_code
+            );
+        }
+
         // Determine the retry strategy
         let strategy = retry_state.determine_strategy(
             &account_id,

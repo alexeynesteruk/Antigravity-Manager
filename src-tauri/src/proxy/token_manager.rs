@@ -830,8 +830,14 @@ impl TokenManager {
         let mut changed = false;
 
         for std_id in &config.monitored_models {
+            // [FIX #3395] Normalize the monitored model to its standard id (e.g. the user
+            // picked "gemini-3.7-flash" in the UI, which aligns to "gemini-3-flash" here) so
+            // the lookups below actually find the group data keyed under the standard id.
+            let lookup_key = crate::proxy::common::model_mapping::normalize_to_standard_id(std_id)
+                .unwrap_or_else(|| std_id.clone());
+
             // Get the group's highest percentage; if the account has no model in that group, treat it as 100%
-            let max_pct = group_max_percentage.get(std_id).cloned().unwrap_or(100);
+            let max_pct = group_max_percentage.get(&lookup_key).cloned().unwrap_or(100);
 
             if max_pct < threshold {
                 // Only trigger group-wide protection if every model in the group is below threshold
@@ -842,7 +848,7 @@ impl TokenManager {
                         account_path,
                         max_pct,
                         threshold,
-                        std_id,
+                        &lookup_key,
                     )
                     .await
                     .unwrap_or(false)
@@ -856,12 +862,12 @@ impl TokenManager {
                     .and_then(|v| v.as_array());
 
                 let is_protected = protected_models.map_or(false, |arr| {
-                    arr.iter().any(|m| m.as_str() == Some(std_id as &str))
+                    arr.iter().any(|m| m.as_str() == Some(lookup_key.as_str()))
                 });
 
                 if is_protected {
                     if self
-                        .restore_quota_protection(account_json, &account_id, account_path, std_id)
+                        .restore_quota_protection(account_json, &account_id, account_path, &lookup_key)
                         .await
                         .unwrap_or(false)
                     {
@@ -1153,7 +1159,7 @@ impl TokenManager {
         account_json["proxy_disabled_at"] = serde_json::Value::Null;
 
         let threshold = config.threshold_percentage as i32;
-        let mut protected_list = Vec::new();
+        let mut protected_list: Vec<serde_json::Value> = Vec::new();
 
         if let Some(models) = quota.get("models").and_then(|m| m.as_array()) {
             let mut group_max_percentage: HashMap<String, i32> = HashMap::new();
@@ -1176,9 +1182,18 @@ impl TokenManager {
             }
 
             for std_id in &config.monitored_models {
-                let max_pct = group_max_percentage.get(std_id).cloned().unwrap_or(100);
-                if max_pct < threshold {
-                    protected_list.push(serde_json::Value::String(std_id.clone()));
+                // [FIX #3395] Same normalization as above, plus a dedup guard: two different
+                // UI-facing aliases can normalize to the same standard id, and pushing it twice
+                // would put a duplicate entry in protected_list.
+                let lookup_key = crate::proxy::common::model_mapping::normalize_to_standard_id(std_id)
+                    .unwrap_or_else(|| std_id.clone());
+                let max_pct = group_max_percentage.get(&lookup_key).cloned().unwrap_or(100);
+                if max_pct < threshold
+                    && !protected_list
+                        .iter()
+                        .any(|v| v.as_str() == Some(lookup_key.as_str()))
+                {
+                    protected_list.push(serde_json::Value::String(lookup_key));
                 }
             }
         }
@@ -1893,14 +1908,21 @@ impl TokenManager {
                         let key = self
                             .email_to_account_id(&bound_token.email)
                             .unwrap_or_else(|| bound_token.account_id.clone());
-                        // [FIX] Pass None for specific model wait time if not applicable
-                        let reset_sec = self.rate_limit_tracker.get_remaining_wait(&key, None);
+                        // [FIX #3395] Pass the normalized target model, not None - quota
+                        // exhaustion locks are keyed as "account_id:model_id" composite keys,
+                        // so querying with None (account-wide lock only) always returned 0 even
+                        // when this specific model was locked, letting sticky sessions keep
+                        // reusing an account that is actually rate-limited for the model being
+                        // requested.
+                        let reset_sec = self
+                            .rate_limit_tracker
+                            .get_remaining_wait(&key, Some(&normalized_target));
                         if reset_sec > 0 {
                             // [Fix Issue #284] Immediately unbind and switch accounts instead of blocking to wait
                             // Reason: blocking to wait causes client socket timeouts (UND_ERR_SOCKET) under concurrent requests
                             tracing::debug!(
-                                "Sticky Session: Bound account {} is rate-limited ({}s), unbinding and switching.",
-                                bound_token.email, reset_sec
+                                "Sticky Session: Bound account {} is rate-limited for {} ({}s), unbinding and switching.",
+                                bound_token.email, normalized_target, reset_sec
                             );
                             self.session_accounts.remove(sid);
                         } else if !attempted.contains(&bound_id)
@@ -1914,6 +1936,15 @@ impl TokenManager {
                             && bound_token.protected_models.contains(&normalized_target)
                         {
                             tracing::debug!("Sticky Session: Bound account {} is quota-protected for model {} [{}], unbinding and switching.", bound_token.email, normalized_target, target_model);
+                            self.session_accounts.remove(sid);
+                        } else if attempted.contains(&bound_id) {
+                            // [FIX #3395] The bound account already failed in this request's
+                            // current attempt round - unbind immediately instead of deadlocking
+                            // on it again.
+                            tracing::debug!(
+                                "Sticky Session: Bound account {} already attempted in current request, unbinding",
+                                bound_token.email
+                            );
                             self.session_accounts.remove(sid);
                         }
                     } else {
