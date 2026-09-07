@@ -744,6 +744,13 @@ pub fn transform_openai_request(
                 }
             }
 
+            // [FIX #3396] Don't drop a user-role message just because it ended up with no
+            // parts - that would break role rotation and could leave a functionCall turn
+            // without the preceding user/functionResponse turn Gemini requires.
+            if role == "user" && parts.is_empty() {
+                parts.push(json!({ "text": " " }));
+            }
+
             json!({ "role": role, "parts": parts })
         })
         .filter(|msg| !msg["parts"].as_array().map(|a| a.is_empty()).unwrap_or(true))
@@ -773,7 +780,32 @@ pub fn transform_openai_request(
         }
         merged_contents.push(msg);
     }
-    let contents = merged_contents;
+    let mut contents = merged_contents;
+
+    // [FIX #3396] Gemini requires conversations to start with a user turn, and a functionCall
+    // turn must immediately follow a user turn or a functionResponse turn. Autonomous agent
+    // loops (Hermes-style, background subworkers) sometimes start with an assistant turn that
+    // invokes a tool right after the system message, with no initial user greeting - inject a
+    // lightweight user primer so Gemini doesn't reject the request with 400 INVALID_ARGUMENT.
+    if contents.is_empty() {
+        contents.push(json!({
+            "role": "user",
+            "parts": [{ "text": "Continue" }]
+        }));
+    } else if contents
+        .first()
+        .and_then(|f| f.get("role"))
+        .and_then(|r| r.as_str())
+        == Some("model")
+    {
+        contents.insert(
+            0,
+            json!({
+                "role": "user",
+                "parts": [{ "text": "Continue the task." }]
+            }),
+        );
+    }
 
     // 3. Build the request body
 
@@ -1732,8 +1764,14 @@ mod tests {
 
         // Extract the tool call part from contents (under request.contents)
         let contents = result["request"]["contents"].as_array().unwrap();
-        // Identify the part with functionCall
-        let parts = contents[0]["parts"].as_array().unwrap();
+        // [FIX #3396] The conversation starts with a model turn (no leading user message), so
+        // transform_openai_request now injects a user primer at index 0. Find the model turn
+        // by role instead of assuming index 0.
+        let model_msg = contents
+            .iter()
+            .find(|c| c["role"] == "model")
+            .expect("Should find model role message");
+        let parts = model_msg["parts"].as_array().unwrap();
         let tool_part = parts
             .iter()
             .find(|p: &&serde_json::Value| p.get("functionCall").is_some())
@@ -1934,5 +1972,71 @@ mod tests {
         let resp_schema = &gen_config["responseSchema"];
         assert_eq!(resp_schema["type"], "object");
         assert_eq!(resp_schema["properties"]["summary"]["type"], "object");
+    }
+
+    #[test]
+    fn test_hermes_autonomous_first_assistant_tool_call_injected_user_primer() {
+        // [FIX #3396] A conversation starting with assistant tool calls (common in Hermes-style
+        // autonomous agents / background subworker loops) must get a user primer injected at
+        // index 0, or Gemini rejects it with "Please ensure that function call turn comes
+        // immediately after a user turn or after a function response turn."
+        let raw_json = json!({
+            "model": "gemini-3.8-flash-high",
+            "messages": [
+                {
+                    "role": "system",
+                    "content": "You are Don Santo, an autonomous agent."
+                },
+                {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [
+                        {
+                            "id": "call_123",
+                            "type": "function",
+                            "function": {
+                                "name": "terminal",
+                                "arguments": "{\"command\": \"ls\"}"
+                            }
+                        }
+                    ]
+                },
+                {
+                    "role": "tool",
+                    "tool_call_id": "call_123",
+                    "name": "terminal",
+                    "content": "output of ls"
+                }
+            ]
+        });
+
+        let request: OpenAIRequest = serde_json::from_value(raw_json).unwrap();
+        let (res_val, _sid, _msg_count, _) =
+            transform_openai_request(&request, "test-v", "gemini-3.8-flash-high", None);
+        let contents = res_val["request"]["contents"]
+            .as_array()
+            .expect("contents must be an array");
+
+        // First turn must be user
+        assert_eq!(contents[0]["role"], "user");
+        assert!(contents[0]["parts"][0]["text"].as_str().is_some());
+
+        // Second turn must be model with functionCall
+        assert_eq!(contents[1]["role"], "model");
+        let has_func_call = contents[1]["parts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|p| p.get("functionCall").is_some());
+        assert!(has_func_call);
+
+        // Third turn must be user with functionResponse
+        assert_eq!(contents[2]["role"], "user");
+        let has_func_resp = contents[2]["parts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|p| p.get("functionResponse").is_some());
+        assert!(has_func_resp);
     }
 }
