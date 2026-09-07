@@ -1,5 +1,29 @@
 use serde::{Deserialize, Serialize};
 
+// [FIX #3319] Per-account lock guarding the actual refresh_token -> access_token HTTP call.
+// This module is the one chokepoint every refresh path funnels through: the main proxy
+// request path (token_manager::get_token), the /internal/warmup handler
+// (token_manager::get_token_by_email), and the periodic background scheduler
+// (oauth::ensure_fresh_token, scanned every 5 minutes for every account) all end up calling
+// refresh_access_token_with_client below, and none of them previously synchronized with each
+// other. Since the proxy's own smooth-refresh buffer and the scheduler's scan interval are
+// both 300 seconds, an actively-used account could easily have two of these paths decide to
+// refresh at nearly the same moment. If Google rotates refresh tokens (issuing a new one and
+// invalidating the old on each use), the losing concurrent request's now-stale refresh_token
+// is rejected as invalid_grant - and two of those in a row causes this app to disable the
+// account, forcing the user to re-authenticate. Serializing the HTTP call itself, keyed by
+// account (falling back to the refresh_token when no account_id is available yet, e.g. during
+// initial onboarding), closes that race for every current and future caller at once.
+static REFRESH_LOCKS: std::sync::OnceLock<dashmap::DashMap<String, std::sync::Arc<tokio::sync::Mutex<()>>>> =
+    std::sync::OnceLock::new();
+
+fn refresh_lock_key(refresh_token: &str, account_id: Option<&str>) -> String {
+    account_id
+        .filter(|id| !id.is_empty())
+        .map(|id| id.to_string())
+        .unwrap_or_else(|| refresh_token.to_string())
+}
+
 // Google OAuth configuration
 const CLIENT_ID: &str = "1071006060591-tmhssin2h21lcre235vtolojh4g403ep.apps.googleusercontent.com";
 const CLIENT_SECRET: &str = "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";
@@ -595,6 +619,55 @@ pub async fn refresh_access_token_with_client(
         return Err("No OAuth clients configured".to_string());
     }
 
+    // [FIX #3319] Serialize refresh attempts for this account/refresh_token across every
+    // caller (main proxy path, warmup handler, background scheduler). Held for the whole
+    // function body, including the retry-and-fallback loop below, so no other caller can
+    // start a concurrent refresh for the same account while this one is in flight.
+    let lock_key = refresh_lock_key(refresh_token, account_id);
+    let lock = REFRESH_LOCKS
+        .get_or_init(dashmap::DashMap::new)
+        .entry(lock_key)
+        .or_insert_with(|| std::sync::Arc::new(tokio::sync::Mutex::new(())))
+        .clone();
+    let _refresh_guard = lock.lock().await;
+
+    // [FIX #3319] Re-check the on-disk account state now that we hold the lock: a caller that
+    // was waiting on it may have captured its refresh_token before another caller's refresh
+    // already completed and persisted. If that happened, either reuse the now-fresh result
+    // directly (no need to call Google again) or, if it's not fresh enough by time but the
+    // refresh_token value has already changed, use that newer value instead of the stale one
+    // this call was originally given - submitting an already-rotated refresh_token would
+    // otherwise fail with invalid_grant on an endpoint that rotates them.
+    let mut effective_refresh_token = refresh_token.to_string();
+    if let Some(id) = account_id.filter(|id| !id.is_empty()) {
+        let id_owned = id.to_string();
+        if let Ok(Some(current)) = tokio::task::spawn_blocking(move || {
+            crate::modules::account::load_account(&id_owned).ok()
+        })
+        .await
+        {
+            let now = chrono::Local::now().timestamp();
+            if current.token.expiry_timestamp > now + TOKEN_REFRESH_SKEW_SECONDS {
+                crate::modules::logger::log_info(&format!(
+                    "[OAuth] Account {:?} was already refreshed by a concurrent caller while this call waited for the lock; reusing its result",
+                    account_id
+                ));
+                return Ok(TokenResponse {
+                    access_token: current.token.access_token,
+                    expires_in: current.token.expiry_timestamp - now,
+                    token_type: "Bearer".to_string(),
+                    refresh_token: Some(current.token.refresh_token),
+                    id_token: current.token.id_token,
+                    oauth_client_key: current.token.oauth_client_key,
+                });
+            }
+            if current.token.refresh_token != refresh_token {
+                effective_refresh_token = current.token.refresh_token;
+            }
+        }
+    }
+    let refresh_token = effective_refresh_token.as_str();
+
     let mut attempt_errors: Vec<String> = Vec::new();
 
     for (idx, client_cfg) in candidates.iter().enumerate() {
@@ -757,5 +830,64 @@ mod tests {
         assert!(url.contains("state=test-state-123456"));
         assert!(url.contains("redirect_uri=http%3A%2F%2Flocalhost%3A8080%2Fcallback"));
         assert!(url.contains("response_type=code"));
+    }
+
+    #[test]
+    fn test_refresh_lock_key_prefers_account_id() {
+        // [FIX #3319] Two calls for the same account must land on the same lock key even if
+        // they carry different (e.g. already-rotated) refresh_token values, otherwise they
+        // would contend on different Arc<Mutex> instances and not actually serialize.
+        assert_eq!(
+            refresh_lock_key("token-a", Some("acct-1")),
+            refresh_lock_key("token-b", Some("acct-1"))
+        );
+        assert_ne!(
+            refresh_lock_key("token-a", Some("acct-1")),
+            refresh_lock_key("token-a", Some("acct-2"))
+        );
+    }
+
+    #[test]
+    fn test_refresh_lock_key_falls_back_to_refresh_token() {
+        // No account_id yet (e.g. during onboarding, before an account file exists): callers
+        // sharing the same refresh_token must still serialize on the same key.
+        assert_eq!(
+            refresh_lock_key("shared-token", None),
+            refresh_lock_key("shared-token", None)
+        );
+        assert_eq!(
+            refresh_lock_key("shared-token", Some("")),
+            refresh_lock_key("shared-token", None)
+        );
+        assert_ne!(
+            refresh_lock_key("token-a", None),
+            refresh_lock_key("token-b", None)
+        );
+    }
+
+    #[test]
+    fn test_refresh_locks_returns_same_mutex_for_same_key() {
+        // [FIX #3319] The core correctness property: two lookups for the same key must
+        // resolve to the identical Arc<Mutex<()>>, or two concurrent callers would each
+        // acquire a different, independent lock and never actually contend with each other.
+        let locks = REFRESH_LOCKS.get_or_init(dashmap::DashMap::new);
+        let key = format!("test-key-{}", std::process::id());
+
+        let a = locks
+            .entry(key.clone())
+            .or_insert_with(|| std::sync::Arc::new(tokio::sync::Mutex::new(())))
+            .clone();
+        let b = locks
+            .entry(key.clone())
+            .or_insert_with(|| std::sync::Arc::new(tokio::sync::Mutex::new(())))
+            .clone();
+        assert!(std::sync::Arc::ptr_eq(&a, &b));
+
+        let other_key = format!("test-key-other-{}", std::process::id());
+        let c = locks
+            .entry(other_key)
+            .or_insert_with(|| std::sync::Arc::new(tokio::sync::Mutex::new(())))
+            .clone();
+        assert!(!std::sync::Arc::ptr_eq(&a, &c));
     }
 }
