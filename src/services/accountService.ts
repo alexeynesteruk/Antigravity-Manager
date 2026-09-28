@@ -2,9 +2,16 @@ import i18n from '../i18n';
 import { Account, DeviceProfile, DeviceProfileVersion, QuotaData } from '../types/account';
 import { request as invoke } from '../utils/request';
 
-// Check the environment (optional)
+export async function updateAccountPriority(accountId: string, priority: number): Promise<void> {
+    if (!Number.isInteger(priority) || priority < 1 || priority > 100) {
+        throw new Error(i18n.t('accounts.priority_invalid'));
+    }
+    await invoke('update_account_priority', { accountId, priority });
+}
+
+// 检查环境 (可选)
 function ensureTauriEnvironment() {
-    // In Web mode, request is also a function, so this shouldn't throw
+    // Web 模式下 request 也是一个 function，所以这里不应抛错
     if (typeof invoke !== 'function') {
         throw new Error(i18n.t('common.tauri_api_not_loaded'));
     }
@@ -12,11 +19,11 @@ function ensureTauriEnvironment() {
 
 export async function listAccounts(): Promise<Account[]> {
     const response = await invoke<any>('list_accounts');
-    // If the response is an object of the form { accounts: [...] }, take its accounts property
+    // 如果返回的是对象格式 { accounts: [...] }, 则取其 accounts 属性
     if (response && typeof response === 'object' && Array.isArray(response.accounts)) {
         return response.accounts;
     }
-    // Otherwise return the response content directly (assumed to be an array)
+    // 否则直接返回响应内容（假设为数组）
     return response || [];
 }
 
@@ -62,13 +69,13 @@ export async function startOAuthLogin(oauthClientKey?: string): Promise<Account>
     try {
         return await invoke('start_oauth_login', oauthClientKey ? { oauthClientKey } : undefined);
     } catch (error) {
-        // Enrich the error message
+        // 增强错误信息
         if (typeof error === 'string') {
-            // If it's a missing refresh_token error, keep it as-is (already includes a detailed explanation)
+            // 如果是 refresh_token 缺失错误,保持原样(已包含详细说明)
             if (error.includes('Refresh Token') || error.includes('refresh_token')) {
                 throw error;
             }
-            // Add context to other errors
+            // 其他错误添加上下文
             throw i18n.t('accounts.add.oauth_error', { error });
         }
         throw error;
@@ -119,7 +126,7 @@ export async function setActiveOAuthClient(clientKey: string): Promise<void> {
     return await invoke('set_active_oauth_client', { clientKey });
 }
 
-// Import
+// 导入
 export async function importV1Accounts(): Promise<Account[]> {
     return await invoke('import_v1_accounts');
 }
@@ -143,14 +150,14 @@ export async function toggleProxyStatus(accountId: string, enable: boolean, reas
 }
 
 /**
- * Reorder the account list
- * @param accountIds array of account IDs in the new order
+ * 重新排序账号列表
+ * @param accountIds 按新顺序排列的账号ID数组
  */
 export async function reorderAccounts(accountIds: string[]): Promise<void> {
     return await invoke('reorder_accounts', { accountIds });
 }
 
-// Device fingerprint related
+// 设备指纹相关
 export interface DeviceProfilesResponse {
     current_storage?: DeviceProfile;
     history?: DeviceProfileVersion[];
@@ -193,7 +200,7 @@ export async function bindDeviceProfileWithProfile(accountId: string, profile: D
     return await invoke('bind_device_profile_with_profile', { accountId, profile });
 }
 
-// Warmup related
+// 预热相关
 export async function warmUpAllAccounts(): Promise<string> {
     return await invoke('warm_up_all_accounts');
 }
@@ -202,7 +209,7 @@ export async function warmUpAccount(accountId: string): Promise<string> {
     return await invoke('warm_up_account', { accountId });
 }
 
-// Account export related
+// 导出账号相关
 export interface ExportAccountItem {
     email: string;
     refresh_token: string;
@@ -216,8 +223,7 @@ export async function exportAccounts(accountIds: string[]): Promise<ExportAccoun
     return await invoke('export_accounts', { accountIds });
 }
 
-// Custom label related
+// 自定义标签相关
 export async function updateAccountLabel(accountId: string, label: string): Promise<void> {
     return await invoke('update_account_label', { accountId, label });
 }
-

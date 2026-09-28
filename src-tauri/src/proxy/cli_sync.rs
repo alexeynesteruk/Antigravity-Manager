@@ -10,12 +10,12 @@ use std::os::windows::process::CommandExt;
 #[cfg(target_os = "windows")]
 const CREATE_NO_WINDOW: u32 = 0x08000000;
 
-/// Scan common Windows CLI install paths
+/// Windows 常见 CLI 安装路径扫描
 #[cfg(target_os = "windows")]
 fn scan_windows_cli_paths(cmd: &str) -> Option<PathBuf> {
     let mut common_paths: Vec<PathBuf> = Vec::new();
 
-    // Common Windows install paths, ordered by priority (only add derivable absolute paths to avoid empty/relative path misdetection)
+    // 常见 Windows 安装路径，按优先级排序（仅加入可推导出的绝对路径，避免空/相对路径误判）
     if let Some(app_data) = std::env::var_os("APPDATA") {
         let npm_base = PathBuf::from(app_data).join("npm");
         common_paths.push(npm_base.join(format!("{}.cmd", cmd)));
@@ -36,6 +36,26 @@ fn scan_windows_cli_paths(cmd: &str) -> Option<PathBuf> {
         let bun_base = home.join(".bun").join("bin");
         common_paths.push(bun_base.join(format!("{}.exe", cmd)));
         common_paths.push(bun_base.join(cmd));
+
+        let local_bin = home.join(".local").join("bin");
+        common_paths.push(local_bin.join(format!("{}.exe", cmd)));
+        common_paths.push(local_bin.join(format!("{}.cmd", cmd)));
+        common_paths.push(local_bin.join(cmd));
+
+        let cargo_bin = home.join(".cargo").join("bin");
+        common_paths.push(cargo_bin.join(format!("{}.exe", cmd)));
+        common_paths.push(cargo_bin.join(format!("{}.cmd", cmd)));
+        common_paths.push(cargo_bin.join(cmd));
+
+        let grok_bin = home.join(".grok").join("bin");
+        common_paths.push(grok_bin.join(format!("{}.exe", cmd)));
+        common_paths.push(grok_bin.join(format!("{}.cmd", cmd)));
+        common_paths.push(grok_bin.join(cmd));
+
+        let grokbuild_bin = home.join(".grokbuild").join("bin");
+        common_paths.push(grokbuild_bin.join(format!("{}.exe", cmd)));
+        common_paths.push(grokbuild_bin.join(format!("{}.cmd", cmd)));
+        common_paths.push(grokbuild_bin.join(cmd));
     }
 
     for path in common_paths {
@@ -49,11 +69,11 @@ fn scan_windows_cli_paths(cmd: &str) -> Option<PathBuf> {
         }
     }
 
-    // Scan the NVM Windows directory
+    // 扫描 NVM Windows 目录
     if let Ok(nvm_home) = std::env::var("NVM_HOME") {
         let nvm_path = PathBuf::from(nvm_home);
         if nvm_path.is_dir() {
-            // NVM Windows layout: %NVM_HOME%\v{version}\{cmd}.cmd
+            // NVM Windows 结构: %NVM_HOME%\v{version}\{cmd}.cmd
             if let Ok(entries) = fs::read_dir(&nvm_path) {
                 for entry in entries.flatten() {
                     let cmd_path = entry.path().join(format!("{}.cmd", cmd));
@@ -61,7 +81,7 @@ fn scan_windows_cli_paths(cmd: &str) -> Option<PathBuf> {
                         tracing::debug!("[CLI-Sync] Detected {} via NVM_HOME: {:?}", cmd, cmd_path);
                         return Some(cmd_path);
                     }
-                    // Also check the .exe variant
+                    // 也检查 .exe 版本
                     let exe_path = entry.path().join(format!("{}.exe", cmd));
                     if is_safe_path(&exe_path) {
                         tracing::debug!("[CLI-Sync] Detected {} via NVM_HOME: {:?}", cmd, exe_path);
@@ -75,7 +95,7 @@ fn scan_windows_cli_paths(cmd: &str) -> Option<PathBuf> {
     None
 }
 
-/// Parse the output of the `where` command to get the first valid path
+/// 解析 where 命令输出获取第一个有效路径
 #[cfg(target_os = "windows")]
 fn parse_where_output(output: &[u8]) -> Option<PathBuf> {
     let stdout = String::from_utf8_lossy(output);
@@ -91,7 +111,32 @@ fn parse_where_output(output: &[u8]) -> Option<PathBuf> {
     None
 }
 
-/// Check whether the path is a .cmd/.bat file
+/// 检测备用 CLI 别名命令是否存在并返回其路径
+fn detect_fallback_binary(name: &str) -> Option<PathBuf> {
+    #[cfg(target_os = "windows")]
+    {
+        let mut c = Command::new("where");
+        c.arg(name);
+        c.creation_flags(CREATE_NO_WINDOW);
+        if let Ok(out) = c.output() {
+            if out.status.success() {
+                return parse_where_output(&out.stdout);
+            }
+        }
+        None
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        if let Ok(out) = Command::new("which").arg(name).output() {
+            if out.status.success() {
+                return Some(PathBuf::from(name));
+            }
+        }
+        None
+    }
+}
+
+/// 检查路径是否是 .cmd/.bat 文件
 #[cfg(target_os = "windows")]
 fn is_cmd_file(path: &PathBuf) -> bool {
     path.extension()
@@ -100,20 +145,20 @@ fn is_cmd_file(path: &PathBuf) -> bool {
         .unwrap_or(false)
 }
 
-/// Validate that a path is safe (prevent command injection)
+/// 验证路径是否安全（防止命令注入）
 #[cfg(target_os = "windows")]
 fn is_safe_path(path: &PathBuf) -> bool {
-    // Check that the path exists and is a file
+    // 检查路径是否存在且是文件
     if !path.exists() || !path.is_file() {
         return false;
     }
 
-    // Must be an absolute path, to avoid executing a relative-path file
+    // 必须为绝对路径，避免执行相对路径文件
     if !path.is_absolute() {
         return false;
     }
 
-    // Check whether the path contains dangerous characters
+    // 检查路径是否包含危险字符
     let path_str = path.to_string_lossy();
     let dangerous_chars = ['&', '|', ';', '<', '>', '(', ')', '`', '$', '^', '%', '!'];
     if path_str.chars().any(|c| dangerous_chars.contains(&c)) {
@@ -127,16 +172,16 @@ fn is_safe_path(path: &PathBuf) -> bool {
     true
 }
 
-/// Run the version command (special handling for .cmd/.bat on Windows)
+/// 执行版本命令（Windows 特殊处理 .cmd/.bat）
 #[cfg(target_os = "windows")]
 fn run_version_command(executable_path: &PathBuf) -> Option<String> {
-    // Safety check: verify the path contains no dangerous characters
+    // 安全校验：验证路径不包含危险字符
     if !is_safe_path(executable_path) {
         return None;
     }
 
     let output = if is_cmd_file(executable_path) {
-        // Wrap the path in quotes to prevent injection, use the /S switch to ensure safe parsing
+        // 使用引号包裹路径防止注入，使用 /S 开关确保安全解析
         let quoted_path = format!("\"{}\"", executable_path.to_string_lossy());
         Command::new("cmd.exe")
             .arg("/C")
@@ -154,17 +199,16 @@ fn run_version_command(executable_path: &PathBuf) -> Option<String> {
     match output {
         Ok(out) if out.status.success() => {
             let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
-            // Use a regex to extract the version number (more precise)
+            // 使用正则提取版本号（更精确）
             extract_version(&s)
         }
         _ => None,
     }
 }
 
-/// Extract the version number (using more precise semver matching)
-#[cfg(target_os = "windows")]
+/// 提取版本号（使用更精确的 semver 匹配）
 fn extract_version(s: &str) -> Option<String> {
-    // Match semver format: x.y.z or x.y
+    // 匹配 semver 格式: x.y.z 或 x.y
     let re = regex::Regex::new(r"(\d+\.\d+(?:\.\d+)?)").ok()?;
     re.captures(s)
         .and_then(|caps| caps.get(1))
@@ -177,6 +221,8 @@ pub enum CliApp {
     Codex,
     Gemini,
     OpenCode,
+    JeikCode,
+    GrokBuild,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
@@ -192,6 +238,8 @@ impl CliApp {
             CliApp::Codex => "codex",
             CliApp::Gemini => "gemini",
             CliApp::OpenCode => "opencode",
+            CliApp::JeikCode => "jeikcode",
+            CliApp::GrokBuild => "grok",
         }
     }
 
@@ -227,7 +275,7 @@ impl CliApp {
                         path: codex_dir.join("config.toml"),
                     },
                 ]
-            },
+            }
             CliApp::Gemini => vec![
                 CliConfigFile {
                     name: ".env".to_string(),
@@ -246,6 +294,32 @@ impl CliApp {
                 name: "config.json".to_string(),
                 path: home.join(".opencode").join("config.json"),
             }],
+            CliApp::JeikCode => {
+                let jeikcode_dir = if let Ok(custom_home) = std::env::var("JEIKCODE_HOME") {
+                    PathBuf::from(custom_home)
+                } else {
+                    home.join(".jeikcode")
+                };
+                vec![CliConfigFile {
+                    name: "config.toml".to_string(),
+                    path: jeikcode_dir.join("config.toml"),
+                }]
+            }
+            CliApp::GrokBuild => {
+                let grok_dir = if let Ok(custom) =
+                    std::env::var("GROK_HOME").or_else(|_| std::env::var("GROKBUILD_HOME"))
+                {
+                    PathBuf::from(custom)
+                } else if home.join(".grok").exists() || !home.join(".grokbuild").exists() {
+                    home.join(".grok")
+                } else {
+                    home.join(".grokbuild")
+                };
+                vec![CliConfigFile {
+                    name: "config.toml".to_string(),
+                    path: grok_dir.join("config.toml"),
+                }]
+            }
         }
     }
 
@@ -255,6 +329,8 @@ impl CliApp {
             CliApp::Codex => "https://api.openai.com/v1",
             CliApp::Gemini => "https://generativelanguage.googleapis.com",
             CliApp::OpenCode => "https://api.openai.com/v1",
+            CliApp::JeikCode => "http://127.0.0.1:8046/v1",
+            CliApp::GrokBuild => "https://api.x.ai/v1",
         }
     }
 }
@@ -266,16 +342,16 @@ pub struct CliStatus {
     pub is_synced: bool,
     pub has_backup: bool,
     pub current_base_url: Option<String>,
-    pub files: Vec<String>, // Returns the list of associated file names for the frontend to display
+    pub files: Vec<String>, // 返回关联的文件名列表供前端展示
 }
 
-/// Detect whether the CLI is installed and get its version
+/// 检测 CLI 是否安装并获取版本
 pub fn check_cli_installed(app: &CliApp) -> (bool, Option<String>) {
     let cmd = app.as_str();
-    // Default to the command name; update to an absolute path if the fallback finds one
+    // 默认使用命令名，如果 fallback 找到路径则更新为绝对路径
     let mut executable_path = PathBuf::from(cmd);
 
-    // 1. Prefer detection via which/where (follows PATH)
+    // 1. 优先使用 which/where 检测 (遵循 PATH)
     let which_output = if cfg!(target_os = "windows") {
         let mut c = Command::new("where");
         c.arg(cmd);
@@ -308,8 +384,8 @@ pub fn check_cli_installed(app: &CliApp) -> (bool, Option<String>) {
         }
     }
 
-    // [FIX #765] macOS enhanced detection: if which fails, explicitly search common binary paths
-    // Fixes the issue where an incomplete Tauri process PATH fails to detect an installed CLI
+    // [FIX #765] macOS 增强检测: 如果 which 失败,显式搜索常用二进制路径
+    // 解决 Tauri 进程 PATH 可能不完整导致检测不到已安装 CLI 的问题
     if !installed && !cfg!(target_os = "windows") {
         let home = dirs::home_dir().unwrap_or_default();
         let mut common_paths = vec![
@@ -324,7 +400,7 @@ pub fn check_cli_installed(app: &CliApp) -> (bool, Option<String>) {
             PathBuf::from("/usr/bin"),
         ];
 
-        // Enhancement: scan all node versions under the nvm directory
+        // 增强：扫描 nvm 目录下的所有 node 版本
         let nvm_base = home.join(".nvm/versions/node");
         if nvm_base.exists() {
             if let Ok(entries) = std::fs::read_dir(&nvm_base) {
@@ -352,11 +428,46 @@ pub fn check_cli_installed(app: &CliApp) -> (bool, Option<String>) {
         }
     }
 
+    // 如果是 JeikCode 且常规检测未命中，尝试检测 atomcode 别名或配置文件是否存在
+    if !installed && app == &CliApp::JeikCode {
+        if let Some(p) = detect_fallback_binary("atomcode") {
+            executable_path = p;
+            installed = true;
+        } else if let Some(home) = dirs::home_dir() {
+            let jeikcode_dir = if let Ok(custom_home) = std::env::var("JEIKCODE_HOME") {
+                PathBuf::from(custom_home)
+            } else {
+                home.join(".jeikcode")
+            };
+            if jeikcode_dir.join("config.toml").exists() || jeikcode_dir.exists() {
+                installed = true;
+            }
+        }
+    }
+
+    // 如果是 GrokBuild 且常规检测未命中，尝试检测 grokbuild 别名或配置文件是否存在
+    if !installed && app == &CliApp::GrokBuild {
+        if let Some(p) = detect_fallback_binary("grokbuild") {
+            executable_path = p;
+            installed = true;
+        } else if let Some(home) = dirs::home_dir() {
+            let grok_dir = home.join(".grok");
+            let grokbuild_dir = home.join(".grokbuild");
+            if grok_dir.join("config.toml").exists()
+                || grokbuild_dir.join("config.toml").exists()
+                || grok_dir.exists()
+                || grokbuild_dir.exists()
+            {
+                installed = true;
+            }
+        }
+    }
+
     if !installed {
         return (false, None);
     }
 
-    // 2. Get the version (special handling for .cmd/.bat on Windows)
+    // 2. 获取版本（Windows 使用特殊处理 .cmd/.bat）
     #[cfg(target_os = "windows")]
     let version = run_version_command(&executable_path);
 
@@ -384,7 +495,7 @@ pub fn check_cli_installed(app: &CliApp) -> (bool, Option<String>) {
     (true, version)
 }
 
-/// Read the current config and detect the sync status
+/// 读取当前配置并检测同步状态
 pub fn get_sync_status(app: &CliApp, proxy_url: &str) -> (bool, bool, Option<String>) {
     let files = app.config_files();
     if files.is_empty() {
@@ -396,7 +507,7 @@ pub fn get_sync_status(app: &CliApp, proxy_url: &str) -> (bool, bool, Option<Str
     let mut current_base_url = None;
 
     for file in &files {
-        // Use a simpler naming rule: original_name + .antigravity.bak
+        // 使用更简单的命名规则: original_name + .antigravity.bak
         let backup_path = file
             .path
             .with_file_name(format!("{}.antigravity.bak", file.name));
@@ -405,9 +516,10 @@ pub fn get_sync_status(app: &CliApp, proxy_url: &str) -> (bool, bool, Option<Str
             has_backup = true;
         }
 
-        // If the physical file does not exist
+        // 如果物理文件不存在
+        // 如果物理文件不存在
         if !file.path.exists() {
-            // For Gemini, it's fine as long as one of settings.json/config.json exists, or neither exists (treated as not synced)
+            // Gemini 的 settings.json/config.json 只要有一个存在即可，或者都不存在（视为未同步）
             if app == &CliApp::Gemini
                 && (file.name == "settings.json" || file.name == "config.json")
             {
@@ -450,7 +562,7 @@ pub fn get_sync_status(app: &CliApp, proxy_url: &str) -> (bool, bool, Option<Str
             }
             CliApp::Codex => {
                 if file.name == "config.toml" {
-                    // Regex-match base_url
+                    // 正则匹配 base_url
                     let re =
                         regex::Regex::new(r#"(?m)^\s*base_url\s*=\s*['"]([^'"]+)['"]"#).unwrap();
                     if let Some(caps) = re.captures(&content) {
@@ -496,13 +608,118 @@ pub fn get_sync_status(app: &CliApp, proxy_url: &str) -> (bool, bool, Option<Str
                     }
                 }
             }
+            CliApp::JeikCode => {
+                if file.name == "config.toml" {
+                    use toml_edit::DocumentMut;
+                    if let Ok(doc) = content.parse::<DocumentMut>() {
+                        let normalized_proxy = proxy_url
+                            .trim_end_matches('/')
+                            .trim_end_matches("/v1")
+                            .trim_end_matches('/');
+
+                        let mut is_ag_synced = false;
+                        if let Some(accounts) =
+                            doc.get("provider_accounts").and_then(|i| i.as_table())
+                        {
+                            // 优先检查 antigravity-manager 账号
+                            if let Some(ag_item) = accounts.get("antigravity-manager") {
+                                if let Some(base_url) =
+                                    ag_item.get("base_url").and_then(|v| v.as_str())
+                                {
+                                    current_base_url = Some(base_url.to_string());
+                                    let norm = base_url
+                                        .trim_end_matches('/')
+                                        .trim_end_matches("/v1")
+                                        .trim_end_matches('/');
+                                    let provider_type = ag_item
+                                        .get("provider")
+                                        .and_then(|v| v.as_str())
+                                        .unwrap_or("");
+                                    if norm == normalized_proxy && provider_type == "anthropic" {
+                                        is_ag_synced = true;
+                                    }
+                                }
+                            }
+
+                            // 若尚未找到，但有其他同 URL 的账号，记录其 URL
+                            if current_base_url.is_none() {
+                                for (_, acc_item) in accounts.iter() {
+                                    if let Some(base_url) =
+                                        acc_item.get("base_url").and_then(|v| v.as_str())
+                                    {
+                                        let norm = base_url
+                                            .trim_end_matches('/')
+                                            .trim_end_matches("/v1")
+                                            .trim_end_matches('/');
+                                        if norm == normalized_proxy {
+                                            current_base_url = Some(base_url.to_string());
+                                            break;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
+                        // 验证是否已同步最核心模型
+                        let has_core_models =
+                            if let Some(models) = doc.get("models").and_then(|i| i.as_table()) {
+                                models.contains_key("claude-sonnet-4-6")
+                            } else {
+                                false
+                            };
+
+                        if is_ag_synced && has_core_models {
+                            // 同步完全正常
+                        } else {
+                            all_synced = false;
+                        }
+                    } else {
+                        all_synced = false;
+                    }
+                }
+            }
+            CliApp::GrokBuild => {
+                if file.name == "config.toml" {
+                    use toml_edit::DocumentMut;
+                    if let Ok(doc) = content.parse::<DocumentMut>() {
+                        let normalized_proxy = proxy_url
+                            .trim_end_matches('/')
+                            .trim_end_matches("/v1")
+                            .trim_end_matches('/');
+
+                        let mut matched = false;
+                        if let Some(models) = doc.get("model").and_then(|i| i.as_table()) {
+                            for (_, m_item) in models.iter() {
+                                if let Some(b_url) = m_item.get("base_url").and_then(|v| v.as_str())
+                                {
+                                    current_base_url = Some(b_url.to_string());
+                                    let norm = b_url
+                                        .trim_end_matches('/')
+                                        .trim_end_matches("/v1")
+                                        .trim_end_matches('/');
+                                    if norm == normalized_proxy {
+                                        matched = true;
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+
+                        if !matched {
+                            all_synced = false;
+                        }
+                    } else {
+                        all_synced = false;
+                    }
+                }
+            }
         }
     }
 
     (all_synced, has_backup, current_base_url)
 }
 
-/// Execute the sync logic
+/// 执行同步逻辑
 pub fn sync_config(
     app: &CliApp,
     proxy_url: &str,
@@ -512,7 +729,7 @@ pub fn sync_config(
     let files = app.config_files();
 
     for file in &files {
-        // Gemini compatibility logic: prefer settings.json
+        // Gemini 兼容性逻辑：优先使用 settings.json
         if app == &CliApp::Gemini && file.name == "config.json" && !file.path.exists() {
             let settings_path = file.path.with_file_name("settings.json");
             if settings_path.exists() {
@@ -521,11 +738,11 @@ pub fn sync_config(
         }
 
         if let Some(parent) = file.path.parent() {
-            fs::create_dir_all(parent).map_err(|e| format!("Failed to create directory: {}", e))?;
+            fs::create_dir_all(parent).map_err(|e| format!("无法创建目录: {}", e))?;
         }
 
-        // [New Feature] Auto backup: if the file exists and has no backup, create an .antigravity.bak backup
-        // This preserves the user's original config so later syncs don't overwrite this backup
+        // [New Feature] 自动备份：如果文件存在且没有备份，创建 .antigravity.bak 备份
+        // 这样可以保留用户最初的配置，后续多次同步不会覆盖这个备份
         if file.path.exists() {
             let backup_path = file
                 .path
@@ -571,7 +788,8 @@ pub fn sync_config(
                             Value::String(proxy_url.to_string()),
                         );
                         if !api_key.is_empty() {
-                            if proxy_url.contains("apikey.fun") {
+                            if proxy_url.contains("apikey.fun") || proxy_url.contains("apikey.fan")
+                            {
                                 env_obj.insert(
                                     "ANTHROPIC_AUTH_TOKEN".to_string(),
                                     Value::String(api_key.to_string()),
@@ -590,24 +808,24 @@ pub fn sync_config(
                                     "ANTHROPIC_API_KEY".to_string(),
                                     Value::String(api_key.to_string()),
                                 );
-                                // [FIX] Avoid conflicts: remove ANTHROPIC_AUTH_TOKEN if present
+                                // [FIX] 避免冲突：如果存在则移除 ANTHROPIC_AUTH_TOKEN
                                 env_obj.remove("ANTHROPIC_AUTH_TOKEN");
                             }
 
-                            // [FIX] Clean up model override settings that may come from another Provider
+                            // [FIX] 清理可能来自其他 Provider 的模型覆盖设置
                             env_obj.remove("ANTHROPIC_MODEL");
                             env_obj.remove("ANTHROPIC_DEFAULT_HAIKU_MODEL");
                             env_obj.remove("ANTHROPIC_DEFAULT_OPUS_MODEL");
                             env_obj.remove("ANTHROPIC_DEFAULT_SONNET_MODEL");
                         } else {
-                            // If the API Key is empty, remove the key instead of setting it to an empty string
+                            // 如果 API Key 为空，则移除该键，避免设置为空字符串
                             env_obj.remove("ANTHROPIC_API_KEY");
                             env_obj.remove("ANTHROPIC_AUTH_TOKEN");
                         }
                     }
 
                     if let Some(m) = model {
-                        // Note: in Claude Code's official config, the currently selected model lives in the root-level model field
+                        // 注意：Claude Code 的官方配置中，当前选定模型放在根节点的 model 字段
                         json.as_object_mut()
                             .unwrap()
                             .insert("model".to_string(), Value::String(m.to_string()));
@@ -624,10 +842,10 @@ pub fn sync_config(
                             "OPENAI_API_KEY".to_string(),
                             Value::String(api_key.to_string()),
                         );
-                        if proxy_url.contains("apikey.fun") {
+                        if proxy_url.contains("apikey.fun") || proxy_url.contains("apikey.fan") {
                             obj.remove("OPENAI_BASE_URL");
                         } else {
-                            // Codex's auth.json also seems to support OPENAI_BASE_URL; ccs doesn't write it, but we'll sync-write it too
+                            // Codex 的 auth.json 似乎也支持 OPENAI_BASE_URL，但 ccs 没写，我们也同步写一下
                             obj.insert(
                                 "OPENAI_BASE_URL".to_string(),
                                 Value::String(proxy_url.to_string()),
@@ -641,18 +859,20 @@ pub fn sync_config(
                         .parse::<DocumentMut>()
                         .unwrap_or_else(|_| DocumentMut::new());
 
-                    // Must use the custom provider; Codex does not support a native codex provider
+                    // 必须使用 custom 提供商，Codex 不支持原生的 codex provider
                     let provider_key = "custom";
-                    let display_name = if proxy_url.contains("apikey.fun") {
+                    let is_apikey_fun =
+                        proxy_url.contains("apikey.fun") || proxy_url.contains("apikey.fan");
+                    let display_name = if is_apikey_fun {
                         "APIKEY.FUN"
                     } else {
                         "Custom Node"
                     };
 
-                    // Set the Root Keys first to ensure they're at the top
+                    // 优先设置 Root Keys 确保位于顶部
                     doc.insert("model_provider", value(provider_key));
 
-                    if proxy_url.contains("apikey.fun") {
+                    if is_apikey_fun {
                         doc.insert("model", value("gpt-5.5"));
                         doc.insert("review_model", value("gpt-5.5"));
                         doc.insert("model_reasoning_effort", value("high"));
@@ -665,14 +885,23 @@ pub fn sync_config(
                     } else {
                         if let Some(m) = model {
                             doc.insert("model", value(m));
+                            let cw = if m.contains("gemini") {
+                                1_024_000
+                            } else if m.contains("claude") {
+                                256_000
+                            } else {
+                                128_000
+                            };
+                            doc.insert("model_context_window", value(cw));
+                            doc.insert("model_auto_compact_token_limit", value(cw));
                         }
                     }
 
-                    // Remove any leftover root-level legacy config
+                    // 移除可能的根级别旧配置
                     doc.remove("openai_api_key");
                     doc.remove("openai_base_url");
 
-                    // Set the [model_providers.custom] hierarchy
+                    // 设置层级 [model_providers.custom]
                     let providers = doc
                         .entry("model_providers")
                         .or_insert(toml_edit::Item::Table(toml_edit::Table::new()));
@@ -691,7 +920,7 @@ pub fn sync_config(
                         }
                     }
 
-                    if proxy_url.contains("apikey.fun") {
+                    if is_apikey_fun {
                         let features = doc
                             .entry("features")
                             .or_insert(toml_edit::Item::Table(toml_edit::Table::new()));
@@ -788,12 +1017,68 @@ pub fn sync_config(
                     content = serde_json::to_string_pretty(&json).unwrap();
                 }
             }
+            CliApp::JeikCode => {
+                if file.name == "config.toml" {
+                    content = sync_jeikcode_toml_content(&content, proxy_url, api_key, model)?;
+                }
+            }
+            CliApp::GrokBuild => {
+                if file.name == "config.toml" {
+                    use toml_edit::{value, DocumentMut, Item, Table};
+                    let mut doc = content
+                        .parse::<DocumentMut>()
+                        .unwrap_or_else(|_| DocumentMut::new());
+
+                    let normalized_proxy_url = {
+                        let trimmed = proxy_url.trim().trim_end_matches('/');
+                        if trimmed.ends_with("/v1") {
+                            trimmed.to_string()
+                        } else {
+                            format!("{}/v1", trimmed)
+                        }
+                    };
+
+                    let core_models = get_core_gateway_models();
+
+                    let default_model_id = match model {
+                        Some(m) if !m.is_empty() => m,
+                        _ => "gemini-3.8-flash-high",
+                    };
+
+                    // 1. 设置 [models] default 为真实选定的网关模型
+                    let models_sec = doc.entry("models").or_insert(Item::Table(Table::new()));
+                    if let Some(m_table) = models_sec.as_table_mut() {
+                        m_table.insert("default", value(default_model_id));
+                    }
+
+                    // 2. 注入所有网关真实模型到 [model."<id>"]
+                    let model_sec = doc.entry("model").or_insert(Item::Table(Table::new()));
+                    if let Some(m_table) = model_sec.as_table_mut() {
+                        for m in core_models {
+                            let entry = m_table.entry(m.id).or_insert(Item::Table(Table::new()));
+                            if let Some(t) = entry.as_table_mut() {
+                                t.insert("model", value(m.id));
+                                t.insert("base_url", value(&normalized_proxy_url));
+                                t.insert("name", value(m.id));
+                                t.insert("api_backend", value("responses"));
+                                t.insert("context_window", value(m.context_window));
+                                t.insert("image_input", value(true));
+                                if !api_key.is_empty() {
+                                    t.insert("api_key", value(api_key));
+                                }
+                            }
+                        }
+                    }
+
+                    content = doc.to_string();
+                }
+            }
         }
 
-        // Use a temp file for an atomic write
+        // 使用临时文件原子写入
         let tmp_path = file.path.with_extension("tmp");
-        fs::write(&tmp_path, &content).map_err(|e| format!("Failed to write temp file: {}", e))?;
-        fs::rename(&tmp_path, &file.path).map_err(|e| format!("Failed to rename config file: {}", e))?;
+        fs::write(&tmp_path, &content).map_err(|e| format!("写入临时文件失败: {}", e))?;
+        fs::rename(&tmp_path, &file.path).map_err(|e| format!("重命名配置文件失败: {}", e))?;
     }
 
     Ok(())
@@ -848,28 +1133,28 @@ pub async fn execute_cli_restore(app_type: CliApp) -> Result<(), String> {
         let files = app_type.config_files();
         let mut restored_count = 0;
 
-        // Try to restore from a backup
+        // 尝试从备份恢复
         for file in &files {
             let backup_path = file
                 .path
                 .with_file_name(format!("{}.antigravity.bak", file.name));
             if backup_path.exists() {
-                // Restore: overwrite the original file
+                // 还原：覆盖原文件
                 if let Err(e) = fs::rename(&backup_path, &file.path) {
-                    return Err(format!("Failed to restore backup {}: {}", file.name, e));
+                    return Err(format!("恢复备份失败 {}: {}", file.name, e));
                 }
                 restored_count += 1;
             }
         }
 
         if restored_count > 0 {
-            // If at least one backup was successfully restored, treat this as a success
+            // 如果成功恢复了至少一个备份，就认为是恢复成功
             return Ok(());
         }
 
-        // If there is no backup, fall back to the original logic: restore the default config
+        // 如果没有备份，则执行原来的逻辑：恢复为默认配置
         let default_url = app_type.default_url();
-        // Clear the API Key when restoring defaults, so the user re-authorizes or uses the official key
+        // 恢复默认时清空 API Key，让用户重新授权或使用官方 Key
         sync_config(&app_type, default_url, "", None)
     })
     .await
@@ -887,19 +1172,554 @@ pub async fn get_cli_config_content(
             files
                 .into_iter()
                 .find(|f| f.name == name)
-                .ok_or("Could not find the specified file".to_string())?
+                .ok_or("找不到指定的文件".to_string())?
         } else {
             files
                 .into_iter()
                 .next()
-                .ok_or("Could not find the config file".to_string())?
+                .ok_or("找不到配置文件".to_string())?
         };
 
         if !file.path.exists() {
-            return Err("Config file does not exist".to_string());
+            return Err("配置文件不存在".to_string());
         }
-        fs::read_to_string(&file.path).map_err(|e| format!("Failed to read config file: {}", e))
+        fs::read_to_string(&file.path).map_err(|e| format!("读取配置文件失败: {}", e))
     })
     .await
     .unwrap_or_else(|_| Err("Task panicked".to_string()))
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct CoreModel {
+    pub id: &'static str,
+    pub context_window: i64,
+}
+
+/// 导出网关全量核心模型（仅剔除带 -日期数字 的后缀版本）
+pub fn get_core_gateway_models() -> &'static [CoreModel] {
+    &[
+        // Claude 系列 (256k 上下文)
+        CoreModel {
+            id: "claude-sonnet-4-6",
+            context_window: 256_000,
+        },
+        CoreModel {
+            id: "claude-sonnet-4-6-thinking",
+            context_window: 256_000,
+        },
+        CoreModel {
+            id: "claude-sonnet-4-5",
+            context_window: 256_000,
+        },
+        CoreModel {
+            id: "claude-sonnet-4-5-thinking",
+            context_window: 256_000,
+        },
+        CoreModel {
+            id: "claude-opus-4-6",
+            context_window: 256_000,
+        },
+        CoreModel {
+            id: "claude-opus-4-6-thinking",
+            context_window: 256_000,
+        },
+        CoreModel {
+            id: "claude-opus-4-5",
+            context_window: 256_000,
+        },
+        CoreModel {
+            id: "claude-opus-4-5-thinking",
+            context_window: 256_000,
+        },
+        CoreModel {
+            id: "claude-opus-4",
+            context_window: 256_000,
+        },
+        CoreModel {
+            id: "claude-3-7-sonnet",
+            context_window: 256_000,
+        },
+        CoreModel {
+            id: "claude-3-5-sonnet",
+            context_window: 256_000,
+        },
+        CoreModel {
+            id: "claude-haiku-4-5",
+            context_window: 256_000,
+        },
+        CoreModel {
+            id: "claude-haiku-4",
+            context_window: 256_000,
+        },
+        CoreModel {
+            id: "claude-3-5-haiku",
+            context_window: 256_000,
+        },
+        CoreModel {
+            id: "claude-3-haiku",
+            context_window: 256_000,
+        },
+        // Gemini 3.x 系列 (1M 上下文)
+        CoreModel {
+            id: "gemini-3.8-flash",
+            context_window: 1_000_000,
+        },
+        CoreModel {
+            id: "gemini-3.8-flash-tiered",
+            context_window: 1_000_000,
+        },
+        CoreModel {
+            id: "gemini-3.8-flash-high",
+            context_window: 1_000_000,
+        },
+        CoreModel {
+            id: "gemini-3.8-flash-medium",
+            context_window: 1_000_000,
+        },
+        CoreModel {
+            id: "gemini-3.8-flash-low",
+            context_window: 1_000_000,
+        },
+        CoreModel {
+            id: "gemini-3.7-flash",
+            context_window: 1_000_000,
+        },
+        CoreModel {
+            id: "gemini-3.7-flash-tiered",
+            context_window: 1_000_000,
+        },
+        CoreModel {
+            id: "gemini-3.7-flash-high",
+            context_window: 1_000_000,
+        },
+        CoreModel {
+            id: "gemini-3.7-flash-medium",
+            context_window: 1_000_000,
+        },
+        CoreModel {
+            id: "gemini-3.7-flash-low",
+            context_window: 1_000_000,
+        },
+        CoreModel {
+            id: "gemini-3.6-flash",
+            context_window: 1_000_000,
+        },
+        CoreModel {
+            id: "gemini-3.6-flash-tiered",
+            context_window: 1_000_000,
+        },
+        CoreModel {
+            id: "gemini-3.6-flash-high",
+            context_window: 1_000_000,
+        },
+        CoreModel {
+            id: "gemini-3.6-flash-medium",
+            context_window: 1_000_000,
+        },
+        CoreModel {
+            id: "gemini-3.6-flash-low",
+            context_window: 1_000_000,
+        },
+        CoreModel {
+            id: "gemini-3.5-flash",
+            context_window: 1_000_000,
+        },
+        CoreModel {
+            id: "gemini-3.5-flash-high",
+            context_window: 1_000_000,
+        },
+        CoreModel {
+            id: "gemini-3.5-flash-medium",
+            context_window: 1_000_000,
+        },
+        CoreModel {
+            id: "gemini-3.5-flash-low",
+            context_window: 1_000_000,
+        },
+        CoreModel {
+            id: "gemini-3-flash",
+            context_window: 1_000_000,
+        },
+        CoreModel {
+            id: "gemini-3-flash-agent",
+            context_window: 1_000_000,
+        },
+        CoreModel {
+            id: "gemini-3.1-pro",
+            context_window: 1_048_576,
+        },
+        CoreModel {
+            id: "gemini-3.1-pro-high",
+            context_window: 1_048_576,
+        },
+        CoreModel {
+            id: "gemini-3.1-pro-low",
+            context_window: 1_048_576,
+        },
+        CoreModel {
+            id: "gemini-3.1-pro-preview",
+            context_window: 1_048_576,
+        },
+        CoreModel {
+            id: "gemini-3-pro",
+            context_window: 1_048_576,
+        },
+        CoreModel {
+            id: "gemini-3-pro-high",
+            context_window: 1_048_576,
+        },
+        CoreModel {
+            id: "gemini-3-pro-low",
+            context_window: 1_048_576,
+        },
+        CoreModel {
+            id: "gemini-3-pro-preview",
+            context_window: 1_048_576,
+        },
+        CoreModel {
+            id: "gemini-pro",
+            context_window: 1_048_576,
+        },
+        CoreModel {
+            id: "gemini-pro-agent",
+            context_window: 1_048_576,
+        },
+        CoreModel {
+            id: "gemini-3.1-flash-lite",
+            context_window: 1_048_576,
+        },
+        CoreModel {
+            id: "gemini-3.1-flash-image",
+            context_window: 1_048_576,
+        },
+        CoreModel {
+            id: "gemini-3-pro-image",
+            context_window: 1_048_576,
+        },
+        // Gemini 2.x 系列 (1M 上下文)
+        CoreModel {
+            id: "gemini-2.5-pro",
+            context_window: 1_048_576,
+        },
+        CoreModel {
+            id: "gemini-2.5-flash",
+            context_window: 1_048_576,
+        },
+        CoreModel {
+            id: "gemini-2.5-flash-lite",
+            context_window: 1_048_576,
+        },
+        CoreModel {
+            id: "gemini-2.5-flash-thinking",
+            context_window: 1_048_576,
+        },
+        CoreModel {
+            id: "gemini-2.0-flash",
+            context_window: 1_048_576,
+        },
+        CoreModel {
+            id: "gemini-2.0-flash-lite",
+            context_window: 1_048_576,
+        },
+        CoreModel {
+            id: "gemini-2.0-flash-exp",
+            context_window: 1_048_576,
+        },
+        CoreModel {
+            id: "gemini-2.0-flash-thinking-exp",
+            context_window: 1_048_576,
+        },
+        // 其他高频模型
+        CoreModel {
+            id: "grok-4.6",
+            context_window: 500_000,
+        },
+        CoreModel {
+            id: "gpt-oss-120b-medium",
+            context_window: 128_000,
+        },
+    ]
+}
+
+/// 核心逻辑：为 JeikCode 生成/更新 config.toml 内容
+pub fn sync_jeikcode_toml_content(
+    content: &str,
+    proxy_url: &str,
+    api_key: &str,
+    model: Option<&str>,
+) -> Result<String, String> {
+    use toml_edit::{value, Array, DocumentMut, Item, Table};
+    let mut doc = content
+        .parse::<DocumentMut>()
+        .unwrap_or_else(|_| DocumentMut::new());
+
+    let target_provider_id = "antigravity-manager";
+    let normalized_proxy_url = {
+        let trimmed = proxy_url.trim().trim_end_matches('/');
+        if trimmed.ends_with("/v1") {
+            trimmed.to_string()
+        } else {
+            format!("{}/v1", trimmed)
+        }
+    };
+    let raw_base_url = proxy_url
+        .trim()
+        .trim_end_matches('/')
+        .trim_end_matches("/v1")
+        .trim_end_matches('/');
+
+    // 1. 查找并清理已经存在的相同提供商 URL 的账号 (以 anthropic 协议最兼容接入)
+    let mut accounts_to_remove = Vec::new();
+    if let Some(accounts_table) = doc.get("provider_accounts").and_then(|i| i.as_table()) {
+        for (acc_name, acc_item) in accounts_table.iter() {
+            if acc_name == target_provider_id {
+                continue;
+            }
+            if let Some(b_url) = acc_item.get("base_url").and_then(|v| v.as_str()) {
+                let norm = b_url
+                    .trim_end_matches('/')
+                    .trim_end_matches("/v1")
+                    .trim_end_matches('/');
+                if norm == raw_base_url {
+                    accounts_to_remove.push(acc_name.to_string());
+                }
+            }
+        }
+    }
+
+    // 从 provider_accounts 移除旧同 URL 账号
+    if let Some(accounts_table) = doc
+        .get_mut("provider_accounts")
+        .and_then(|i| i.as_table_mut())
+    {
+        for acc in &accounts_to_remove {
+            accounts_table.remove(acc);
+        }
+    }
+
+    // 检查旧版 providers 表
+    if let Some(providers_table) = doc.get_mut("providers").and_then(|i| i.as_table_mut()) {
+        let mut old_p_remove = Vec::new();
+        for (p_name, p_item) in providers_table.iter() {
+            if let Some(b_url) = p_item.get("base_url").and_then(|v| v.as_str()) {
+                let norm = b_url
+                    .trim_end_matches('/')
+                    .trim_end_matches("/v1")
+                    .trim_end_matches('/');
+                if norm == raw_base_url {
+                    old_p_remove.push(p_name.to_string());
+                }
+            }
+        }
+        for p in old_p_remove {
+            providers_table.remove(&p);
+        }
+    }
+
+    // 2. 清理属于被删除账号的模型，以及之前属于 antigravity-manager 的旧模型（以便完全重新生成）
+    if let Some(models_table) = doc.get_mut("models").and_then(|i| i.as_table_mut()) {
+        let mut models_to_remove = Vec::new();
+        for (m_key, m_item) in models_table.iter() {
+            if let Some(acc) = m_item.get("account").and_then(|v| v.as_str()) {
+                if accounts_to_remove.iter().any(|a| a == acc) || acc == target_provider_id {
+                    models_to_remove.push(m_key.to_string());
+                }
+            }
+        }
+        for m in models_to_remove {
+            models_table.remove(&m);
+        }
+    }
+
+    // 3. 添加 / 更新 [provider_accounts.antigravity-manager]，以 anthropic 协议接入
+    let accounts = doc
+        .entry("provider_accounts")
+        .or_insert(Item::Table(Table::new()));
+    if let Some(acc_table) = accounts.as_table_mut() {
+        let ag = acc_table
+            .entry(target_provider_id)
+            .or_insert(Item::Table(Table::new()));
+        if let Some(ag_table) = ag.as_table_mut() {
+            ag_table.insert("provider", value("anthropic"));
+            ag_table.insert("base_url", value(&normalized_proxy_url));
+            ag_table.insert("api_key", value(api_key));
+        }
+    }
+
+    // 4. 添加最核心的所有 Claude 和 Gemini 模型
+    let core_models = get_core_gateway_models();
+
+    let models_entry = doc.entry("models").or_insert(Item::Table(Table::new()));
+    if let Some(m_table) = models_entry.as_table_mut() {
+        for m in core_models {
+            let mut model_table = Table::new();
+            model_table.insert("account", value(target_provider_id));
+            model_table.insert("model", value(m.id));
+            model_table.insert("context_window", value(m.context_window));
+            model_table.insert("image_input", value(true));
+            model_table.insert("reasoning_model", value(true));
+            model_table.insert("reasoning_history", value("exclude"));
+            model_table.insert("reasoning_effort", value("high"));
+
+            let mut levels = Array::new();
+            levels.push("low");
+            levels.push("medium");
+            levels.push("high");
+            model_table.insert(
+                "reasoning_levels",
+                Item::Value(toml_edit::Value::Array(levels)),
+            );
+
+            m_table.insert(m.id, Item::Table(model_table));
+        }
+    }
+
+    // 5. 设置默认模型
+    let existing_default_model = doc
+        .get("default_model")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+
+    let chosen_model = match model {
+        Some(m) if !m.is_empty() => m.to_string(),
+        _ => {
+            if let Some(existing) = existing_default_model {
+                if core_models.iter().any(|cm| cm.id == existing) {
+                    existing
+                } else {
+                    "gemini-3.8-flash-high".to_string()
+                }
+            } else {
+                "gemini-3.8-flash-high".to_string()
+            }
+        }
+    };
+    doc.insert("default_model", value(&chosen_model));
+    doc.insert("default_provider", value(&chosen_model));
+
+    Ok(doc.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_sync_jeikcode_toml_content() {
+        let initial_toml = r#"default_model = "old-model"
+default_provider = "old-model"
+language = "zh-CN"
+
+[provider_accounts.local-gemini]
+api_key = "sk-old1"
+base_url = "http://127.0.0.1:8046/v1"
+provider = "openai"
+
+[provider_accounts."local_antigravity测试"]
+api_key = "sk-old2"
+base_url = "http://127.0.0.1:8046"
+provider = "anthropic"
+
+[provider_accounts.other-provider]
+api_key = "sk-other"
+base_url = "https://other.com/v1"
+provider = "openai"
+
+[models."gemini-3.7"]
+account = "local-gemini"
+model = "gemini-3.7-flash-high"
+reasoning_model = false
+
+[models."other-model"]
+account = "other-provider"
+model = "deepseek-chat"
+"#;
+
+        let res = sync_jeikcode_toml_content(
+            initial_toml,
+            "http://127.0.0.1:8046",
+            "sk-newkey123",
+            Some("gemini-3.8-flash-high"),
+        )
+        .expect("sync should succeed");
+
+        use toml_edit::DocumentMut;
+        let doc: DocumentMut = res.parse().expect("result should be valid toml");
+
+        // 验证 antigravity-manager 存在且正确
+        let accounts = doc.get("provider_accounts").unwrap().as_table().unwrap();
+        let ag = accounts.get("antigravity-manager").unwrap();
+        assert_eq!(ag.get("provider").unwrap().as_str().unwrap(), "anthropic");
+        assert_eq!(
+            ag.get("base_url").unwrap().as_str().unwrap(),
+            "http://127.0.0.1:8046/v1"
+        );
+        assert_eq!(ag.get("api_key").unwrap().as_str().unwrap(), "sk-newkey123");
+
+        // 验证同 URL 旧账号被清除
+        assert!(!accounts.contains_key("local-gemini"));
+        assert!(!accounts.contains_key("local_antigravity测试"));
+        // 验证不同 URL 账号被保留
+        assert!(accounts.contains_key("other-provider"));
+
+        // 验证核心模型已添加
+        let models = doc.get("models").unwrap().as_table().unwrap();
+        assert!(models.contains_key("claude-sonnet-4-6"));
+        assert!(models.contains_key("claude-sonnet-4-6-thinking"));
+        assert!(models.contains_key("claude-opus-4-6"));
+        assert!(models.contains_key("gemini-3.8-flash"));
+        assert!(models.contains_key("gemini-3.8-flash-tiered"));
+        assert!(models.contains_key("gemini-3.8-flash-high"));
+        assert!(models.contains_key("gemini-3.7-flash"));
+        assert!(models.contains_key("gemini-3.1-pro"));
+
+        // 验证旧关联模型已被清除，且保留其他账号模型
+        assert!(!models.contains_key("gemini-3.7"));
+        assert!(models.contains_key("other-model"));
+
+        // 验证模型属性：开启思考模式和思考不回传，以及上下文大小（Gemini 1M，Claude 256k）
+        let m = models.get("gemini-3.8-flash-high").unwrap();
+        assert_eq!(
+            m.get("account").unwrap().as_str().unwrap(),
+            "antigravity-manager"
+        );
+        assert_eq!(
+            m.get("context_window").unwrap().as_integer().unwrap(),
+            1_000_000
+        );
+        assert_eq!(m.get("reasoning_model").unwrap().as_bool().unwrap(), true);
+        assert_eq!(
+            m.get("reasoning_history").unwrap().as_str().unwrap(),
+            "exclude"
+        );
+        assert_eq!(m.get("image_input").unwrap().as_bool().unwrap(), true);
+
+        let m_claude = models.get("claude-sonnet-4-6").unwrap();
+        assert_eq!(
+            m_claude.get("account").unwrap().as_str().unwrap(),
+            "antigravity-manager"
+        );
+        assert_eq!(
+            m_claude
+                .get("context_window")
+                .unwrap()
+                .as_integer()
+                .unwrap(),
+            256_000
+        );
+        assert_eq!(
+            m_claude.get("reasoning_model").unwrap().as_bool().unwrap(),
+            true
+        );
+        assert_eq!(
+            m_claude.get("reasoning_history").unwrap().as_str().unwrap(),
+            "exclude"
+        );
+
+        // 验证默认模型
+        assert_eq!(
+            doc.get("default_model").unwrap().as_str().unwrap(),
+            "gemini-3.8-flash-high"
+        );
+    }
 }

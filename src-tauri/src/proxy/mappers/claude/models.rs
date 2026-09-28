@@ -14,7 +14,12 @@ pub struct ClaudeRequest {
     pub tools: Option<Vec<Tool>>,
     #[serde(default)]
     pub stream: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        alias = "maxTokens",
+        alias = "max_completion_tokens",
+        alias = "maxCompletionTokens"
+    )]
     pub max_tokens: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub temperature: Option<f64>,
@@ -41,7 +46,13 @@ pub struct ClaudeRequest {
 pub struct ThinkingConfig {
     #[serde(rename = "type")]
     pub type_: String, // "enabled" or "adaptive"
-    #[serde(alias = "budgetTokens")]
+    #[serde(
+        default,
+        rename = "budget_tokens",
+        alias = "budgetTokens",
+        alias = "max_tokens",
+        alias = "maxTokens"
+    )]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub budget_tokens: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -143,20 +154,28 @@ pub enum ContentBlock {
     },
 }
 
+fn default_base64_type() -> String {
+    "base64".to_string()
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ImageSource {
-    #[serde(rename = "type")]
+    #[serde(rename = "type", default = "default_base64_type")]
     pub source_type: String,
-    pub media_type: String,
-    pub data: String,
+    #[serde(default)]
+    pub media_type: Option<String>,
+    #[serde(default)]
+    pub data: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DocumentSource {
-    #[serde(rename = "type")]
+    #[serde(rename = "type", default = "default_base64_type")]
     pub source_type: String, // "base64"
-    pub media_type: String, // e.g. "application/pdf"
-    pub data: String,       // base64 data
+    #[serde(default)]
+    pub media_type: Option<String>, // e.g. "application/pdf"
+    #[serde(default)]
+    pub data: Option<String>, // base64 data
 }
 
 /// Tool - supports both client tools (with input_schema) and server tools (like web_search)

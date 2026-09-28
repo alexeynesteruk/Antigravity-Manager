@@ -27,7 +27,7 @@ import { showToast } from "../components/common/ToastContainer";
 import { exportAccounts } from "../services/accountService";
 import { useAccountStore } from "../stores/useAccountStore";
 import { useConfigStore } from "../stores/useConfigStore";
-import { Account } from "../types/account";
+import { Account, getAccountTier } from "../types/account";
 import { cn } from "../utils/cn";
 import { isTauri } from "../utils/env";
 import { request as invoke } from "../utils/request";
@@ -55,6 +55,7 @@ function Accounts() {
     warmUpAccounts,
     warmUpAccount,
     updateAccountLabel,
+    updateAccountPriority,
   } = useAccountStore();
   const { config, showAllQuotas, toggleShowAllQuotas } = useConfigStore();
 
@@ -149,7 +150,7 @@ function Accounts() {
           showToast(msg, "success");
         } else {
           showToast(
-            t("accounts.warmup_all_triggered", "Full warmup task triggered"),
+            t("accounts.warmup_all_triggered", "全量预热任务已触发"),
             "success",
           );
         }
@@ -185,7 +186,7 @@ function Accounts() {
   const [localPageSize, setLocalPageSize] = useState<number | null>(() => {
     const saved = localStorage.getItem("accounts_page_size");
     return saved ? parseInt(saved) : null;
-  }); // Local page-size state
+  }); // 本地分页大小状态
 
   // Save page size preference
   useEffect(() => {
@@ -194,40 +195,40 @@ function Accounts() {
     }
   }, [localPageSize]);
 
-  // Dynamically calculate page size
+  // 动态计算分页条数
   const ITEMS_PER_PAGE = useMemo(() => {
-    // Prefer the locally configured page size
+    // 优先使用本地设置的分页大小
     if (localPageSize && localPageSize > 0) {
       return localPageSize;
     }
 
-    // Otherwise use the user-configured fixed value
+    // 其次使用用户配置的固定值
     if (config?.accounts_page_size && config.accounts_page_size > 0) {
       return config.accounts_page_size;
     }
 
-    // Fall back to the original dynamic calculation logic
+    // 回退到原有的动态计算逻辑
     if (!containerSize.height) return viewMode === "grid" ? 6 : 8;
 
     if (viewMode === "list") {
-      const headerHeight = 36; // Header height after indentation reduction
-      const rowHeight = 72; // Actual row height including multi-line model info
-      // Calculate how many rows fit, default minimum 10 rows
+      const headerHeight = 36; // 缩深后的表头高度
+      const rowHeight = 72; // 包含多行模型信息后的实际行高
+      // 计算能容纳多少行, 默认最低 10 行
       const autoFitCount = Math.floor(
         (containerSize.height - headerHeight) / rowHeight,
       );
       return Math.max(10, autoFitCount);
     } else {
-      const cardHeight = 180; // Actual AccountCard height (including spacing)
+      const cardHeight = 180; // AccountCard 实际高度 (含间距)
       const gap = 16; // gap-4
 
-      // Match Tailwind breakpoint logic
+      // 匹配 Tailwind 断点逻辑
       let cols = 1;
       if (containerSize.width >= 1200)
-        cols = 4; // xl (around 1280)
+        cols = 4; // xl (约为 1280 左右)
       else if (containerSize.width >= 900)
-        cols = 3; // lg (around 1024)
-      else if (containerSize.width >= 600) cols = 2; // md (around 768)
+        cols = 3; // lg (约为 1024 左右)
+      else if (containerSize.width >= 600) cols = 2; // md (约为 768 左右)
 
       const rows = Math.max(
         1,
@@ -246,50 +247,27 @@ function Accounts() {
     setCurrentPage(1);
   }, [viewMode]);
 
-  // Search filter logic
+  // 搜索过滤逻辑
   const searchedAccounts = useMemo(() => {
     if (!searchQuery) return accounts;
     const lowQuery = searchQuery.toLowerCase();
     return accounts.filter((a) => a.email.toLowerCase().includes(lowQuery));
   }, [accounts, searchQuery]);
 
-  // Calculate the count for each filter state (based on search results)
+  // 计算各筛选状态下的数量 (基于搜索结果)
   const filterCounts = useMemo(() => {
     return {
       all: searchedAccounts.length,
-      pro: searchedAccounts.filter((a) =>
-        a.quota?.subscription_tier?.toLowerCase().includes("pro"),
-      ).length,
-      ultra: searchedAccounts.filter((a) =>
-        a.quota?.subscription_tier?.toLowerCase().includes("ultra"),
-      ).length,
-      free: searchedAccounts.filter((a) => {
-        const tier = a.quota?.subscription_tier?.toLowerCase();
-        return tier && !tier.includes("pro") && !tier.includes("ultra");
-      }).length,
+      pro: searchedAccounts.filter((a) => getAccountTier(a) === "pro").length,
+      ultra: searchedAccounts.filter((a) => getAccountTier(a) === "ultra").length,
+      free: searchedAccounts.filter((a) => getAccountTier(a) === "free").length,
     };
   }, [searchedAccounts]);
 
-  // Final filtered and searched result
+  // 过滤和搜索最终结果
   const filteredAccounts = useMemo(() => {
-    let result = searchedAccounts;
-
-    if (filter === "pro") {
-      result = result.filter((a) =>
-        a.quota?.subscription_tier?.toLowerCase().includes("pro"),
-      );
-    } else if (filter === "ultra") {
-      result = result.filter((a) =>
-        a.quota?.subscription_tier?.toLowerCase().includes("ultra"),
-      );
-    } else if (filter === "free") {
-      result = result.filter((a) => {
-        const tier = a.quota?.subscription_tier?.toLowerCase();
-        return tier && !tier.includes("pro") && !tier.includes("ultra");
-      });
-    }
-
-    return result;
+    if (filter === "all") return searchedAccounts;
+    return searchedAccounts.filter((a) => getAccountTier(a) === filter);
   }, [searchedAccounts, filter]);
 
   // Pagination Logic
@@ -302,7 +280,7 @@ function Accounts() {
     setCurrentPage(page);
   };
 
-  // Clear selection when the filter changes, and reset pagination
+  // 清空选择当过滤改变 并重置分页
   useEffect(() => {
     setSelectedIds(new Set());
     setCurrentPage(1);
@@ -319,7 +297,7 @@ function Accounts() {
   };
 
   const handleToggleAll = () => {
-    // Select all items on the current page
+    // 全选当前页的所有项
     const currentIds = paginatedAccounts.map((a) => a.id);
     const allSelected = currentIds.every((id) => selectedIds.has(id));
 
@@ -488,7 +466,7 @@ function Accounts() {
       const details: string[] = [];
 
       if (isBatch) {
-        // Batch refresh selected
+        // 批量刷新选中
         const ids = Array.from(selectedIds);
         setRefreshingIds(new Set(ids));
 
@@ -507,7 +485,7 @@ function Accounts() {
           }
         });
       } else {
-        // Refresh all
+        // 刷新所有
         setRefreshingIds(new Set(accounts.map((a) => a.id)));
         const stats = await useAccountStore.getState().refreshAllQuotas();
         if (stats) {
@@ -589,7 +567,7 @@ function Accounts() {
         await invoke("save_text_file", { path, content });
         showToast(`${t("common.success")} ${path}`, "success");
       } else {
-        // Web mode: use browser download
+        // Web 模式：使用浏览器下载
         const blob = new Blob([content], { type: "application/json" });
         const url = URL.createObjectURL(blob);
         const a = document.createElement("a");
@@ -712,7 +690,7 @@ function Accounts() {
         showToast(t("accounts.import_fail", { error: String(error) }), "error");
       }
     } else {
-      // Web mode: trigger the hidden file input
+      // Web 模式: 触发隐藏的 file input
       fileInputRef.current?.click();
     }
   };
@@ -730,7 +708,7 @@ function Accounts() {
       console.error("Import failed:", error);
       showToast(t("accounts.import_fail", { error: String(error) }), "error");
     } finally {
-      // Reset input, allow re-selecting the same file
+      // 重置 input,允许重复选择同一文件
       event.target.value = "";
     }
   };
@@ -750,7 +728,7 @@ function Accounts() {
 
   return (
     <div className="h-full flex flex-col p-5 gap-4 max-w-7xl mx-auto w-full">
-      {/* Test button - at the very top */}
+      {/* 测试按钮 - 在最顶部 */}
       <input
         ref={fileInputRef}
         type="file"
@@ -759,9 +737,9 @@ function Accounts() {
         onChange={handleFileChange}
       />
 
-      {/* Top toolbar: search, filter, and action buttons */}
+      {/* 顶部工具栏:搜索、过滤和操作按钮 */}
       <div className="flex-none flex items-center gap-2">
-        {/* Search box - responsive: input on large screens, icon on small screens */}
+        {/* 搜索框 - 响应式:大屏显示输入框,小屏显示图标 */}
         <div className="hidden lg:block flex-none w-40 relative transition-all focus-within:w-48">
           <Search className="absolute left-3 top-1/2 transform -translate-y-1/2 w-4 h-4 text-gray-400" />
           <input
@@ -773,7 +751,7 @@ function Accounts() {
           />
         </div>
 
-        {/* Search button - shown on small screens */}
+        {/* 搜索按钮 - 小屏显示 */}
         <div className="lg:hidden relative">
           {!isSearchExpanded ? (
             <button
@@ -804,7 +782,7 @@ function Accounts() {
           )}
         </div>
 
-        {/* Quota period toggle (5H / 7-day weekly quota) */}
+        {/* 配额周期切换 (5H / 7天周配额) */}
         <div className="flex gap-1 bg-gray-100 dark:bg-base-200 p-1 rounded-lg shrink-0 items-center">
           <button
             className={cn(
@@ -814,7 +792,7 @@ function Accounts() {
                 : "text-gray-500 dark:text-gray-400 hover:text-gray-900 dark:hover:text-base-content",
             )}
             onClick={() => setQuotaWindow("5h")}
-            title={t("accounts.quota_window_5h", "5-Hour Sliding Quota")}
+            title={t("accounts.quota_window_5h", "5小时滑动配额")}
           >
             <Clock className="w-3.5 h-3.5" />
             <span>5H</span>
@@ -827,14 +805,14 @@ function Accounts() {
                 : "text-gray-500 dark:text-gray-400 hover:text-gray-900 dark:hover:text-base-content",
             )}
             onClick={() => setQuotaWindow("weekly")}
-            title={t("accounts.quota_window_weekly", "7-Day Weekly Quota")}
+            title={t("accounts.quota_window_weekly", "7天周配额")}
           >
             <Calendar className="w-3.5 h-3.5" />
-            <span>{t("accounts.quota_window_weekly_short", "Weekly Quota")}</span>
+            <span>{t("accounts.quota_window_weekly_short", "周配额")}</span>
           </button>
         </div>
 
-        {/* View toggle button group */}
+        {/* 视图切换按钮组 */}
         <div className="flex gap-1 bg-gray-100 dark:bg-base-200 p-1 rounded-lg shrink-0">
           <button
             className={cn(
@@ -862,9 +840,9 @@ function Accounts() {
           </button>
         </div>
 
-        {/* Filter button group - responsive icons */}
+        {/* 过滤按钮组 - 图标化响应式 */}
         <div className="flex gap-0.5 bg-gray-100/80 dark:bg-base-200 p-1 rounded-xl border border-gray-200/50 dark:border-white/5 shrink-0">
-          {/* All */}
+          {/* 全部 */}
           <button
             className={cn(
               "px-2 md:px-3 py-1.5 rounded-lg text-[11px] font-semibold transition-all flex items-center gap-1 md:gap-1.5 whitespace-nowrap shrink-0",
@@ -955,7 +933,7 @@ function Accounts() {
 
         <div className="flex-1 min-w-[8px]"></div>
 
-        {/* Action button group */}
+        {/* 操作按钮组 */}
         <div className="flex items-center gap-1.5 shrink-0">
           <AddAccountDialog onAdd={handleAddAccount} showText={false} />
 
@@ -1033,7 +1011,7 @@ function Accounts() {
             title={
               selectedIds.size > 0
                 ? t("accounts.warmup_selected", { count: selectedIds.size })
-                : t("accounts.warmup_all", "One-Click Warmup All Accounts")
+                : t("accounts.warmup_all", "一键预热所有账号")
             }
           >
             <Sparkles
@@ -1044,7 +1022,7 @@ function Accounts() {
                 ? t("common.loading")
                 : selectedIds.size > 0
                   ? t("accounts.warmup_selected", { count: selectedIds.size })
-                  : t("accounts.warmup_all", "One-Click Warmup")}
+                  : t("accounts.warmup_all", "一键预热")}
             </span>
           </button>
 
@@ -1091,7 +1069,7 @@ function Accounts() {
         </div>
       </div>
 
-      {/* Account list content area */}
+      {/* 账号列表内容区域 */}
       <div className="flex-1 min-h-0 relative" ref={containerRef}>
         {viewMode === "list" ? (
           <div className="h-full bg-white dark:bg-base-100 rounded-2xl shadow-sm border border-gray-100 dark:border-base-200 flex flex-col overflow-hidden">
@@ -1154,7 +1132,7 @@ function Accounts() {
         )}
       </div>
 
-      {/* Minimal pagination - borderless floating style */}
+      {/* 极简分页 - 无边框浮动样式 */}
       {filteredAccounts.length > 0 && (
         <div className="flex-none">
           <Pagination
@@ -1165,7 +1143,7 @@ function Accounts() {
             itemsPerPage={ITEMS_PER_PAGE}
             onPageSizeChange={(newSize) => {
               setLocalPageSize(newSize);
-              setCurrentPage(1); // Reset to the first page
+              setCurrentPage(1); // 重置到第一页
             }}
             pageSizeOptions={[10, 20, 50, 100]}
           />
@@ -1173,8 +1151,9 @@ function Accounts() {
       )}
 
       <AccountDetailsDialog
-        account={detailsAccount}
+        account={accounts.find(a => a.id === detailsAccount?.id) || null}
         onClose={() => setDetailsAccount(null)}
+        onUpdatePriority={updateAccountPriority}
       />
       <DeviceFingerprintDialog
         account={deviceAccount}
@@ -1246,35 +1225,29 @@ function Accounts() {
         isOpen={isWarmupConfirmOpen}
         title={
           selectedIds.size > 0
-            ? t("accounts.dialog.batch_warmup_title", "Batch Manual Warmup")
-            : t("accounts.dialog.warmup_all_title", "Full Manual Warmup")
+            ? t("accounts.dialog.batch_warmup_title", "批量手动预热")
+            : t("accounts.dialog.warmup_all_title", "全量手动预热")
         }
         message={
           selectedIds.size > 0
             ? t(
               "accounts.dialog.batch_warmup_msg",
-              "Are you sure you want to immediately trigger warmup for the {{count}} selected accounts?",
+              "确定要为选中的 {{count}} 个账号立即触发预热吗？",
               { count: selectedIds.size },
             )
             : t(
               "accounts.dialog.warmup_all_msg",
-              "Are you sure you want to immediately trigger a warmup task for all eligible accounts? This will send a minimal amount of traffic to Google services.",
+              "确定要立即为所有符合条件的账号触发预热任务吗？这将向 Google 服务发送极小流量。",
             )
         }
         type="confirm"
-        confirmText={t("accounts.warmup_now", "Warmup Now")}
+        confirmText={t("accounts.warmup_now", "立即预热")}
         isDestructive={false}
         onConfirm={handleWarmupAll}
         onCancel={() => setIsWarmupConfirmOpen(false)}
       />
 
-      {/* Account detail dialog */}
-      <AccountDetailsDialog
-        account={detailsAccount}
-        onClose={() => setDetailsAccount(null)}
-      />
-
-      {/* Account error detail dialog */}
+      {/* 账号错误详情弹窗 */}
       <AccountErrorDialog
         account={accounts.find(a => a.id === errorAccountId) || null}
         onClose={() => setErrorAccountId(null)}

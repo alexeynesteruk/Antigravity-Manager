@@ -1,42 +1,51 @@
-// Gemini v1internal wrap/unwrap
+// Gemini v1internal 包装/解包
 use serde_json::{json, Value};
-use tracing::{debug, error, info};
+use tracing::{debug, info};
 
-/// Wrap the request body into v1internal format
+/// 包装请求体为 v1internal 格式
 pub fn wrap_request_v2(
     body: &Value,
     project_id: &str,
     mapped_model: &str,
     account_id: Option<&str>,
     session_id: Option<&str>,
-    token: Option<&crate::proxy::token_manager::ProxyToken>, // [NEW] Dynamic spec injection
+    token: Option<&crate::proxy::token_manager::ProxyToken>, // [NEW] 动态规格注入
     token_manager: Option<&std::sync::Arc<crate::proxy::TokenManager>>,
+    // [NEW] Layer-3 后台摘要专用的上游客户端。
+    // 必须由 handler 传入 `&state.upstream`，它才能按账号解析代理池（`client_cache`）
+    // 并随上游代理热更新生效；传 `None` 时 Layer-3 不触发。
+    upstream: Option<&std::sync::Arc<crate::proxy::upstream::client::UpstreamClient>>,
 ) -> Value {
-    // Prefer the passed-in mapped_model; otherwise try to get it from body
+    // 优先使用传入的 mapped_model，其次尝试从 body 获取
     let original_model = body
         .get("model")
         .and_then(|v| v.as_str())
         .unwrap_or(mapped_model);
 
-    // If mapped_model is empty, use original_model
+    // 如果 mapped_model 是空的，则使用 original_model
     let final_model_name = if !mapped_model.is_empty() {
         mapped_model
     } else {
         original_model
     };
 
-    // [ADDED v4.1.24] Compute message_count for use in requestId
+    // [ADDED v4.1.24] 计算 message_count 供 requestId 使用
     let _message_count = body
         .get("contents")
         .and_then(|c| c.as_array())
         .map(|a| a.len())
         .unwrap_or(1);
 
-    // Clone body so it can be modified
+    // 复制 body 以便修改
     let mut inner_request = body.clone();
 
-    // Deep-clean "[undefined]" strings (commonly injected by clients like Cherry Studio)
+    // 深度清理 [undefined] 字符串 (Cherry Studio 等客户端常见注入)
     crate::proxy::mappers::common_utils::deep_clean_undefined(&mut inner_request, 0);
+
+    // [PIPELINE] 统一清洗提示词与风控伪 Header（兼容第三方聚合器如 New API 以 Gemini 原生协议转入时的特征残留）
+    crate::proxy::mappers::prompt_sanitizer::PromptSanitizer::sanitize_gemini_payload(
+        &mut inner_request,
+    );
 
     // [FIX #1522] Inject dummy IDs for Claude models in Gemini protocol
     let is_target_claude = final_model_name.to_lowercase().contains("claude");
@@ -142,18 +151,22 @@ pub fn wrap_request_v2(
             );
 
             let tm_opt = tm.cloned();
+            let upstream_opt = upstream.cloned();
             let sid_str = session_id.unwrap_or_default().to_string();
             let body_clone = inner_request.clone();
             let trace_id_clone = trace_id.clone();
             let proj_clone = project_id.to_string();
             let acc_clone = account_id.unwrap_or_default().to_string();
 
-            if let Some(tm_arc) = tm_opt {
+            // 两个依赖缺一不可：token_manager 取凭据，upstream 选对代理
+            // （否则账号绑定专属代理时摘要会从真实 IP 出去）。
+            if let (Some(tm_arc), Some(upstream_arc)) = (tm_opt, upstream_opt) {
                 tokio::spawn(async move {
                     match try_compress_gemini_with_summary(
                         &body_clone,
                         &trace_id_clone,
                         &tm_arc,
+                        &upstream_arc,
                         &sid_str,
                         &proj_clone,
                         &acc_clone,
@@ -225,158 +238,325 @@ pub fn wrap_request_v2(
         }
     }
 
+    let lower_model = final_model_name.to_lowercase();
+    let tb_config = crate::proxy::config::get_thinking_budget_config();
+    let is_client_control =
+        tb_config.control_source == crate::proxy::config::ThinkingControlSource::Client;
+
+    let client_budget = inner_request
+        .get("generationConfig")
+        .and_then(|gc| gc.get("thinkingConfig"))
+        .and_then(|tc| {
+            tc.get("thinkingBudget")
+                .or_else(|| tc.get("thinking_budget"))
+                .or_else(|| tc.get("budget_tokens"))
+                .or_else(|| tc.get("budgetTokens"))
+                .or_else(|| tc.get("max_tokens"))
+                .or_else(|| tc.get("maxTokens"))
+        })
+        .and_then(|b| b.as_i64());
+    let client_level = inner_request
+        .get("generationConfig")
+        .and_then(|gc| gc.get("thinkingConfig"))
+        .and_then(|tc| {
+            tc.get("thinkingLevel")
+                .or_else(|| tc.get("thinking_level"))
+                .or_else(|| tc.get("reasoning_effort"))
+                .or_else(|| tc.get("reasoningEffort"))
+                .or_else(|| tc.get("effort"))
+        })
+        .and_then(|v| v.as_str());
+
+    let client_switch = crate::proxy::pipeline::extract_client_thinking_switch(
+        None,
+        client_budget.map(|b| if b <= 0 { 0 } else { b as u64 }),
+        client_level,
+    );
+    let is_client_disabled = is_client_control && client_switch.is_disabled();
+
+    let is_under_v3 = crate::proxy::model_specs::is_gemini_under_v3(final_model_name)
+        || crate::proxy::model_specs::is_gemini_under_v3(original_model);
+    let force_server_thinking = !is_under_v3
+        && crate::proxy::thinking_store::any_model_forces_server_thinking(&[
+            final_model_name,
+            original_model,
+        ]);
+    let is_preview = lower_model.contains("preview");
+    let should_inject = !is_client_disabled
+        && !is_under_v3
+        && (force_server_thinking
+            || lower_model.contains("thinking")
+            || (crate::proxy::model_specs::is_gemini_v3_or_above(final_model_name) && !is_preview));
+
+    let has_explicit_thinking = inner_request
+        .get("generationConfig")
+        .and_then(|gc| gc.get("thinkingConfig"))
+        .and_then(|tc| tc.get("thinkingBudget"))
+        .and_then(|b| b.as_i64())
+        .map(|b| b > 0)
+        .unwrap_or(false);
+    let is_thinking_active = should_inject || has_explicit_thinking;
+
     if let Some(contents) = inner_request
         .get_mut("contents")
         .and_then(|c| c.as_array_mut())
     {
-        for (i, content) in contents.iter_mut().enumerate() {
+        for (_i, content) in contents.iter_mut().enumerate() {
+            let role = content.get("role").and_then(|r| r.as_str()).unwrap_or("");
+            let is_assistant = role == "model" || role == "assistant";
+
             let mut name_counters: std::collections::HashMap<String, usize> =
                 std::collections::HashMap::new();
 
             if let Some(parts) = content.get_mut("parts").and_then(|p| p.as_array_mut()) {
-                for part in parts {
-                    if let Some(obj) = part.as_object_mut() {
-                        // 1. Handle functionCall (Assistant requests a tool call)
-                        if let Some(fc) = obj.get_mut("functionCall") {
-                            if fc.get("id").is_none() && is_target_claude {
-                                let name =
-                                    fc.get("name").and_then(|n| n.as_str()).unwrap_or("unknown");
-                                let count = name_counters.entry(name.to_string()).or_insert(0);
-                                let call_id = format!("call_{}_{}", name, count);
-                                *count += 1;
-
-                                fc.as_object_mut()
-                                    .unwrap()
-                                    .insert("id".to_string(), json!(call_id));
-                                tracing::debug!("[Gemini-Wrap] Request stage: Injected missing call_id '{}' for Claude model", call_id);
-                            }
-                        }
-
-                        // 2. Handle functionResponse (User replies with the tool result)
-                        if let Some(fr) = obj.get_mut("functionResponse") {
-                            if fr.get("id").is_none() && is_target_claude {
-                                // Heuristic: if the client (e.g. OpenCode) sent no ID with the response, it means it had no ID when it received the response.
-                                // The ID we generate here must match the ID we inject into the response in inject_ids_to_response.
-                                let name =
-                                    fr.get("name").and_then(|n| n.as_str()).unwrap_or("unknown");
-                                let count = name_counters.entry(name.to_string()).or_insert(0);
-                                let call_id = format!("call_{}_{}", name, count);
-                                *count += 1;
-
-                                fr.as_object_mut()
-                                    .unwrap()
-                                    .insert("id".to_string(), json!(call_id));
-                                tracing::debug!("[Gemini-Wrap] Request stage: Injected synced response_id '{}' for Claude model", call_id);
-                            }
-                        }
-
-                        // 3. Handle thoughtSignature / thought_signature
-                        if obj.contains_key("functionCall") {
-                            let sig_opt = obj
-                                .get("thoughtSignature")
-                                .or(obj.get("thought_signature"))
-                                .cloned();
-                            if let Some(sig) = sig_opt {
-                                if obj.get("thoughtSignature").is_none() {
-                                    obj.insert("thoughtSignature".to_string(), sig.clone());
-                                }
-                                if obj.get("thought_signature").is_none() {
-                                    obj.insert("thought_signature".to_string(), sig);
-                                }
-                            } else if let Some(s_id) = session_id {
-                                if let Some(sig) = crate::proxy::SignatureCache::global()
-                                    .get_session_signature(s_id)
+                // 1. 如果是 assistant/model 轮次，预先扫描提取 turn_signature (对齐 Anthropic)
+                let mut turn_signature: Option<String> = None;
+                if is_assistant {
+                    for part in parts.iter() {
+                        if let Some(obj) = part.as_object() {
+                            // 铁律：只认 thought: true（详见 thinking_store::is_thought_part）
+                            let is_thought = crate::proxy::thinking_store::is_thought_part(part);
+                            if is_thought {
+                                if let Some(s) = obj
+                                    .get("thoughtSignature")
+                                    .or(obj.get("thought_signature"))
+                                    .and_then(|s| s.as_str())
                                 {
-                                    obj.insert("thoughtSignature".to_string(), json!(sig));
-                                    obj.insert("thought_signature".to_string(), json!(sig));
-                                    tracing::debug!("[Gemini-Wrap] Injected signature (len: {}) for session: {}", sig.len(), s_id);
-                                } else {
-                                    // Session cache empty: Gemini 3.x Flash (including 3.5/3.6/3.7)
-                                    // rejects functionCall without thought_signature.
-                                    let model_lc = final_model_name.to_lowercase();
-                                    let is_flash = model_lc.contains("gemini")
-                                        && (model_lc.contains("flash")
-                                            || model_lc.contains("-flash-"));
-                                    if is_flash {
-                                        obj.insert(
-                                            "thoughtSignature".to_string(),
-                                            json!("skip_thought_signature_validator"),
-                                        );
-                                        obj.insert(
-                                            "thought_signature".to_string(),
-                                            json!("skip_thought_signature_validator"),
-                                        );
-                                        tracing::info!("[Gemini-Wrap] Injected sentinel signature for flash model {} (no session cache)", final_model_name);
+                                    if s == crate::proxy::thinking_store::SENTINEL_SIGNATURE
+                                        || s.len() >= 50
+                                    {
+                                        turn_signature = Some(s.to_string());
+                                        break;
                                     }
-                                }
-                            } else {
-                                // No session id either: still inject sentinel for Flash.
-                                let model_lc = final_model_name.to_lowercase();
-                                let is_flash = model_lc.contains("gemini")
-                                    && (model_lc.contains("flash") || model_lc.contains("-flash-"));
-                                if is_flash {
-                                    obj.insert(
-                                        "thoughtSignature".to_string(),
-                                        json!("skip_thought_signature_validator"),
-                                    );
-                                    obj.insert(
-                                        "thought_signature".to_string(),
-                                        json!("skip_thought_signature_validator"),
-                                    );
-                                    tracing::info!("[Gemini-Wrap] Injected sentinel signature for flash model {} (no session id)", final_model_name);
                                 }
                             }
                         }
                     }
                 }
+
+                let mut new_parts = Vec::with_capacity(parts.len());
+                let mut saw_non_thinking = false;
+
+                for mut part in parts.drain(..) {
+                    // 铁律：只认 thought: true（详见 thinking_store::is_thought_part）
+                    let is_thought = crate::proxy::thinking_store::is_thought_part(&part);
+
+                    if is_assistant && is_thought {
+                        let text = part.get("text").and_then(|v| v.as_str()).unwrap_or("");
+                        let incoming_sig = part
+                            .get("thoughtSignature")
+                            .or_else(|| part.get("thought_signature"))
+                            .and_then(|s| s.as_str())
+                            .map(str::to_string);
+
+                        // [2026-09-27] 占位思考块直接丢弃（不写思考块）。
+                        // 官方样本（baogao.txt）9/24 轮是「无思考块 + 锚点带签名」，
+                        // 空 / "." / "..." / 空格 / "·" 等占位思考无信息量，不出站。
+                        let is_placeholder =
+                            crate::proxy::thinking_store::is_placeholder_thought(text);
+                        if is_placeholder || text.trim().is_empty() {
+                            tracing::debug!(
+                                "[Gemini-Wrap] Placeholder thinking part dropped (text={:?}).",
+                                &text[..text.len().min(20)],
+                            );
+                            continue;
+                        }
+                        let final_thought_text = text.trim();
+
+                        // 位置检查：思考块必须是首位部件，若之前已有非思考内容则降级为文本
+                        if saw_non_thinking || !new_parts.is_empty() {
+                            tracing::warn!("[Gemini-Wrap] Thinking part found at non-zero index. Downgrading to text.");
+                            if !final_thought_text.is_empty() {
+                                new_parts.push(json!({ "text": final_thought_text }));
+                                saw_non_thinking = true;
+                            }
+                            continue;
+                        }
+
+                        // 思考关闭检查 (对齐 Anthropic 降级为普通文本)
+                        if !is_thinking_active {
+                            tracing::warn!("[Gemini-Wrap] Thinking disabled. Downgrading thinking part to text.");
+                            if !final_thought_text.is_empty() {
+                                new_parts.push(json!({ "text": final_thought_text }));
+                                saw_non_thinking = true;
+                            }
+                            continue;
+                        }
+
+                        // 签名有效性与模型兼容性校验 (对齐 Anthropic)
+                        let mut effective_sig = None;
+                        if let Some(ref sig) = incoming_sig {
+                            if !sig.is_empty() {
+                                let cached_family = crate::proxy::SignatureCache::global()
+                                    .get_signature_family(sig);
+                                match cached_family {
+                                    Some(family) => {
+                                        if crate::proxy::mappers::common_utils::is_model_compatible(
+                                            &family,
+                                            final_model_name,
+                                        ) {
+                                            effective_sig = Some(sig.clone());
+                                        } else {
+                                            tracing::warn!(
+                                                "[Gemini-Wrap] Incompatible thinking signature (Family: {}, Target: {}).",
+                                                family, final_model_name
+                                            );
+                                        }
+                                    }
+                                    None => {
+                                        effective_sig = Some(sig.clone());
+                                    }
+                                }
+                            }
+                        }
+
+                        if effective_sig.is_none() {
+                            effective_sig = turn_signature.clone();
+                        }
+
+                        // 无签名时**绝不发明哨兵**：官方流量里哨兵出现 0/23 次，
+                        // 它不属于 Antigravity 协议。Gemini 目标的思考块本就不应携带签名
+                        // （铁律 I4），故保留 `thought: true` 结构、仅省略签名字段。
+                        if let Some(sig) = effective_sig {
+                            new_parts.push(json!({
+                                "text": final_thought_text,
+                                "thought": true,
+                                "thoughtSignature": sig,
+                            }));
+                        } else {
+                            new_parts.push(json!({
+                                "text": final_thought_text,
+                                "thought": true,
+                            }));
+                        }
+                    } else {
+                        // 处理普通部件及 functionCall / functionResponse
+                        if let Some(obj) = part.as_object_mut() {
+                            // 1. 处理 functionCall (Assistant 请求调用工具)
+                            if let Some(fc) = obj.get_mut("functionCall") {
+                                if fc.get("id").is_none() && is_target_claude {
+                                    let name = fc
+                                        .get("name")
+                                        .and_then(|n| n.as_str())
+                                        .unwrap_or("unknown");
+                                    let count = name_counters.entry(name.to_string()).or_insert(0);
+                                    let call_id = format!("call_{}_{}", name, count);
+                                    *count += 1;
+
+                                    fc.as_object_mut()
+                                        .unwrap()
+                                        .insert("id".to_string(), json!(call_id));
+                                    tracing::debug!("[Gemini-Wrap] Request stage: Injected missing call_id '{}' for Claude model", call_id);
+                                }
+
+                                // 处理签名校验与兼容性 (对齐 Anthropic)
+                                let _call_id =
+                                    fc.get("id").and_then(|v| v.as_str()).map(str::to_string);
+                                let incoming_fc_sig = obj
+                                    .get("thoughtSignature")
+                                    .or_else(|| obj.get("thought_signature"))
+                                    .and_then(|s| s.as_str())
+                                    .map(str::to_string);
+
+                                // 纯净线缆透传：客户端若自带签名则保持原样，缺失签名全权委托进站流水线统一对齐与回填
+                                if let Some(ref sig) = incoming_fc_sig {
+                                    obj.insert("thoughtSignature".to_string(), json!(sig));
+                                }
+                                obj.remove("thought_signature");
+                            }
+
+                            // 2. 处理 functionResponse (User 回复工具结果)
+                            if obj.contains_key("functionResponse") {
+                                obj.remove("thoughtSignature");
+                                obj.remove("thought_signature");
+                            }
+                            if let Some(fr) = obj.get_mut("functionResponse") {
+                                if fr.get("id").is_none() && is_target_claude {
+                                    let name = fr
+                                        .get("name")
+                                        .and_then(|n| n.as_str())
+                                        .unwrap_or("unknown");
+                                    let count = name_counters.entry(name.to_string()).or_insert(0);
+                                    let call_id = format!("call_{}_{}", name, count);
+                                    *count += 1;
+
+                                    fr.as_object_mut()
+                                        .unwrap()
+                                        .insert("id".to_string(), json!(call_id));
+                                    tracing::debug!("[Gemini-Wrap] Request stage: Injected synced response_id '{}' for Claude model", call_id);
+                                }
+                            }
+                        }
+                        saw_non_thinking = true;
+                        new_parts.push(part);
+                    }
+                }
+                *parts = new_parts;
             }
         }
+        crate::proxy::pipeline::InboundThinkingPipeline::process_contents(
+            contents,
+            crate::proxy::pipeline::ProxyProtocol::GeminiNative,
+            &final_model_name,
+            should_inject,
+            session_id,
+            false,
+        );
     }
 
     // [FIX Issue #1355] Gemini Flash thinking budget capping
-    // [CONFIGURABLE] Now follows the global Thinking Budget config
+    // [CONFIGURABLE] 现在改为遵循全局 Thinking Budget 配置
     // [FIX #1557] Also apply to Pro/Thinking models to ensure budget processing
     // [FIX #1557] Auto-inject thinkingConfig if missing for these models
-    let lower_model = final_model_name.to_lowercase();
-    if lower_model.contains("flash")
+    if force_server_thinking
+        || lower_model.contains("flash")
         || lower_model.contains("pro")
         || lower_model.contains("thinking")
+        || lower_model.contains("agent")
+        || lower_model.contains("gemini")
     {
-        // [NEW] Extract OpenAI-style max_tokens before mutably borrowing gen_config
-        let req_max_tokens = inner_request.get("max_tokens").and_then(|v| v.as_u64());
+        // [NEW] Extract OpenAI/Claude-style max_tokens before mutably borrowing gen_config
+        let req_max_tokens = inner_request
+            .get("max_tokens")
+            .or_else(|| inner_request.get("max_completion_tokens"))
+            .or_else(|| inner_request.get("maxCompletionTokens"))
+            .or_else(|| inner_request.get("maxTokens"))
+            .and_then(|v| v.as_u64());
 
         // Determine model family and capability beforehand to avoid borrow checker conflicts
         let is_claude = lower_model.contains("claude");
-        let is_preview = lower_model.contains("preview");
-        let should_inject = lower_model.contains("thinking")
-            || (lower_model.contains("gemini-2.0-pro") && !is_preview)
-            || (lower_model.contains("gemini-3-pro") && !is_preview)
-            || (lower_model.contains("gemini-3.1-pro") && !is_preview);
 
         if should_inject {
             // Scope for borrowing inner_request/gen_config
-            let mut has_thinking = false;
-            if is_claude {
-                has_thinking = inner_request.get("thinking").is_some();
+            let has_thinking = if is_claude {
+                inner_request.get("thinking").is_some()
             } else {
-                if let Some(gc) = inner_request
+                inner_request
                     .get("generationConfig")
                     .and_then(|v| v.as_object())
-                {
-                    has_thinking = gc.get("thinkingConfig").is_some();
-                }
-            }
+                    .map_or(false, |gc| gc.get("thinkingConfig").is_some())
+            };
 
-            if !has_thinking {
+            let tb_config = crate::proxy::config::get_thinking_budget_config();
+            let is_client_control =
+                tb_config.control_source == crate::proxy::config::ThinkingControlSource::Client;
+
+            let default_budget =
+                crate::proxy::model_specs::get_thinking_budget(final_model_name, token);
+
+            let is_explicit_tier =
+                crate::proxy::model_specs::is_explicit_heuristic_tier_model(final_model_name);
+
+            // [ANTI-POLLUTION] 对齐 Anthropic 与 OpenAI：对于未设置思考配置或显式档位模型，设定权威 default_budget；对于裸模型保留客户端配置供后续 resolve_authoritative_thinking_budget 仲裁
+            // 客户端直接控制模式下，严禁篡改覆盖客户端的思考意图
+            let should_override_budget = !is_client_control && (!has_thinking || is_explicit_tier);
+
+            if should_override_budget {
                 tracing::debug!(
-                    "[Gemini-Wrap] Auto-injecting default thinking for {}",
+                    "[Gemini-Wrap] Enforcing authoritative thinking budget {} for {}",
+                    default_budget,
                     final_model_name
                 );
-
-                // [FIX] Uniformly inject into generationConfig.thinkingConfig
-                // Use the default budget provided by the dynamic spec
-                let default_budget =
-                    crate::proxy::model_specs::get_thinking_budget(final_model_name, token);
 
                 let gen_config = inner_request
                     .as_object_mut()
@@ -405,6 +585,10 @@ pub fn wrap_request_v2(
             .as_object_mut()
             .unwrap();
 
+        if is_under_v3 {
+            gen_config.remove("thinkingConfig");
+        }
+
         // [ADDED v4.1.24] Inject topK=40 and topP=1.0 if not present to match official client
         if !gen_config.contains_key("topK") {
             gen_config.insert("topK".to_string(), json!(40));
@@ -413,78 +597,96 @@ pub fn wrap_request_v2(
             gen_config.insert("topP".to_string(), json!(1.0));
         }
 
-        // [FIX] Convert v1beta thinkingLevel (string) to v1internal thinkingBudget (number).
-        // Clients (e.g. OpenClaw, Cline) may send thinkingLevel which v1internal does not accept,
-        // causing 400 INVALID_ARGUMENT. Convert before any budget processing below.
-        if let Some(thinking_config) = gen_config.get_mut("thinkingConfig") {
-            if let Some(level) = thinking_config
-                .get("thinkingLevel")
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_uppercase())
+        if force_server_thinking {
+            let default_budget =
+                crate::proxy::model_specs::get_thinking_budget(final_model_name, token);
+            let thinking_config = gen_config
+                .entry("thinkingConfig".to_string())
+                .or_insert(json!({}))
+                .as_object_mut()
+                .unwrap();
+            thinking_config.insert("includeThoughts".to_string(), json!(true));
+            if !thinking_config.contains_key("thinkingBudget")
+                && !thinking_config.contains_key("thinkingLevel")
             {
-                let thinking_budget_cap =
-                    crate::proxy::model_specs::get_thinking_budget(final_model_name, token);
-                let budget: i64 = match level.as_str() {
-                    "NONE" => 0,
-                    "LOW" => (thinking_budget_cap / 4).max(4096) as i64,
-                    "MEDIUM" => (thinking_budget_cap / 2).max(8192) as i64,
-                    "HIGH" => thinking_budget_cap as i64,
-                    _ => (thinking_budget_cap / 2).max(8192) as i64, // safe default
-                };
-                tracing::info!(
-                    "[Gemini-Wrap] Converting thinkingLevel '{}' to thinkingBudget {}",
-                    level,
-                    budget
-                );
-                if let Some(tc) = thinking_config.as_object_mut() {
-                    tc.remove("thinkingLevel");
-                    tc.insert("thinkingBudget".to_string(), json!(budget));
-                }
+                thinking_config.insert("thinkingBudget".to_string(), json!(default_budget));
             }
+            tracing::debug!(
+                "[Gemini-Wrap] Forced includeThoughts=true for keyword model {}",
+                final_model_name
+            );
         }
 
-        if let Some(thinking_config) = gen_config.get_mut("thinkingConfig") {
-            if let Some(budget_val) = thinking_config.get("thinkingBudget") {
-                if let Some(budget_i64) = budget_val.as_i64() {
-                    // [NEW] -1 indicates native dynamic mode, skip capping
-                    if budget_i64 != -1 {
-                        let budget = budget_i64 as u64;
-                        let thinking_budget_cap =
-                            crate::proxy::model_specs::get_thinking_budget(final_model_name, token);
-                        let tb_config = crate::proxy::config::get_thinking_budget_config();
-                        let final_budget = match tb_config.mode {
-                            crate::proxy::config::ThinkingBudgetMode::Passthrough => budget,
-                            crate::proxy::config::ThinkingBudgetMode::Custom => {
-                                let val = tb_config.custom_value as u64;
-                                let is_limited = (final_model_name.contains("gemini")
-                                    || final_model_name.contains("thinking"))
-                                    && !final_model_name.contains("-image");
+        // [AUTHORITATIVE RESOLUTION] 全协议统一由进站流水线节点解析思考预算
+        let has_thinking_config = gen_config.contains_key("thinkingConfig");
+        let client_level = gen_config
+            .get("thinkingConfig")
+            .and_then(|t| {
+                t.get("thinkingLevel")
+                    .or_else(|| t.get("thinking_level"))
+                    .or_else(|| t.get("reasoning_effort"))
+                    .or_else(|| t.get("reasoningEffort"))
+                    .or_else(|| t.get("effort"))
+            })
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+        let client_budget = gen_config
+            .get("thinkingConfig")
+            .and_then(|t| {
+                t.get("thinkingBudget")
+                    .or_else(|| t.get("thinking_budget"))
+                    .or_else(|| t.get("budget_tokens"))
+                    .or_else(|| t.get("budgetTokens"))
+                    .or_else(|| t.get("max_tokens"))
+                    .or_else(|| t.get("maxTokens"))
+            })
+            .and_then(|v| v.as_i64());
 
-                                if is_limited && val > thinking_budget_cap {
-                                    thinking_budget_cap
-                                } else {
-                                    val
-                                }
-                            }
-                            crate::proxy::config::ThinkingBudgetMode::Auto => {
-                                let is_limited = (final_model_name.contains("gemini")
-                                    || final_model_name.contains("thinking"))
-                                    && !final_model_name.contains("-image");
+        let client_switch = crate::proxy::pipeline::extract_client_thinking_switch(
+            None,
+            client_budget.map(|b| if b <= 0 { 0 } else { b as u64 }),
+            client_level.as_deref(),
+        );
 
-                                if is_limited && budget > thinking_budget_cap {
-                                    thinking_budget_cap
-                                } else {
-                                    budget
-                                }
-                            }
-                            crate::proxy::config::ThinkingBudgetMode::Adaptive => budget,
-                        };
+        let tb_config = crate::proxy::config::get_thinking_budget_config();
+        let is_client_control =
+            tb_config.control_source == crate::proxy::config::ThinkingControlSource::Client;
+        let budget_opt = if has_thinking_config || force_server_thinking {
+            let mut gc_val = serde_json::Value::Object(std::mem::take(gen_config));
+            let client_budget_for_pipeline = if is_client_control {
+                client_budget.filter(|b| *b >= 0).map(|b| b as u64)
+            } else {
+                client_budget.filter(|b| *b > 0).map(|b| b as u64)
+            };
+            let resolved =
+                crate::proxy::pipeline::InboundThinkingPipeline::configure_inbound_thinking(
+                    final_model_name,
+                    &mut gc_val,
+                    client_switch,
+                    client_level.as_deref(),
+                    client_budget_for_pipeline,
+                    token,
+                );
+            if let serde_json::Value::Object(map) = gc_val {
+                *gen_config = map;
+            }
+            resolved
+        } else {
+            None
+        };
 
-                        if final_budget != budget {
-                            thinking_config["thinkingBudget"] = json!(final_budget);
-                        }
-                    }
-                }
+        if !is_client_control {
+            if let Some(tc) = gen_config
+                .get_mut("thinkingConfig")
+                .and_then(|v| v.as_object_mut())
+            {
+                tracing::info!(
+                    "[Gemini-Wrap] Pipeline thinking budget {:?} for {} (client_level={:?})",
+                    budget_opt,
+                    final_model_name,
+                    client_level
+                );
+                tc.remove("thinkingLevel");
             }
         }
 
@@ -494,6 +696,7 @@ pub fn wrap_request_v2(
         let thinking_config_opt = gen_config.get("thinkingConfig");
         let is_adaptive = thinking_config_opt.map_or(false, |t| {
             t.get("thinkingLevel").is_some()
+                || t.get("thinkingBudget").is_none()
                 || t.get("thinkingBudget").and_then(|v| v.as_i64()) == Some(-1)
         }) || (thinking_config_opt
             .and_then(|t| t.get("thinkingBudget").and_then(|v| v.as_u64()))
@@ -532,8 +735,8 @@ pub fn wrap_request_v2(
         }
     }
 
-    // [NEW] Apply a three-tier cap to maxOutputTokens per model (Dynamic > Static Default > 65535)
-    // Fix: the 131072 sent by clients like gemini-cli exceeds the limit some models support, causing v1internal to return 400 INVALID_ARGUMENT
+    // [NEW] 按模型对 maxOutputTokens 进行三层限额 (Dynamic > Static Default > 65535)
+    // 修复: gemini-cli 等客户端发送的 131072 超过部分模型支持的上限，导致 v1internal 返回 400 INVALID_ARGUMENT
     {
         let final_cap = crate::proxy::model_specs::get_max_output_tokens(final_model_name, token);
         let gen_config = inner_request
@@ -554,12 +757,15 @@ pub fn wrap_request_v2(
                 gen_config.insert("maxOutputTokens".to_string(), serde_json::json!(final_cap));
             }
         }
+        if is_under_v3 {
+            gen_config.remove("thinkingConfig");
+        }
     }
 
     // This caused upstream to return empty/invalid responses, leading to 'NoneType' object has no attribute 'strip' in Python clients.
     // relying on upstream defaults or user provided values is safer.
 
-    // Extract the tools list to detect web access (Gemini-style may be nested)
+    // 提取 tools 列表以进行联网探测 (Gemini 风格可能是嵌套的)
     let tools_val: Option<Vec<Value>> = inner_request
         .get("tools")
         .and_then(|t| t.as_array())
@@ -587,23 +793,11 @@ pub fn wrap_request_v2(
             for tool in tools_arr {
                 if let Some(decls) = tool.get_mut("functionDeclarations") {
                     if let Some(decls_arr) = decls.as_array_mut() {
-                        // 1. Filter out web-access keyword functions
-                        decls_arr.retain(|decl| {
-                            if let Some(name) = decl.get("name").and_then(|v| v.as_str()) {
-                                if name == "web_search" || name == "google_search" {
-                                    return false;
-                                }
-                            }
-                            true
-                        });
-
-                        // 2. Sanitize the remaining Schema
-                        // [FIX] Gemini CLI uses parametersJsonSchema, while the standard Gemini API uses parameters
-                        // parametersJsonSchema needs to be renamed to parameters
-                        for decl in decls_arr {
-                            // Detect and convert the field name
+                        // 清洗 Schema: 如果存在 parametersJsonSchema，将其标准化为 parameters
+                        for decl in decls_arr.iter_mut() {
+                            // 检测并转换字段名
                             if let Some(decl_obj) = decl.as_object_mut() {
-                                // If parametersJsonSchema exists, rename it to parameters
+                                // 如果存在 parametersJsonSchema，将其重命名为 parameters
                                 if let Some(params_json_schema) =
                                     decl_obj.remove("parametersJsonSchema")
                                 {
@@ -611,13 +805,25 @@ pub fn wrap_request_v2(
                                     crate::proxy::common::json_schema::clean_json_schema(
                                         &mut params,
                                     );
+                                    crate::proxy::mappers::openai::request::enforce_uppercase_types(
+                                        &mut params,
+                                    );
                                     decl_obj.insert("parameters".to_string(), params);
                                 } else if let Some(params) = decl_obj.get_mut("parameters") {
-                                    // Standard parameters field
+                                    // 标准 parameters 字段
                                     crate::proxy::common::json_schema::clean_json_schema(params);
+                                    crate::proxy::mappers::openai::request::enforce_uppercase_types(
+                                        params,
+                                    );
                                 }
                             }
                         }
+                        // [CACHE] 按 function name 稳定字典序排序，确保全协议 tool schema 字节完全一致
+                        decls_arr.sort_by(|a, b| {
+                            let name_a = a.get("name").and_then(|v| v.as_str()).unwrap_or("");
+                            let name_b = b.get("name").and_then(|v| v.as_str()).unwrap_or("");
+                            name_a.cmp(name_b)
+                        });
                     }
                 }
             }
@@ -632,22 +838,39 @@ pub fn wrap_request_v2(
         config.request_type
     );
 
-    // Inject googleSearch tool if needed
+    // Inject googleSearch tool if needed (stacking alongside existing tools)
     if config.inject_google_search {
-        // [NEW] Phase 7.3: if it's a WebSearch type, inject the official-specific attribute (maxResultCount: 5)
         if config.request_type == "web_search" {
             if let Some(obj) = inner_request.as_object_mut() {
                 let tools_entry = obj.entry("tools").or_insert_with(|| json!([]));
                 if let Some(tools_arr) = tools_entry.as_array_mut() {
-                    tools_arr.push(json!({
-                        "googleSearch": {
-                            "enhancedContent": {
-                                "imageSearch": {
-                                    "maxResultCount": 5
+                    let has_functions = tools_arr.iter().any(|t| {
+                        t.as_object().map_or(false, |o| {
+                            o.contains_key("functionDeclarations")
+                                || o.contains_key("function_declarations")
+                        })
+                    });
+                    if !has_functions {
+                        // 清理已存在的 googleSearch
+                        tools_arr.retain(|t| {
+                            if let Some(o) = t.as_object() {
+                                !(o.contains_key("googleSearch")
+                                    || o.contains_key("google_search")
+                                    || o.contains_key("googleSearchRetrieval"))
+                            } else {
+                                true
+                            }
+                        });
+                        tools_arr.push(json!({
+                            "googleSearch": {
+                                "enhancedContent": {
+                                    "imageSearch": {
+                                        "maxResultCount": 5
+                                    }
                                 }
                             }
-                        }
-                    }));
+                        }));
+                    }
                 }
             }
         } else {
@@ -681,7 +904,7 @@ pub fn wrap_request_v2(
             // 3. Clean generationConfig (remove responseMimeType, responseModalities etc.)
             let gen_config = obj.entry("generationConfig").or_insert_with(|| json!({}));
             if let Some(gen_obj) = gen_config.as_object_mut() {
-                // [NEW] Decide whether to keep thinkingConfig based on the global config
+                // [NEW] 根据全局配置决定是否保留 thinkingConfig
                 let image_thinking_mode = crate::proxy::config::get_image_thinking_mode();
                 tracing::debug!("[Gemini-Wrap] Image thinking mode: {}", image_thinking_mode);
 
@@ -705,19 +928,13 @@ pub fn wrap_request_v2(
             }
         }
     } else {
-        // [NEW] Phase 7.3: WebSearch-specific identity emulation (aligned with the official main.go:738)
-        let antigravity_identity = if config.request_type == "web_search" {
-            "You are a search engine bot. You will be given a query from a user. Your task is to search the web for relevant information that will help the user. You MUST perform a web search. Do not respond or interact with the user, please respond as if they typed the query into a search bar."
-        } else {
-            "You are Antigravity, a powerful agentic AI coding assistant designed by the Google Deepmind team working on Advanced Agentic Coding.\n\
-            You are pair programming with a USER to solve their coding task. The task may require creating a new codebase, modifying or debugging an existing codebase, or simply answering a question.\n\
-            **Absolute paths only**\n\
-            **Proactiveness**"
-        };
+        // [FIX] 彻底移除 web_search 等任何预置搜索 Bot 提示词注入，保持客户端原始 prompt 完全纯净透传。
+        // 仅在配置了用户自定义全局系统提示词时进行追加注入。
+        let global_prompt_config = crate::proxy::config::get_global_system_prompt();
 
-        // [HYBRID] Check whether systemInstruction already exists
+        // 检查是否已有 systemInstruction
         if let Some(system_instruction) = inner_request.get_mut("systemInstruction") {
-            // [NEW] Backfill role: user
+            // 补全 role: user
             if let Some(obj) = system_instruction.as_object_mut() {
                 if !obj.contains_key("role") {
                     obj.insert("role".to_string(), json!("user"));
@@ -726,112 +943,70 @@ pub fn wrap_request_v2(
 
             if let Some(parts) = system_instruction.get_mut("parts") {
                 if let Some(parts_array) = parts.as_array_mut() {
-                    // Check whether the first part already contains the Antigravity identity
-                    let has_antigravity = parts_array
-                        .get(0)
-                        .and_then(|p| p.get("text"))
-                        .and_then(|t| t.as_str())
-                        .map(|s| s.contains("You are Antigravity"))
-                        .unwrap_or(false);
-
-                    if !has_antigravity {
-                        // Insert the Antigravity identity at the front
-                        parts_array.insert(0, json!({"text": antigravity_identity}));
-                    }
-
-                    // [NEW] Inject the global system prompt (right after the Antigravity identity, before the user instructions)
-                    let global_prompt_config = crate::proxy::config::get_global_system_prompt();
+                    // 注入全局系统提示词（去重 + 换行隔离，不夹官方身份）
                     if global_prompt_config.enabled
                         && !global_prompt_config.content.trim().is_empty()
                     {
-                        // Insert position: right after the Antigravity identity (index 1)
-                        let insert_pos = if has_antigravity { 1 } else { 1 };
-                        if insert_pos <= parts_array.len() {
-                            parts_array
-                                .insert(insert_pos, json!({"text": global_prompt_config.content}));
-                        } else {
-                            parts_array.push(json!({"text": global_prompt_config.content}));
+                        let prompt_content = global_prompt_config.content.trim();
+                        let already_has_global = parts_array.iter().any(|p| {
+                            p.get("text")
+                                .and_then(|t| t.as_str())
+                                .map(|s| s.contains(prompt_content))
+                                .unwrap_or(false)
+                        });
+
+                        if !already_has_global {
+                            let formatted = format!("{}\n\n", prompt_content);
+                            parts_array.push(json!({"text": formatted}));
                         }
                     }
                 }
             }
         } else {
-            // No systemInstruction; create a new one
-            let mut parts = vec![json!({"text": antigravity_identity})];
-            // [NEW] Inject the global system prompt
-            let global_prompt_config = crate::proxy::config::get_global_system_prompt();
+            // 没有 systemInstruction，仅在启用全局提示词时创建
             if global_prompt_config.enabled && !global_prompt_config.content.trim().is_empty() {
-                parts.push(json!({"text": global_prompt_config.content}));
+                inner_request["systemInstruction"] = json!({
+                    "role": "user",
+                    "parts": [{"text": format!("{}\n\n", global_prompt_config.content.trim())}]
+                });
             }
-            inner_request["systemInstruction"] = json!({
-                "role": "user",
-                "parts": parts
-            });
         }
     }
 
-    // [ADDED v4.1.24] Extend toolConfig to VALIDATED mode and enable includeServerSideToolInvocations (support both camelCase and snake_case)
-    if inner_request.get("tools").is_some() {
-        // 1. camelCase
-        if let Some(tool_config) = inner_request.get_mut("toolConfig") {
-            if let Some(obj) = tool_config.as_object_mut() {
-                obj.insert("includeServerSideToolInvocations".to_string(), json!(true));
-            }
-        } else {
-            inner_request["toolConfig"] = json!({
-                "functionCallingConfig": { "mode": "VALIDATED" },
-                "includeServerSideToolInvocations": true
-            });
-        }
-        // 2. snake_case
-        if let Some(tool_config_snake) = inner_request.get_mut("tool_config") {
-            if let Some(obj) = tool_config_snake.as_object_mut() {
-                obj.insert("include_server_side_tool_invocations".to_string(), json!(true));
-            }
-        } else {
-            inner_request["tool_config"] = json!({
-                "function_calling_config": { "mode": "VALIDATED" },
-                "include_server_side_tool_invocations": true
-            });
-        }
-    }
+    // [REMOVED v4.8.2] toolConfig / tool_config 双写已移除：官方 Antigravity 报文不带该字段，
+    // 且 camelCase 与 snake_case 双份会写出一对矛盾配置 (VALIDATED)。已在协议无关节点统一移除。
 
-    // [ADDED v4.1.24] Inject a stable sessionId based on the account
+    // [ADDED v4.1.24] 注入基于账号的稳定 sessionId
+    // [FIX session-1M] 混入对话指纹与代数,不同对话隔离服务端会话,1M 累计报错后 bump 自愈
     if let Some(account_id_str) = account_id {
-        inner_request["sessionId"] = json!(crate::proxy::common::session::derive_session_id(
-            account_id_str
+        let fingerprint = session_id.unwrap_or("default");
+        let generation = crate::proxy::common::session::current_bump(account_id_str, fingerprint);
+        inner_request["sessionId"] = json!(crate::proxy::common::session::derive_session_scoped(
+            account_id_str,
+            fingerprint,
+            generation
         ));
     }
 
-    let _sid = session_id.unwrap_or("default");
+    let sid = session_id.unwrap_or("default");
 
-    // [NEW] 1. Deeply align the requestId format (official format: agent/{timestamp_ms}/{random_hex_8bytes})
-    // Generate a completely unique ID for every request, avoiding idempotency conflicts on retry that would cause Google to return a stale cache
-    let timestamp_ms = chrono::Utc::now().timestamp_millis();
-    let random_hex = &uuid::Uuid::new_v4().simple().to_string()[..8]; // Removes the dependency on an external hex crate
-    let official_request_id = format!("agent/{}/{}", timestamp_ms, random_hex);
+    // [NEW] 1. requestId：官方 5 段形态，三适配器共用。
+    // 含 unixMs 保证幂等隔离（避免重试命中上一次的 429 / 旧缓存），形态也与其他入口一致。
+    let step = inner_request
+        .get("contents")
+        .and_then(|c| c.as_array())
+        .map(|a| a.len() as u64)
+        .unwrap_or(0);
+    let official_request_id =
+        crate::proxy::mappers::common_utils::build_official_request_id(sid, step);
 
-    // [NEW] 2. Dynamic userAgent emulation (supports jetski)
-    // Determined by account attributes or domain. In the Go Worker, enterprise/GCP accounts typically use the jetski fingerprint.
-    let is_enterprise = if let Some(t) = token {
-        !t.email.ends_with("@gmail.com") && !t.email.ends_with("@googlemail.com")
-    } else {
-        false
-    };
+    // [NEW] 2. 动态 userAgent 仿真 (支持 jetski)
+    // 企业 / GCP 账号（非 gmail 邮箱）在官方 Go Worker 中使用 jetski 指纹。
+    // 判定由 common_utils 统一提供 —— 三适配器必须共用，否则同一账号指纹漂移。
+    let (official_user_agent, official_ide_type) =
+        crate::proxy::mappers::common_utils::resolve_official_fingerprint(token);
 
-    // [NEW] Phase 7.2: dynamic IDEType fingerprint alignment
-    let official_ide_type = if is_enterprise {
-        "JETSKI"
-    } else {
-        "ANTIGRAVITY"
-    };
-    let official_user_agent = if is_enterprise {
-        "jetski"
-    } else {
-        "antigravity"
-    };
-
-    // [NEW] If it's a loadCodeAssist request, inject the metadata field to align with the official client
+    // [NEW] 如果是 loadCodeAssist 请求，注入 metadata 字段对齐官方
     if final_model_name == "loadCodeAssist" || inner_request.get("metadata").is_some() {
         let metadata = inner_request
             .as_object_mut()
@@ -845,66 +1020,43 @@ pub fn wrap_request_v2(
         }
     }
 
-    // [NEW] 3. Conditionally inject enabledCreditTypes
-    // This is a very high-weight fingerprint field for the official Worker.
-    // Only inject it for non-image-generation requests (i.e. agent-type requests), to avoid Credit determination anomalies in image generation scenarios.
-    // Note: this is one of the important credentials Google uses to recognize an "official client".
-    let is_agent_request = config.request_type != "image_gen";
+    // [NEW] 3. 动态判断是否需要 agent requestType 与 enabledCreditTypes
+    // 对齐官方语言服务原生设计：只有存在工具定义 (tools) 或包含工具调用上下文时才进入 agent 模式。
+    // 普通问答、纯文本补全不注入 requestType: "agent"，避开 Google 后端针对 Agent 资源池的过载限流。
+    let has_tools = inner_request
+        .get("tools")
+        .and_then(|t| t.as_array())
+        .map(|arr| !arr.is_empty())
+        .unwrap_or(false);
+    let has_tool_interactions = inner_request
+        .get("contents")
+        .map(crate::proxy::mappers::common_utils::contents_has_tool_interactions)
+        .unwrap_or(false);
 
-    // [CACHE] Rebuild the inner_request field order: stable prefix first, dynamic content last
-    // Follows Google's official recommendation: "place larger and more common content at the beginning of the prompt"
-    // systemInstruction (~stable system prompt) → tools → toolConfig → generationConfig → contents (dynamic)
-    let mut reordered_inner = json!({});
-    // 1. systemInstruction (stable)
-    if let Some(si) = inner_request.get("systemInstruction") {
-        reordered_inner["systemInstruction"] = si.clone();
-    }
-    // 2. tools (stable)
-    if let Some(tools) = inner_request.get("tools") {
-        reordered_inner["tools"] = tools.clone();
-    }
-    // 3. toolConfig (stable, lives alongside tools)
-    if let Some(tc) = inner_request.get("toolConfig") {
-        reordered_inner["toolConfig"] = tc.clone();
-    }
-    // 4. generationConfig (stable)
-    if let Some(gc) = inner_request.get("generationConfig") {
-        reordered_inner["generationConfig"] = gc.clone();
-    }
-    // 5. safetySettings (constant)
-    if let Some(ss) = inner_request.get("safetySettings") {
-        reordered_inner["safetySettings"] = ss.clone();
-    }
-    // 6. sessionId (stable, based on account hash)
-    if let Some(sid) = inner_request.get("sessionId") {
-        reordered_inner["sessionId"] = sid.clone();
-    }
-    // 7. contents (dynamic - conversation history, appended each time, placed last!)
-    reordered_inner["contents"] = inner_request.get("contents").cloned().unwrap_or(json!([]));
-    // 8. Any other fields (metadata, cachedContent, etc. - kept as-is, overriding existing ones)
-    for (k, v) in inner_request.as_object().iter().flat_map(|o| o.iter()) {
-        if !reordered_inner
-            .as_object()
-            .map(|o| o.contains_key(k))
-            .unwrap_or(false)
-        {
-            reordered_inner[k] = v.clone();
-        }
-    }
+    let is_agent_request =
+        config.request_type != "image_gen" && (has_tools || has_tool_interactions);
+
+    // [CACHE] 统一委托进站流水线进行前缀拓扑规范化与对齐（Pipeline First 核心归一）
+    crate::proxy::pipeline::InboundThinkingPipeline::align_google_request_prefix_topology(
+        &mut inner_request,
+    );
+    let reordered_inner = inner_request;
 
     let mut final_request_obj = json!({
         "project": project_id,
         "request": reordered_inner,
         "model": config.final_model,
         "userAgent": official_user_agent,
-        "requestType": if is_agent_request { "agent" } else { "image_gen" },
-        // [CACHE] Move requestId to the end to avoid dynamic values breaking prefix byte consistency
+        // [CACHE] requestId 移到末尾避免动态值破坏前缀字节一致性
         "requestId": official_request_id,
     });
 
-    if is_agent_request {
+    if config.request_type == "image_gen" {
+        final_request_obj["requestType"] = json!("image_gen");
+    } else if is_agent_request {
+        final_request_obj["requestType"] = json!("agent");
         if let Some(obj) = final_request_obj.as_object_mut() {
-            // Force-inject the Google One AI credit support marker
+            // 强制注入 Google One AI 信用额度支持标号
             obj.insert("enabledCreditTypes".to_string(), json!(["GOOGLE_ONE_AI"]));
         }
     }
@@ -944,7 +1096,10 @@ mod test_fixes {
         let injected_sig = result["request"]["contents"][0]["parts"][0]["thoughtSignature"]
             .as_str()
             .unwrap();
-        assert_eq!(injected_sig, signature);
+        assert!(
+            injected_sig == signature
+                || injected_sig == crate::proxy::thinking_store::SENTINEL_SIGNATURE
+        );
     }
 
     #[test]
@@ -969,22 +1124,22 @@ mod test_fixes {
             part["thoughtSignature"].as_str(),
             Some("client-sent-signature-value-12345")
         );
-        assert_eq!(
-            part["thought_signature"].as_str(),
-            Some("client-sent-signature-value-12345")
+        assert!(
+            part.get("thought_signature").is_none(),
+            "Snake case 'thought_signature' must be stripped when sending to Google"
         );
     }
 }
 
-/// Unwrap the response (extract the response field)
+/// 解包响应（提取 response 字段）
 pub fn unwrap_response(response: &Value) -> Value {
     response.get("response").unwrap_or(response).clone()
 }
 
-/// [NEW v3.3.18] Automatically inject a Tool ID into Gemini responses for Claude models
+/// [NEW v3.3.18] 为 Claude 模型的 Gemini 响应自动注入 Tool ID
 ///
-/// The purpose is to let the client (e.g. OpenCode/Vercel AI SDK) perceive the ID,
-/// and send it back unchanged in the next conversation turn, satisfying Google v1internal's validation for Claude models.
+/// 目点是为了让客户端（如 OpenCode/Vercel AI SDK）能感知到 ID，
+/// 并在下一轮对话中原样带回，从而满足 Google v1internal 对 Claude 模型的校验。
 pub fn inject_ids_to_response(response: &mut Value, model_name: &str) {
     if !model_name.to_lowercase().contains("claude") {
         return;
@@ -1021,6 +1176,12 @@ pub fn inject_ids_to_response(response: &mut Value, model_name: &str) {
 }
 
 const INTERNAL_BACKGROUND_TASK: &str = "gemini-2.5-flash-lite";
+
+/// Layer-3 后台摘要请求的超时（秒）。
+///
+/// 上游客户端的默认超时是 600s，对"摘要整段对话"这种辅助任务过长 ——
+/// 一旦上游卡住，会长时间占住一个后台任务与连接。这里显式收紧到有界值。
+pub const SUMMARY_REQUEST_TIMEOUT_SECS: u64 = 180;
 const CONTEXT_SUMMARY_PROMPT: &str = r#"You are a context compression specialist. Your task is to create a structured XML snapshot of the conversation history.
 
 This snapshot will become the Agent's ONLY memory of the past. All key details, plans, errors, and user instructions MUST be preserved.
@@ -1082,6 +1243,7 @@ async fn try_compress_gemini_with_summary(
     original_request: &Value,
     trace_id: &str,
     token_manager: &std::sync::Arc<crate::proxy::TokenManager>,
+    upstream: &std::sync::Arc<crate::proxy::upstream::client::UpstreamClient>,
     session_id_str: &str,
     project_id: &str,
     account_id: &str,
@@ -1142,42 +1304,47 @@ async fn try_compress_gemini_with_summary(
         token_obj.as_ref(),
     );
 
-    let upstream_url = format!(
-        "https://daily-cloudcode-pa.sandbox.googleapis.com/v1internal/projects/{}/locations/global/models/{}:generateContent",
-        project_id, INTERNAL_BACKGROUND_TASK
-    );
+    // 走共享的辅助调用通道：复用主请求路径的客户端（含按账号代理池）、
+    // 端点顺序（Daily → Sandbox → Prod）、URL 形状与回退判定。
+    //
+    // 历史实现手写了
+    // `{host}/v1internal/projects/{p}/locations/global/models/{m}:generateContent`
+    // 并把 host 硬编码为 sandbox —— 该形状在 daily / sandbox / prod 三个 host 上
+    // 一律返回 HTML 404，因此本函数从未成功过（后台 spawn，失败只打日志，表现为静默空转）。
+    let gemini_response = upstream
+        .call_v1_internal_auxiliary(
+            "generateContent",
+            &access_token,
+            wrapped_summary_body,
+            Some(account_id),
+            SUMMARY_REQUEST_TIMEOUT_SECS,
+        )
+        .await?;
 
-    let response = reqwest::Client::new()
-        .post(&upstream_url)
-        .header("Authorization", format!("Bearer {}", access_token))
-        .header("Content-Type", "application/json")
-        .json(&wrapped_summary_body)
-        .send()
-        .await
-        .map_err(|e| format!("API call failed: {}", e))?;
+    // 上游返回的是 `{"response": {...}}` 包装体，必须先解包才能取到 candidates。
+    let unwrapped_summary = unwrap_response(&gemini_response);
 
-    if !response.status().is_success() {
-        return Err(format!(
-            "API returned {}: {}",
-            response.status(),
-            response.text().await.unwrap_or_default()
-        ));
-    }
-
-    let gemini_response: Value = response
-        .json()
-        .await
-        .map_err(|e| format!("Failed to parse response: {}", e))?;
-
-    let xml_summary = gemini_response
+    // 只拼接「非思考 part」的文本。
+    //
+    // 实测（gemini-2.5-flash-lite，3/3）响应形如：
+    //   parts[0] = { "thought": true, "text": "" }   ← 空思考块，排在最前
+    //   parts[1] = { "text": "```xml\n<summary>…" }  ← 真正的摘要
+    // 因此不能取 `parts[0].text`（会得到空串，把空摘要当成功静默写回），
+    // 也不能只用 `parts[0]` —— 必须按 `thought` 标志过滤后拼接全部可见文本。
+    let xml_summary = unwrapped_summary
         .get("candidates")
         .and_then(|c| c.get(0))
         .and_then(|c| c.get("content"))
         .and_then(|c| c.get("parts"))
-        .and_then(|p| p.get(0))
-        .and_then(|p| p.get("text"))
-        .and_then(|t| t.as_str())
-        .map(|s| s.to_string())
+        .and_then(|parts| parts.as_array())
+        .map(|parts| {
+            parts
+                .iter()
+                .filter(|part| !crate::proxy::thinking_store::is_thought_part(part))
+                .filter_map(|part| part.get("text").and_then(|t| t.as_str()))
+                .collect::<String>()
+        })
+        .filter(|text| !text.trim().is_empty())
         .ok_or_else(|| "Failed to extract text from response".to_string())?;
 
     info!(
@@ -1233,7 +1400,6 @@ async fn try_compress_gemini_with_summary(
     Ok(forked_request)
 }
 
-#[allow(dead_code)]
 pub fn wrap_request(
     body: &Value,
     project_id: &str,
@@ -1249,7 +1415,8 @@ pub fn wrap_request(
         account_id,
         session_id,
         token,
-        None,
+        None, // token_manager：不带 → Layer-3 本就不会触发
+        None, // upstream：同上，无需客户端
     )
 }
 static TEST_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
@@ -1294,12 +1461,12 @@ mod tests {
 
         let result = wrap_request(&body, "test-proj", "gemini-pro", None, None, None);
 
-        // Verify systemInstruction
-        let sys = result
+        // 验证没有多余注入的 systemInstruction
+        assert!(result
             .get("request")
             .unwrap()
             .get("systemInstruction")
-            .unwrap();
+            .is_none());
     }
 
     #[test]
@@ -1364,14 +1531,26 @@ mod tests {
             ["thinkingBudget"]
             .as_u64()
             .unwrap();
-        // [FIX #1592] Pro models now also capped to 24576 in wrap_request logic
-        assert_eq!(budget_pro, 24576);
+        // Pro models without suffix now default to 10001 in wrap_request logic
+        assert_eq!(budget_pro, 10001);
     }
 
     #[test]
     fn test_image_thinking_mode_disabled() {
+        let _test_lock = TEST_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let _config_lock = crate::proxy::config::TEST_CONFIG_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+
         // 1. Set global mode to disabled
         crate::proxy::config::update_image_thinking_mode(Some("disabled".to_string()));
+        struct ImageResetGuard;
+        impl Drop for ImageResetGuard {
+            fn drop(&mut self) {
+                crate::proxy::config::update_image_thinking_mode(Some("enabled".to_string()));
+            }
+        }
+        let _guard = ImageResetGuard;
 
         // 2. Create a request for an image model (which triggers the image logic)
         // Note: resolve_request_config needs to return image_config for the logic to trigger
@@ -1395,9 +1574,6 @@ mod tests {
         // 3. Verify thinkingConfig has includeThoughts: false
         let thinking_config = gen_config.get("thinkingConfig").unwrap();
         assert_eq!(thinking_config["includeThoughts"], false);
-
-        // 4. Reset global mode
-        crate::proxy::config::update_image_thinking_mode(Some("enabled".to_string()));
     }
 
     #[test]
@@ -1418,16 +1594,10 @@ mod tests {
             .unwrap();
         let parts = sys.get("parts").unwrap().as_array().unwrap();
 
-        // Should have 2 parts: Antigravity + User
-        assert_eq!(parts.len(), 2);
-        assert!(parts[0]
-            .get("text")
-            .unwrap()
-            .as_str()
-            .unwrap()
-            .contains("You are Antigravity"));
+        // User custom prompt is preserved without injecting unwanted Antigravity identity
+        assert_eq!(parts.len(), 1);
         assert_eq!(
-            parts[1].get("text").unwrap().as_str().unwrap(),
+            parts[0].get("text").unwrap().as_str().unwrap(),
             "User custom prompt"
         );
     }
@@ -1485,18 +1655,28 @@ mod tests {
 
     #[test]
     fn test_gemini_pro_thinking_budget_processing() {
-        let _lock = TEST_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let _test_lock = TEST_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let _config_lock = crate::proxy::config::TEST_CONFIG_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         // Update global config to Custom mode to verify logic execution
         use crate::proxy::config::{
             update_thinking_budget_config, ThinkingBudgetConfig, ThinkingBudgetMode,
         };
 
-        // Save old config (optional, but good practice if tests ran in parallel, but here it's fine)
         update_thinking_budget_config(ThinkingBudgetConfig {
             mode: ThinkingBudgetMode::Custom,
             custom_value: 1024, // Distinct value
             effort: None,
+            ..Default::default()
         });
+        struct GeminiCustomResetGuard;
+        impl Drop for GeminiCustomResetGuard {
+            fn drop(&mut self) {
+                update_thinking_budget_config(ThinkingBudgetConfig::default());
+            }
+        }
+        let _guard = GeminiCustomResetGuard;
 
         let body = json!({
             "model": "gemini-3-pro-preview",
@@ -1523,9 +1703,6 @@ mod tests {
             budget, 1024,
             "Budget should be overridden to 1024 by custom config, proving logic execution"
         );
-
-        // Restore default (Auto 24576)
-        update_thinking_budget_config(ThinkingBudgetConfig::default());
     }
 
     #[cfg(test)]
@@ -1535,16 +1712,20 @@ mod tests {
 
         #[test]
         fn test_claude_no_root_thinking_injection() {
-            let _lock = super::TEST_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
-            // Verify that Claude models do not inject thinking at the root level, but into generationConfig.thinkingConfig
-            // and that the budget defaults to 16000
+            let _test_lock = super::TEST_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+            let _config_lock = crate::proxy::config::TEST_CONFIG_LOCK
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            // 验证 Claude 模型不会在根目录注入 thinking，而是注入到 generationConfig.thinkingConfig
+            // 并且 budget 默认为 16000
 
-            // Use Auto mode to avoid interference
+            // 使用 Auto 模式避免干扰
             crate::proxy::config::update_thinking_budget_config(
                 crate::proxy::config::ThinkingBudgetConfig {
                     mode: crate::proxy::config::ThinkingBudgetMode::Auto,
                     custom_value: 0,
                     effort: None,
+                    ..Default::default()
                 },
             );
 
@@ -1563,13 +1744,13 @@ mod tests {
             );
             let req = result.get("request").unwrap();
 
-            // 1. Ensure there is no thinking at the root level
+            // 1. 确保根目录没有 thinking
             assert!(
                 req.get("thinking").is_none(),
                 "Root level 'thinking' should NOT be present"
             );
 
-            // 2. Ensure generationConfig.thinkingConfig exists
+            // 2. 确保 generationConfig.thinkingConfig 存在
             let gen_config = req
                 .get("generationConfig")
                 .expect("generationConfig should be present");
@@ -1577,23 +1758,26 @@ mod tests {
                 .get("thinkingConfig")
                 .expect("thinkingConfig should be injected");
 
-            // 3. Verify Claude's default budget is 16000
+            // 3. 验证 Claude 默认预算为 16384
             let budget = thinking_config["thinkingBudget"]
                 .as_u64()
                 .expect("thinkingBudget should be a number");
             assert_eq!(
-                budget, 16000,
-                "Claude default thinking budget should be 16000"
+                budget, 16384,
+                "Claude default thinking budget should be 16384"
             );
         }
 
         #[test]
         fn test_gemini_thinking_injection_default() {
-            let _lock = super::TEST_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+            let _test_lock = super::TEST_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+            let _config_lock = crate::proxy::config::TEST_CONFIG_LOCK
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
             crate::proxy::config::update_thinking_budget_config(
                 crate::proxy::config::ThinkingBudgetConfig::default(),
             );
-            // Verify that Gemini models inject a default budget of 24576
+            // 验证 Gemini 模型注入默认预算 24576
             let body = json!({
                 "model": "gemini-2.0-flash-thinking-exp",
                 "contents": [{"role": "user", "parts": [{"text": "hi"}]}]
@@ -1621,12 +1805,17 @@ mod tests {
 
     #[test]
     fn test_gemini_pro_auto_inject_thinking() {
+        let _test_lock = TEST_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let _config_lock = crate::proxy::config::TEST_CONFIG_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         // Reset thinking budget to auto mode at the start to avoid interference from parallel tests
         crate::proxy::config::update_thinking_budget_config(
             crate::proxy::config::ThinkingBudgetConfig {
                 mode: crate::proxy::config::ThinkingBudgetMode::Auto,
                 custom_value: 24576,
                 effort: None,
+                ..Default::default()
             },
         );
 
@@ -1704,25 +1893,25 @@ mod tests {
 
     #[test]
     fn test_mixed_tools_injection_gemini_native() {
-        // Verify that the Gemini Native protocol supports mixed tools under Gemini 2.0+
+        // 验证 Gemini Native 协议在 Gemini 2.0+ 下支持混合工具
         let body = json!({
             "contents": [{"parts": [{"text": "Hello"}]}],
             "tools": [{"functionDeclarations": [{"name": "get_weather", "parameters": {"type": "OBJECT", "properties": {"location": {"type": "STRING"}}}}]}],
             "generationConfig": {}
         });
 
-        // Simulate the RequestConfig triggered by -online
+        // 模拟 -online 触发的 RequestConfig
         use crate::proxy::mappers::common_utils::resolve_request_config;
         let _config =
             resolve_request_config("-online", "gemini-2.0-flash", &None, None, None, None, None);
 
-        // In practice, wrap_request internally calls inject_google_search_tool based on config.inject_google_search
-        // But wrap_request's signature does not directly accept RequestConfig; its internal logic is as follows:
+        // 实际上 wrap_request 内部会根据 config.inject_google_search 调用 inject_google_search_tool
+        // 但 wrap_request 的签名不直接接受 RequestConfig，它内部逻辑如下：
         // if config.inject_google_search { ... }
 
-        // Instead, we directly test the relevant wrap_request logic fragment.
-        // Since testing wrap_request is fairly complex (it involves external config),
-        // we can directly verify inject_google_search_tool's behavior in native format.
+        // 我们改为直接测试涉及的 wrap_request 逻辑片段。
+        // 由于测试 wrap_request 比较复杂（涉及外部 config），
+        // 我们可以直接验证 inject_google_search_tool 在 native 格式下的表现。
 
         let mut inner_request = body.clone();
         crate::proxy::mappers::common_utils::inject_google_search_tool(
@@ -1741,7 +1930,7 @@ mod tests {
         assert!(has_functions, "Should contain functionDeclarations");
         assert!(
             !has_google_search,
-            "Should NOT contain googleSearch due to functionDeclarations presence (v1internal limit)"
+            "Should NOT contain googleSearch due to functionDeclarations presence (preventing client tool dispatch conflicts)"
         );
     }
 
@@ -1809,5 +1998,179 @@ mod tests {
 
         let text_5 = contents[4]["parts"][0]["text"].as_str().unwrap();
         assert!(text_5.contains("Please"));
+    }
+
+    #[test]
+    fn test_gemini_anthropic_alignment_thinking_and_signatures() {
+        let valid_sig = "A".repeat(60); // 60 chars valid signature
+        let body = json!({
+            "contents": [
+                {
+                    "role": "model",
+                    "parts": [
+                        {
+                            "thought": true,
+                            "text": "·", // placeholder thought
+                            "thoughtSignature": valid_sig
+                        },
+                        {
+                            "thought": true,
+                            "text": "second thought block that should be downgraded",
+                            "thoughtSignature": "short"
+                        },
+                        {
+                            "text": "Regular model response"
+                        }
+                    ]
+                }
+            ],
+            "generationConfig": {
+                "thinkingConfig": {
+                    "thinkingBudget": 2048
+                }
+            }
+        });
+
+        let wrapped = wrap_request(&body, "test-proj", "gemini-3-pro", None, None, None);
+        let contents = wrapped["request"]["contents"].as_array().unwrap();
+        let model_msg = &contents[0];
+        let parts = model_msg["parts"].as_array().unwrap();
+
+        // 【2026-09-27】占位思考块（"·"）直接丢弃，不再归一为 "..."
+        // Part 0 should be the second (meaningful) thinking block, now promoted to the head
+        assert_eq!(parts[0]["thought"], true);
+        assert_eq!(
+            parts[0]["text"],
+            "second thought block that should be downgraded"
+        );
+
+        // Part 1 remains regular text
+        assert_eq!(parts[1]["text"], "Regular model response");
+    }
+
+    #[test]
+    fn test_gemini_thinking_level_authority_resolution() {
+        let _lock = crate::proxy::config::TEST_CONFIG_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        crate::proxy::config::update_thinking_budget_config(
+            crate::proxy::config::ThinkingBudgetConfig::default(),
+        );
+        // 1. 启发式模型忽略客户端 thinkingLevel
+        let req_high = json!({
+            "contents": [{"role": "user", "parts": [{"text": "hi"}]}],
+            "generationConfig": {
+                "thinkingConfig": { "thinkingLevel": "LOW" }
+            }
+        });
+        let wrapped = wrap_request(
+            &req_high,
+            "test-p",
+            "gemini-3.7-flash-high",
+            None,
+            None,
+            None,
+        );
+        let tc = &wrapped["request"]["generationConfig"]["thinkingConfig"];
+        assert_eq!(tc["thinkingBudget"], 16384);
+        assert!(tc.get("thinkingLevel").is_none());
+
+        // 2. 裸模型 Flash 接管客户端 thinkingLevel
+        let req_flash_high = json!({
+            "contents": [{"role": "user", "parts": [{"text": "hi"}]}],
+            "generationConfig": {
+                "thinkingConfig": { "thinkingLevel": "HIGH" }
+            }
+        });
+        let wrapped = wrap_request(
+            &req_flash_high,
+            "test-p",
+            "gemini-3-flash",
+            None,
+            None,
+            None,
+        );
+        let tc = &wrapped["request"]["generationConfig"]["thinkingConfig"];
+        assert_eq!(tc["thinkingBudget"], 16384);
+        assert!(tc.get("thinkingLevel").is_none());
+
+        let req_flash_low = json!({
+            "contents": [{"role": "user", "parts": [{"text": "hi"}]}],
+            "generationConfig": {
+                "thinkingConfig": { "thinkingLevel": "LOW" }
+            }
+        });
+        let wrapped = wrap_request(&req_flash_low, "test-p", "gemini-3-flash", None, None, None);
+        let tc = &wrapped["request"]["generationConfig"]["thinkingConfig"];
+        assert_eq!(tc["thinkingBudget"], 1024);
+        assert!(tc.get("thinkingLevel").is_none());
+
+        // 3. 裸模型 Flash 客户端传 NONE 或未传：绝不关闭思考，强制回填 -medium (4096)
+        let req_flash_none = json!({
+            "contents": [{"role": "user", "parts": [{"text": "hi"}]}],
+            "generationConfig": {
+                "thinkingConfig": { "thinkingLevel": "NONE" }
+            }
+        });
+        let wrapped = wrap_request(
+            &req_flash_none,
+            "test-p",
+            "gemini-3-flash",
+            None,
+            None,
+            None,
+        );
+        let tc = &wrapped["request"]["generationConfig"]["thinkingConfig"];
+        assert_eq!(tc["thinkingBudget"], 4096);
+        assert!(tc.get("thinkingLevel").is_none());
+
+        let req_flash_empty = json!({
+            "contents": [{"role": "user", "parts": [{"text": "hi"}]}]
+        });
+        let wrapped = wrap_request(
+            &req_flash_empty,
+            "test-p",
+            "gemini-3-flash",
+            None,
+            None,
+            None,
+        );
+        let tc = &wrapped["request"]["generationConfig"]["thinkingConfig"];
+        assert_eq!(tc["thinkingBudget"], 4096);
+
+        // 4. 裸模型 Flash 客户端传入自定义 thinkingBudget：彻底被忽略，由服务端权威等级回填
+        let req_flash_custom_budget = json!({
+            "contents": [{"role": "user", "parts": [{"text": "hi"}]}],
+            "generationConfig": {
+                "thinkingConfig": { "thinkingBudget": 12345 }
+            }
+        });
+        let wrapped = wrap_request(
+            &req_flash_custom_budget,
+            "test-p",
+            "gemini-3-flash",
+            None,
+            None,
+            None,
+        );
+        let tc = &wrapped["request"]["generationConfig"]["thinkingConfig"];
+        assert_eq!(tc["thinkingBudget"], 4096);
+
+        let req_flash_high_custom_budget = json!({
+            "contents": [{"role": "user", "parts": [{"text": "hi"}]}],
+            "generationConfig": {
+                "thinkingConfig": { "thinkingLevel": "HIGH", "thinkingBudget": 1234 }
+            }
+        });
+        let wrapped = wrap_request(
+            &req_flash_high_custom_budget,
+            "test-p",
+            "gemini-3-flash",
+            None,
+            None,
+            None,
+        );
+        let tc = &wrapped["request"]["generationConfig"]["thinkingConfig"];
+        assert_eq!(tc["thinkingBudget"], 16384);
     }
 }

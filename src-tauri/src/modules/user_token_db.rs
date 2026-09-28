@@ -158,6 +158,7 @@ pub fn init_db() -> Result<(), String> {
         [],
     );
     let _ = conn.execute("CREATE INDEX IF NOT EXISTS idx_token_usage_logs_request_time ON token_usage_logs(request_time)", []);
+    let _ = conn.execute("CREATE INDEX IF NOT EXISTS idx_token_usage_logs_token_time ON token_usage_logs(token_id, request_time DESC)", []);
 
     // [FIX Issue #1719] Data sanitization: fix NULL fields caused by upgrading from old versions
     // These fields may not have existed in older versions; after ALTER TABLE adds them they default to NULL, causing deserialization to fail

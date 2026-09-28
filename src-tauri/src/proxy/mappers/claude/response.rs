@@ -1,151 +1,22 @@
-// Claude non-streaming response transformation (Gemini → Claude)
-// Corresponds to NonStreamingProcessor
+// Claude 非流式响应转换 (Gemini → Claude)
+// 对应 NonStreamingProcessor
 
 use super::models::*;
 use super::utils::to_claude_usage;
-use serde_json::json;
 
-/// Known parameter remappings for Gemini → Claude compatibility
-/// [FIX] Gemini sometimes uses different parameter names than specified in tool schema
+/// Passthrough tool arguments for Gemini → Claude compatibility
 fn remap_function_call_args(tool_name: &str, args: &mut serde_json::Value) {
-    // [DEBUG] Always log incoming tool usage for diagnosis
+    // 纯透传协议工具参数，不进行任何字段重命名与拦截改写
     if let Some(obj) = args.as_object() {
-        tracing::debug!("[Response] Tool Call: '{}' Args: {:?}", tool_name, obj);
-    }
-
-    if let Some(obj) = args.as_object_mut() {
-        // [IMPROVED] Case-insensitive matching for tool names
-        // [IMPROVED] Case-insensitive matching for tool names
-        match tool_name.to_lowercase().as_str() {
-            "grep" | "search" | "search_code_definitions" | "search_code_snippets" => {
-                // [FIX] Gemini hallucination: maps parameter description to "description" field
-                if let Some(desc) = obj.remove("description") {
-                    if !obj.contains_key("pattern") {
-                        obj.insert("pattern".to_string(), desc);
-                        tracing::debug!("[Response] Remapped Grep: description → pattern");
-                    }
-                }
-
-                // Gemini uses "query", Claude Code expects "pattern"
-                if let Some(query) = obj.remove("query") {
-                    if !obj.contains_key("pattern") {
-                        obj.insert("pattern".to_string(), query);
-                        tracing::debug!("[Response] Remapped Grep: query → pattern");
-                    }
-                }
-
-                // [CRITICAL FIX] Claude Code uses "path" (string), NOT "paths" (array)!
-                if !obj.contains_key("path") {
-                    if let Some(paths) = obj.remove("paths") {
-                        let path_str = if let Some(arr) = paths.as_array() {
-                            arr.get(0)
-                                .and_then(|v| v.as_str())
-                                .unwrap_or(".")
-                                .to_string()
-                        } else if let Some(s) = paths.as_str() {
-                            s.to_string()
-                        } else {
-                            ".".to_string()
-                        };
-                        obj.insert("path".to_string(), serde_json::json!(path_str));
-                        tracing::debug!("[Response] Remapped Grep: paths → path(\"{}\")", path_str);
-                    } else {
-                        // Default to current directory if missing
-                        obj.insert("path".to_string(), json!("."));
-                        tracing::debug!("[Response] Added default path: \".\"");
-                    }
-                }
-
-                // Note: We keep "-n" and "output_mode" if present as they are valid in Grep schema
-            }
-            "glob" => {
-                // [FIX] Gemini hallucination: maps parameter description to "description" field
-                if let Some(desc) = obj.remove("description") {
-                    if !obj.contains_key("pattern") {
-                        obj.insert("pattern".to_string(), desc);
-                        tracing::debug!("[Response] Remapped Glob: description → pattern");
-                    }
-                }
-
-                // Gemini uses "query", Claude Code expects "pattern"
-                if let Some(query) = obj.remove("query") {
-                    if !obj.contains_key("pattern") {
-                        obj.insert("pattern".to_string(), query);
-                        tracing::debug!("[Response] Remapped Glob: query → pattern");
-                    }
-                }
-
-                // [CRITICAL FIX] Claude Code uses "path" (string), NOT "paths" (array)!
-                if !obj.contains_key("path") {
-                    if let Some(paths) = obj.remove("paths") {
-                        let path_str = if let Some(arr) = paths.as_array() {
-                            arr.get(0)
-                                .and_then(|v| v.as_str())
-                                .unwrap_or(".")
-                                .to_string()
-                        } else if let Some(s) = paths.as_str() {
-                            s.to_string()
-                        } else {
-                            ".".to_string()
-                        };
-                        obj.insert("path".to_string(), serde_json::json!(path_str));
-                        tracing::debug!("[Response] Remapped Glob: paths → path(\"{}\")", path_str);
-                    } else {
-                        // Default to current directory if missing
-                        obj.insert("path".to_string(), json!("."));
-                        tracing::debug!("[Response] Added default path: \".\"");
-                    }
-                }
-            }
-            "read" => {
-                // Gemini might use "path" vs "file_path"
-                if let Some(path) = obj.remove("path") {
-                    if !obj.contains_key("file_path") {
-                        obj.insert("file_path".to_string(), path);
-                        tracing::debug!("[Response] Remapped Read: path → file_path");
-                    }
-                }
-            }
-            "ls" => {
-                // LS tool: ensure "path" parameter exists
-                if !obj.contains_key("path") {
-                    obj.insert("path".to_string(), serde_json::json!("."));
-                    tracing::debug!("[Response] Remapped LS: default path → \".\"");
-                }
-            }
-            other => {
-                // [NEW] [Issue #785] Generic Property Mapping for all tools
-                // If a tool has "paths" (array of 1) but no "path", convert it.
-                let mut path_to_inject = None;
-                if !obj.contains_key("path") {
-                    if let Some(paths) = obj.get("paths").and_then(|v| v.as_array()) {
-                        if paths.len() == 1 {
-                            if let Some(p) = paths[0].as_str() {
-                                path_to_inject = Some(p.to_string());
-                            }
-                        }
-                    }
-                }
-
-                if let Some(path) = path_to_inject {
-                    obj.insert("path".to_string(), serde_json::json!(path));
-                    tracing::debug!(
-                        "[Response] Probabilistic fix for tool '{}': paths[0] → path(\"{}\")",
-                        other,
-                        path
-                    );
-                }
-                tracing::debug!(
-                    "[Response] Unmapped tool call processed via generic rules: {} (keys: {:?})",
-                    other,
-                    obj.keys()
-                );
-            }
-        }
+        tracing::debug!(
+            "[Response] Tool Call (Passthrough): '{}' Args: {:?}",
+            tool_name,
+            obj
+        );
     }
 }
 
-/// Non-streaming response processor
+/// 非流式响应处理器
 pub struct NonStreamingProcessor {
     content_blocks: Vec<ContentBlock>,
     text_builder: String,
@@ -158,7 +29,7 @@ pub struct NonStreamingProcessor {
     pub session_id: Option<String>,
     pub model_name: String,
     pub message_count: usize, // [NEW v4.0.0] Message count for rewind detection
-    // [FIX #3379] Registered tool names, used to detect call:default_api:* leakage
+    // [FIX #3379] Registered tool names for call:default_api leakage detection
     pub registered_tool_names: Vec<String>,
 }
 
@@ -180,12 +51,12 @@ impl NonStreamingProcessor {
         }
     }
 
-    // [FIX #3379] Set the registered tool names used for leakage detection
+    // [FIX #3379] Set registered tool names for leakage detection
     pub fn set_registered_tool_names(&mut self, names: Vec<String>) {
         self.registered_tool_names = names;
     }
 
-    /// Process a Gemini response and convert it into a Claude response
+    /// 处理 Gemini 响应并转换为 Claude 响应
     pub fn process(
         &mut self,
         gemini_response: &GeminiResponse,
@@ -194,7 +65,7 @@ impl NonStreamingProcessor {
     ) -> ClaudeResponse {
         self.scaling_enabled = scaling_enabled;
         self.context_limit = context_limit;
-        // Get parts
+        // 获取 parts
         let empty_parts = vec![];
         let parts = gemini_response
             .candidates
@@ -204,23 +75,23 @@ impl NonStreamingProcessor {
             .map(|content| &content.parts)
             .unwrap_or(&empty_parts);
 
-        // Process all parts
+        // 处理所有 parts
         for part in parts {
             self.process_part(part);
         }
 
-        // Handle grounding (web search) -> convert into server_tool_use / web_search_tool_result
+        // 处理 grounding(web search) -> 转换为 server_tool_use / web_search_tool_result
         if let Some(candidate) = gemini_response.candidates.as_ref().and_then(|c| c.get(0)) {
             if let Some(grounding) = &candidate.grounding_metadata {
                 self.process_grounding(grounding);
             }
         }
 
-        // Flush the remaining content
+        // 刷新剩余内容
         self.flush_thinking();
         self.flush_text();
 
-        // Handle trailingSignature (empty text with a signature)
+        // 处理 trailingSignature (空 text 带签名)
         if let Some(signature) = self.trailing_signature.take() {
             self.content_blocks.push(ContentBlock::Thinking {
                 thinking: String::new(),
@@ -229,31 +100,12 @@ impl NonStreamingProcessor {
             });
         }
 
-        // Build the response
+        // 构建响应
         self.build_response(gemini_response)
     }
 
-    /// Process a single part
     fn process_part(&mut self, part: &GeminiPart) {
-        let signature = part.thought_signature.as_ref().map(|sig| {
-            use base64::Engine;
-            match base64::engine::general_purpose::STANDARD.decode(sig) {
-                Ok(decoded_bytes) => {
-                    match String::from_utf8(decoded_bytes) {
-                        Ok(decoded_str) => {
-                            tracing::debug!(
-                                "[Response] Decoded base64 signature (len {} -> {})",
-                                sig.len(),
-                                decoded_str.len()
-                            );
-                            decoded_str
-                        }
-                        Err(_) => sig.clone(), // Not valid UTF-8, keep as is
-                    }
-                }
-                Err(_) => sig.clone(), // Not base64, keep as is
-            }
-        });
+        let signature = part.thought_signature.clone();
 
         // [FIX #765] Cache signature in NonStreamingProcessor
         if let Some(sig) = &signature {
@@ -273,12 +125,12 @@ impl NonStreamingProcessor {
             }
         }
 
-        // 1. Handle FunctionCall
+        // 1. FunctionCall 处理
         if let Some(fc) = &part.function_call {
             self.flush_thinking();
             self.flush_text();
 
-            // Handle trailingSignature (B4/C3 scenario)
+            // 处理 trailingSignature (B4/C3 场景)
             if let Some(trailing_sig) = self.trailing_signature.take() {
                 self.content_blocks.push(ContentBlock::Thinking {
                     thinking: String::new(),
@@ -289,7 +141,7 @@ impl NonStreamingProcessor {
 
             self.has_tool_call = true;
 
-            // Generate the tool_use id
+            // 生成 tool_use id
             let tool_id = fc.id.clone().unwrap_or_else(|| {
                 format!(
                     "{}-{}",
@@ -298,14 +150,9 @@ impl NonStreamingProcessor {
                 )
             });
 
-            let mut tool_name = fc.name.clone();
-            // [OPTIMIZED] Only rename if it's "search" which is a known hallucination.
-            // Avoid renaming "grep" to "Grep" if possible to protect signature.
-            if tool_name.to_lowercase() == "search" {
-                tool_name = "Grep".to_string();
-            }
+            let tool_name = fc.name.clone();
 
-            // [FIX] Remap args for Gemini → Claude compatibility
+            // 纯透传协议参数
             let mut args = fc.args.clone().unwrap_or(serde_json::json!({}));
             remap_function_call_args(&tool_name, &mut args);
 
@@ -317,7 +164,7 @@ impl NonStreamingProcessor {
                 cache_control: None,
             };
 
-            // Only use the FC's own signature
+            // 只使用 FC 自己的签名
             if let ContentBlock::ToolUse { signature: sig, .. } = &mut tool_use {
                 *sig = signature;
             }
@@ -326,13 +173,13 @@ impl NonStreamingProcessor {
             return;
         }
 
-        // 2. Handle Text
+        // 2. Text 处理
         if let Some(text) = &part.text {
             if part.thought.unwrap_or(false) {
                 // Thinking part
                 self.flush_text();
 
-                // Handle trailingSignature
+                // 处理 trailingSignature
                 if let Some(trailing_sig) = self.trailing_signature.take() {
                     self.flush_thinking();
                     self.content_blocks.push(ContentBlock::Thinking {
@@ -347,9 +194,9 @@ impl NonStreamingProcessor {
                     self.thinking_signature = signature;
                 }
             } else {
-                // Ordinary Text
+                // 普通 Text
                 if text.is_empty() {
-                    // Empty text with a signature - buffer it in trailingSignature
+                    // 空 text 带签名 - 暂存到 trailingSignature
                     if signature.is_some() {
                         self.trailing_signature = signature;
                     }
@@ -358,7 +205,7 @@ impl NonStreamingProcessor {
 
                 self.flush_thinking();
 
-                // Handle the previous trailingSignature
+                // 处理之前的 trailingSignature
                 if let Some(trailing_sig) = self.trailing_signature.take() {
                     self.flush_text();
                     self.content_blocks.push(ContentBlock::Thinking {
@@ -370,7 +217,7 @@ impl NonStreamingProcessor {
 
                 self.text_builder.push_str(text);
 
-                // Non-empty text with a signature - flush immediately and emit an empty thinking block
+                // 非空 text 带签名 - 立即刷新并输出空 thinking 块
                 if let Some(sig) = signature {
                     self.flush_text();
                     self.content_blocks.push(ContentBlock::Thinking {
@@ -382,7 +229,7 @@ impl NonStreamingProcessor {
             }
         }
 
-        // 3. Handle InlineData (Image)
+        // 3. InlineData (Image) 处理
         if let Some(img) = &part.inline_data {
             self.flush_thinking();
 
@@ -396,37 +243,37 @@ impl NonStreamingProcessor {
         }
     }
 
-    /// Process Grounding metadata (Web Search results)
+    /// 处理 Grounding 元数据 (Web Search 结果)
     fn process_grounding(&mut self, grounding: &GroundingMetadata) {
         let mut grounding_text = String::new();
 
-        // 1. Handle the search query
+        // 1. 处理搜索词
         if let Some(queries) = &grounding.web_search_queries {
             if !queries.is_empty() {
-                grounding_text.push_str("\n\n---\n**🔍 Searched for you:** ");
+                grounding_text.push_str("\n\n---\n**🔍 已为您搜索：** ");
                 grounding_text.push_str(&queries.join(", "));
             }
         }
 
-        // 2. Handle source links (Chunks)
+        // 2. 处理来源链接 (Chunks)
         if let Some(chunks) = &grounding.grounding_chunks {
             let mut links = Vec::new();
             for (i, chunk) in chunks.iter().enumerate() {
                 if let Some(web) = &chunk.web {
-                    let title = web.title.as_deref().unwrap_or("Web source");
+                    let title = web.title.as_deref().unwrap_or("网页来源");
                     let uri = web.uri.as_deref().unwrap_or("#");
                     links.push(format!("[{}] [{}]({})", i + 1, title, uri));
                 }
             }
 
             if !links.is_empty() {
-                grounding_text.push_str("\n\n**🌐 Source citations:**\n");
+                grounding_text.push_str("\n\n**🌐 来源引文：**\n");
                 grounding_text.push_str(&links.join("\n"));
             }
         }
 
         if !grounding_text.is_empty() {
-            // Flush before and after the regular content and insert the text
+            // 在常规内容前后刷新并插入文本
             self.flush_thinking();
             self.flush_text();
             self.text_builder.push_str(&grounding_text);
@@ -434,7 +281,7 @@ impl NonStreamingProcessor {
         }
     }
 
-    /// Flush the text builder
+    /// 刷新 text builder
     fn flush_text(&mut self) {
         if self.text_builder.is_empty() {
             return;
@@ -443,52 +290,11 @@ impl NonStreamingProcessor {
         let mut current_text = self.text_builder.clone();
         self.text_builder.clear();
 
-        // [NEW] MCP XML Bridge: loop-parse any XML tags that may exist in the text
-        while let Some(start_idx) = current_text.find("<mcp__") {
-            if let Some(tag_end_idx) = current_text[start_idx..].find('>') {
-                let actual_tag_end = start_idx + tag_end_idx;
-                let tool_name = &current_text[start_idx + 1..actual_tag_end];
-                let end_tag = format!("</{}>", tool_name);
-
-                if let Some(close_idx) = current_text.find(&end_tag) {
-                    // 1. Handle the text before the tag
-                    if start_idx > 0 {
-                        self.content_blocks.push(ContentBlock::Text {
-                            text: current_text[..start_idx].to_string(),
-                        });
-                    }
-
-                    // 2. Parse the XML content and convert it into a ToolUse
-                    let input_str = &current_text[actual_tag_end + 1..close_idx];
-                    let input_json: serde_json::Value = serde_json::from_str(input_str.trim())
-                        .unwrap_or_else(|_| serde_json::json!({ "input": input_str.trim() }));
-
-                    self.content_blocks.push(ContentBlock::ToolUse {
-                        id: format!("{}-xml", tool_name),
-                        name: tool_name.to_string(),
-                        input: input_json,
-                        signature: None,
-                        cache_control: None,
-                    });
-                    self.has_tool_call = true;
-
-                    // 3. Continue processing the remaining text
-                    current_text = current_text[close_idx + end_tag.len()..].to_string();
-                    continue;
-                }
-            }
-            // If the XML format is incomplete, exit the loop and treat it as ordinary text
-            break;
-        }
-
-        // [FIX #3379] call:default_api:* leakage detection (non-streaming path).
-        // Occasionally a tool call comes back as plain text instead of a proper tool_use
-        // block (e.g. "call:default_api:Read{file_path:...}"), which silently ends the
-        // client's agent/tool loop. Recover it into a ToolUse block, but only when every
-        // guard passes: a tool with this name is actually registered on the request (G4),
-        // the text is nothing but the call expression with no surrounding prose (G5), and
-        // the arguments parse as a JSON object (G6). A partial/ambiguous match is left as
-        // plain text rather than guessed at.
+        // [FIX #3379] call:default_api:* leakage detection (non-streaming path)
+        // Symmetric to streaming.rs try_recover_call_default_api_text.
+        // Guards applied: G1 (tools registered), G3 (strict prefix), G4 (whitelist),
+        //                 G5 (no surrounding prose), G6 (valid JSON args).
+        // G2/G7 not needed in non-streaming path since we process the full response at once.
         if !self.registered_tool_names.is_empty() {
             let trimmed = current_text.trim();
             if trimmed.starts_with("call:default_api:") {
@@ -499,14 +305,14 @@ impl NonStreamingProcessor {
                 let args_str = rest[tool_end..].trim();
 
                 if !tool_name.is_empty() {
-                    // G5: no surrounding prose - the text must be only the call expression.
+                    // G5: no surrounding prose — text must be only the expression
                     let after_name = trimmed[PREFIX.len() + tool_name.len()..].trim();
                     let g5_ok = after_name.is_empty()
                         || after_name.starts_with('{')
                         || after_name.starts_with('(');
 
                     if g5_ok {
-                        // G4: whitelist check against the request's actual registered tools.
+                        // G4: whitelist check
                         let matched = self
                             .registered_tool_names
                             .iter()
@@ -514,7 +320,7 @@ impl NonStreamingProcessor {
                             .cloned();
 
                         if let Some(matched_name) = matched {
-                            // G6: arguments must parse as a JSON object.
+                            // G6: parse args
                             let parsed = if args_str.is_empty() {
                                 Some(serde_json::json!({}))
                             } else {
@@ -541,7 +347,7 @@ impl NonStreamingProcessor {
                                     cache_control: None,
                                 });
                                 self.has_tool_call = true;
-                                // current_text is fully consumed as a tool_use; nothing else to emit.
+                                // current_text fully consumed as a tool_use — nothing else to emit
                                 return;
                             } else {
                                 tracing::warn!(
@@ -551,13 +357,56 @@ impl NonStreamingProcessor {
                             }
                         } else {
                             tracing::warn!(
-                                "[#3379] Non-streaming: call:default_api:{} detected but no matching registered tool; emitting as text",
+                                "[#3379] Non-streaming: call:default_api:{} detected but tool not in whitelist; emitting as text",
                                 tool_name
                             );
                         }
+                    } else {
+                        tracing::warn!(
+                            "[#3379] Non-streaming: call:default_api:{} detected but G5 (no prose) failed; emitting as text",
+                            tool_name
+                        );
                     }
                 }
             }
+        }
+
+        // [NEW] MCP XML Bridge: 循环解析文本中可能存在的 XML 标签
+        while let Some(start_idx) = current_text.find("<mcp__") {
+            if let Some(tag_end_idx) = current_text[start_idx..].find('>') {
+                let actual_tag_end = start_idx + tag_end_idx;
+                let tool_name = &current_text[start_idx + 1..actual_tag_end];
+                let end_tag = format!("</{}>", tool_name);
+
+                if let Some(close_idx) = current_text.find(&end_tag) {
+                    // 1. 处理标签前的文本
+                    if start_idx > 0 {
+                        self.content_blocks.push(ContentBlock::Text {
+                            text: current_text[..start_idx].to_string(),
+                        });
+                    }
+
+                    // 2. 解析 XML 内容并转换为 ToolUse
+                    let input_str = &current_text[actual_tag_end + 1..close_idx];
+                    let input_json: serde_json::Value = serde_json::from_str(input_str.trim())
+                        .unwrap_or_else(|_| serde_json::json!({ "input": input_str.trim() }));
+
+                    self.content_blocks.push(ContentBlock::ToolUse {
+                        id: format!("{}-xml", tool_name),
+                        name: tool_name.to_string(),
+                        input: input_json,
+                        signature: None,
+                        cache_control: None,
+                    });
+                    self.has_tool_call = true;
+
+                    // 3. 继续处理剩余文本
+                    current_text = current_text[close_idx + end_tag.len()..].to_string();
+                    continue;
+                }
+            }
+            // 如果 XML 格式不完整, 退出循环并按普通文本处理
+            break;
         }
 
         if !current_text.is_empty() {
@@ -566,9 +415,9 @@ impl NonStreamingProcessor {
         }
     }
 
-    /// Flush the thinking builder
+    /// 刷新 thinking builder
     fn flush_thinking(&mut self) {
-        // If there is neither content nor a signature, return immediately
+        // 如果既没有内容也没有签名，直接返回
         if self.thinking_builder.is_empty() && self.thinking_signature.is_none() {
             return;
         }
@@ -584,7 +433,7 @@ impl NonStreamingProcessor {
         self.thinking_builder.clear();
     }
 
-    /// Build the final response
+    /// 构建最终响应
     fn build_response(&self, gemini_response: &GeminiResponse) -> ClaudeResponse {
         let finish_reason = gemini_response
             .candidates
@@ -681,7 +530,7 @@ mod tests {
             None,
             "gemini-2.5-flash".to_string(),
             1,
-            Vec::new(),
+            vec![], // registered_tool_names: not needed for this test
         );
         assert!(result.is_ok());
 
@@ -739,7 +588,7 @@ mod tests {
             None,
             "gemini-2.5-flash".to_string(),
             1,
-            Vec::new(),
+            vec![], // registered_tool_names: not needed for this test
         );
         assert!(result.is_ok());
 

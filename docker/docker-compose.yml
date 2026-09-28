@@ -14,4 +14,10 @@ services:
       - LOG_LEVEL=${LOG_LEVEL:-info}
       - API_KEY=${API_KEY:-test}  # [Important] Set your own secret key; if not set, check the logs for a randomly generated one
       - ABV_BIND_LOCAL_ONLY=${ABV_BIND_LOCAL_ONLY:-true}  # Bind to 127.0.0.1 only
+      - ABV_DATA_DIR=${ABV_DATA_DIR:-/root/.antigravity_tools}  # Container data directory; must match the volume target path above
     restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "100m"
+        max-file: "3"

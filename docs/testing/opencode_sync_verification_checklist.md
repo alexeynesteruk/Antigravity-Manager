@@ -165,6 +165,37 @@ ls -la ~/.config/opencode/*.bak
 
 ---
 
+## APIKEY.FUN → OpenCode
+
+- [ ] On APIKEY.FUN, query a key's models and click **OpenCode**. Verify
+  `provider.apikey-fun` uses `@ai-sdk/openai-compatible`, the current key and
+  BaseURL, and the queried model IDs. Existing providers must remain unchanged.
+- [ ] Repeat with a saved BaseURL ending in `/v1/`; the stored URL must end in
+  exactly `/v1`, without a duplicate suffix.
+- [ ] Edit the key after querying, or switch keys while a query is in flight.
+  Models fetched with another key or URL must not be exported for the current key.
+- [ ] Verify the button is disabled while querying or syncing and for a blank key.
+- [ ] Sync a nonempty model list twice: unavailable models are removed, while
+  custom limits/options on surviving unknown models are preserved. Omitting models
+  (including a query that returned no models) preserves the existing model list.
+- [ ] With an existing `opencode.jsonc` containing comments, trailing commas,
+  Unicode instructions/paths, and another provider, sync and verify those values
+  survive. The original file must be preserved in the `.antigravity-manager.bak`
+  backup; subsequent syncs must not overwrite that backup.
+- [ ] With an invalid JSON/JSONC config, verify sync reports an error and leaves
+  the original file unchanged.
+- [ ] Verify both desktop invocation and the authenticated web endpoint
+  `POST /api/proxy/opencode/openai-sync`. In web/server deployments, the config is
+  written on the server running Antigravity Manager.
+- [ ] Restart OpenCode, select an `apikey-fun/…` model, and send a short request.
+
+Automated backend coverage:
+
+```bash
+cd src-tauri
+cargo test --lib opencode_sync
+```
+
 ## Test Environment
 
 - **OS**: 
@@ -172,3 +203,37 @@ ls -la ~/.config/opencode/*.bak
 - **Antigravity Manager Version**: 
 - **Test Date**: 
 - **Tester**: 
+
+## APIKEY.FUN multiple key profiles
+
+Each saved key can have an independent OpenCode provider. Its default ID is
+`apikey-fun-<last six SHA-256 hex characters of the trimmed key>`. A colliding
+short ID uses the full digest instead; writes also reject an existing suffixed
+profile owned by another key. A matching legacy `apikey-fun` provider remains
+usable. No automatic migration or deletion of the legacy profile is needed.
+
+The checkbox creates missing profiles, updates differing profiles, and removes
+fully synced profiles. Models must be loaded before creating a new profile.
+Removing a saved key from the sidebar does not delete its OpenCode profile.
+
+Automated regression checks (from the repository root):
+
+```sh
+npm run build
+node scripts/test-opencode-profiles.mjs
+cargo test --manifest-path src-tauri/Cargo.toml opencode_sync --lib --locked
+```
+
+Manual scenarios to verify with test credentials:
+
+- [ ] Activate two keys, restart the page, and confirm both profiles remain active.
+- [ ] Deactivate one key and confirm the other key and unrelated providers remain unchanged.
+- [ ] Change a profile's URL, model IDs, or npm adapter externally; refresh and verify the next click updates it.
+- [ ] Activate a key already stored in the legacy provider and confirm no duplicate is created.
+- [ ] Switch or clear keys during a delayed model request; confirm stale results and errors do not appear.
+- [ ] Use Space/Enter on the profile checkbox and confirm its state matches the banner.
+- [ ] Use both the desktop Tauri commands and the authenticated web management endpoints.
+
+User-supplied UI reference, with API key fragments redacted:
+
+![OpenCode profile controls with API key fragments redacted](../images/opencode-multiple-key-profiles.png)

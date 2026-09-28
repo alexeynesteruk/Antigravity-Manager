@@ -21,12 +21,18 @@ import {
     TrendingUp,
     Zap,
     Code,
-    Wand2
+    CodeXml,
+    Wand2,
+    CheckSquare,
+    MinusSquare,
+    Square
 } from 'lucide-react';
 import { motion } from 'framer-motion';
 import { showToast } from '../components/common/ToastContainer';
 import { copyToClipboard } from '../utils/clipboard';
 import { request } from '../utils/request';
+import { generateUUID } from '../utils/uuid';
+import { getProfileInfo, type OpencodeProviderSummary } from '../utils/opencodeProfiles';
 
 interface ManagedApiKey {
     id: string;
@@ -37,6 +43,7 @@ interface ManagedApiKey {
     lastUsedAt: number;
     lastStatus?: 'ok' | 'bad' | 'unknown';
     lastRemaining?: string;
+    models?: string[];
 }
 
 interface UsageSummary {
@@ -51,7 +58,7 @@ interface UsageSummary {
 }
 
 const STORAGE_KEY = 'apikey_fun_managed_keys_local';
-const DEFAULT_ENDPOINT = 'https://api.apikey.fun/v1';
+const DEFAULT_ENDPOINT = 'https://api.apikey.fan/v1';
 
 function maskKey(value: string): string {
     const trimmed = value.trim();
@@ -77,8 +84,26 @@ export const ApiKeyFun: React.FC = () => {
     const [querying, setQuerying] = useState(false);
     const [usage, setUsage] = useState<UsageSummary | null>(null);
     const [models, setModels] = useState<string[]>([]);
+    const [modelsSource, setModelsSource] = useState<{ key: string; endpoint: string } | null>(null);
     const [queryError, setQueryError] = useState<string | null>(null);
     const [modelsError, setModelsError] = useState<string | null>(null);
+    const [opencodeProviders, setOpencodeProviders] = useState<OpencodeProviderSummary[]>([]);
+    const [syncingKey, setSyncingKey] = useState<string | null>(null);
+    const isTogglingRef = useRef(false);
+    const querySeqRef = useRef(0);
+
+    const providersSeqRef = useRef(0);
+    const fetchOpencodeProviders = useCallback(async () => {
+        const seq = ++providersSeqRef.current;
+        const providers = await request<OpencodeProviderSummary[]>('get_opencode_providers');
+        if (!Array.isArray(providers)) throw new Error('Invalid OpenCode providers response');
+        if (seq === providersSeqRef.current) setOpencodeProviders(providers);
+        return providers;
+    }, []);
+
+    useEffect(() => {
+        fetchOpencodeProviders().catch(err => console.warn('Failed to fetch opencode providers', err));
+    }, [fetchOpencodeProviders]);
     
     // Key Management
     const [managedKeys, setManagedKeys] = useState<ManagedApiKey[]>(() => {
@@ -100,8 +125,6 @@ export const ApiKeyFun: React.FC = () => {
         localStorage.setItem(STORAGE_KEY, JSON.stringify(managedKeys));
     }, [managedKeys]);
 
-
-
     const handleCopy = async (text: string) => {
         const success = await copyToClipboard(text);
         if (success) {
@@ -113,16 +136,21 @@ export const ApiKeyFun: React.FC = () => {
     const runQuery = useCallback(async (keyToQuery: string, urlToQuery: string) => {
         const key = keyToQuery.trim();
         const endpoint = urlToQuery.trim().replace(/\/+$/, '');
-        if (!key) return;
+        const seq = ++querySeqRef.current;
+        if (!key) {
+            setQuerying(false);
+            return;
+        }
 
         setQuerying(true);
         setQueryError(null);
         setUsage(null);
         setModels([]);
+        setModelsSource(null);
 
+        let fetchedModels: string[] = [];
         try {
             // 1. Fetch available models
-            let fetchedModels: string[] = [];
             let rawText = '';
             setModelsError(null);
             try {
@@ -130,19 +158,23 @@ export const ApiKeyFun: React.FC = () => {
                     url: `${endpoint}/models`,
                     key
                 });
+                if (seq !== querySeqRef.current) return;
                 const modelsData = JSON.parse(rawText);
                 if (modelsData && Array.isArray(modelsData.data)) {
-                    fetchedModels = modelsData.data.map((m: any) => typeof m === 'string' ? m : m.id).filter(Boolean);
+                    fetchedModels = modelsData.data.map((m: any) => typeof m === 'string' ? m : m?.id).filter((id: unknown): id is string => typeof id === 'string' && Boolean(id.trim())).map((id: string) => id.trim());
                 } else if (Array.isArray(modelsData)) {
-                    fetchedModels = modelsData.map((m: any) => typeof m === 'string' ? m : m.id).filter(Boolean);
+                    fetchedModels = modelsData.map((m: any) => typeof m === 'string' ? m : m?.id).filter((id: unknown): id is string => typeof id === 'string' && Boolean(id.trim())).map((id: string) => id.trim());
                 } else {
-                    setModelsError(t('apiKeyFun.errors.parseFormat', { defaultValue: 'Parse format error: {{err}}', err: Object.keys(modelsData).join(',') }));
+                    setModelsError(t('apiKeyFun.errors.parseFormat', { defaultValue: '解析格式异常: {{err}}', err: Object.keys(modelsData).join(',') }));
                 }
             } catch (err: any) {
+                if (seq !== querySeqRef.current) return;
                 console.warn('Failed to fetch models list', err);
-                setModelsError(t('apiKeyFun.errors.fetchFailed', { defaultValue: 'Fetch failed: {{err}}', err: err.message || String(err) }));
+                setModelsError(t('apiKeyFun.errors.fetchFailed', { defaultValue: '获取失败: {{err}}', err: err.message || String(err) }));
             }
+            if (seq !== querySeqRef.current) return;
             setModels(fetchedModels);
+            setModelsSource({ key, endpoint });
 
             // 2. Fetch balance (Try sub2api /usage first, then New API billing)
             let usageSummary: UsageSummary | null = null;
@@ -210,6 +242,8 @@ export const ApiKeyFun: React.FC = () => {
                 }
             }
 
+            if (seq !== querySeqRef.current) return;
+
             if (usageSummary) {
                 setUsage(usageSummary);
                 // Update or add to managed keys automatically
@@ -223,28 +257,32 @@ export const ApiKeyFun: React.FC = () => {
                             lastRemaining: usageSummary?.remaining,
                             lastStatus: 'ok',
                             lastUsedAt: now,
-                            baseUrl: endpoint // optionally update baseUrl
+                            baseUrl: endpoint, // optionally update baseUrl
+                            models: fetchedModels.length > 0 ? fetchedModels
+                                : updated[existingIndex].baseUrl === endpoint ? updated[existingIndex].models : undefined
                         };
                         return updated;
                     } else {
                         // Automatically save new key
                         return [{
-                            id: crypto.randomUUID(),
+                            id: generateUUID(),
                             key,
                             name: maskKey(key),
                             baseUrl: endpoint,
                             createdAt: now,
                             lastUsedAt: now,
                             lastStatus: 'ok',
-                            lastRemaining: usageSummary?.remaining
+                            lastRemaining: usageSummary?.remaining,
+                            models: fetchedModels
                         }, ...prev];
                     }
                 });
             } else {
-                throw new Error(t('apiKeyFun.errors.queryFailed', { defaultValue: 'Unable to fetch valid quota data or the model list. Please check that the API key is valid and the endpoint URL is correct.' }));
+                throw new Error(t('apiKeyFun.errors.queryFailed', { defaultValue: '无法获取有效的额度数据或模型列表，请确认 API Key 是否有效，以及接口地址是否正确。' }));
             }
 
         } catch (error: any) {
+            if (seq !== querySeqRef.current) return;
             console.error('Balance query failed', error);
             setQueryError(error?.message || 'Query failed. Please verify network or key validity.');
             setManagedKeys(prev => {
@@ -256,58 +294,56 @@ export const ApiKeyFun: React.FC = () => {
                         ...updated[existingIndex],
                         lastStatus: 'bad',
                         lastUsedAt: now,
-                        baseUrl: endpoint
+                        baseUrl: endpoint,
+                        models: fetchedModels.length > 0 ? fetchedModels
+                            : updated[existingIndex].baseUrl === endpoint ? updated[existingIndex].models : undefined
                     };
                     return updated;
                 } else {
                     return [{
-                        id: crypto.randomUUID(),
+                        id: generateUUID(),
                         key,
                         name: maskKey(key),
                         baseUrl: endpoint,
                         createdAt: now,
                         lastUsedAt: now,
-                        lastStatus: 'bad'
+                        lastStatus: 'bad',
+                        models: fetchedModels
                     }, ...prev];
                 }
             });
         } finally {
-            setQuerying(false);
+            if (seq === querySeqRef.current) {
+                setQuerying(false);
+            }
         }
     }, [t]);
 
     // Load first key on mount and automatically run query
     useEffect(() => {
-        if (!initialKeyLoaded.current && managedKeys.length > 0) {
+        if (!initialKeyLoaded.current) {
             initialKeyLoaded.current = true;
-            const initialKey = managedKeys[0].key;
-            const initialUrl = managedKeys[0].baseUrl || DEFAULT_ENDPOINT;
-            
-            setApiKey(initialKey);
-            setBaseUrl(initialUrl);
-            
-            // Auto fetch immediately!
-            runQuery(initialKey, initialUrl);
+            if (managedKeys.length > 0) {
+                const initialKey = managedKeys[0].key;
+                const initialUrl = managedKeys[0].baseUrl || DEFAULT_ENDPOINT;
+                setApiKey(initialKey);
+                setBaseUrl(initialUrl);
+                if (managedKeys[0].models && managedKeys[0].models.length > 0) {
+                    setModels(managedKeys[0].models);
+                    setModelsSource({ key: initialKey.trim(), endpoint: initialUrl.trim().replace(/\/+$/, '') });
+                }
+                runQuery(initialKey, initialUrl);
+            }
         }
     }, [managedKeys, runQuery]);
 
-
-
     const handleSyncCli = async (app: 'Codex' | 'Claude' | 'Gemini') => {
-        if (!apiKey) return;
+        if (!apiKey.trim()) return;
         const rawKey = apiKey.trim();
-        const url = baseUrl.trim();
-        
-        let proxyUrl = url;
-        let syncKey = rawKey;
-
-        if (app === 'Codex') {
-            proxyUrl = url.endsWith('/v1') ? url : `${url}/v1`;
-        } else if (app === 'Claude') {
-            proxyUrl = url.replace(/\/v1$/, '');
-        } else {
-            proxyUrl = url.replace(/\/v1$/, '');
-        }
+        const cleanUrl = baseUrl.trim().replace(/\/+$/, '');
+        const baseWithoutV1 = cleanUrl.replace(/\/v1$/i, '');
+        const proxyUrl = app === 'Codex' ? `${baseWithoutV1}/v1` : baseWithoutV1;
+        const syncKey = rawKey;
 
         try {
             await request('execute_cli_sync', { 
@@ -319,6 +355,75 @@ export const ApiKeyFun: React.FC = () => {
         } catch (error: any) {
             showToast(t('apiKeyFun.syncError', { defaultValue: 'Failed to sync: {{error}}', error: error.toString() }), 'error');
         }
+    };
+
+    const getModelsForKey = useCallback((targetKey: string, targetUrl?: string): string[] | undefined => {
+        const trimmed = targetKey.trim();
+        if (!trimmed) return undefined;
+        const normTarget = targetUrl ? targetUrl.trim().replace(/\/+$/, '') : null;
+        if (modelsSource?.key === trimmed && (!normTarget || modelsSource.endpoint === normTarget) && models.length > 0) {
+            return models.map(m => m.trim()).filter(Boolean);
+        }
+        const found = managedKeys.find(m => m.key.trim() === trimmed);
+        if (found?.models && found.models.length > 0) {
+            if (!normTarget || !found.baseUrl || found.baseUrl.trim().replace(/\/+$/, '') === normTarget) {
+                return found.models.map(m => m.trim()).filter(Boolean);
+            }
+        }
+        return undefined;
+    }, [modelsSource, models, managedKeys]);
+
+    const profileInfo = useCallback((key: string, url: string, modelIds?: string[]) =>
+        getProfileInfo(opencodeProviders, key, url, modelIds), [opencodeProviders]);
+
+    const handleToggleOpenCodeProfile = async (targetKey: string, targetUrl: string, explicitModels?: string[]) => {
+        const trimmedKey = targetKey.trim();
+        if (!trimmedKey || !targetUrl.trim() || isTogglingRef.current || (querying && trimmedKey === apiKey.trim())) return;
+        isTogglingRef.current = true;
+        setSyncingKey(trimmedKey);
+
+        try {
+            const keyModels = explicitModels ?? getModelsForKey(trimmedKey, targetUrl);
+            const providers = await fetchOpencodeProviders();
+            const info = getProfileInfo(providers, trimmedKey, targetUrl, keyModels);
+            if (info.status === 'synced') {
+                // Deactivate / remove profile
+                await request('execute_opencode_remove_provider', {
+                    providerId: info.providerId
+                });
+                showToast(t('apiKeyFun.opencode.removedToast', { defaultValue: 'Removed from OpenCode: {{name}}', name: info.providerName }), 'success');
+            } else {
+                // 'not_present' or 'partial' -> Sync / update profile
+                const proxyUrl = targetUrl.trim().replace(/\/+$/, '');
+                const cleaned = (keyModels ?? []).map(id => id.trim()).filter(Boolean);
+                if (cleaned.length === 0 && !info.existing?.models.length) {
+                    throw new Error(t('apiKeyFun.opencode.modelsRequired'));
+                }
+                const modelInputs = cleaned.length > 0
+                    ? cleaned.map(id => ({ id }))
+                    : undefined;
+
+                await request('execute_opencode_openai_sync', {
+                    proxyUrl,
+                    apiKey: trimmedKey,
+                    providerId: info.providerId,
+                    providerName: info.providerName,
+                    models: modelInputs
+                });
+                showToast(t('apiKeyFun.opencode.syncedToast', { defaultValue: 'Synced to OpenCode: {{name}}', name: info.providerName }), 'success');
+            }
+            await fetchOpencodeProviders();
+        } catch (error: any) {
+            showToast(t('apiKeyFun.syncError', { defaultValue: 'Failed to sync: {{error}}', error: error.toString() }), 'error');
+        } finally {
+            isTogglingRef.current = false;
+            setSyncingKey(null);
+        }
+    };
+
+    const handleSyncOpenCode = async () => {
+        if (!apiKey.trim() || !baseUrl.trim() || querying || Boolean(syncingKey)) return;
+        await handleToggleOpenCodeProfile(apiKey, baseUrl);
     };
 
     const handleDeleteKey = (id: string, e: React.MouseEvent) => {
@@ -335,14 +440,30 @@ export const ApiKeyFun: React.FC = () => {
 
     const saveRename = (id: string) => {
         const trimmed = editNameValue.trim();
-        if (!trimmed) return;
-        setManagedKeys(prev => prev.map(item => item.id === id ? { ...item, name: trimmed } : item));
+        if (trimmed) {
+            setManagedKeys(prev => prev.map(item => item.id === id ? { ...item, name: trimmed } : item));
+        }
         setEditingId(null);
+    };
+
+    const handleApiKeyChange = (value: string) => {
+        ++querySeqRef.current;
+        setQuerying(false);
+        setUsage(null);
+        setModels([]);
+        setModelsSource(null);
+        setQueryError(null);
+        setModelsError(null);
+        setApiKey(value);
     };
 
     const handleSelectKey = (item: ManagedApiKey) => {
         setApiKey(item.key);
         setBaseUrl(item.baseUrl || DEFAULT_ENDPOINT);
+        if (item.models && item.models.length > 0) {
+            setModels(item.models);
+            setModelsSource({ key: item.key.trim(), endpoint: (item.baseUrl || DEFAULT_ENDPOINT).trim().replace(/\/+$/, '') });
+        }
         runQuery(item.key, item.baseUrl || DEFAULT_ENDPOINT);
     };
 
@@ -372,26 +493,26 @@ export const ApiKeyFun: React.FC = () => {
                     <div className="flex flex-col gap-1.5 max-w-4xl">
                         <div className="flex flex-col md:flex-row items-center md:items-end gap-3">
                             <h1 className="text-xl md:text-2xl font-bold text-gray-900 dark:text-white tracking-wide leading-none">
-                                {t('apiKeyFun.title', { defaultValue: 'APIKEY.FUN Relay Station' })}
+                                {t('apiKeyFun.title', { defaultValue: 'APIKEY.FUN 中转站' })}
                             </h1>
                             <span className="bg-blue-100 text-blue-700 dark:bg-blue-900/50 dark:text-blue-300 border border-blue-200 dark:border-blue-800/40 px-2.5 py-0.5 rounded-full text-[10px] font-semibold tracking-wide uppercase">
-                                {t('apiKeyFun.eyebrow', { defaultValue: 'Relay Station' })}
+                                {t('apiKeyFun.eyebrow', { defaultValue: '中转站' })}
                             </span>
                         </div>
                         <p className="text-xs md:text-sm text-gray-600 dark:text-gray-300/90 leading-relaxed font-normal mt-1">
-                            {t('apiKeyFun.description', { defaultValue: 'An official partner relay station of Antigravity Tools, providing users with a stable, open, and cost-effective API access service for large models. Supports mainstream models such as Claude, OpenAI, and Gemini, and is suitable for unified configuration across Codex, Gemini CLI, Claude Code, and other development tools. Register through the exclusive Antigravity Tools link to enjoy a permanent 5% discount on top-ups.' })}
+                            {t('apiKeyFun.description', { defaultValue: 'Antigravity Tools 官方合作中转站，为用户提供稳定、开放、高性价比的大模型 API 接入服务。支持 Claude、OpenAI、Gemini 等主流模型，适合在 Codex、Gemini CLI、Claude Code 及其他开发工具中统一配置使用。通过 Antigravity Tools 专属链接注册，可享受最高充值永久 95 折优惠。' })}
                         </p>
                     </div>
                 </div>
 
                 <a
-                    href="https://apikey.fun/register?aff=AntManager"
+                    href="https://apikey.fan/register?aff=AntManager"
                     target="_blank"
                     rel="noopener noreferrer"
                     className="bg-white hover:bg-blue-50 dark:bg-base-200 dark:hover:bg-base-300 text-blue-700 dark:text-blue-400 border border-blue-200 dark:border-blue-800/50 px-6 py-3 rounded-xl font-bold text-sm flex items-center gap-2 transition-all shadow-md shadow-blue-500/10 dark:shadow-none flex-shrink-0 hover:scale-[1.02] active:scale-[0.98] duration-200 z-10"
                 >
                     <ExternalLink size={16} className="text-blue-500 dark:text-blue-400" />
-                    <span>{t('apiKeyFun.viewNow', { defaultValue: 'View Now' })}</span>
+                    <span>{t('apiKeyFun.viewNow', { defaultValue: '立即查看' })}</span>
                 </a>
             </div>
 
@@ -407,7 +528,7 @@ export const ApiKeyFun: React.FC = () => {
                     </div>
                     <div className="flex flex-col min-w-0">
                         <span className="text-xs font-medium text-gray-400 dark:text-gray-500 truncate">
-                            {t('apiKeyFun.usage.remainingAmount', { defaultValue: 'Remaining Balance' })}
+                            {t('apiKeyFun.usage.remainingAmount', { defaultValue: '剩余额度' })}
                         </span>
                         <span className="text-xl font-bold text-gray-900 dark:text-white mt-0.5 tracking-tight truncate">
                             {usage ? usage.remaining : '$0.00'}
@@ -425,7 +546,7 @@ export const ApiKeyFun: React.FC = () => {
                     </div>
                     <div className="flex flex-col min-w-0">
                         <span className="text-xs font-medium text-gray-400 dark:text-gray-500 truncate">
-                            {t('apiKeyFun.usage.usedAmount', { defaultValue: 'Used Balance' })}
+                            {t('apiKeyFun.usage.usedAmount', { defaultValue: '已用额度' })}
                         </span>
                         <span className="text-xl font-bold text-gray-900 dark:text-white mt-0.5 tracking-tight truncate">
                             {usage ? usage.used : '--'}
@@ -528,70 +649,150 @@ export const ApiKeyFun: React.FC = () => {
                                 <div
                                     key={item.id}
                                     onClick={() => !isEditing && handleSelectKey(item)}
-                                    className={`p-4 rounded-2xl border text-left transition-all relative flex items-center justify-between cursor-pointer group ${
+                                    className={`p-4 rounded-2xl border text-left transition-all relative flex flex-col justify-between cursor-pointer group ${
                                         isActive
                                             ? 'border-blue-500 bg-blue-50/40 dark:bg-blue-500/10 shadow-sm shadow-blue-500/10'
                                             : 'border-slate-200 dark:border-white/5 hover:border-slate-300 dark:hover:border-white/10 bg-white dark:bg-white/[0.02]'
                                     }`}
                                 >
-                                    <div className="flex flex-col gap-1.5 w-full min-w-0 pr-2">
-                                        {isEditing ? (
-                                            <input
-                                                type="text"
-                                                className="input input-sm input-bordered w-full max-w-[200px]"
-                                                value={editNameValue}
-                                                onChange={e => setEditNameValue(e.target.value)}
-                                                onBlur={() => saveRename(item.id)}
-                                                onKeyDown={e => e.key === 'Enter' && saveRename(item.id)}
-                                                autoFocus
-                                                onClick={e => e.stopPropagation()}
-                                            />
-                                        ) : (
-                                            <span className="font-bold text-[13px] text-slate-800 dark:text-gray-200 truncate">
-                                                {item.name}
-                                            </span>
-                                        )}
-                                        
-                                        <div className="flex items-center gap-2 text-[11px] text-slate-500 dark:text-gray-400 font-medium">
-                                            <span>
-                                                {t('apiKeyFun.keyManager.lastRemainingLabel', { defaultValue: 'Last Balance' })} {item.lastRemaining ? item.lastRemaining : '--'}
-                                            </span>
-                                            {item.lastStatus && (
-                                                <span className={`w-1.5 h-1.5 rounded-full ${item.lastStatus === 'ok' ? 'bg-green-500 shadow-[0_0_8px_rgba(34,197,94,0.6)]' : 'bg-red-500 shadow-[0_0_8px_rgba(239,68,68,0.6)]'}`} />
+                                    <div className="flex items-center justify-between w-full">
+                                        <div className="flex flex-col gap-1.5 w-full min-w-0 pr-2">
+                                            {isEditing ? (
+                                                <input
+                                                    type="text"
+                                                    className="input input-sm input-bordered w-full max-w-[200px]"
+                                                    value={editNameValue}
+                                                    onChange={e => setEditNameValue(e.target.value)}
+                                                    onBlur={() => saveRename(item.id)}
+                                                    onKeyDown={e => {
+                                                        if (e.key === 'Enter') {
+                                                            saveRename(item.id);
+                                                        } else if (e.key === 'Escape') {
+                                                            e.preventDefault();
+                                                            setEditingId(null);
+                                                        }
+                                                    }}
+                                                    autoFocus
+                                                    onClick={e => e.stopPropagation()}
+                                                />
+                                            ) : (
+                                                <button type="button" className="text-left font-bold text-[13px] text-slate-800 dark:text-gray-200 truncate">
+                                                    {item.name}
+                                                </button>
                                             )}
+
+                                            <div className="flex items-center gap-2 text-[11px] text-slate-500 dark:text-gray-400 font-medium">
+                                                <span>
+                                                    {t('apiKeyFun.keyManager.lastRemainingLabel', { defaultValue: '上次余额' })} {item.lastRemaining ? item.lastRemaining : '--'}
+                                                </span>
+                                                {item.lastStatus && (
+                                                    <span className={`w-1.5 h-1.5 rounded-full ${item.lastStatus === 'ok' ? 'bg-green-500 shadow-[0_0_8px_rgba(34,197,94,0.6)]' : 'bg-red-500 shadow-[0_0_8px_rgba(239,68,68,0.6)]'}`} />
+                                                )}
+                                            </div>
+
+                                            <span className="text-[10px] text-slate-400 dark:text-gray-500 font-normal">
+                                                {t('apiKeyFun.keyManager.addedAt', { defaultValue: '添加于' })} {formatDate(item.createdAt)}
+                                            </span>
                                         </div>
                                         
-                                        <span className="text-[10px] text-slate-400 dark:text-gray-500 font-normal">
-                                            {t('apiKeyFun.keyManager.addedAt', { defaultValue: 'Added on' })} {formatDate(item.createdAt)}
-                                        </span>
+                                        {/* Hover Actions */}
+                                        <div className="flex flex-row items-center gap-0.5 opacity-0 group-hover:opacity-100 transition-opacity shrink-0">
+                                            <button
+                                                onClick={e => { e.stopPropagation(); handleCopy(item.key); }}
+                                                className="p-1.5 text-slate-400 hover:text-blue-500 hover:bg-blue-50 dark:hover:bg-white/10 rounded-lg transition-colors"
+                                                title="Copy Key"
+                                            >
+                                                <Copy size={15} />
+                                            </button>
+                                            {!isEditing && (
+                                                <button
+                                                    onClick={e => startRename(item, e)}
+                                                    className="p-1.5 text-slate-400 hover:text-blue-500 hover:bg-blue-50 dark:hover:bg-white/10 rounded-lg transition-colors"
+                                                    title="Edit Name"
+                                                >
+                                                    <Pencil size={14} />
+                                                </button>
+                                            )}
+                                            <button
+                                                onClick={e => handleDeleteKey(item.id, e)}
+                                                className="p-1.5 text-slate-400 hover:text-red-500 hover:bg-red-50 dark:hover:bg-red-500/10 rounded-lg transition-colors"
+                                                title="Delete"
+                                            >
+                                                <Trash2 size={15} />
+                                            </button>
+                                        </div>
                                     </div>
 
-                                    {/* Hover Actions */}
-                                    <div className="flex flex-row items-center gap-0.5 opacity-0 group-hover:opacity-100 transition-opacity shrink-0">
-                                        <button
-                                            onClick={e => { e.stopPropagation(); handleCopy(item.key); }}
-                                            className="p-1.5 text-slate-400 hover:text-blue-500 hover:bg-blue-50 dark:hover:bg-white/10 rounded-lg transition-colors"
-                                            title="Copy Key"
-                                        >
-                                            <Copy size={15} />
-                                        </button>
-                                        {!isEditing && (
-                                            <button
-                                                onClick={e => startRename(item, e)}
-                                                className="p-1.5 text-slate-400 hover:text-blue-500 hover:bg-blue-50 dark:hover:bg-white/10 rounded-lg transition-colors"
-                                                title="Edit Name"
+                                    {/* OpenCode Profile Status & Activation */}
+                                    {(() => {
+                                        const isActiveKey = item.key.trim() === apiKey.trim();
+                                        const effectiveUrl = (isActiveKey && baseUrl.trim()) ? baseUrl.trim() : (item.baseUrl || DEFAULT_ENDPOINT);
+                                        const currentModels = getModelsForKey(item.key, effectiveUrl);
+                                        const keyInfo = profileInfo(item.key, effectiveUrl, currentModels);
+                                        const isThisKeySyncing = syncingKey === item.key.trim();
+
+                                        return (
+                                            <div
+                                                onClick={e => e.stopPropagation()}
+                                                className="flex items-center justify-between pt-2 mt-2 border-t border-slate-100 dark:border-white/5 text-[11px]"
                                             >
-                                                <Pencil size={14} />
-                                            </button>
-                                        )}
-                                        <button
-                                            onClick={e => handleDeleteKey(item.id, e)}
-                                            className="p-1.5 text-slate-400 hover:text-red-500 hover:bg-red-50 dark:hover:bg-red-500/10 rounded-lg transition-colors"
-                                            title="Delete"
-                                        >
-                                            <Trash2 size={15} />
-                                        </button>
-                                    </div>
+                                                <div
+                                                    role="checkbox"
+                                                    aria-checked={keyInfo.status === 'synced' ? true : keyInfo.status === 'partial' ? 'mixed' : false}
+                                                    aria-label={`OpenCode ${keyInfo.suffix}`}
+                                                    aria-busy={isThisKeySyncing}
+                                                    aria-disabled={Boolean(syncingKey) || (isActiveKey && querying)}
+                                                    tabIndex={0}
+                                                    className="flex items-center gap-1.5 min-w-0 cursor-pointer select-none rounded focus:outline-none focus:ring-1 focus:ring-teal-500"
+                                                    onClick={() => handleToggleOpenCodeProfile(item.key, effectiveUrl, currentModels)}
+                                                    onKeyDown={(e) => {
+                                                        if (e.key === 'Enter' || e.key === ' ') {
+                                                            e.preventDefault();
+                                                            handleToggleOpenCodeProfile(item.key, effectiveUrl, currentModels);
+                                                        }
+                                                    }}
+                                                    title={
+                                                        keyInfo.status === 'synced'
+                                                            ? t('apiKeyFun.opencode.clickToRemove', { defaultValue: 'OpenCode profile is active and synced. Click to deactivate/remove' })
+                                                            : keyInfo.status === 'partial'
+                                                                ? t('apiKeyFun.opencode.clickToUpdate', { defaultValue: 'Settings or models differ. Click to update' })
+                                                                : t('apiKeyFun.opencode.clickToActivate', { defaultValue: 'Click to activate separate profile in OpenCode' })
+                                                    }
+                                                >
+                                                    {isThisKeySyncing ? (
+                                                        <RefreshCw size={13} className="animate-spin text-teal-500 shrink-0" />
+                                                    ) : keyInfo.status === 'synced' ? (
+                                                        <CheckSquare size={14} className="text-emerald-500 shrink-0" />
+                                                    ) : keyInfo.status === 'partial' ? (
+                                                        <MinusSquare size={14} className="text-amber-500 shrink-0" />
+                                                    ) : (
+                                                        <Square size={14} className="text-slate-400 dark:text-gray-600 shrink-0" />
+                                                    )}
+                                                    <span className="font-mono text-slate-600 dark:text-gray-300 truncate">
+                                                        OpenCode: <span className="font-semibold text-slate-800 dark:text-gray-100">{keyInfo.suffix}</span>
+                                                    </span>
+                                                </div>
+
+                                                <div className="flex items-center gap-1 shrink-0">
+                                                    {keyInfo.status === 'synced' && (
+                                                        <span className="badge badge-xs badge-success text-[9px] font-medium gap-1 py-1 px-1.5">
+                                                            {t('apiKeyFun.opencode.active', { defaultValue: 'Active' })}
+                                                        </span>
+                                                    )}
+                                                    {keyInfo.status === 'partial' && (
+                                                        <span className="badge badge-xs badge-warning text-[9px] font-medium gap-1 py-1 px-1.5">
+                                                            {t('apiKeyFun.opencode.modified', { defaultValue: 'Modified' })}
+                                                        </span>
+                                                    )}
+                                                    {keyInfo.status === 'not_present' && (
+                                                        <span className="text-[10px] text-slate-400 dark:text-gray-500">
+                                                            {t('apiKeyFun.opencode.inactive', { defaultValue: 'Inactive' })}
+                                                        </span>
+                                                    )}
+                                                </div>
+                                            </div>
+                                        );
+                                    })()}
                                 </div>
                             );
                         })}
@@ -626,7 +827,7 @@ export const ApiKeyFun: React.FC = () => {
                                             className="w-full h-14 pl-5 pr-36 font-mono text-sm bg-slate-50 dark:bg-black/20 border-2 border-slate-200 dark:border-white/10 rounded-2xl focus:bg-white dark:focus:bg-black/40 focus:border-blue-500 dark:focus:border-blue-500/80 focus:ring-4 focus:ring-blue-500/20 dark:focus:ring-blue-500/10 transition-all shadow-sm outline-none text-gray-800 dark:text-gray-200 placeholder-slate-400 dark:placeholder-gray-600"
                                             placeholder={t('apiKeyFun.apiKeyPlaceholder', { defaultValue: 'Paste your API Key...' })}
                                             value={apiKey}
-                                            onChange={e => setApiKey(e.target.value)}
+                                            onChange={e => handleApiKeyChange(e.target.value)}
                                             onKeyDown={(e) => {
                                                 if (e.key === 'Enter' && !querying && apiKey) {
                                                     runQuery(apiKey, baseUrl);
@@ -637,7 +838,7 @@ export const ApiKeyFun: React.FC = () => {
                                             {apiKey && (
                                                 <button
                                                     className="p-2 rounded-lg text-slate-400 hover:bg-slate-200 hover:text-slate-600 dark:text-gray-500 dark:hover:bg-white/10 dark:hover:text-gray-300 transition-colors"
-                                                    onClick={() => setApiKey('')}
+                                                    onClick={() => handleApiKeyChange('')}
                                                     title="Clear"
                                                 >
                                                     <X size={16} strokeWidth={2.5} />
@@ -687,10 +888,10 @@ export const ApiKeyFun: React.FC = () => {
                                     </div>
                                     <div className="flex flex-col">
                                         <span className="text-sm font-bold text-base-content">
-                                            {t('apiKeyFun.cli.quickConfig', { defaultValue: 'One-Click Configure Local Dev Environment' })}
+                                            {t('apiKeyFun.cli.quickConfig', { defaultValue: '一键配置本地开发环境' })}
                                         </span>
                                         <span className="text-[10px] text-base-content/60 font-medium">
-                                            {t('apiKeyFun.cli.syncDesc', { defaultValue: 'Sync to Official Standard Config' })}
+                                            {t('apiKeyFun.cli.syncDesc', { defaultValue: '同步至官方标准配置' })}
                                         </span>
                                     </div>
                                 </div>
@@ -703,7 +904,7 @@ export const ApiKeyFun: React.FC = () => {
                                     });
                                     const hasClaude = models.some(m => m.toLowerCase().includes('claude'));
                                     
-                                    // Show both by default, unless it's explicitly detected that only one is supported
+                                    // 默认都显示，除非明确检测到只支持其中一种
                                     const showCodex = !hasModels || hasGpt || (!hasGpt && !hasClaude);
                                     const showClaude = !hasModels || hasClaude || (!hasGpt && !hasClaude);
 
@@ -713,7 +914,8 @@ export const ApiKeyFun: React.FC = () => {
                                                 <button 
                                                     onClick={() => handleSyncCli('Codex')}
                                                     className="flex-1 sm:flex-none btn btn-sm px-5 font-medium rounded-full bg-blue-500 hover:bg-blue-600 text-white border-none shadow-md shadow-blue-500/20 transition-all group"
-                                                    disabled={!apiKey}
+                                                    disabled={!apiKey.trim()}
+                                                    title={t('apiKeyFun.cli.codexTooltip', { defaultValue: 'Sync API Key & BaseURL to Codex / ChatGPT CLI' })}
                                                 >
                                                     <Code size={14} className="mr-1.5 opacity-90 group-hover:scale-110 group-hover:opacity-100 transition-all" />
                                                     Codex
@@ -723,12 +925,61 @@ export const ApiKeyFun: React.FC = () => {
                                                 <button 
                                                     onClick={() => handleSyncCli('Claude')}
                                                     className="flex-1 sm:flex-none btn btn-sm px-5 font-medium rounded-full bg-purple-500 hover:bg-purple-600 text-white border-none shadow-md shadow-purple-500/20 transition-all group"
-                                                    disabled={!apiKey}
+                                                    disabled={!apiKey.trim()}
+                                                    title={t('apiKeyFun.cli.claudeTooltip', { defaultValue: 'Sync API Key & BaseURL to Claude Code' })}
                                                 >
                                                     <Cpu size={14} className="mr-1.5 opacity-90 group-hover:scale-110 group-hover:opacity-100 transition-all" />
                                                     Claude
                                                 </button>
                                             )}
+                                            {(() => {
+                                                const activeModels = getModelsForKey(apiKey, baseUrl);
+                                                const activeInfo = profileInfo(apiKey, baseUrl, activeModels);
+                                                const isCurrentKeySyncing = syncingKey === apiKey.trim();
+
+                                                return (
+                                                    <div className="flex items-center gap-1.5 flex-1 sm:flex-none">
+                                                        <button
+                                                            onClick={handleSyncOpenCode}
+                                                            role="checkbox"
+                                                            aria-checked={activeInfo.status === 'synced' ? true : activeInfo.status === 'partial' ? 'mixed' : false}
+                                                            aria-label={`OpenCode ${activeInfo.suffix}`}
+                                                            className={`btn btn-sm px-4 font-medium rounded-full border-none shadow-md transition-all group flex items-center gap-2 ${
+                                                                activeInfo.status === 'synced'
+                                                                    ? 'bg-teal-600 hover:bg-teal-700 text-white shadow-teal-600/20'
+                                                                    : activeInfo.status === 'partial'
+                                                                        ? 'bg-amber-500 hover:bg-amber-600 text-white shadow-amber-500/20'
+                                                                        : 'bg-teal-500 hover:bg-teal-600 text-white shadow-teal-500/20'
+                                                            }`}
+                                                            disabled={!apiKey.trim() || !baseUrl.trim() || querying || Boolean(syncingKey)}
+                                                            title={
+                                                                activeInfo.status === 'synced'
+                                                                    ? t('apiKeyFun.opencode.syncedActiveTooltip', { defaultValue: 'OpenCode: profile is active and fully synced. Click to deactivate' })
+                                                                    : activeInfo.status === 'partial'
+                                                                        ? t('apiKeyFun.opencode.partialTooltip', { defaultValue: 'OpenCode: settings or models differ. Click to sync' })
+                                                                        : t('apiKeyFun.cli.opencodeTooltip', { defaultValue: 'Activate as separate profile in OpenCode' })
+                                                            }
+                                                        >
+                                                            {isCurrentKeySyncing ? (
+                                                                <RefreshCw size={13} className="animate-spin mr-0.5" />
+                                                            ) : activeInfo.status === 'synced' ? (
+                                                                <CheckSquare size={14} className="text-white shrink-0" />
+                                                            ) : activeInfo.status === 'partial' ? (
+                                                                <MinusSquare size={14} className="text-white shrink-0" />
+                                                            ) : (
+                                                                <Square size={14} className="text-white/70 shrink-0" />
+                                                            )}
+                                                            <CodeXml size={14} className="opacity-90 group-hover:scale-110 group-hover:opacity-100 transition-all" />
+                                                            <span>OpenCode</span>
+                                                            {activeInfo.suffix && (
+                                                                <span className="text-[10px] opacity-85 font-mono">
+                                                                    ({activeInfo.suffix})
+                                                                </span>
+                                                            )}
+                                                        </button>
+                                                    </div>
+                                                );
+                                            })()}
                                         </div>
                                     );
                                 })()}

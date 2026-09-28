@@ -1,5 +1,5 @@
 import { ArrowRightLeft, RefreshCw, Trash2, Download, Info, Lock, Ban, Diamond, Gem, Circle, Clock, ToggleLeft, ToggleRight, Fingerprint } from 'lucide-react';
-import { Account } from '../../types/account';
+import { Account, getAccountTier } from '../../types/account';
 import { getQuotaColor, formatTimeRemaining, getTimeRemainingColor } from '../../utils/format';
 import { cn } from '../../utils/cn';
 import { useTranslation } from 'react-i18next';
@@ -13,7 +13,7 @@ interface AccountRowProps {
     isCurrent: boolean;
     isRefreshing: boolean;
     isSwitching?: boolean;
-    onSwitch: () => void;
+    onSwitch: (targetIde?: string) => void;
     onRefresh: () => void;
     onViewDevice: () => void;
     onViewDetails: () => void;
@@ -26,7 +26,7 @@ interface AccountRowProps {
 
 function AccountRow({ account, selected, onSelect, isCurrent, isRefreshing, isSwitching = false, onSwitch, onRefresh, onViewDetails, onExport, onDelete, onToggleProxy, onViewDevice }: AccountRowProps) {
     const { t } = useTranslation();
-    // [Refactor] Find the quota model by priority
+    // [重构] 按优先级查找配额模型
     const geminiProModel = findQuotaModel(account.quota?.models, 'gemini-pro');
     const geminiFlashModel = findQuotaModel(account.quota?.models, 'gemini-flash');
 
@@ -49,7 +49,7 @@ function AccountRow({ account, selected, onSelect, isCurrent, isRefreshing, isSw
     const claudeModel = findQuotaModel(account.quota?.models, 'claude');
     const isDisabled = Boolean(account.disabled);
 
-    // Color mapping, to avoid dynamic class names being purged by Tailwind
+    // 颜色映射，避免动态类名被 Tailwind purge
     const getColorClass = (percentage: number) => {
         const color = getQuotaColor(percentage);
         switch (color) {
@@ -75,7 +75,7 @@ function AccountRow({ account, selected, onSelect, isCurrent, isRefreshing, isSw
             isCurrent && "bg-blue-50/50 dark:bg-blue-900/10",
             (isRefreshing || isDisabled) && "opacity-70"
         )}>
-            {/* Index */}
+            {/* 序号 */}
             <td className="pl-6 py-1 w-12">
                 <input
                     type="checkbox"
@@ -86,7 +86,7 @@ function AccountRow({ account, selected, onSelect, isCurrent, isRefreshing, isSw
                 />
             </td>
 
-            {/* Email */}
+            {/* 邮箱 */}
             <td className="px-4 py-1">
                 <div className="flex items-center gap-3">
                     <span className={cn(
@@ -130,17 +130,17 @@ function AccountRow({ account, selected, onSelect, isCurrent, isRefreshing, isSw
                             </span>
                         )}
 
-                        {/* Subscription type badge */}
-                        {account.quota?.subscription_tier && (() => {
-                            const tier = account.quota.subscription_tier.toLowerCase();
-                            if (tier.includes('ultra')) {
+                        {/* 订阅类型徽章 */}
+                        {(() => {
+                            const tier = getAccountTier(account);
+                            if (tier === 'ultra') {
                                 return (
                                     <span className="flex items-center gap-1 px-2 py-0.5 rounded-md bg-gradient-to-r from-purple-600 to-pink-600 text-white text-[10px] font-bold shadow-sm hover:scale-105 transition-transform cursor-default">
                                         <Gem className="w-2.5 h-2.5 fill-current" />
                                         ULTRA
                                     </span>
                                 );
-                            } else if (tier.includes('pro')) {
+                            } else if (tier === 'pro') {
                                 return (
                                     <span className="flex items-center gap-1 px-2 py-0.5 rounded-md bg-gradient-to-r from-blue-600 to-indigo-600 text-white text-[10px] font-bold shadow-sm hover:scale-105 transition-transform cursor-default">
                                         <Diamond className="w-2.5 h-2.5 fill-current" />
@@ -160,7 +160,7 @@ function AccountRow({ account, selected, onSelect, isCurrent, isRefreshing, isSw
                 </div>
             </td>
 
-            {/* Model quota */}
+            {/* 模型配额 */}
             <td className="px-4 py-1">
                 {account.quota?.is_forbidden ? (
                     <div className="flex items-center gap-2 text-xs text-red-500 dark:text-red-400 bg-red-50/50 dark:bg-red-900/10 p-1.5 rounded-lg border border-red-100 dark:border-red-900/30">
@@ -306,7 +306,7 @@ function AccountRow({ account, selected, onSelect, isCurrent, isRefreshing, isSw
                 )}
             </td>
 
-            {/* Last used */}
+            {/* 最后使用 */}
             <td className="px-4 py-1">
                 <div className="flex flex-col">
                     <span className="text-xs font-medium text-gray-600 dark:text-gray-400 font-mono whitespace-nowrap">
@@ -318,7 +318,7 @@ function AccountRow({ account, selected, onSelect, isCurrent, isRefreshing, isSw
                 </div>
             </td>
 
-            {/* Actions */}
+            {/* 操作 */}
             <td className="px-4 py-1">
                 <div className="flex items-center gap-0.5 opacity-60 group-hover:opacity-100 transition-opacity">
                     <button
@@ -337,7 +337,7 @@ function AccountRow({ account, selected, onSelect, isCurrent, isRefreshing, isSw
                     </button>
                     <button
                         className={`p-1.5 text-gray-500 dark:text-gray-400 rounded-lg transition-all ${(isSwitching || isDisabled) ? 'bg-blue-50 dark:bg-blue-900/10 text-blue-600 dark:text-blue-400 cursor-not-allowed' : 'hover:text-blue-600 dark:hover:text-blue-400 hover:bg-blue-50 dark:hover:bg-blue-900/30'}`}
-                        onClick={(e) => { e.stopPropagation(); onSwitch(); }}
+                        onClick={(e) => { e.stopPropagation(); onSwitch('classic'); }}
                         title={isDisabled ? t('accounts.disabled_tooltip') : (isSwitching ? t('common.loading') : t('accounts.switch_to'))}
                         disabled={isSwitching || isDisabled}
                     >

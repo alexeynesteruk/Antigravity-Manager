@@ -1,5 +1,5 @@
-// Claude streaming response transformation (Gemini SSE → Claude SSE)
-// Corresponds to StreamingState + PartProcessor
+// Claude 流式响应转换 (Gemini SSE → Claude SSE)
+// 对应 StreamingState + PartProcessor
 
 use super::models::*;
 use super::utils::to_claude_usage;
@@ -10,161 +10,19 @@ use crate::proxy::SignatureCache;
 use bytes::Bytes;
 use serde_json::{json, Value};
 
-/// Known parameter remappings for Gemini → Claude compatibility
-/// [FIX] Gemini sometimes uses different parameter names than specified in tool schema
+/// Passthrough tool arguments for Gemini → Claude compatibility
 pub fn remap_function_call_args(name: &str, args: &mut Value) {
-    // [DEBUG] Always log incoming tool usage for diagnosis
+    // 纯透传协议工具参数，不进行任何字段重命名与拦截改写
     if let Some(obj) = args.as_object() {
-        tracing::debug!("[Streaming] Tool Call: '{}' Args: {:?}", name, obj);
-    }
-
-    // [IMPORTANT] Claude Code CLI's EnterPlanMode tool must not carry any arguments
-    // A reason parameter injected by the proxy layer would cause InputValidationError
-    if name == "EnterPlanMode" {
-        if let Some(obj) = args.as_object_mut() {
-            obj.clear();
-        }
-        return;
-    }
-
-    if let Some(obj) = args.as_object_mut() {
-        // [IMPROVED] Case-insensitive matching for tool names
-        match name.to_lowercase().as_str() {
-            "grep" | "search" | "search_code_definitions" | "search_code_snippets" => {
-                // [FIX] Gemini hallucination: maps parameter description to "description" field
-                if let Some(desc) = obj.remove("description") {
-                    if !obj.contains_key("pattern") {
-                        obj.insert("pattern".to_string(), desc);
-                        tracing::debug!("[Streaming] Remapped Grep: description → pattern");
-                    }
-                }
-
-                // Gemini uses "query", Claude Code expects "pattern"
-                if let Some(query) = obj.remove("query") {
-                    if !obj.contains_key("pattern") {
-                        obj.insert("pattern".to_string(), query);
-                        tracing::debug!("[Streaming] Remapped Grep: query → pattern");
-                    }
-                }
-
-                // [CRITICAL FIX] Claude Code uses "path" (string), NOT "paths" (array)!
-                if !obj.contains_key("path") {
-                    if let Some(paths) = obj.remove("paths") {
-                        let path_str = if let Some(arr) = paths.as_array() {
-                            arr.get(0)
-                                .and_then(|v| v.as_str())
-                                .unwrap_or(".")
-                                .to_string()
-                        } else if let Some(s) = paths.as_str() {
-                            s.to_string()
-                        } else {
-                            ".".to_string()
-                        };
-                        obj.insert("path".to_string(), serde_json::json!(path_str));
-                        tracing::debug!(
-                            "[Streaming] Remapped Grep: paths → path(\"{}\")",
-                            path_str
-                        );
-                    } else {
-                        // Default to current directory if missing
-                        obj.insert("path".to_string(), json!("."));
-                        tracing::debug!("[Streaming] Added default path: \".\"");
-                    }
-                }
-
-                // Note: We keep "-n" and "output_mode" if present as they are valid in Grep schema
-            }
-            "glob" => {
-                // [FIX] Gemini hallucination: maps parameter description to "description" field
-                if let Some(desc) = obj.remove("description") {
-                    if !obj.contains_key("pattern") {
-                        obj.insert("pattern".to_string(), desc);
-                        tracing::debug!("[Streaming] Remapped Glob: description → pattern");
-                    }
-                }
-
-                // Gemini uses "query", Claude Code expects "pattern"
-                if let Some(query) = obj.remove("query") {
-                    if !obj.contains_key("pattern") {
-                        obj.insert("pattern".to_string(), query);
-                        tracing::debug!("[Streaming] Remapped Glob: query → pattern");
-                    }
-                }
-
-                // [CRITICAL FIX] Claude Code uses "path" (string), NOT "paths" (array)!
-                if !obj.contains_key("path") {
-                    if let Some(paths) = obj.remove("paths") {
-                        let path_str = if let Some(arr) = paths.as_array() {
-                            arr.get(0)
-                                .and_then(|v| v.as_str())
-                                .unwrap_or(".")
-                                .to_string()
-                        } else if let Some(s) = paths.as_str() {
-                            s.to_string()
-                        } else {
-                            ".".to_string()
-                        };
-                        obj.insert("path".to_string(), serde_json::json!(path_str));
-                        tracing::debug!(
-                            "[Streaming] Remapped Glob: paths → path(\"{}\")",
-                            path_str
-                        );
-                    } else {
-                        // Default to current directory if missing
-                        obj.insert("path".to_string(), json!("."));
-                        tracing::debug!("[Streaming] Added default path: \".\"");
-                    }
-                }
-            }
-            "read" => {
-                // Gemini might use "path" vs "file_path"
-                if let Some(path) = obj.remove("path") {
-                    if !obj.contains_key("file_path") {
-                        obj.insert("file_path".to_string(), path);
-                        tracing::debug!("[Streaming] Remapped Read: path → file_path");
-                    }
-                }
-            }
-            "ls" => {
-                // LS tool: ensure "path" parameter exists
-                if !obj.contains_key("path") {
-                    obj.insert("path".to_string(), json!("."));
-                    tracing::debug!("[Streaming] Remapped LS: default path → \".\"");
-                }
-            }
-            other => {
-                // [NEW] [Issue #785] Generic Property Mapping for all tools
-                // If a tool has "paths" (array of 1) but no "path", convert it.
-                let mut path_to_inject = None;
-                if !obj.contains_key("path") {
-                    if let Some(paths) = obj.get("paths").and_then(|v| v.as_array()) {
-                        if paths.len() == 1 {
-                            if let Some(p) = paths[0].as_str() {
-                                path_to_inject = Some(p.to_string());
-                            }
-                        }
-                    }
-                }
-
-                if let Some(path) = path_to_inject {
-                    obj.insert("path".to_string(), json!(path));
-                    tracing::debug!(
-                        "[Streaming] Probabilistic fix for tool '{}': paths[0] → path(\"{}\")",
-                        other,
-                        path
-                    );
-                }
-                tracing::debug!(
-                    "[Streaming] Unmapped tool call processed via generic rules: {} (keys: {:?})",
-                    other,
-                    obj.keys()
-                );
-            }
-        }
+        tracing::debug!(
+            "[Streaming] Tool Call (Passthrough): '{}' Args: {:?}",
+            name,
+            obj
+        );
     }
 }
 
-/// Block type enum
+/// 块类型枚举
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BlockType {
     None,
@@ -173,7 +31,7 @@ pub enum BlockType {
     Function,
 }
 
-/// Signature manager
+/// 签名管理器
 pub struct SignatureManager {
     pending: Option<String>,
 }
@@ -198,7 +56,7 @@ impl SignatureManager {
     }
 }
 
-/// Streaming state machine
+/// 流式状态机
 pub struct StreamingState {
     block_type: BlockType,
     pub block_index: usize,
@@ -209,7 +67,7 @@ pub struct StreamingState {
     trailing_signature: Option<String>,
     pub web_search_query: Option<String>,
     pub grounding_chunks: Option<Vec<serde_json::Value>>,
-    // [IMPROVED] Error recovery state tracking (prepared for future use)
+    // [IMPROVED] Error recovery 状态追踪 (prepared for future use)
     #[allow(dead_code)]
     parse_error_count: usize,
     #[allow(dead_code)]
@@ -222,7 +80,7 @@ pub struct StreamingState {
     pub scaling_enabled: bool,
     // [NEW] Context limit for smart threshold recovery (default to 1M)
     pub context_limit: u32,
-    // [NEW] MCP XML Bridge buffer
+    // [NEW] MCP XML Bridge 缓冲区
     pub mcp_xml_buffer: String,
     pub in_mcp_xml: bool,
     // [FIX] Estimated prompt tokens for calibrator learning
@@ -234,6 +92,9 @@ pub struct StreamingState {
     pub client_adapter: Option<std::sync::Arc<dyn ClientAdapter>>, // [FIX] Remove Box, use Arc<dyn> directly
     // [FIX #MCP] Registered tool names for fuzzy matching
     pub registered_tool_names: Vec<String>,
+    // [FIX #3379] Track whether any text_delta was emitted this turn (guard G7)
+    pub text_delta_emitted_this_turn: bool,
+    pub thinking_acc: crate::proxy::thinking_store::TurnAccumulator,
 }
 
 impl StreamingState {
@@ -248,7 +109,7 @@ impl StreamingState {
             trailing_signature: None,
             web_search_query: None,
             grounding_chunks: None,
-            // [IMPROVED] Initialize error recovery fields
+            // [IMPROVED] 初始化 error recovery 字段
             parse_error_count: 0,
             last_valid_state: None,
             model_name: None,
@@ -263,6 +124,8 @@ impl StreamingState {
             message_count: 0,
             client_adapter: None,
             registered_tool_names: Vec::new(),
+            text_delta_emitted_this_turn: false,
+            thinking_acc: crate::proxy::thinking_store::TurnAccumulator::new(),
         }
     }
 
@@ -276,7 +139,7 @@ impl StreamingState {
         self.registered_tool_names = names;
     }
 
-    /// Send an SSE event
+    /// 发送 SSE 事件
     pub fn emit(&self, event_type: &str, data: serde_json::Value) -> Bytes {
         let sse = format!(
             "event: {}\ndata: {}\n\n",
@@ -286,7 +149,7 @@ impl StreamingState {
         Bytes::from(sse)
     }
 
-    /// Send the message_start event
+    /// 发送 message_start 事件
     pub fn emit_message_start(&mut self, raw_json: &serde_json::Value) -> Bytes {
         if self.message_start_sent {
             return Bytes::new();
@@ -319,11 +182,6 @@ impl StreamingState {
         if let Some(u) = usage {
             message["usage"] = json!(u);
         } else {
-            // [FIX #3397] Some models' first upstream chunk carries no usageMetadata (e.g.
-            // gpt-oss-120b-medium). Strict Anthropic-protocol clients (OpenCode's
-            // @ai-sdk/anthropic) reject a message_start event whose usage field is missing
-            // entirely, so emit a zero-value placeholder rather than omitting it. Later
-            // message_delta events still carry the real, final token counts.
             message["usage"] = json!({
                 "input_tokens": 0,
                 "output_tokens": 0
@@ -342,7 +200,7 @@ impl StreamingState {
         result
     }
 
-    /// Start a new content block
+    /// 开始新的内容块
     pub fn start_block(
         &mut self,
         block_type: BlockType,
@@ -366,7 +224,7 @@ impl StreamingState {
         chunks
     }
 
-    /// End the current content block
+    /// 结束当前内容块
     pub fn end_block(&mut self) -> Vec<Bytes> {
         if self.block_type == BlockType::None {
             return vec![];
@@ -374,10 +232,21 @@ impl StreamingState {
 
         let mut chunks = Vec::new();
 
-        // Send the buffered signature when a Thinking block ends
-        if self.block_type == BlockType::Thinking && self.signatures.has_pending() {
-            if let Some(signature) = self.signatures.consume() {
-                chunks.push(self.emit_delta("signature_delta", json!({ "signature": signature })));
+        // Thinking 块结束时发送暂存的签名（上游未下发时回退到会话签名）。
+        // **绝不发明哨兵** —— 哨兵是"跳过校验"开关而非假合法签名，
+        // 下发给客户端只会污染其历史；且官方流量里出现 0/23 次，不属于 Antigravity 协议。
+        // 真签名的恢复由网关侧 SQL 状态机（`hydrate`）与终审 `place_turn_signature` 承担。
+        if self.block_type == BlockType::Thinking {
+            let signature = if self.signatures.has_pending() {
+                self.signatures.consume()
+            } else {
+                self.session_id.as_deref().and_then(|sid| {
+                    crate::proxy::SignatureCache::global().get_session_signature(sid)
+                })
+            };
+
+            if let Some(sig) = signature {
+                chunks.push(self.emit_delta("signature_delta", json!({ "signature": sig })));
             }
         }
 
@@ -395,7 +264,7 @@ impl StreamingState {
         chunks
     }
 
-    /// Send a delta event
+    /// 发送 delta 事件
     pub fn emit_delta(&self, delta_type: &str, delta_content: serde_json::Value) -> Bytes {
         let mut delta = json!({ "type": delta_type });
         if let serde_json::Value::Object(map) = delta_content {
@@ -414,7 +283,7 @@ impl StreamingState {
         )
     }
 
-    /// Send the finish event
+    /// 发送结束事件
     pub fn emit_finish(
         &mut self,
         finish_reason: Option<&str>,
@@ -422,36 +291,36 @@ impl StreamingState {
     ) -> Vec<Bytes> {
         let mut chunks = Vec::new();
 
-        // Close the last block
+        // 关闭最后一个块
         chunks.extend(self.end_block());
 
-        // Handle trailingSignature (B4/C3 scenario)
-        // [FIX] Only when no block has been sent yet can we end with a thinking block (as the start of the message)
-        // In practice, for the Claude protocol, if Text has already been sent, Thinking cannot be appended here.
-        // The solution here is: only store the signature, and no longer send an invalid trailing Thinking block.
-        // The signature will be automatically recovered via SignatureCache in the next request.
+        // 处理 trailingSignature (B4/C3 场景)
+        // [FIX] 只有当还没有发送过任何块时, 才能以 thinking 块结束(作为消息的开头)
+        // 实际上, 对于 Claude 协议, 如果已经发送过 Text, 就不能在此追加 Thinking。
+        // 这里的解决方案是: 只存储签名, 不再发送非法的末尾 Thinking 块。
+        // 签名会通过 SignatureCache 在下一轮请求中自动恢复。
         if let Some(signature) = self.trailing_signature.take() {
             tracing::info!(
                 "[Streaming] Captured trailing signature (len: {}), caching for session.",
                 signature.len()
             );
             self.signatures.store(Some(signature));
-            // No longer appending chunks.push(self.emit("content_block_start", ...))
+            // 不再追加 chunks.push(self.emit("content_block_start", ...))
         }
 
-        // Handle grounding (web search) -> convert to a Markdown text block
+        // 处理 grounding(web search) -> 转换为 Markdown 文本块
         if self.web_search_query.is_some() || self.grounding_chunks.is_some() {
             let mut grounding_text = String::new();
 
-            // 1. Handle the search query
+            // 1. 处理搜索词
             if let Some(query) = &self.web_search_query {
                 if !query.is_empty() {
-                    grounding_text.push_str("\n\n---\n**🔍 Searched for you:** ");
+                    grounding_text.push_str("\n\n---\n**🔍 已为您搜索：** ");
                     grounding_text.push_str(query);
                 }
             }
 
-            // 2. Handle source links
+            // 2. 处理来源链接
             if let Some(chunks) = &self.grounding_chunks {
                 let mut links = Vec::new();
                 for (i, chunk) in chunks.iter().enumerate() {
@@ -459,21 +328,21 @@ impl StreamingState {
                         let title = web
                             .get("title")
                             .and_then(|v| v.as_str())
-                            .unwrap_or("Web source");
+                            .unwrap_or("网页来源");
                         let uri = web.get("uri").and_then(|v| v.as_str()).unwrap_or("#");
                         links.push(format!("[{}] [{}]({})", i + 1, title, uri));
                     }
                 }
 
                 if !links.is_empty() {
-                    grounding_text.push_str("\n\n**🌐 Source citations:**\n");
+                    grounding_text.push_str("\n\n**🌐 来源引文：**\n");
                     grounding_text.push_str(&links.join("\n"));
                 }
             }
 
             let trimmed_grounding = grounding_text.trim();
             if !trimmed_grounding.is_empty() {
-                // Send a new text block
+                // 发送一个新的 text 块
                 chunks.push(self.emit(
                     "content_block_start",
                     json!({
@@ -491,7 +360,7 @@ impl StreamingState {
             }
         }
 
-        // Determine stop_reason
+        // 确定 stop_reason
         let stop_reason = if self.used_tool {
             "tool_use"
         } else if finish_reason == Some("MAX_TOKENS") {
@@ -546,42 +415,42 @@ impl StreamingState {
         chunks
     }
 
-    /// Mark that a tool was used
+    /// 标记使用了工具
     pub fn mark_tool_used(&mut self) {
         self.used_tool = true;
     }
 
-    /// Get the current block type
+    /// 获取当前块类型
     pub fn current_block_type(&self) -> BlockType {
         self.block_type
     }
 
-    /// Get the current block index
+    /// 获取当前块索引
     pub fn current_block_index(&self) -> usize {
         self.block_index
     }
 
-    /// Store the signature
+    /// 存储签名
     pub fn store_signature(&mut self, signature: Option<String>) {
         self.signatures.store(signature);
     }
 
-    /// Set the trailing signature
+    /// 设置 trailing signature
     pub fn set_trailing_signature(&mut self, signature: Option<String>) {
         self.trailing_signature = signature;
     }
 
-    /// Get the trailing signature (for inspection only)
+    /// 获取 trailing signature (仅用于检查)
     pub fn has_trailing_signature(&self) -> bool {
         self.trailing_signature.is_some()
     }
 
-    /// Handle SSE parse errors, implementing graceful degradation
+    /// 处理 SSE 解析错误，实现优雅降级
     ///
-    /// When a parse error occurs in the SSE stream:
-    /// 1. Safely close the current block
-    /// 2. Increment the error counter
-    /// 3. Output error information in debug mode
+    /// 当 SSE stream 中发生解析错误时:
+    /// 1. 安全关闭当前 block
+    /// 2. 递增错误计数器
+    /// 3. 在 debug 模式下输出错误信息
     #[allow(dead_code)] // Prepared for future error recovery implementation
     pub fn handle_parse_error(&mut self, raw_data: &str) -> Vec<Bytes> {
         let mut chunks = Vec::new();
@@ -594,26 +463,29 @@ impl StreamingState {
             raw_data.len()
         );
 
-        // Safely close the current block
+        // 安全关闭当前 block
         if self.block_type != BlockType::None {
             self.last_valid_state = Some(self.block_type);
             chunks.extend(self.end_block());
         }
 
-        // Output detailed error information in Debug mode
+        // Debug 模式下输出详细错误信息
         #[cfg(debug_assertions)]
         {
             let preview = if raw_data.len() > 100 {
-                format!("{}...", &raw_data[..100])
+                format!(
+                    "{}...",
+                    crate::proxy::mappers::common_utils::safe_truncate_str(raw_data, 100)
+                )
             } else {
                 raw_data.to_string()
             };
             tracing::debug!("[SSE-Parser] Failed chunk preview: {}", preview);
         }
 
-        // Warn and attempt to send an error signal when the error rate is too high
+        // 错误率过高时发出警告并尝试发送错误信号
         if self.parse_error_count > 3 {
-            // Lower the threshold, notify the user earlier
+            // 降低阈值,更早通知用户
             tracing::error!(
                 "[SSE-Parser] High error rate detected ({} errors). Stream may be corrupted.",
                 self.parse_error_count
@@ -628,7 +500,7 @@ impl StreamingState {
                     "type": "error",
                     "error": {
                         "type": "overloaded_error", // Use standard type
-                        "message": "Network connection is unstable. Please check your network or proxy settings.",
+                        "message": "网络连接不稳定，请检查您的网络或代理设置。",
                     }
                 }),
             ));
@@ -637,21 +509,21 @@ impl StreamingState {
         chunks
     }
 
-    /// Reset the error state (called after recovery)
+    /// 重置错误状态 (recovery 后调用)
     #[allow(dead_code)]
     pub fn reset_error_state(&mut self) {
         self.parse_error_count = 0;
         self.last_valid_state = None;
     }
 
-    /// Get the error count (for monitoring)
+    /// 获取错误计数 (用于监控)
     #[allow(dead_code)]
     pub fn get_error_count(&self) -> usize {
         self.parse_error_count
     }
 }
 
-/// Part processor
+/// Part 处理器
 pub struct PartProcessor<'a> {
     state: &'a mut StreamingState,
 }
@@ -661,34 +533,17 @@ impl<'a> PartProcessor<'a> {
         Self { state }
     }
 
-    /// Process a single part
+    /// 处理单个 part
     pub fn process(&mut self, part: &GeminiPart) -> Vec<Bytes> {
         let mut chunks = Vec::new();
-        // [FIX #545] Decode Base64 signature if present (Gemini sends Base64, Claude expects Raw)
-        let signature = part.thought_signature.as_ref().map(|sig| {
-            // Try to decode as base64
-            use base64::Engine;
-            match base64::engine::general_purpose::STANDARD.decode(sig) {
-                Ok(decoded_bytes) => {
-                    match String::from_utf8(decoded_bytes) {
-                        Ok(decoded_str) => {
-                            tracing::debug!(
-                                "[Streaming] Decoded base64 signature (len {} -> {})",
-                                sig.len(),
-                                decoded_str.len()
-                            );
-                            decoded_str
-                        }
-                        Err(_) => sig.clone(), // Not valid UTF-8, keep as is
-                    }
-                }
-                Err(_) => sig.clone(), // Not base64, keep as is
-            }
-        });
+        // Gemini thought_signature is a base64 protobuf string (e.g. EiY... or EtY...)
+        // DO NOT decode it to raw UTF-8 bytes: that corrupts ASCII-range protobufs (like UUID tags 0x12, 0x26, 0x0a, 0x24)
+        // into control characters, shrinks length below MIN_SIGNATURE_LENGTH, and breaks Gemini signature validation.
+        let signature = part.thought_signature.clone();
 
-        // 1. Handle FunctionCall
+        // 1. FunctionCall 处理
         if let Some(fc) = &part.function_call {
-            // Handle trailingSignature first (B4/C3 scenario)
+            // 先处理 trailingSignature (B4/C3 场景)
             if self.state.has_trailing_signature() {
                 chunks.extend(self.state.end_block());
                 if let Some(trailing_sig) = self.state.trailing_signature.take() {
@@ -718,18 +573,18 @@ impl<'a> PartProcessor<'a> {
             return chunks;
         }
 
-        // 2. Handle Text
+        // 2. Text 处理
         if let Some(text) = &part.text {
             if part.thought.unwrap_or(false) {
                 // Thinking
                 chunks.extend(self.process_thinking(text, signature));
             } else {
-                // Ordinary Text
+                // 普通 Text
                 chunks.extend(self.process_text(text, signature));
             }
         }
 
-        // 3. Handle InlineData (Image)
+        // 3. InlineData (Image) 处理
         if let Some(img) = &part.inline_data {
             let mime_type = &img.mime_type;
             let data = &img.data;
@@ -742,11 +597,11 @@ impl<'a> PartProcessor<'a> {
         chunks
     }
 
-    /// Handle Thinking
+    /// 处理 Thinking
     fn process_thinking(&mut self, text: &str, signature: Option<String>) -> Vec<Bytes> {
         let mut chunks = Vec::new();
 
-        // Handle the previous trailingSignature
+        // 处理之前的 trailingSignature
         if self.state.has_trailing_signature() {
             chunks.extend(self.state.end_block());
             if let Some(trailing_sig) = self.state.trailing_signature.take() {
@@ -770,7 +625,7 @@ impl<'a> PartProcessor<'a> {
             }
         }
 
-        // Start or continue the thinking block
+        // 开始或继续 thinking 块
         if self.state.current_block_type() != BlockType::Thinking {
             chunks.extend(self.state.start_block(
                 BlockType::Thinking,
@@ -829,7 +684,7 @@ impl<'a> PartProcessor<'a> {
             );
         }
 
-        // Buffer the signature (for local block handling)
+        // 暂存签名 (for local block handling)
         // If FIFO, we strictly follow the sequence. The default logic is effectively LIFO for a single turn
         // (store latest, consume at end).
         // For opencode, we just want to ensure we capture IT.
@@ -838,11 +693,11 @@ impl<'a> PartProcessor<'a> {
         chunks
     }
 
-    /// Handle ordinary Text
+    /// 处理普通 Text
     fn process_text(&mut self, text: &str, signature: Option<String>) -> Vec<Bytes> {
         let mut chunks = Vec::new();
 
-        // Empty text with a signature - buffer it
+        // 空 text 带签名 - 暂存
         if text.is_empty() {
             if signature.is_some() {
                 self.state.set_trailing_signature(signature);
@@ -853,7 +708,7 @@ impl<'a> PartProcessor<'a> {
         // [FIX #859] Mark that we have received actual content (text)
         self.state.has_content = true;
 
-        // Handle the previous trailingSignature
+        // 处理之前的 trailingSignature
         if self.state.has_trailing_signature() {
             chunks.extend(self.state.end_block());
             if let Some(trailing_sig) = self.state.trailing_signature.take() {
@@ -877,11 +732,11 @@ impl<'a> PartProcessor<'a> {
             }
         }
 
-        // Non-empty text with a signature - handle it immediately
+        // 非空 text 带签名 - 立即处理
         if signature.is_some() {
-            // [FIX] To protect the signature, the Text block carrying it is sent directly
-            // Note: a thinking block must not be opened here, because non-thinking content may already exist before it.
-            // In this case, we only need to ensure the signature is cached in the state.
+            // [FIX] 为保护签名, 签名所在的 Text 块直接发送
+            // 注意: 不得在此开启 thinking 块, 因为之前可能已有非 thinking 内容。
+            // 这种情况下, 我们只需确签被缓存在状态中。
             self.state.store_signature(signature);
 
             chunks.extend(
@@ -918,7 +773,7 @@ impl<'a> PartProcessor<'a> {
                                 serde_json::from_str(input_str.trim())
                                     .unwrap_or_else(|_| json!({ "input": input_str.trim() }));
 
-                            // Construct and send tool_use
+                            // 构造并发送 tool_use
                             let fc = FunctionCall {
                                 name: tool_name.to_string(),
                                 args: Some(input_json),
@@ -927,14 +782,14 @@ impl<'a> PartProcessor<'a> {
 
                             let tool_chunks = self.process_function_call(&fc, None);
 
-                            // Clear the buffer and reset the state
+                            // 清理缓冲区并重置状态
                             self.state.mcp_xml_buffer.clear();
                             self.state.in_mcp_xml = false;
 
-                            // Handle any non-XML text that may exist before the tag
+                            // 处理标签之前可能存在的非 XML 文本
                             if start_idx > 0 {
                                 let prefix_text = &buffer[..start_idx];
-                                // Cannot recurse here. Emit the preceding text block directly.
+                                // 这里不能递归。直接 emit 之前的 text 块。
                                 if self.state.current_block_type() != BlockType::Text {
                                     chunks.extend(self.state.start_block(
                                         BlockType::Text,
@@ -949,10 +804,10 @@ impl<'a> PartProcessor<'a> {
 
                             chunks.extend(tool_chunks);
 
-                            // Handle any non-XML text that may exist after the tag
+                            // 处理标签之后可能存在的非 XML 文本
                             let suffix = &buffer[close_idx + end_tag.len()..];
                             if !suffix.is_empty() {
-                                // Recursively process the suffix content
+                                // 递归处理后缀内容
                                 chunks.extend(self.process_text(suffix, None));
                             }
 
@@ -965,6 +820,13 @@ impl<'a> PartProcessor<'a> {
             return vec![];
         }
 
+        // [FIX #3379] call:default_api:* leakage recovery bridge
+        // Attempt to recover leaked tool-call text as a proper tool_use block.
+        // Strict Fail-Closed: any unmet guard falls through to normal text_delta.
+        if let Some(recovery_chunks) = self.try_recover_call_default_api_text(text) {
+            return recovery_chunks;
+        }
+
         if self.state.current_block_type() != BlockType::Text {
             chunks.extend(
                 self.state
@@ -972,9 +834,221 @@ impl<'a> PartProcessor<'a> {
             );
         }
 
+        self.state.text_delta_emitted_this_turn = true;
         chunks.push(self.state.emit_delta("text_delta", json!({ "text": text })));
 
         chunks
+    }
+
+    // -------------------------------------------------------------------------
+    // [FIX #3379] Helpers: call:default_api:* leakage detection & recovery
+    // -------------------------------------------------------------------------
+
+    /// Attempt to extract `(tool_name, args_str)` from a raw `call:default_api:*` text.
+    /// Returns None if the text does not strictly match the expected prefix format.
+    fn try_parse_call_default_api(text: &str) -> Option<(String, String)> {
+        const PREFIX: &str = "call:default_api:";
+        let trimmed = text.trim();
+        if !trimmed.starts_with(PREFIX) {
+            return None;
+        }
+        let rest = &trimmed[PREFIX.len()..];
+        // Tool name ends at the first `{` or `(` delimiter
+        let tool_end = rest.find(|c| c == '{' || c == '(').unwrap_or(rest.len());
+        let tool_name = rest[..tool_end].trim().to_string();
+        if tool_name.is_empty() {
+            return None;
+        }
+        let args_str = rest[tool_end..].trim().to_string();
+        Some((tool_name, args_str))
+    }
+
+    /// Two-phase JSON argument parser for Gemini's loose call:default_api format.
+    ///
+    /// Phase 1: standard `serde_json` parse (handles well-formed JSON).
+    /// Phase 2: lenient key-quoting heuristic for unquoted keys (e.g. `{file_path:foo}`).
+    /// Returns `None` (guard G6) if both phases fail.
+    fn parse_loose_json_args(args_str: &str) -> Option<serde_json::Value> {
+        if args_str.is_empty() {
+            // No-arg tool call → valid empty object
+            return Some(serde_json::json!({}));
+        }
+
+        // Phase 1: strict JSON
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(args_str) {
+            if v.is_object() {
+                return Some(v);
+            }
+        }
+
+        // Phase 2: lenient key-quoting for Gemini's internal pseudo-JSON
+        // Only attempt if the string looks like a {…} block.
+        let s = args_str.trim();
+        if !s.starts_with('{') || !s.ends_with('}') {
+            return None;
+        }
+        let inner = &s[1..s.len() - 1];
+
+        // Naïve key-quoting: add double-quotes around bare identifier keys.
+        // This covers the most common Gemini output patterns.
+        let mut result = String::from("{");
+        let mut in_value = false;
+        let mut i = 0;
+        let chars: Vec<char> = inner.chars().collect();
+        while i < chars.len() {
+            let c = chars[i];
+            match c {
+                ',' if !in_value => {
+                    result.push(',');
+                    i += 1;
+                }
+                ':' => {
+                    result.push(':');
+                    in_value = true;
+                    i += 1;
+                }
+                '"' if in_value => {
+                    // Quoted value — pass through until closing quote
+                    result.push('"');
+                    i += 1;
+                    while i < chars.len() && chars[i] != '"' {
+                        if chars[i] == '\\' {
+                            result.push('\\');
+                            i += 1;
+                        }
+                        if i < chars.len() {
+                            result.push(chars[i]);
+                            i += 1;
+                        }
+                    }
+                    if i < chars.len() {
+                        result.push('"');
+                        i += 1;
+                    }
+                    in_value = false;
+                }
+                _ if !in_value => {
+                    // Bare key — wrap with quotes
+                    let key_start = i;
+                    while i < chars.len() && chars[i] != ':' && chars[i] != ',' {
+                        i += 1;
+                    }
+                    let key: String = chars[key_start..i].iter().collect();
+                    let key_trimmed = key.trim();
+                    result.push('"');
+                    result.push_str(key_trimmed);
+                    result.push('"');
+                }
+                _ => {
+                    // Bare value — collect until `,` or end
+                    let val_start = i;
+                    while i < chars.len() && chars[i] != ',' {
+                        result.push(chars[i]);
+                        i += 1;
+                    }
+                    let _ = val_start; // consumed inline
+                    in_value = false;
+                }
+            }
+        }
+        result.push('}');
+
+        serde_json::from_str::<serde_json::Value>(&result)
+            .ok()
+            .filter(|v| v.is_object())
+    }
+
+    /// Fail-Closed recovery: attempts to convert a `call:default_api:*` text leak
+    /// into a proper `tool_use` block by passing 7 strict guards.
+    ///
+    /// Returns `Some(chunks)` when recovery succeeds, or `None` to let the caller
+    /// fall through to the normal `text_delta` path.
+    fn try_recover_call_default_api_text(&mut self, text: &str) -> Option<Vec<bytes::Bytes>> {
+        // G1: Tools must have been registered for this request
+        if self.state.registered_tool_names.is_empty() {
+            return None;
+        }
+
+        // G3: Strict prefix check before doing any expensive work
+        if !text.trim().starts_with("call:default_api:") {
+            return None;
+        }
+
+        let (tool_name, args_str) = Self::try_parse_call_default_api(text)?;
+
+        // G5: The entire text (trimmed) must consist solely of this one expression.
+        // This prevents documentation strings like "Use call:default_api:Read{...}" from
+        // being mistakenly executed.
+        let full_expr = format!(
+            "call:default_api:{}{}",
+            tool_name,
+            if args_str.is_empty() {
+                String::new()
+            } else {
+                format!(" {}", args_str)
+            }
+        );
+        // Allow minor whitespace variance but reject any surrounding prose
+        let trimmed_text = text.trim();
+        // The text must start with call:default_api:<tool_name> and end right after the args block
+        if !trimmed_text.starts_with(&format!("call:default_api:{}", tool_name)) {
+            return None;
+        }
+        // After the tool name and args there must be nothing else (ignore trailing whitespace)
+        let after_tool_name = &trimmed_text["call:default_api:".len() + tool_name.len()..].trim();
+        // after_tool_name is either empty (no args) or is the args string itself
+        if !after_tool_name.is_empty()
+            && !after_tool_name.starts_with('{')
+            && !after_tool_name.starts_with('(')
+        {
+            // There is non-arg text after the tool name — reject
+            return None;
+        }
+        let _ = full_expr; // suppress unused warning
+
+        // G4: Tool name must be in the registered whitelist (exact match, case-insensitive)
+        let matched_name = self
+            .state
+            .registered_tool_names
+            .iter()
+            .find(|n| n.eq_ignore_ascii_case(&tool_name))
+            .cloned()?;
+
+        // G2: Current turn must NOT have already produced a structured functionCall
+        if self.state.used_tool {
+            tracing::warn!(
+                "[#3379] Detected call:default_api:{} leakage but used_tool=true; skipping recovery",
+                tool_name
+            );
+            return None;
+        }
+
+        // G7: No text_delta must have been emitted this turn
+        if self.state.text_delta_emitted_this_turn {
+            tracing::warn!(
+                "[#3379] Detected call:default_api:{} leakage but text_delta already emitted this turn; skipping recovery",
+                tool_name
+            );
+            return None;
+        }
+
+        // G6: Arguments must parse as a valid JSON object
+        let parsed_args = Self::parse_loose_json_args(&args_str)?;
+
+        // All guards passed — perform recovery
+        tracing::warn!(
+            "[#3379-RECOVERY] Recovering call:default_api:{} as tool_use (args_len={})",
+            matched_name,
+            args_str.len()
+        );
+
+        let fc = FunctionCall {
+            name: matched_name,
+            args: Some(parsed_args),
+            id: None,
+        };
+
+        Some(self.process_function_call(&fc, None))
     }
 
     /// Process FunctionCall and capture signature for global storage
@@ -995,42 +1069,17 @@ impl<'a> PartProcessor<'a> {
             )
         });
 
-        let mut tool_name = fc.name.clone();
-        if tool_name.to_lowercase() == "search" {
-            tool_name = "grep".to_string();
-            tracing::debug!("[Streaming] Normalizing tool name: Search → grep");
-        }
+        let tool_name = fc.name.clone();
 
-        // [FIX #MCP] MCP tool name fuzzy matching
-        // Gemini often hallucinates incorrect MCP tool names, e.g.:
-        //   "mcp__puppeteer_navigate" instead of "mcp__puppeteer__puppeteer_navigate"
-        // We attempt to find the closest registered tool name.
-        if tool_name.starts_with("mcp__") && !self.state.registered_tool_names.is_empty() {
-            if !self.state.registered_tool_names.contains(&tool_name) {
-                if let Some(matched) =
-                    fuzzy_match_mcp_tool(&tool_name, &self.state.registered_tool_names)
-                {
-                    tracing::warn!(
-                        "[FIX #MCP] Corrected MCP tool name: '{}' → '{}'",
-                        tool_name,
-                        matched
-                    );
-                    tool_name = matched;
-                } else {
-                    tracing::warn!(
-                        "[FIX #MCP] No fuzzy match found for MCP tool '{}'. Passing as-is.",
-                        tool_name
-                    );
-                }
-            }
-        }
+        // Record real tool_id into TurnAccumulator for precise session/fingerprint recovery
+        self.state.thinking_acc.record_tool_id(&tool_name, &tool_id);
 
-        // 1. Send content_block_start (input is an empty object)
+        // 1. 发送 content_block_start (input 为空对象)
         let mut tool_use = json!({
             "type": "tool_use",
             "id": tool_id,
             "name": tool_name,
-            "input": {} // Must be empty; arguments are sent via delta
+            "input": {} // 必须为空，参数通过 delta 发送
         });
 
         if let Some(ref sig) = signature {
@@ -1056,145 +1105,34 @@ impl<'a> PartProcessor<'a> {
 
         chunks.extend(self.state.start_block(BlockType::Function, tool_use));
 
-        // 2. Send input_json_delta (the complete arguments JSON string)
-        // [FIX] Remap args before serialization for Gemini → Claude compatibility
-        if let Some(args) = &fc.args {
-            let mut remapped_args = args.clone();
+        // 2. 发送 input_json_delta (完整的参数 JSON 字符串)
+        // [FIX #Bug2/#Bug4] ALWAYS emit input_json_delta, even for empty/null args.
+        // Claude protocol requires this delta before content_block_stop.
+        // Skipping it causes clients (Claude Code) to misinterpret tool calls as text.
+        {
+            let json_str = if let Some(args) = &fc.args {
+                let mut remapped_args = args.clone();
+                remap_function_call_args(&fc.name, &mut remapped_args);
+                serde_json::to_string(&remapped_args).unwrap_or_else(|_| "{}".to_string())
+            } else {
+                // [FIX #Bug4] No args provided (e.g. EnterPlanMode): emit empty JSON object
+                tracing::debug!(
+                    "[Streaming] Tool '{}' has no args, emitting empty input_json_delta",
+                    fc.name
+                );
+                "{}".to_string()
+            };
 
-            let tool_name_title = fc.name.clone();
-            // [OPTIMIZED] Only rename if it's "search" which is a known hallucination.
-            // Avoid renaming "grep" to "Grep" if possible to protect signature,
-            // unless we're sure Grep is the standard.
-            let mut final_tool_name = tool_name_title;
-            if final_tool_name.to_lowercase() == "search" {
-                final_tool_name = "Grep".to_string();
-            }
-            remap_function_call_args(&final_tool_name, &mut remapped_args);
-
-            let json_str =
-                serde_json::to_string(&remapped_args).unwrap_or_else(|_| "{}".to_string());
             chunks.push(
                 self.state
                     .emit_delta("input_json_delta", json!({ "partial_json": json_str })),
             );
         }
 
-        // 3. End the block
+        // 3. 结束块
         chunks.extend(self.state.end_block());
 
         chunks
-    }
-}
-
-/// [FIX #MCP] Fuzzy match an incorrect MCP tool name against registered tool names.
-///
-/// MCP tool naming convention: `mcp__<server_name>__<tool_name>`
-/// Gemini often hallucinates by:
-///   1. Dropping the server prefix: `mcp__navigate` → should be `mcp__puppeteer__puppeteer_navigate`
-///   2. Merging server+tool: `mcp__puppeteer_navigate` → should be `mcp__puppeteer__puppeteer_navigate`
-///   3. Partial name: `mcp__pup_navigate` → should be `mcp__puppeteer__puppeteer_navigate`
-///
-/// Strategy (in priority order):
-///   1. Exact suffix match: if the hallucinated name's suffix exactly matches a registered tool's suffix
-///   2. Suffix contained: if the hallucinated name (without `mcp__`) is contained in a registered tool name
-///   3. Longest common subsequence scoring: picks the registered tool with the best LCS ratio
-fn fuzzy_match_mcp_tool(hallucinated: &str, registered: &[String]) -> Option<String> {
-    let mcp_tools: Vec<&String> = registered
-        .iter()
-        .filter(|name| name.starts_with("mcp__"))
-        .collect();
-
-    if mcp_tools.is_empty() {
-        return None;
-    }
-
-    // Extract the part after "mcp__" for the hallucinated name
-    let hallucinated_suffix = &hallucinated[5..]; // skip "mcp__"
-
-    // Strategy 1: Exact suffix match
-    // e.g., hallucinated = "mcp__puppeteer_navigate", registered = "mcp__puppeteer__puppeteer_navigate"
-    // Check if any registered tool ends with the hallucinated suffix after `__`
-    for tool in &mcp_tools {
-        // For registered tool "mcp__server__tool_name", extract "tool_name"
-        if let Some(last_sep) = tool.rfind("__") {
-            let tool_suffix = &tool[last_sep + 2..];
-            if hallucinated_suffix == tool_suffix {
-                return Some(tool.to_string());
-            }
-        }
-    }
-
-    // Strategy 2: Suffix contained match
-    // e.g., hallucinated = "mcp__puppeteer_navigate", check if "puppeteer_navigate" is a substring
-    // of any registered tool's full name
-    let mut contained_matches: Vec<(&String, usize)> = Vec::new();
-    for tool in &mcp_tools {
-        let tool_lower = tool.to_lowercase();
-        let hall_lower = hallucinated_suffix.to_lowercase();
-        if tool_lower.contains(&hall_lower) {
-            contained_matches.push((tool, tool.len()));
-        }
-    }
-    // Pick the shortest match (most specific)
-    if !contained_matches.is_empty() {
-        contained_matches.sort_by_key(|(_, len)| *len);
-        return Some(contained_matches[0].0.to_string());
-    }
-
-    // Strategy 3: Normalized token overlap scoring
-    // Split both names into tokens by '_' and '__', compute overlap ratio
-    let hall_tokens: Vec<&str> = hallucinated_suffix
-        .split(|c: char| c == '_')
-        .filter(|s| !s.is_empty())
-        .collect();
-
-    if hall_tokens.is_empty() {
-        return None;
-    }
-
-    let mut best_match: Option<String> = None;
-    let mut best_score: f64 = 0.0;
-    let threshold = 0.4; // Minimum overlap ratio to consider a match
-
-    for tool in &mcp_tools {
-        let tool_after_mcp = &tool[5..]; // skip "mcp__"
-        let tool_tokens: Vec<&str> = tool_after_mcp
-            .split(|c: char| c == '_')
-            .filter(|s| !s.is_empty())
-            .collect();
-
-        if tool_tokens.is_empty() {
-            continue;
-        }
-
-        // Count matching tokens
-        let mut matches = 0;
-        for ht in &hall_tokens {
-            if tool_tokens.iter().any(|tt| tt.eq_ignore_ascii_case(ht)) {
-                matches += 1;
-            }
-        }
-
-        // Score = matching tokens / max(hall_tokens, tool_tokens)
-        let max_len = hall_tokens.len().max(tool_tokens.len()) as f64;
-        let score = matches as f64 / max_len;
-
-        if score > best_score {
-            best_score = score;
-            best_match = Some(tool.to_string());
-        }
-    }
-
-    if best_score >= threshold {
-        tracing::debug!(
-            "[FIX #MCP] Fuzzy match score for '{}': {:.2} -> {:?}",
-            hallucinated,
-            best_score,
-            best_match
-        );
-        best_match
-    } else {
-        None
     }
 }
 
@@ -1269,92 +1207,322 @@ mod tests {
         assert!(output.contains(r#""type":"content_block_stop""#));
     }
 
+    /// [FIX #Bug4] Tool with args=None MUST still emit input_json_delta with "{}"
     #[test]
-    fn test_fuzzy_match_mcp_tool_exact_suffix() {
-        let registered = vec![
-            "mcp__puppeteer__puppeteer_navigate".to_string(),
-            "mcp__puppeteer__puppeteer_screenshot".to_string(),
-            "mcp__filesystem__read_file".to_string(),
-        ];
+    fn test_process_function_call_no_args_emits_empty_delta() {
+        let mut state = StreamingState::new();
+        let mut processor = PartProcessor::new(&mut state);
 
-        // Gemini drops server prefix, produces: mcp__puppeteer_navigate
-        // Should match mcp__puppeteer__puppeteer_navigate via suffix "puppeteer_navigate"
-        let result = fuzzy_match_mcp_tool("mcp__puppeteer_navigate", &registered);
-        assert_eq!(
-            result,
-            Some("mcp__puppeteer__puppeteer_navigate".to_string())
+        let fc = FunctionCall {
+            name: "EnterPlanMode".to_string(),
+            args: None, // No args at all
+            id: Some("call_no_args".to_string()),
+        };
+
+        let part = GeminiPart {
+            text: None,
+            function_call: Some(fc),
+            inline_data: None,
+            thought: None,
+            thought_signature: None,
+            function_response: None,
+        };
+
+        let chunks = processor.process(&part);
+        let output = chunks
+            .iter()
+            .map(|b| String::from_utf8(b.to_vec()).unwrap())
+            .collect::<Vec<_>>()
+            .join("");
+
+        // Must have tool_use block start
+        assert!(output.contains(r#""type":"content_block_start""#));
+        assert!(output.contains(r#""name":"EnterPlanMode""#));
+
+        // [FIX #Bug4] Must emit input_json_delta even for None args
+        assert!(
+            output.contains(r#""type":"input_json_delta""#),
+            "MUST emit input_json_delta even when args is None; output={}",
+            &output[..output.len().min(600)]
+        );
+        assert!(
+            output.contains(r#""partial_json":"{}""#),
+            "input_json_delta must be empty JSON object for None args"
+        );
+
+        // Must close block
+        assert!(output.contains(r#""type":"content_block_stop""#));
+        assert!(state.used_tool);
+    }
+
+    /// [FIX #Bug2] Tool with args=Some({}) (empty obj) MUST still emit input_json_delta
+    #[test]
+    fn test_process_function_call_empty_args_emits_delta() {
+        let mut state = StreamingState::new();
+        let mut processor = PartProcessor::new(&mut state);
+
+        let fc = FunctionCall {
+            name: "SomeTool".to_string(),
+            args: Some(json!({})), // Empty args object
+            id: Some("call_empty".to_string()),
+        };
+
+        let part = GeminiPart {
+            text: None,
+            function_call: Some(fc),
+            inline_data: None,
+            thought: None,
+            thought_signature: None,
+            function_response: None,
+        };
+
+        let chunks = processor.process(&part);
+        let output = chunks
+            .iter()
+            .map(|b| String::from_utf8(b.to_vec()).unwrap())
+            .collect::<Vec<_>>()
+            .join("");
+
+        // [FIX #Bug2] Must emit input_json_delta for empty object args
+        assert!(
+            output.contains(r#""type":"input_json_delta""#),
+            "Must emit input_json_delta for empty args object; output={}",
+            &output[..output.len().min(600)]
+        );
+        assert!(state.used_tool);
+    }
+
+    // -------------------------------------------------------------------------
+    // [FIX #3379] Tests: call:default_api:* leakage recovery
+    // -------------------------------------------------------------------------
+
+    /// Helper: build a PartProcessor with registered tool names
+    fn make_processor_with_tools<'a>(
+        state: &'a mut StreamingState,
+        tools: Vec<&str>,
+    ) -> PartProcessor<'a> {
+        state.set_registered_tool_names(tools.into_iter().map(|s| s.to_string()).collect());
+        PartProcessor::new(state)
+    }
+
+    /// Collect all SSE chunks into a single string
+    fn chunks_to_string(chunks: &[bytes::Bytes]) -> String {
+        chunks
+            .iter()
+            .map(|b| String::from_utf8_lossy(b).to_string())
+            .collect::<Vec<_>>()
+            .join("")
+    }
+
+    #[test]
+    fn test_3379_positive_recovery_standard_json() {
+        // Positive: registered tool, standard JSON args, no prose → should recover
+        let mut state = StreamingState::new();
+        let mut processor = make_processor_with_tools(&mut state, vec!["Read"]);
+
+        let text = r#"call:default_api:Read{"file_path":"/tmp/foo.txt","limit":100}"#;
+        let part = GeminiPart {
+            text: Some(text.to_string()),
+            function_call: None,
+            inline_data: None,
+            thought: None,
+            thought_signature: None,
+            function_response: None,
+        };
+        let chunks = processor.process(&part);
+        let output = chunks_to_string(&chunks);
+
+        // Should produce a tool_use block, not a text_delta
+        assert!(
+            output.contains(r#""type":"content_block_start""#),
+            "Expected tool_use block_start, got: {}",
+            output
+        );
+        assert!(
+            output.contains(r#""name":"Read""#),
+            "Expected tool name Read"
+        );
+        assert!(
+            !output.contains("text_delta"),
+            "Must NOT produce text_delta for recovered call"
+        );
+        assert!(state.used_tool, "used_tool must be true after recovery");
+    }
+
+    #[test]
+    fn test_3379_negative_tool_not_registered() {
+        // G4 guard: tool name not in whitelist → text_delta
+        let mut state = StreamingState::new();
+        let mut processor = make_processor_with_tools(&mut state, vec!["Write"]);
+
+        let text = r#"call:default_api:Read{"file_path":"/tmp/foo.txt"}"#;
+        let part = GeminiPart {
+            text: Some(text.to_string()),
+            function_call: None,
+            inline_data: None,
+            thought: None,
+            thought_signature: None,
+            function_response: None,
+        };
+        let chunks = processor.process(&part);
+        let output = chunks_to_string(&chunks);
+
+        assert!(
+            output.contains("text_delta"),
+            "Unregistered tool must fall through to text_delta"
+        );
+        assert!(!state.used_tool, "used_tool must remain false");
+    }
+
+    #[test]
+    fn test_3379_negative_no_tools_registered() {
+        // G1 guard: no tools in request → text_delta
+        let mut state = StreamingState::new(); // no registered_tool_names
+        let mut processor = PartProcessor::new(&mut state);
+
+        let text = r#"call:default_api:Read{"file_path":"/tmp/foo.txt"}"#;
+        let part = GeminiPart {
+            text: Some(text.to_string()),
+            function_call: None,
+            inline_data: None,
+            thought: None,
+            thought_signature: None,
+            function_response: None,
+        };
+        let chunks = processor.process(&part);
+        let output = chunks_to_string(&chunks);
+
+        assert!(
+            output.contains("text_delta"),
+            "Empty registered_tool_names must fall through to text_delta"
         );
     }
 
     #[test]
-    fn test_fuzzy_match_mcp_tool_exact_match_no_correction() {
-        let registered = vec!["mcp__puppeteer__puppeteer_navigate".to_string()];
+    fn test_3379_negative_surrounding_prose() {
+        // G5 guard: text not solely the call expression → text_delta
+        let mut state = StreamingState::new();
+        let mut processor = make_processor_with_tools(&mut state, vec!["Read"]);
 
-        // Already correct - should not be called (the caller checks contains first)
-        // But if called, should find it
-        let result = fuzzy_match_mcp_tool("mcp__puppeteer__puppeteer_navigate", &registered);
-        // It will match via suffix strategy
+        let text = "Here is what I am doing: call:default_api:Read{\"file_path\":\"/tmp/foo.txt\"}";
+        let part = GeminiPart {
+            text: Some(text.to_string()),
+            function_call: None,
+            inline_data: None,
+            thought: None,
+            thought_signature: None,
+            function_response: None,
+        };
+        let chunks = processor.process(&part);
+        let output = chunks_to_string(&chunks);
+
+        assert!(
+            output.contains("text_delta"),
+            "Prose-wrapped call must fall through to text_delta"
+        );
+        assert!(!state.used_tool);
+    }
+
+    #[test]
+    fn test_3379_negative_broken_json_args() {
+        // G6 guard: args not valid JSON → text_delta
+        let mut state = StreamingState::new();
+        let mut processor = make_processor_with_tools(&mut state, vec!["Read"]);
+
+        let text = "call:default_api:Read{file_path: NOT JSON !!!}";
+        let part = GeminiPart {
+            text: Some(text.to_string()),
+            function_call: None,
+            inline_data: None,
+            thought: None,
+            thought_signature: None,
+            function_response: None,
+        };
+        let chunks = processor.process(&part);
+        let output = chunks_to_string(&chunks);
+
+        assert!(
+            output.contains("text_delta"),
+            "Broken JSON args must fall through to text_delta"
+        );
+        assert!(!state.used_tool);
+    }
+
+    #[test]
+    fn test_3379_negative_text_delta_already_emitted() {
+        // G7 guard: text_delta already emitted this turn → skip recovery
+        let mut state = StreamingState::new();
+        state.set_registered_tool_names(vec!["Read".to_string()]);
+        // Simulate a prior text_delta having been emitted
+        state.text_delta_emitted_this_turn = true;
+
+        let mut processor = PartProcessor::new(&mut state);
+        let text = r#"call:default_api:Read{"file_path":"/tmp/foo.txt"}"#;
+        let part = GeminiPart {
+            text: Some(text.to_string()),
+            function_call: None,
+            inline_data: None,
+            thought: None,
+            thought_signature: None,
+            function_response: None,
+        };
+        let chunks = processor.process(&part);
+        let output = chunks_to_string(&chunks);
+
+        assert!(
+            output.contains("text_delta"),
+            "G7 must prevent recovery after text_delta was emitted"
+        );
+        assert!(!state.used_tool);
+    }
+
+    #[test]
+    fn test_3379_parse_loose_json_standard() {
+        // parse_loose_json_args: standard JSON passes Phase 1
+        let result =
+            PartProcessor::parse_loose_json_args(r#"{"file_path":"/tmp/foo","limit":100}"#);
         assert!(result.is_some());
+        let v = result.unwrap();
+        assert_eq!(v["file_path"], "/tmp/foo");
+        assert_eq!(v["limit"], 100);
     }
 
     #[test]
-    fn test_fuzzy_match_mcp_tool_suffix_contained() {
-        let registered = vec![
-            "mcp__puppeteer__puppeteer_navigate".to_string(),
-            "mcp__puppeteer__puppeteer_click".to_string(),
-        ];
+    fn test_3379_parse_loose_json_empty() {
+        // Empty args → valid empty object
+        let result = PartProcessor::parse_loose_json_args("");
+        assert_eq!(result, Some(serde_json::json!({})));
+    }
 
-        // Gemini produces a partial-but-contained name
-        let result = fuzzy_match_mcp_tool("mcp__navigate", &registered);
-        assert_eq!(
-            result,
-            Some("mcp__puppeteer__puppeteer_navigate".to_string())
+    #[test]
+    fn test_3379_regression_native_function_call_unaffected() {
+        // Regression: native functionCall must still produce tool_use unaffected
+        let mut state = StreamingState::new();
+        state.set_registered_tool_names(vec!["Read".to_string()]);
+        let mut processor = PartProcessor::new(&mut state);
+
+        let fc = FunctionCall {
+            name: "Read".to_string(),
+            args: Some(json!({"file_path": "/tmp/native.txt"})),
+            id: Some("call_native_001".to_string()),
+        };
+        let part = GeminiPart {
+            text: None,
+            function_call: Some(fc),
+            inline_data: None,
+            thought: None,
+            thought_signature: None,
+            function_response: None,
+        };
+        let chunks = processor.process(&part);
+        let output = chunks_to_string(&chunks);
+
+        assert!(
+            output.contains(r#""type":"content_block_start""#),
+            "Native functionCall must still produce tool_use"
         );
-    }
-
-    #[test]
-    fn test_fuzzy_match_mcp_tool_token_overlap() {
-        let registered = vec![
-            "mcp__filesystem__read_file".to_string(),
-            "mcp__filesystem__write_file".to_string(),
-            "mcp__filesystem__list_directory".to_string(),
-        ];
-
-        // Gemini produces: mcp__read_file → should match mcp__filesystem__read_file
-        let result = fuzzy_match_mcp_tool("mcp__read_file", &registered);
-        assert_eq!(result, Some("mcp__filesystem__read_file".to_string()));
-    }
-
-    #[test]
-    fn test_fuzzy_match_mcp_tool_no_match() {
-        let registered = vec!["mcp__puppeteer__puppeteer_navigate".to_string()];
-
-        // Completely unrelated name
-        let result = fuzzy_match_mcp_tool("mcp__totally_unrelated_xyz", &registered);
-        assert_eq!(result, None);
-    }
-
-    #[test]
-    fn test_fuzzy_match_mcp_tool_no_mcp_tools() {
-        let registered = vec!["regular_tool".to_string(), "another_tool".to_string()];
-
-        // No MCP tools in registry
-        let result = fuzzy_match_mcp_tool("mcp__puppeteer_navigate", &registered);
-        assert_eq!(result, None);
-    }
-
-    #[test]
-    fn test_fuzzy_match_mcp_tool_screenshot() {
-        let registered = vec![
-            "mcp__puppeteer__puppeteer_navigate".to_string(),
-            "mcp__puppeteer__puppeteer_screenshot".to_string(),
-            "mcp__puppeteer__puppeteer_click".to_string(),
-        ];
-
-        let result = fuzzy_match_mcp_tool("mcp__puppeteer_screenshot", &registered);
-        assert_eq!(
-            result,
-            Some("mcp__puppeteer__puppeteer_screenshot".to_string())
-        );
+        assert!(output.contains(r#""name":"Read""#));
+        assert!(!output.contains("text_delta"));
+        assert!(state.used_tool);
     }
 }

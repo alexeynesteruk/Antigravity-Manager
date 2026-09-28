@@ -4,10 +4,10 @@ use std::collections::HashMap;
 use std::sync::{OnceLock, RwLock};
 
 // ============================================================================
-// Helper utility functions
+// 辅助工具函数
 // ============================================================================
 
-/// Normalize a proxy URL, defaulting to http:// if the scheme is missing
+/// 标准化代理 URL，如果缺失协议则默认补全 http://
 pub fn normalize_proxy_url(url: &str) -> String {
     let url = url.trim();
     if url.is_empty() {
@@ -21,12 +21,15 @@ pub fn normalize_proxy_url(url: &str) -> String {
 }
 
 // ============================================================================
-// Global Thinking Budget config storage
-// Used to access the config from within request transform functions (without changing their signatures)
+// 全局 Thinking Budget 配置存储
+// 用于在 request transform 函数中访问配置（无需修改函数签名）
 // ============================================================================
+#[cfg(test)]
+pub static TEST_CONFIG_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 static GLOBAL_THINKING_BUDGET_CONFIG: OnceLock<RwLock<ThinkingBudgetConfig>> = OnceLock::new();
 
-/// Get the current Thinking Budget config
+/// 获取当前 Thinking Budget 配置
 pub fn get_thinking_budget_config() -> ThinkingBudgetConfig {
     GLOBAL_THINKING_BUDGET_CONFIG
         .get()
@@ -35,35 +38,57 @@ pub fn get_thinking_budget_config() -> ThinkingBudgetConfig {
         .unwrap_or_default()
 }
 
-/// Update the global Thinking Budget config
+/// 更新全局 Thinking Budget 配置
 pub fn update_thinking_budget_config(config: ThinkingBudgetConfig) {
     if let Some(lock) = GLOBAL_THINKING_BUDGET_CONFIG.get() {
         if let Ok(mut cfg) = lock.write() {
             *cfg = config.clone();
             tracing::info!(
-                "[Thinking-Budget] Global config updated: mode={:?}, custom_value={}",
-                config.mode,
-                config.custom_value
+                "[Thinking-Budget] Global config updated: source={:?}, flash_mode={:?} (L:{}, M:{}, H:{}, T:{}), pro_mode={:?} (L:{}, H:{}), claude_mode={:?} (L:{}, M:{}, H:{})",
+                config.control_source,
+                config.flash_mode,
+                config.flash_low,
+                config.flash_medium,
+                config.flash_high,
+                config.flash_tiered,
+                config.pro_mode,
+                config.pro_low,
+                config.pro_high,
+                config.claude_mode,
+                config.claude_low,
+                config.claude_medium,
+                config.claude_high
             );
         }
     } else {
-        // First-time initialization
+        // 首次初始化
         let _ = GLOBAL_THINKING_BUDGET_CONFIG.set(RwLock::new(config.clone()));
         tracing::info!(
-            "[Thinking-Budget] Global config initialized: mode={:?}, custom_value={}",
-            config.mode,
-            config.custom_value
+            "[Thinking-Budget] Global config initialized: source={:?}, flash_mode={:?} (L:{}, M:{}, H:{}, T:{}), pro_mode={:?} (L:{}, H:{}), claude_mode={:?} (L:{}, M:{}, H:{})",
+            config.control_source,
+            config.flash_mode,
+            config.flash_low,
+            config.flash_medium,
+            config.flash_high,
+            config.flash_tiered,
+            config.pro_mode,
+            config.pro_low,
+            config.pro_high,
+            config.claude_mode,
+            config.claude_low,
+            config.claude_medium,
+            config.claude_high
         );
     }
 }
 
 // ============================================================================
-// Global system prompt config storage
-// Users can configure a global prompt in settings, automatically injected into every request's systemInstruction
+// 全局系统提示词配置存储
+// 用户可在设置中配置一段全局提示词，自动注入到所有请求的 systemInstruction 中
 // ============================================================================
 static GLOBAL_SYSTEM_PROMPT_CONFIG: OnceLock<RwLock<GlobalSystemPromptConfig>> = OnceLock::new();
 
-/// Get the current global system prompt config
+/// 获取当前全局系统提示词配置
 pub fn get_global_system_prompt() -> GlobalSystemPromptConfig {
     GLOBAL_SYSTEM_PROMPT_CONFIG
         .get()
@@ -72,7 +97,7 @@ pub fn get_global_system_prompt() -> GlobalSystemPromptConfig {
         .unwrap_or_default()
 }
 
-/// Update the global system prompt config
+/// 更新全局系统提示词配置
 pub fn update_global_system_prompt_config(config: GlobalSystemPromptConfig) {
     if let Some(lock) = GLOBAL_SYSTEM_PROMPT_CONFIG.get() {
         if let Ok(mut cfg) = lock.write() {
@@ -84,7 +109,7 @@ pub fn update_global_system_prompt_config(config: GlobalSystemPromptConfig) {
             );
         }
     } else {
-        // First-time initialization
+        // 首次初始化
         let _ = GLOBAL_SYSTEM_PROMPT_CONFIG.set(RwLock::new(config.clone()));
         tracing::info!(
             "[Global-System-Prompt] Config initialized: enabled={}, content_len={}",
@@ -95,7 +120,7 @@ pub fn update_global_system_prompt_config(config: GlobalSystemPromptConfig) {
 }
 
 // ============================================================================
-// Global image thinking mode config storage
+// 全局图像思维模式配置存储
 // ============================================================================
 static GLOBAL_IMAGE_THINKING_MODE: OnceLock<RwLock<String>> = OnceLock::new();
 
@@ -122,13 +147,105 @@ pub fn update_image_thinking_mode(mode: Option<String>) {
 }
 
 // ============================================================================
-// Global compression level config storage
+// 全局压缩等级配置存储
 // ============================================================================
 static GLOBAL_COMPRESSION_LEVEL: OnceLock<RwLock<String>> = OnceLock::new();
 static GLOBAL_USAGE_SCALING: OnceLock<RwLock<bool>> = OnceLock::new();
 static GLOBAL_THRESHOLD_L1: OnceLock<RwLock<f32>> = OnceLock::new();
 static GLOBAL_THRESHOLD_L2: OnceLock<RwLock<f32>> = OnceLock::new();
 static GLOBAL_THRESHOLD_L3: OnceLock<RwLock<f32>> = OnceLock::new();
+static GLOBAL_PAYLOAD_STORAGE_MODE: OnceLock<RwLock<String>> = OnceLock::new();
+static GLOBAL_LOG_RETENTION_DAYS: OnceLock<RwLock<u32>> = OnceLock::new();
+static GLOBAL_THINKING_STORE_ENABLED: OnceLock<RwLock<bool>> = OnceLock::new();
+static GLOBAL_THINKING_RETENTION_DAYS: OnceLock<RwLock<u32>> = OnceLock::new();
+static GLOBAL_THINKING_MAX_MEMORY_TURNS: OnceLock<RwLock<u32>> = OnceLock::new();
+
+fn write_or_init<T: Clone>(slot: &OnceLock<RwLock<T>>, value: T) {
+    if let Some(lock) = slot.get() {
+        if let Ok(mut cfg) = lock.write() {
+            *cfg = value;
+        }
+    } else {
+        let _ = slot.set(RwLock::new(value));
+    }
+}
+
+pub fn get_payload_storage_mode() -> String {
+    GLOBAL_PAYLOAD_STORAGE_MODE
+        .get()
+        .and_then(|lock| lock.read().ok())
+        .map(|v| v.clone())
+        .unwrap_or_else(|| "simple".to_string())
+}
+
+pub fn get_log_retention_days() -> u32 {
+    GLOBAL_LOG_RETENTION_DAYS
+        .get()
+        .and_then(|lock| lock.read().ok())
+        .map(|v| *v)
+        .unwrap_or(30)
+        .clamp(1, 3650)
+}
+
+pub fn is_thinking_store_enabled() -> bool {
+    GLOBAL_THINKING_STORE_ENABLED
+        .get()
+        .and_then(|lock| lock.read().ok())
+        .map(|v| *v)
+        .unwrap_or(true)
+}
+
+pub fn get_thinking_retention_days() -> u32 {
+    GLOBAL_THINKING_RETENTION_DAYS
+        .get()
+        .and_then(|lock| lock.read().ok())
+        .map(|v| *v)
+        .unwrap_or(15)
+        .clamp(1, 3650)
+}
+
+pub fn get_thinking_max_memory_turns() -> usize {
+    GLOBAL_THINKING_MAX_MEMORY_TURNS
+        .get()
+        .and_then(|lock| lock.read().ok())
+        .map(|v| *v as usize)
+        .unwrap_or(600)
+        .clamp(10, 10_000)
+}
+
+pub fn update_global_audit_config(
+    payload_storage_mode: String,
+    log_retention_days: u32,
+    thinking_store_enabled: bool,
+    thinking_retention_days: u32,
+    thinking_max_memory_turns: Option<u32>,
+) {
+    let mode = if payload_storage_mode == "full" {
+        "full"
+    } else {
+        "simple"
+    };
+    write_or_init(&GLOBAL_PAYLOAD_STORAGE_MODE, mode.to_string());
+    write_or_init(
+        &GLOBAL_LOG_RETENTION_DAYS,
+        log_retention_days.clamp(1, 3650),
+    );
+    write_or_init(&GLOBAL_THINKING_STORE_ENABLED, thinking_store_enabled);
+    write_or_init(
+        &GLOBAL_THINKING_RETENTION_DAYS,
+        thinking_retention_days.clamp(1, 3650),
+    );
+    let max_turns = thinking_max_memory_turns.unwrap_or(600).clamp(10, 10_000);
+    write_or_init(&GLOBAL_THINKING_MAX_MEMORY_TURNS, max_turns);
+    tracing::info!(
+        "[Audit] storage_mode={}, log_retention_days={}, thinking_store={}, thinking_retention_days={}, thinking_max_memory_turns={}",
+        mode,
+        log_retention_days.clamp(1, 3650),
+        thinking_store_enabled,
+        thinking_retention_days.clamp(1, 3650),
+        max_turns
+    );
+}
 
 pub fn get_global_threshold_l1() -> f32 {
     GLOBAL_THRESHOLD_L1
@@ -221,13 +338,13 @@ pub fn update_global_thresholds(l1: f32, l2: f32, l3: f32) {
     }
 }
 
-/// Global system prompt config
+/// 全局系统提示词配置
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GlobalSystemPromptConfig {
-    /// Whether the global system prompt is enabled
+    /// 是否启用全局系统提示词
     #[serde(default)]
     pub enabled: bool,
-    /// System prompt content
+    /// 系统提示词内容
     #[serde(default)]
     pub content: String,
 }
@@ -355,56 +472,81 @@ impl Default for ZaiConfig {
     }
 }
 
-/// Experimental feature config (Feature Flags)
+/// 实验性功能配置 (Feature Flags)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExperimentalConfig {
-    /// Enable the two-tier signature cache (Signature Cache)
+    /// 启用双层签名缓存 (Signature Cache)
     #[serde(default = "default_true")]
     pub enable_signature_cache: bool,
 
-    /// Enable automatic tool loop recovery (Tool Loop Recovery)
+    /// 启用工具循环自动恢复 (Tool Loop Recovery)
     #[serde(default = "default_true")]
     pub enable_tool_loop_recovery: bool,
 
-    /// Enable cross-model compatibility checks (Cross-Model Checks)
+    /// 启用跨模型兼容性检查 (Cross-Model Checks)
     #[serde(default = "default_true")]
     pub enable_cross_model_checks: bool,
 
-    /// Enable context usage scaling (Context Usage Scaling)
-    /// Aggressive mode: scales usage and activates auto compaction to break past the 200k limit
-    /// Off by default to preserve transparency, letting the client trigger native compaction instructions
+    /// 启用上下文用量缩放 (Context Usage Scaling)
+    /// 激进模式: 缩放用量并激活自动压缩以突破 200k 限制
+    /// 默认关闭以保持透明度,让客户端能触发原生压缩指令
     #[serde(default = "default_false")]
     pub enable_usage_scaling: bool,
 
-    /// Compression level (Compression Level)
+    /// 压缩级别 (Compression Level)
     /// disabled, low, medium, high
     #[serde(default = "default_compression_level")]
     pub compression_level: String,
 
-    /// Context compression threshold L1 (Tool Trimming)
+    /// 上下文压缩阈值 L1 (Tool Trimming)
     #[serde(default = "default_threshold_l1")]
     pub context_compression_threshold_l1: f32,
 
-    /// Context compression threshold L2 (Thinking Compression)
+    /// 上下文压缩阈值 L2 (Thinking Compression)
     #[serde(default = "default_threshold_l2")]
     pub context_compression_threshold_l2: f32,
 
-    /// Context compression threshold L3 (Fork + Summary)
+    /// 上下文压缩阈值 L3 (Fork + Summary)
     #[serde(default = "default_threshold_l3")]
     pub context_compression_threshold_l3: f32,
+
+    /// 监控报文体存储模式: `simple`（默认，精简落库）或 `full`（原文）
+    #[serde(default = "default_payload_storage_mode")]
+    pub payload_storage_mode: String,
+
+    /// 请求日志保留天数
+    #[serde(default = "default_log_retention_days")]
+    pub log_retention_days: u32,
+
+    /// 服务端思考块回填（默认开启，可关闭）
+    #[serde(default = "default_thinking_store_enabled")]
+    pub thinking_store_enabled: bool,
+
+    /// 思考块 SQLite 记录保留天数
+    #[serde(default = "default_thinking_retention_days")]
+    pub thinking_retention_days: u32,
+
+    /// 每轮会话在内存中保留的最大思考块轮次（默认 600，滑动窗口淘汰并由 SQLite 索引承接）
+    #[serde(default = "default_thinking_max_memory_turns")]
+    pub thinking_max_memory_turns: u32,
 }
 
 impl Default for ExperimentalConfig {
     fn default() -> Self {
         Self {
             enable_signature_cache: true,
-            enable_tool_loop_recovery: true,
+            enable_tool_loop_recovery: false,
             enable_cross_model_checks: true,
             enable_usage_scaling: false,
             compression_level: "disabled".to_string(),
             context_compression_threshold_l1: 0.4,
             context_compression_threshold_l2: 0.55,
             context_compression_threshold_l3: 0.7,
+            payload_storage_mode: default_payload_storage_mode(),
+            log_retention_days: default_log_retention_days(),
+            thinking_store_enabled: default_thinking_store_enabled(),
+            thinking_retention_days: default_thinking_retention_days(),
+            thinking_max_memory_turns: default_thinking_max_memory_turns(),
         }
     }
 }
@@ -421,48 +563,190 @@ fn default_threshold_l3() -> f32 {
 fn default_compression_level() -> String {
     "disabled".to_string()
 }
+fn default_payload_storage_mode() -> String {
+    "simple".to_string()
+}
+fn default_log_retention_days() -> u32 {
+    30
+}
+fn default_thinking_store_enabled() -> bool {
+    true
+}
+fn default_thinking_retention_days() -> u32 {
+    15
+}
+fn default_thinking_max_memory_turns() -> u32 {
+    600
+}
 
-/// Thinking Budget mode
-/// Controls how the thinking_budget parameter passed in by the caller is handled
+/// 思考预算控制权大选择
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum ThinkingControlSource {
+    /// 网关权威控制（首选 / 推荐）：网关全权接管，按模型系列与档位标准字典进行权威解析与注入
+    Gateway,
+    /// 客户端直接控制（危险，不推荐）：四大协议归一化后，直接提取客户端传入的思考预算透传给上游
+    Client,
+}
+
+impl Default for ThinkingControlSource {
+    fn default() -> Self {
+        Self::Gateway
+    }
+}
+
+/// Thinking Budget 模式
+/// 控制如何处理模型调用时的思考预算
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "snake_case")]
 pub enum ThinkingBudgetMode {
-    /// Auto limit: applies a 24576 cap to specific models (Flash/Thinking)
-    Auto,
-    /// Passthrough: use the caller-supplied value as-is, with no modification
-    Passthrough,
-    /// Custom: override all requests with a user-set fixed value
+    /// 默认模式（官方自适应）：完全透传官方模型 ID，不注入 thinkingBudget
+    #[serde(rename = "default")]
+    Default,
+    /// 自定义思考预算模式：按各档位配置注入对应预算
+    #[serde(rename = "custom")]
     Custom,
-    /// Adaptive: use the effort parameter to control thinking intensity (Claude 4.6+)
+    /// 旧版兼容模式：自动限制
+    #[serde(rename = "auto")]
+    Auto,
+    /// 旧版兼容模式：透传
+    #[serde(rename = "passthrough")]
+    Passthrough,
+    /// 旧版兼容模式：自适应
+    #[serde(rename = "adaptive")]
     Adaptive,
 }
 
 impl Default for ThinkingBudgetMode {
     fn default() -> Self {
-        Self::Auto
+        Self::Custom
     }
 }
 
-/// Thinking Budget config
+/// Thinking Budget 配置
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ThinkingBudgetConfig {
-    /// Mode selection
-    #[serde(default)]
+    /// 控制权大选择：网关控制 vs 客户端控制
+    #[serde(default = "default_control_source")]
+    pub control_source: ThinkingControlSource,
+
+    // --- Gemini Flash 系列配置 ---
+    #[serde(default = "default_thinking_budget_mode")]
+    pub flash_mode: ThinkingBudgetMode,
+    #[serde(default = "default_flash_low")]
+    pub flash_low: i32, // 默认 1000
+    #[serde(default = "default_flash_medium")]
+    pub flash_medium: i32, // 默认 4000
+    #[serde(default = "default_flash_high")]
+    pub flash_high: i32, // 默认 10000
+    #[serde(default = "default_flash_tiered")]
+    pub flash_tiered: i32, // 默认 -1
+
+    // --- Gemini Pro 系列配置（官方仅 Low 与 High 两档） ---
+    #[serde(default = "default_thinking_budget_mode")]
+    pub pro_mode: ThinkingBudgetMode,
+    #[serde(default = "default_pro_low")]
+    pub pro_low: i32, // 默认 1001
+    #[serde(default = "default_pro_high")]
+    pub pro_high: i32, // 默认 10001
+
+    // --- Claude 系列配置 ---
+    #[serde(default = "default_thinking_budget_mode")]
+    pub claude_mode: ThinkingBudgetMode,
+    #[serde(default = "default_claude_budget")]
+    pub claude_budget: i32, // 统一思考预算 (默认 16000, 填 -1 自适应)
+    #[serde(default = "default_claude_low")]
+    pub claude_low: i32, // 默认 1024
+    #[serde(default = "default_claude_medium")]
+    pub claude_medium: i32, // 默认 4096
+    #[serde(default = "default_claude_high")]
+    pub claude_high: i32, // 默认 16000
+
+    // --- 历史向后兼容字段 ---
+    #[serde(default = "default_thinking_budget_mode")]
     pub mode: ThinkingBudgetMode,
-    /// Custom fixed value (only takes effect when mode=Custom)
     #[serde(default = "default_thinking_budget_custom_value")]
     pub custom_value: u32,
-    /// Thinking intensity (only takes effect when mode=Adaptive): low, medium, high
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub effort: Option<String>,
+    #[serde(default = "default_flash_low")]
+    pub custom_low: i32,
+    #[serde(default = "default_flash_medium")]
+    pub custom_medium: i32,
+    #[serde(default = "default_flash_high")]
+    pub custom_high: i32,
+    #[serde(default = "default_flash_tiered")]
+    pub custom_tiered: i32,
+}
+
+fn default_control_source() -> ThinkingControlSource {
+    ThinkingControlSource::Gateway
+}
+
+fn default_thinking_budget_mode() -> ThinkingBudgetMode {
+    ThinkingBudgetMode::Custom
+}
+
+fn default_flash_low() -> i32 {
+    1024
+}
+fn default_flash_medium() -> i32 {
+    4096
+}
+fn default_flash_high() -> i32 {
+    16384
+}
+fn default_flash_tiered() -> i32 {
+    -1
+}
+
+fn default_pro_low() -> i32 {
+    1001
+}
+fn default_pro_high() -> i32 {
+    10001
+}
+
+fn default_claude_budget() -> i32 {
+    16384
+}
+fn default_claude_low() -> i32 {
+    1024
+}
+fn default_claude_medium() -> i32 {
+    4096
+}
+fn default_claude_high() -> i32 {
+    16384
 }
 
 impl Default for ThinkingBudgetConfig {
     fn default() -> Self {
         Self {
-            mode: ThinkingBudgetMode::Auto,
+            control_source: default_control_source(),
+            flash_mode: default_thinking_budget_mode(),
+            flash_low: default_flash_low(),
+            flash_medium: default_flash_medium(),
+            flash_high: default_flash_high(),
+            flash_tiered: default_flash_tiered(),
+
+            pro_mode: default_thinking_budget_mode(),
+            pro_low: default_pro_low(),
+            pro_high: default_pro_high(),
+
+            claude_mode: default_thinking_budget_mode(),
+            claude_budget: default_claude_budget(),
+            claude_low: default_claude_low(),
+            claude_medium: default_claude_medium(),
+            claude_high: default_claude_high(),
+
+            mode: default_thinking_budget_mode(),
             custom_value: default_thinking_budget_custom_value(),
             effort: None,
+            custom_low: default_flash_low(),
+            custom_medium: default_flash_medium(),
+            custom_high: default_flash_high(),
+            custom_tiered: default_flash_tiered(),
         }
     }
 }
@@ -496,14 +780,14 @@ impl Default for DebugLoggingConfig {
     }
 }
 
-/// IP blocklist config
+/// IP 黑名单配置
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IpBlacklistConfig {
-    /// Whether the blocklist is enabled
+    /// 是否启用黑名单
     #[serde(default)]
     pub enabled: bool,
 
-    /// Custom ban message
+    /// 自定义封禁消息
     #[serde(default = "default_block_message")]
     pub block_message: String,
 }
@@ -521,14 +805,14 @@ fn default_block_message() -> String {
     "Access denied".to_string()
 }
 
-/// IP allowlist config
+/// IP 白名单配置
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IpWhitelistConfig {
-    /// Whether allowlist mode is enabled (once enabled, only allowlisted IPs can access)
+    /// 是否启用白名单模式 (启用后只允许白名单IP访问)
     #[serde(default)]
     pub enabled: bool,
 
-    /// Allowlist-priority mode (allowlisted IPs skip the blocklist check)
+    /// 白名单优先模式 (白名单IP跳过黑名单检查)
     #[serde(default = "default_true")]
     pub whitelist_priority: bool,
 }
@@ -542,14 +826,14 @@ impl Default for IpWhitelistConfig {
     }
 }
 
-/// Security monitor config
+/// 安全监控配置
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SecurityMonitorConfig {
-    /// IP blocklist config
+    /// IP 黑名单配置
     #[serde(default)]
     pub blacklist: IpBlacklistConfig,
 
-    /// IP allowlist config
+    /// IP 白名单配置
     #[serde(default)]
     pub whitelist: IpWhitelistConfig,
 }
@@ -563,7 +847,7 @@ impl Default for SecurityMonitorConfig {
     }
 }
 
-/// Image task scheduling config
+/// 图片任务调度配置
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ImageSchedulerConfig {
     #[serde(default = "default_image_per_account_concurrency")]
@@ -582,15 +866,15 @@ fn default_image_per_account_concurrency() -> usize {
     4
 }
 
-/// Reverse proxy service config
+/// 反代服务配置
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProxyConfig {
-    /// Whether the reverse proxy service is enabled
+    /// 是否启用反代服务
     pub enabled: bool,
 
-    /// Whether LAN access is allowed
-    /// - false: local access only, 127.0.0.1 (default, privacy-first)
-    /// - true: allow LAN access, 0.0.0.0
+    /// 是否允许局域网访问
+    /// - false: 仅本机访问 127.0.0.1（默认，隐私优先）
+    /// - true: 允许局域网访问 0.0.0.0
     #[serde(default)]
     pub allow_lan_access: bool,
 
@@ -602,39 +886,46 @@ pub struct ProxyConfig {
     #[serde(default)]
     pub auth_mode: ProxyAuthMode,
 
-    /// Listening port
+    /// 监听端口
     pub port: u16,
 
-    /// API key
+    /// API 密钥
     pub api_key: String,
 
-    /// Web UI admin panel password (optional; falls back to api_key if unset)
+    /// Web UI 管理后台密码 (可选，如未设置则使用 api_key)
     pub admin_password: Option<String>,
 
-    /// Whether to auto-start
+    /// 是否自动启动
     pub auto_start: bool,
 
-    /// Custom exact model mapping table (key: original model name, value: target model name)
+    /// 自定义精确模型映射表 (key: 原始模型名, value: 目标模型名)
     #[serde(default)]
     pub custom_mapping: std::collections::HashMap<String, String>,
 
-    /// API request timeout (seconds)
+    /// API 请求超时时间(秒)
     #[serde(default = "default_request_timeout")]
     pub request_timeout: u64,
 
-    /// Whether request logging is enabled (monitoring)
+    /// 是否开启请求日志记录 (监控)
     #[serde(default)]
     pub enable_logging: bool,
 
-    /// Debug logging config (saves the full trace)
+    /// 是否捕获健康检查日志 (默认 false: 对 GET /health /healthz 请求全部过滤且不入库)
+    #[serde(default)]
+    pub capture_health_logs: bool,
+
+    #[serde(default)]
+    pub log_retention: LogRetentionConfig,
+
+    /// 调试日志配置 (保存完整链路)
     #[serde(default)]
     pub debug_logging: DebugLoggingConfig,
 
-    /// Upstream proxy config
+    /// 上游代理配置
     #[serde(default)]
     pub upstream_proxy: UpstreamProxyConfig,
 
-    /// Whether to expose only real quota models in /v1/models (hiding the built-in virtual aliases)
+    /// 是否只在 /v1/models 中暴露真实配额模型（隐藏内置虚拟别名）
     #[serde(default)]
     pub only_raw_quota_models: bool,
 
@@ -642,25 +933,25 @@ pub struct ProxyConfig {
     #[serde(default)]
     pub zai: ZaiConfig,
 
-    /// Custom User-Agent header (optional override)
+    /// 自定义 User-Agent 请求头 (可选覆盖)
     #[serde(default)]
     pub user_agent_override: Option<String>,
 
-    /// Account scheduling config (sticky sessions / rate limit retry)
+    /// 账号调度配置 (粘性会话/限流重试)
     #[serde(default)]
     pub scheduling: crate::proxy::sticky_config::StickySessionConfig,
 
-    /// Experimental feature config
+    /// 实验性功能配置
     #[serde(default)]
     pub experimental: ExperimentalConfig,
 
-    /// Security monitor config (IP allowlist/blocklist)
+    /// 安全监控配置 (IP 黑白名单)
     #[serde(default)]
     pub security_monitor: SecurityMonitorConfig,
 
-    /// Account ID for Fixed Account Mode
-    /// - None: use round-robin mode
-    /// - Some(account_id): always use the specified account
+    /// 固定账号模式的账号ID (Fixed Account Mode)
+    /// - None: 使用轮询模式
+    /// - Some(account_id): 固定使用指定账号
     #[serde(default)]
     pub preferred_account_id: Option<String>,
 
@@ -668,53 +959,133 @@ pub struct ProxyConfig {
     #[serde(default)]
     pub saved_user_agent: Option<String>,
 
-    /// Thinking Budget config
-    /// Controls how the token budget for AI deep thinking is handled
+    /// Thinking Budget 配置
+    /// 控制如何处理 AI 深度思考时的 Token 预算
     #[serde(default)]
     pub thinking_budget: ThinkingBudgetConfig,
 
-    /// Global system prompt config
-    /// Automatically injected into every API request's systemInstruction
+    /// 全局系统提示词配置
+    /// 自动注入到所有 API 请求的 systemInstruction 中
     #[serde(default)]
     pub global_system_prompt: GlobalSystemPromptConfig,
 
-    /// Image thinking mode config
-    /// - enabled: keep the thinking chain (default)
-    /// - disabled: remove the thinking chain (image quality first)
+    /// 图像思维模式配置
+    /// - enabled: 保留思维链 (默认)
+    /// - disabled: 移除思维链 (画质优先)
     #[serde(default)]
     pub image_thinking_mode: Option<String>,
 
-    /// Per-account concurrency for image upstream tasks (takes effect after restart)
+    /// 图片上游任务的单账号并发数（重启后生效）
     #[serde(default)]
     pub image_scheduler: ImageSchedulerConfig,
 
-    /// Proxy pool config
+    /// 代理池配置
     #[serde(default)]
     pub proxy_pool: ProxyPoolConfig,
 }
 
-/// Upstream proxy config
+/// Request log retention policy.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LogRetentionConfig {
+    #[serde(default = "default_max_body_age_hours")]
+    pub max_body_age_hours: u64,
+    #[serde(default = "default_max_age_days")]
+    pub max_age_days: u64,
+    #[serde(default = "default_max_rows")]
+    pub max_rows: u64,
+    /// Application disk budget in MiB, including the database and WAL.
+    #[serde(default = "default_max_disk_mb")]
+    pub max_disk_mb: u64,
+    /// Max log storage limit in GB (supports decimals, e.g. 0.5)
+    #[serde(default = "default_max_storage_gb")]
+    pub max_storage_gb: f64,
+}
+
+fn default_max_body_age_hours() -> u64 {
+    24
+}
+fn default_max_age_days() -> u64 {
+    30
+}
+fn default_max_rows() -> u64 {
+    100_000
+}
+fn default_max_disk_mb() -> u64 {
+    1024
+}
+fn default_max_storage_gb() -> f64 {
+    1.0
+}
+
+impl LogRetentionConfig {
+    pub fn budget_bytes(&self) -> u64 {
+        if self.max_storage_gb > 0.0 {
+            (self.max_storage_gb * 1024.0 * 1024.0 * 1024.0) as u64
+        } else if self.max_disk_mb > 0 {
+            self.max_disk_mb.saturating_mul(1024 * 1024)
+        } else {
+            0
+        }
+    }
+}
+
+impl Default for LogRetentionConfig {
+    fn default() -> Self {
+        Self {
+            max_body_age_hours: 24,
+            max_age_days: 30,
+            max_rows: 100_000,
+            max_disk_mb: 1024,
+            max_storage_gb: 1.0,
+        }
+    }
+}
+
+/// 上游代理配置
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct UpstreamProxyConfig {
-    /// Whether it's enabled
+    /// 是否启用
     pub enabled: bool,
-    /// Proxy address (http://, https://, socks5://)
+    /// 代理地址 (http://, https://, socks5://)
     pub url: String,
+}
+
+pub fn default_custom_mapping() -> std::collections::HashMap<String, String> {
+    let mut m = std::collections::HashMap::new();
+    m.insert(
+        "gemini-3.6-flash".to_string(),
+        "gemini-3.6-flash-tiered".to_string(),
+    );
+    m.insert(
+        "gemini-3.7-flash".to_string(),
+        "gemini-3.7-flash-tiered".to_string(),
+    );
+    m.insert(
+        "gemini-3.8-flash".to_string(),
+        "gemini-3.8-flash-tiered".to_string(),
+    );
+    m.insert(
+        "gemini-3.x-flash".to_string(),
+        "3.x-flash-tiered".to_string(),
+    );
+    m
 }
 
 impl Default for ProxyConfig {
     fn default() -> Self {
         Self {
             enabled: false,
-            allow_lan_access: false, // Local access only by default, privacy-first
+            allow_lan_access: false, // 默认仅本机访问，隐私优先
             auth_mode: ProxyAuthMode::default(),
             port: 8045,
             api_key: format!("sk-{}", uuid::Uuid::new_v4().simple()),
             admin_password: None,
             auto_start: false,
-            custom_mapping: std::collections::HashMap::new(),
+            custom_mapping: default_custom_mapping(),
             request_timeout: default_request_timeout(),
-            enable_logging: true, // Enabled by default, supports token usage stats
+            enable_logging: true,       // 默认开启，支持 token 统计功能
+            capture_health_logs: false, // 默认关闭，过滤 GET /health 探活且不入库
+            log_retention: LogRetentionConfig::default(),
             debug_logging: DebugLoggingConfig::default(),
             upstream_proxy: UpstreamProxyConfig::default(),
             only_raw_quota_models: false,
@@ -722,7 +1093,7 @@ impl Default for ProxyConfig {
             scheduling: crate::proxy::sticky_config::StickySessionConfig::default(),
             experimental: ExperimentalConfig::default(),
             security_monitor: SecurityMonitorConfig::default(),
-            preferred_account_id: None, // Round-robin mode by default
+            preferred_account_id: None, // 默认使用轮询模式
             user_agent_override: None,
             saved_user_agent: None,
             thinking_budget: ThinkingBudgetConfig::default(),
@@ -735,7 +1106,7 @@ impl Default for ProxyConfig {
 }
 
 fn default_request_timeout() -> u64 {
-    120 // 120 seconds by default; the original 60 seconds was too short
+    120 // 默认 120 秒,原来 60 秒太短
 }
 
 fn default_zai_base_url() -> String {
@@ -755,9 +1126,9 @@ fn default_zai_haiku_model() -> String {
 }
 
 impl ProxyConfig {
-    /// Get the actual bind address
-    /// - allow_lan_access = false: returns "127.0.0.1" (default, privacy-first)
-    /// - allow_lan_access = true: returns "0.0.0.0" (allows LAN access)
+    /// 获取实际的监听地址
+    /// - allow_lan_access = false: 返回 "127.0.0.1"（默认，隐私优先）
+    /// - allow_lan_access = true: 返回 "0.0.0.0"（通配监听：底层自动启用 IPv6/IPv4 双栈监听，允许局域网与外部公网 IPv4/IPv6 访问）
     pub fn get_bind_address(&self) -> &str {
         if self.allow_lan_access {
             "0.0.0.0"
@@ -767,7 +1138,7 @@ impl ProxyConfig {
     }
 }
 
-/// Proxy auth info
+/// 代理认证信息
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProxyAuth {
     pub username: String,
@@ -778,33 +1149,33 @@ pub struct ProxyAuth {
     pub password: String,
 }
 
-/// A single proxy entry config
+/// 单个代理配置
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProxyEntry {
-    pub id: String,                       // Unique identifier
-    pub name: String,                     // Display name
-    pub url: String,                      // Proxy address (http://, https://, socks5://)
-    pub auth: Option<ProxyAuth>,          // Auth info (optional)
-    pub enabled: bool,                    // Whether it's enabled
-    pub priority: i32,                    // Priority (lower number = higher priority)
-    pub tags: Vec<String>,                // Tags (e.g. "US", "Residential IP")
-    pub max_accounts: Option<usize>,      // Max bound accounts (0 = unlimited)
-    pub health_check_url: Option<String>, // Health check URL
-    pub last_check_time: Option<i64>,     // Last check time
-    pub is_healthy: bool,                 // Health status
-    pub latency: Option<u64>,             // Latency (ms) [NEW]
+    pub id: String,                       // 唯一标识
+    pub name: String,                     // 显示名称
+    pub url: String,                      // 代理地址 (http://, https://, socks5://)
+    pub auth: Option<ProxyAuth>,          // 认证信息 (可选)
+    pub enabled: bool,                    // 是否启用
+    pub priority: i32,                    // 优先级 (数字越小优先级越高)
+    pub tags: Vec<String>,                // 标签 (如 "美国", "住宅IP")
+    pub max_accounts: Option<usize>,      // 最大绑定账号数 (0 = 无限制)
+    pub health_check_url: Option<String>, // 健康检查 URL
+    pub last_check_time: Option<i64>,     // 上次检查时间
+    pub is_healthy: bool,                 // 健康状态
+    pub latency: Option<u64>,             // 延迟 (毫秒) [NEW]
 }
 
-/// Proxy pool config
+/// 代理池配置
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProxyPoolConfig {
-    pub enabled: bool, // Whether the proxy pool is enabled
-    // pub mode: ProxyPoolMode,        // [REMOVED] proxy pool mode, unified into Hybrid logic
-    pub proxies: Vec<ProxyEntry>,         // Proxy list
-    pub health_check_interval: u64,       // Health check interval (seconds)
-    pub auto_failover: bool,              // Auto failover
-    pub strategy: ProxySelectionStrategy, // Proxy selection strategy
-    /// Account-to-proxy binding relationships (account_id -> proxy_id), persisted storage
+    pub enabled: bool, // 是否启用代理池
+    // pub mode: ProxyPoolMode,        // [REMOVED] 代理池模式，统一为 Hybrid 逻辑
+    pub proxies: Vec<ProxyEntry>,         // 代理列表
+    pub health_check_interval: u64,       // 健康检查间隔 (秒)
+    pub auto_failover: bool,              // 自动故障转移
+    pub strategy: ProxySelectionStrategy, // 代理选择策略
+    /// 账号到代理的绑定关系 (account_id -> proxy_id)，持久化存储
     #[serde(default)]
     pub account_bindings: HashMap<String, String>,
 }
@@ -823,19 +1194,19 @@ impl Default for ProxyPoolConfig {
     }
 }
 
-/// Proxy selection strategy
+/// 代理选择策略
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "snake_case")]
 pub enum ProxySelectionStrategy {
-    /// Round-robin: use each proxy in turn
+    /// 轮询: 依次使用
     RoundRobin,
-    /// Random: pick a random proxy
+    /// 随机: 随机选择
     Random,
-    /// Priority: sort by the priority field
+    /// 优先级: 按 priority 字段排序
     Priority,
-    /// Least connections: pick the currently least-used proxy
+    /// 最少连接: 选择当前使用最少的代理
     LeastConnections,
-    /// Weighted round-robin: based on health status and priority
+    /// 加权轮询: 根据健康状态和优先级
     WeightedRoundRobin,
 }
 
@@ -845,7 +1216,7 @@ mod tests {
 
     #[test]
     fn test_normalize_proxy_url() {
-        // Test a URL that already has a scheme
+        // 测试已有协议
         assert_eq!(
             normalize_proxy_url("http://127.0.0.1:7890"),
             "http://127.0.0.1:7890"
@@ -863,7 +1234,7 @@ mod tests {
             "socks5h://127.0.0.1:1080"
         );
 
-        // Test a URL missing a scheme (defaults to filling in http://)
+        // 测试缺少协议（默认补全 http://）
         assert_eq!(
             normalize_proxy_url("127.0.0.1:7890"),
             "http://127.0.0.1:7890"
@@ -873,7 +1244,7 @@ mod tests {
             "http://localhost:1082"
         );
 
-        // Test edge cases
+        // 测试边缘情况
         assert_eq!(normalize_proxy_url(""), "");
         assert_eq!(normalize_proxy_url("   "), "");
     }

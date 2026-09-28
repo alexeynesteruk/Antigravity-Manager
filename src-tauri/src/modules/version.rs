@@ -3,16 +3,15 @@ use crate::modules::process;
 use std::fs;
 use std::path::PathBuf;
 
-/// Antigravity version information
+/// Antigravity 版本信息
 #[derive(Debug, Clone)]
 pub struct AntigravityVersion {
     pub short_version: String,
-    #[allow(dead_code)] // Reserved for build/diagnostic output
+    #[allow(dead_code)] // 预留给构建/诊断输出
     pub bundle_version: String,
 }
 
-/// Extract the first semantic version number (X.Y.Z) from an arbitrary string
-#[allow(dead_code)]
+/// 从任意字符串中提取第一个语义化版本号 (X.Y.Z)
 fn extract_semver(raw: &str) -> Option<String> {
     for token in raw.split(|c: char| c.is_whitespace() || c == ',' || c == ';') {
         let t = token.trim_matches(|c: char| c == '"' || c == '\'' || c == '(' || c == ')');
@@ -36,13 +35,18 @@ fn extract_semver(raw: &str) -> Option<String> {
     None
 }
 
-/// Detect the Antigravity version (cross-platform)
-pub fn get_antigravity_version(target_ide: Option<&str>) -> Result<AntigravityVersion, String> {
-    // 1. Get the Antigravity executable path (reuse existing functionality)
-    let exe_path = process::get_antigravity_executable_path(target_ide)
+/// 检测 Antigravity 版本（跨平台，支持预快照路径优先）
+pub fn get_antigravity_version_with_path(
+    target_ide: Option<&str>,
+    preferred_path: Option<&std::path::Path>,
+) -> Result<AntigravityVersion, String> {
+    // 1. 优先使用预捕获路径，若无则探查 Antigravity 可执行文件路径
+    let exe_path = preferred_path
+        .map(|p| p.to_path_buf())
+        .or_else(|| process::get_antigravity_executable_path(target_ide))
         .ok_or("Unable to locate Antigravity executable")?;
 
-    // 2. Read version information based on the platform
+    // 2. 根据平台读取版本信息
     #[cfg(target_os = "macos")]
     {
         get_version_macos(&exe_path)
@@ -59,13 +63,18 @@ pub fn get_antigravity_version(target_ide: Option<&str>) -> Result<AntigravityVe
     }
 }
 
-/// macOS: read the version from Info.plist
+/// 检测 Antigravity 版本（跨平台）
+pub fn get_antigravity_version(target_ide: Option<&str>) -> Result<AntigravityVersion, String> {
+    get_antigravity_version_with_path(target_ide, None)
+}
+
+/// macOS: 从 Info.plist 读取版本
 #[cfg(target_os = "macos")]
 fn get_version_macos(exe_path: &PathBuf) -> Result<AntigravityVersion, String> {
     use plist::Value;
 
-    // exe_path may be /Applications/Antigravity.app or the internal executable
-    // Need to find the .app directory
+    // exe_path 可能是 /Applications/Antigravity.app 或内部可执行文件
+    // 需要找到 .app 目录
     let path_str = exe_path.to_string_lossy();
     let app_path = if let Some(idx) = path_str.find(".app") {
         PathBuf::from(&path_str[..idx + 4])
@@ -104,48 +113,102 @@ fn get_version_macos(exe_path: &PathBuf) -> Result<AntigravityVersion, String> {
     })
 }
 
-/// Windows: read the version from the executable's metadata
+/// Windows: 从可执行文件元数据读取版本（纯原生 Win32 API，不调用 powershell）
 #[cfg(target_os = "windows")]
 fn get_version_windows(exe_path: &PathBuf) -> Result<AntigravityVersion, String> {
-    use crate::utils::command::CommandExtWrapper;
-    use std::process::Command;
+    use std::ffi::OsStr;
+    use std::os::windows::ffi::OsStrExt;
 
-    // Windows: use PowerShell to read the file version information
-    let mut cmd = Command::new("powershell");
-    let output = cmd
-        .creation_flags_windows()
-        .args([
-            "-Command",
-            &format!(
-                "(Get-Item '{}').VersionInfo.FileVersion",
-                exe_path.display()
-            ),
-        ])
-        .output()
-        .map_err(|e| format!("Failed to execute PowerShell: {}", e))?;
-
-    if !output.status.success() {
-        return Err("Failed to read version from executable".to_string());
+    #[link(name = "version")]
+    extern "system" {
+        fn GetFileVersionInfoSizeW(lptstrFilename: *const u16, lpdwHandle: *mut u32) -> u32;
+        fn GetFileVersionInfoW(
+            lptstrFilename: *const u16,
+            dwHandle: u32,
+            dwLen: u32,
+            lpData: *mut std::ffi::c_void,
+        ) -> i32;
+        fn VerQueryValueW(
+            pBlock: *const std::ffi::c_void,
+            lpSubBlock: *const u16,
+            lplpBuffer: *mut *mut std::ffi::c_void,
+            puLen: *mut u32,
+        ) -> i32;
     }
 
-    let version = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let mut path_u16: Vec<u16> = exe_path.as_os_str().encode_wide().collect();
+    path_u16.push(0);
 
-    if version.is_empty() {
-        return Err("Version information not found in executable".to_string());
+    let mut dummy: u32 = 0;
+    let size = unsafe { GetFileVersionInfoSizeW(path_u16.as_ptr(), &mut dummy) };
+    if size == 0 {
+        return Err("Failed to get version info size from executable".to_string());
     }
 
-    Ok(AntigravityVersion {
-        short_version: version.clone(),
-        bundle_version: version,
-    })
+    let mut data = vec![0u8; size as usize];
+    let ok =
+        unsafe { GetFileVersionInfoW(path_u16.as_ptr(), 0, size, data.as_mut_ptr() as *mut _) };
+    if ok == 0 {
+        return Err("Failed to read version info from executable".to_string());
+    }
+
+    let subblock_root: Vec<u16> = OsStr::new(r"\").encode_wide().chain(Some(0)).collect();
+    let mut root_buf: *mut std::ffi::c_void = std::ptr::null_mut();
+    let mut root_len: u32 = 0;
+
+    #[repr(C)]
+    struct VsFixedFileInfo {
+        dw_signature: u32,
+        dw_struc_version: u32,
+        dw_file_version_ms: u32,
+        dw_file_version_ls: u32,
+        dw_product_version_ms: u32,
+        dw_product_version_ls: u32,
+        dw_file_flags_mask: u32,
+        dw_file_flags: u32,
+        dw_file_os: u32,
+        dw_file_type: u32,
+        dw_file_subtype: u32,
+        dw_file_date_ms: u32,
+        dw_file_date_ls: u32,
+    }
+
+    if unsafe {
+        VerQueryValueW(
+            data.as_ptr() as *const _,
+            subblock_root.as_ptr(),
+            &mut root_buf,
+            &mut root_len,
+        )
+    } != 0
+        && !root_buf.is_null()
+        && (root_len as usize) >= std::mem::size_of::<VsFixedFileInfo>()
+    {
+        let ffi = unsafe { &*(root_buf as *const VsFixedFileInfo) };
+        let major = (ffi.dw_file_version_ms >> 16) & 0xffff;
+        let minor = ffi.dw_file_version_ms & 0xffff;
+        let patch = (ffi.dw_file_version_ls >> 16) & 0xffff;
+        let build = ffi.dw_file_version_ls & 0xffff;
+        let version = if build > 0 {
+            format!("{}.{}.{}.{}", major, minor, patch, build)
+        } else {
+            format!("{}.{}.{}", major, minor, patch)
+        };
+        return Ok(AntigravityVersion {
+            short_version: version.clone(),
+            bundle_version: version,
+        });
+    }
+
+    Err("Version information not found in executable".to_string())
 }
 
-/// Linux: read from package.json or the --version argument
+/// Linux: 从 package.json 或 --version 参数读取
 #[cfg(target_os = "linux")]
 fn get_version_linux(exe_path: &PathBuf) -> Result<AntigravityVersion, String> {
     use std::process::Command;
 
-    // Method 1 (preferred): try reading from package.json in the install directory, avoiding running the executable which could unexpectedly launch the GUI
+    // 方法1 (优先): 尝试从安装目录的 package.json 读取，避免执行可执行文件意外拉起 GUI
     if let Some(parent) = exe_path.parent() {
         let package_json = parent.join("resources/app/package.json");
         if package_json.exists() {
@@ -162,7 +225,7 @@ fn get_version_linux(exe_path: &PathBuf) -> Result<AntigravityVersion, String> {
         }
     }
 
-    // Method 2 (fallback): try executing --version (only when it can't be obtained from package.json)
+    // 方法2 (兜底): 尝试执行 --version (仅在无法从 package.json 获取时执行)
     let output = Command::new(exe_path).arg("--version").output();
 
     if let Ok(result) = output {
@@ -188,12 +251,12 @@ fn get_version_linux(exe_path: &PathBuf) -> Result<AntigravityVersion, String> {
     Err("Unable to determine Antigravity version on Linux".to_string())
 }
 
-/// Determine whether this is a new version (>= 1.16.5)
+/// 判断是否为新版本 (>= 1.16.5)
 pub fn is_new_version(version: &AntigravityVersion) -> bool {
     compare_version(&version.short_version, "1.16.5") >= std::cmp::Ordering::Equal
 }
 
-/// Compare version numbers
+/// 比较版本号
 pub fn compare_version(v1: &str, v2: &str) -> std::cmp::Ordering {
     let parts1: Vec<u32> = v1.split('.').filter_map(|s| s.parse().ok()).collect();
     let parts2: Vec<u32> = v2.split('.').filter_map(|s| s.parse().ok()).collect();

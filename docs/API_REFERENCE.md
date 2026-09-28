@@ -33,7 +33,7 @@ The Antigravity Gateway is a dual-role server:
 | **GET** | `/accounts/current` | get the currently active account | - |
 | **POST** | `/accounts` | add an account (OAuth Refresh Token) | `{"refreshToken": "..."}` |
 | **DELETE**| `/accounts/:id` | delete an account | - |
-| **POST** | `/accounts/switch` | switch the active account | `{"accountId": "acc_123"}` |
+| **POST** | `/accounts/switch` | switch the active account | `{"accountId": "acc_123", "targetIde": "agy"}` (targetIde optional; passing `"agy"` writes credentials only, no IDE restart needed) |
 | **POST** | `/accounts/refresh` | **refresh quota for all accounts** | - |
 | **GET** | `/accounts/:id/quota` | **look up a specific account's quota** | - |
 | **POST** | `/accounts/:id/toggle-proxy` | disable/enable the account proxy | - |

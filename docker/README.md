@@ -57,6 +57,24 @@ docker run -d \
   lbjlaq/antigravity-manager:latest
 ```
 
+> [!TIP]
+> **🧪 Try the Beta / Preview Images**:
+> To use the latest Beta pre-release features, pull the matching Beta version tag (pre-release builds are published independently and never overwrite the `latest` stable tag):
+> ```bash
+> # Pull a specific Beta pre-release
+> docker pull lbjlaq/antigravity-manager:v4.8.2-beta.0
+> 
+> # Run the Beta container
+> docker run -d --name antigravity-manager-beta \
+>   -p 8045:8045 \
+>   -e API_KEY=your-api-key \
+>   -e WEB_PASSWORD=your-login-password \
+>   -e ABV_MAX_BODY_SIZE=104857600 \
+>   -v ~/.antigravity_tools:/root/.antigravity_tools \
+>   lbjlaq/antigravity-manager:v4.8.2-beta.0
+> ```
+> For the complete list of version tags see [Docker Hub Tags](https://hub.docker.com/r/lbjlaq/antigravity-manager/tags). To run the latest un-tagged `beta` branch source, build locally: `docker build -t lbjlaq/antigravity-manager:beta -f docker/Dockerfile .`.
+
 #### 🔐 Authentication Logic (Security Scenarios)
 *   **Scenario A: only `API_KEY` is set**
     - **Web login**: use `API_KEY` to log into the admin panel.
@@ -84,9 +102,26 @@ docker compose up -d
 
 ### 3. Building the Image Manually (Developers)
 If you need to modify the code or customize the build, run this in the project root:
+
+**Windows PowerShell (recommended)**
+```powershell
+# One-click build of a customized image (tags: antigravity-manager:local + version-fix)
+.\docker\build.ps1
+
+# Use a China mainland mirror to speed up the build
+.\docker\build.ps1 -UseMirror
+
+# Build and push to your own registry
+.\docker\build.ps1 -UseMirror -Push -Registry "yourname/antigravity-manager"
+```
+
+**Manual docker build**
 ```bash
 # Build with the default "latest" tag
 docker build -t antigravity-manager:latest -f docker/Dockerfile .
+
+# Customized (fork) compose startup; on Windows, port mapping works without host networking
+docker compose -f docker/docker-compose.yml -f docker/docker-compose.fork.yml up -d --build
 ```
 
 #### 💡 Build Arguments

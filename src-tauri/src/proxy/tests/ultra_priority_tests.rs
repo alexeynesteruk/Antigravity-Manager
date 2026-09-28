@@ -39,6 +39,7 @@ fn create_test_token(
 
     ProxyToken {
         account_id: email.to_string(),
+        priority: crate::models::account::default_priority(),
         access_token: "test_token".to_string(),
         refresh_token: "test_refresh".to_string(),
         expires_in: 3600,
@@ -94,18 +95,9 @@ fn test_is_ultra_required_model() {
 
 /// Simulates the sorting logic in token_manager.rs (updated: tier always takes priority)
 fn compare_tokens_for_model(a: &ProxyToken, b: &ProxyToken, _target_model: &str) -> Ordering {
-    let tier_priority = |tier: &Option<String>| {
-        let t = tier.as_deref().unwrap_or("").to_lowercase();
-        if t.contains("ultra") {
-            0
-        } else if t.contains("pro") {
-            1
-        } else if t.contains("free") {
-            2
-        } else {
-            3
-        }
-    };
+    // 复用生产实现，保证测试验证的就是真实排序规则
+    let tier_priority =
+        |tier: &Option<String>| crate::models::quota::tier_priority(tier.as_deref());
 
     // Priority 0: always prioritize subscription tier (Ultra > Pro > Free)
     let tier_cmp = tier_priority(&a.subscription_tier).cmp(&tier_priority(&b.subscription_tier));

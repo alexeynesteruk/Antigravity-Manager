@@ -1,6 +1,8 @@
 mod commands;
 pub mod constants;
 pub mod error;
+#[cfg(target_os = "linux")]
+mod linux_graphics;
 mod models;
 mod modules;
 mod proxy; // Proxy service module
@@ -82,23 +84,57 @@ fn credential_state(value: &str) -> &'static str {
 }
 
 #[cfg(target_os = "linux")]
-fn configure_linux_gdk_backend() {
-    if std::env::var("GDK_BACKEND").is_ok() {
-        return;
-    }
+fn nvidia_proprietary_loaded() -> bool {
+    std::path::Path::new("/dev/nvidia0").exists()
+        || std::path::Path::new("/proc/driver/nvidia/version").exists()
+}
+
+#[cfg(target_os = "linux")]
+fn configure_linux_graphics() {
+    use linux_graphics::{
+        desktop_is_wlroots_family, should_disable_webkit_dmabuf, should_force_x11_backend,
+    };
 
     let is_wayland = is_wayland_session();
     let has_x11_display = std::env::var("DISPLAY")
         .map(|v| !v.trim().is_empty())
         .unwrap_or(false);
+    let desktop = std::env::var("XDG_CURRENT_DESKTOP")
+        .unwrap_or_else(|_| std::env::var("XDG_SESSION_DESKTOP").unwrap_or_default());
     let force_wayland = env_flag_enabled("ANTIGRAVITY_FORCE_WAYLAND");
     let force_x11 = env_flag_enabled("ANTIGRAVITY_FORCE_X11");
+    let gdk_already_set = std::env::var("GDK_BACKEND").is_ok();
 
-    if force_x11 || (is_wayland && has_x11_display && !force_wayland) {
-        // Force X11 backend under Wayland sessions to avoid a GTK Wayland shm crash.
+    if should_force_x11_backend(
+        gdk_already_set,
+        force_x11,
+        force_wayland,
+        is_wayland,
+        has_x11_display,
+        &desktop,
+    ) {
+        // Force X11 backend under GNOME/KDE Wayland to avoid a GTK shm crash.
         std::env::set_var("GDK_BACKEND", "x11");
         warn!(
             "Forcing GDK_BACKEND=x11 for stability on Wayland. Set ANTIGRAVITY_FORCE_WAYLAND=1 to keep Wayland backend."
+        );
+    } else if is_wayland && !gdk_already_set && desktop_is_wlroots_family(&desktop) {
+        info!(
+            "Keeping native Wayland GDK backend on {} (Xwayland DISPLAY is not a reason to force X11).",
+            desktop
+        );
+    }
+
+    let webkit_already_set = std::env::var("WEBKIT_DISABLE_DMABUF_RENDERER").is_ok();
+    if should_disable_webkit_dmabuf(
+        webkit_already_set,
+        is_wayland,
+        nvidia_proprietary_loaded(),
+        &desktop,
+    ) {
+        std::env::set_var("WEBKIT_DISABLE_DMABUF_RENDERER", "1");
+        info!(
+            "WEBKIT_DISABLE_DMABUF_RENDERER=1 (WebKit DMA-BUF workaround on this Wayland setup). Set it yourself to override."
         );
     }
 }
@@ -211,7 +247,7 @@ pub fn run() {
     logger::init_logger();
 
     #[cfg(target_os = "linux")]
-    configure_linux_gdk_backend();
+    configure_linux_graphics();
 
     // Initialize token stats database
     if let Err(e) = modules::token_stats::init_db() {
@@ -400,13 +436,7 @@ pub fn run() {
                 .build(),
         )
         .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
-            let _ = app.get_webview_window("main").map(|window| {
-                let _ = window.show();
-                let _ = window.set_focus();
-                #[cfg(target_os = "macos")]
-                app.set_activation_policy(tauri::ActivationPolicy::Regular)
-                    .unwrap_or(());
-            });
+            let _ = modules::lightweight::exit_lightweight_mode(app);
         }))
         .manage(commands::proxy::ProxyServiceState::new())
         .manage(commands::cloudflared::CloudflaredState::new())
@@ -416,6 +446,31 @@ pub fn run() {
 
             // Initialize log bridge with app handle for debug console
             modules::log_bridge::init_log_bridge(app.handle().clone());
+
+            // 为主窗口显式设置应用图标（强制触发 Win32 WM_SETICON，防止透明/覆盖标题栏窗口在任务栏丢失图标）
+            if let Some(window) = app.get_webview_window("main") {
+                #[cfg(not(target_os = "macos"))]
+                {
+                    let icon_bytes: &[u8] = include_bytes!("../icons/icon.png");
+                    if let Ok(img) = image::load_from_memory(icon_bytes) {
+                        let rgba = img.to_rgba8();
+                        let (width, height) = rgba.dimensions();
+                        let _ = window.set_icon(tauri::image::Image::new_owned(
+                            rgba.into_raw(),
+                            width,
+                            height,
+                        ));
+                    }
+                }
+            }
+
+            // Windows: 异步原生自愈桌面与开始菜单历史快捷方式图标缺失，并刷新外壳（零子进程，不调用 powershell）
+            #[cfg(target_os = "windows")]
+            {
+                std::thread::spawn(|| {
+                    crate::utils::win_shortcut::heal_shortcuts_native();
+                });
+            }
 
             // Linux: Workaround for transparent window crash/freeze
             // The transparent window feature is unstable on Linux with WebKitGTK
@@ -519,16 +574,25 @@ pub fn run() {
                     .unwrap_or(true);
 
                 if tray_enabled {
-                    let _ = window.hide();
-                    #[cfg(target_os = "macos")]
-                    {
-                        use tauri::Manager;
-                        window
-                            .app_handle()
-                            .set_activation_policy(tauri::ActivationPolicy::Accessory)
-                            .unwrap_or(());
-                    }
                     api.prevent_close();
+
+                    let is_lightweight = modules::load_app_config()
+                        .map(|c| c.lightweight_mode)
+                        .unwrap_or(false);
+
+                    if is_lightweight {
+                        let _ = modules::lightweight::enter_lightweight_mode(window.app_handle());
+                    } else {
+                        let _ = window.hide();
+                        #[cfg(target_os = "macos")]
+                        {
+                            use tauri::Manager;
+                            window
+                                .app_handle()
+                                .set_activation_policy(tauri::ActivationPolicy::Accessory)
+                                .unwrap_or(());
+                        }
+                    }
                 }
             }
         })
@@ -559,6 +623,7 @@ pub fn run() {
             commands::refresh_all_quotas,
             // Config commands
             commands::load_config,
+            commands::get_config,
             commands::save_config,
             // Additional commands
             commands::prepare_oauth_url,
@@ -580,12 +645,15 @@ pub fn run() {
             commands::get_antigravity_cache_paths,
             commands::open_data_folder,
             commands::get_data_dir_path,
+            commands::set_data_dir,
+            commands::migrate_data_dir,
             commands::show_main_window,
             commands::set_window_theme,
             commands::get_antigravity_path,
             commands::get_antigravity_cli_path,
             commands::get_antigravity_args,
             commands::check_for_updates,
+            commands::check_native_update,
             commands::check_homebrew_installation,
             commands::check_appimage_installation,
             commands::brew_upgrade_cask,
@@ -608,7 +676,11 @@ pub fn run() {
             commands::proxy::get_proxy_logs_count_filtered,
             commands::proxy::get_proxy_logs_filtered,
             commands::proxy::set_proxy_monitor_enabled,
+            commands::proxy::set_proxy_capture_health_logs,
             commands::proxy::clear_proxy_logs,
+            commands::proxy::clear_thinking_store,
+            commands::proxy::get_thinking_store_count,
+            commands::proxy::get_proxy_db_disk_size,
             commands::proxy::generate_api_key,
             commands::proxy::reload_proxy_accounts,
             commands::proxy::update_model_mapping,
@@ -622,7 +694,6 @@ pub fn run() {
             commands::proxy::get_preferred_account,
             commands::proxy::clear_proxy_rate_limit,
             commands::proxy::clear_all_proxy_rate_limits,
-            commands::proxy::check_proxy_health,
             // Proxy Pool Binding commands
             commands::proxy_pool::bind_account_proxy,
             commands::proxy_pool::unbind_account_proxy,
@@ -635,6 +706,7 @@ pub fn run() {
             commands::warm_up_all_accounts,
             commands::warm_up_account,
             commands::update_account_label,
+            commands::update_account_priority,
             // HTTP API settings commands
             commands::get_http_api_settings,
             commands::save_http_api_settings,
@@ -654,11 +726,24 @@ pub fn run() {
             proxy::cli_sync::execute_cli_restore,
             proxy::cli_sync::get_cli_config_content,
             proxy::opencode_sync::get_opencode_sync_status,
+            proxy::opencode_sync::get_opencode_providers,
             proxy::opencode_sync::get_canonical_families,
             proxy::opencode_sync::execute_opencode_sync,
+            proxy::opencode_sync::execute_opencode_openai_sync,
+            proxy::opencode_sync::execute_opencode_remove_provider,
             proxy::opencode_sync::execute_opencode_restore,
             proxy::opencode_sync::get_opencode_config_content,
             proxy::opencode_sync::execute_opencode_clear,
+            proxy::hermes_sync::get_hermes_sync_status,
+            proxy::hermes_sync::execute_hermes_sync,
+            proxy::hermes_sync::execute_hermes_restore,
+            proxy::hermes_sync::execute_hermes_clear,
+            proxy::hermes_sync::get_hermes_config_content,
+            proxy::openclaw_sync::get_openclaw_sync_status,
+            proxy::openclaw_sync::execute_openclaw_sync,
+            proxy::openclaw_sync::execute_openclaw_restore,
+            proxy::openclaw_sync::execute_openclaw_clear,
+            proxy::openclaw_sync::get_openclaw_config_content,
             proxy::droid_sync::get_droid_sync_status,
             proxy::droid_sync::execute_droid_sync,
             proxy::droid_sync::execute_droid_restore,
@@ -708,33 +793,46 @@ pub fn run() {
         .expect("error while building tauri application")
         .run(|app_handle, event| {
             match event {
-                // Handle app exit - cleanup background tasks
+                // Prevent app from exiting when window is destroyed in lightweight mode
+                tauri::RunEvent::ExitRequested { api, .. } => {
+                    let tray_enabled = app_handle
+                        .try_state::<AppRuntimeFlags>()
+                        .map(|flags| flags.tray_enabled)
+                        .unwrap_or(true);
+
+                    if tray_enabled {
+                        api.prevent_exit();
+                    }
+                }
+                // Handle app exit - cleanup background tasks and release ports
                 tauri::RunEvent::Exit => {
-                    tracing::info!("Application exiting, cleaning up background tasks...");
+                    tracing::info!("Application exiting, cleaning up background tasks and releasing ports...");
                     if let Some(state) =
                         app_handle.try_state::<crate::commands::proxy::ProxyServiceState>()
                     {
+                        let cf_state = app_handle.try_state::<crate::commands::cloudflared::CloudflaredState>();
                         tauri::async_runtime::block_on(async {
-                            // Use timeout-based read() instead of try_read() to handle lock contention
-                            match tokio::time::timeout(
-                                std::time::Duration::from_secs(3),
-                                state.instance.read(),
-                            )
-                            .await
-                            {
-                                Ok(guard) => {
-                                    if let Some(instance) = guard.as_ref() {
-                                        // Use graceful_shutdown with 2s timeout for task cleanup
-                                        instance
-                                            .token_manager
-                                            .graceful_shutdown(std::time::Duration::from_secs(2))
-                                            .await;
-                                    }
+                            // 1. 停止 cloudflared 隧道
+                            if let Some(cf) = cf_state {
+                                let _ = tokio::time::timeout(std::time::Duration::from_millis(500), cf.stop()).await;
+                            }
+
+                            // 2. 停止 Admin Server（释放 TCP 监听器和 Socket）
+                            if let Ok(mut lock) = tokio::time::timeout(std::time::Duration::from_millis(1000), state.admin_server.write()).await {
+                                if let Some(admin) = lock.take() {
+                                    admin.stop().await;
                                 }
-                                Err(_) => {
-                                    tracing::warn!(
-                                        "Lock acquisition timed out after 3s, forcing exit"
-                                    );
+                            }
+
+                            // 3. 停止业务代理实例及后台任务
+                            if let Ok(mut lock) = tokio::time::timeout(std::time::Duration::from_millis(1000), state.instance.write()).await {
+                                if let Some(instance) = lock.take() {
+                                    let _ = tokio::time::timeout(
+                                        std::time::Duration::from_millis(500),
+                                        instance.token_manager.graceful_shutdown(std::time::Duration::from_millis(400)),
+                                    ).await;
+                                    instance.axum_server.set_running(false).await;
+                                    instance.axum_server.stop();
                                 }
                             }
                         });
@@ -743,14 +841,7 @@ pub fn run() {
                 // Handle macOS dock icon click to reopen window
                 #[cfg(target_os = "macos")]
                 tauri::RunEvent::Reopen { .. } => {
-                    if let Some(window) = app_handle.get_webview_window("main") {
-                        let _ = window.show();
-                        let _ = window.unminimize();
-                        let _ = window.set_focus();
-                        app_handle
-                            .set_activation_policy(tauri::ActivationPolicy::Regular)
-                            .unwrap_or(());
-                    }
+                    let _ = modules::lightweight::exit_lightweight_mode(app_handle);
                 }
                 _ => {}
             }

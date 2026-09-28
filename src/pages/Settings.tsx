@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, startTransition } from 'react';
 import { Save, Github, User, MessageCircle, ExternalLink, RefreshCw, Heart, Coffee, LayoutDashboard, Users, Network, Activity, BarChart3, Settings as SettingsIcon, Lock, CheckCircle2, Globe, Send } from 'lucide-react';
 import { request as invoke } from '../utils/request';
 import { open } from '@tauri-apps/plugin-dialog';
@@ -14,17 +14,34 @@ import { useDebugConsole } from '../stores/useDebugConsole';
 import { useTranslation } from 'react-i18next';
 import { isTauri } from '../utils/env';
 import { relaunch } from '@tauri-apps/plugin-process';
+import { emit } from '@tauri-apps/api/event';
 
 import DebugConsole from '../components/debug/DebugConsole';
 import ProxyPoolSettings from '../components/settings/ProxyPoolSettings';
 
+function normalizeDataDirDisplay(path: string): string {
+    const trimmed = path.trim();
+    if (trimmed.startsWith('\\\\?\\UNC\\')) {
+        return `\\\\${trimmed.slice('\\\\?\\UNC\\'.length)}`;
+    }
+    if (trimmed.startsWith('\\\\?\\')) {
+        return trimmed.slice('\\\\?\\'.length);
+    }
+    if (trimmed.startsWith('//?/UNC/')) {
+        return `//${trimmed.slice('//?/UNC/'.length)}`;
+    }
+    if (trimmed.startsWith('//?/')) {
+        return trimmed.slice('//?/'.length);
+    }
+    return trimmed;
+}
 
 function Settings() {
     const { t, i18n } = useTranslation();
     const { config, loadConfig, saveConfig, updateLanguage, updateTheme } = useConfigStore();
     const { enable, disable, isEnabled } = useDebugConsole();
     const [activeTab, setActiveTab] = useState<'general' | 'account' | 'proxy' | 'advanced' | 'debug' | 'about'>('general');
-    const [appVersion, setAppVersion] = useState<string>('4.6.5');
+    const [appVersion, setAppVersion] = useState<string>('4.8.4');
     const [formData, setFormData] = useState<AppConfig>({
         language: 'zh',
         theme: 'system',
@@ -78,15 +95,16 @@ function Settings() {
             enabled: false,
             backoff_steps: [30, 60, 120, 300, 600]
         },
-        hidden_menu_items: [],  // Menu display settings: hide no menu items by default
+        hidden_menu_items: [],  // 菜单显示设置：默认不隐藏任何菜单项
 
     });
 
     // Dialog state
-    // Dialog state
-    const [isClearLogsOpen, setIsClearLogsOpen] = useState(false);
     const [isSupportModalOpen, setIsSupportModalOpen] = useState(false);
     const [dataDirPath, setDataDirPath] = useState<string>('~/.antigravity_tools/');
+    const [pendingDataDir, setPendingDataDir] = useState<string>('');
+    const [isMigrateDataDirOpen, setIsMigrateDataDirOpen] = useState(false);
+    const [isMigratingDataDir, setIsMigratingDataDir] = useState(false);
 
     // Antigravity cache clearing state
     const [isClearCacheOpen, setIsClearCacheOpen] = useState(false);
@@ -101,6 +119,7 @@ function Settings() {
         currentVersion: string;
         downloadUrl: string;
         source?: string;
+        channel?: 'stable' | 'beta';
     } | null>(null);
 
     // Homebrew Cask state
@@ -108,42 +127,44 @@ function Settings() {
     const [isBrewUpgrading, setIsBrewUpgrading] = useState(false);
     const [isBrewConfirmOpen, setIsBrewConfirmOpen] = useState(false);
     const [isBrewSuccessOpen, setIsBrewSuccessOpen] = useState(false);
+    const [isUpdateConfirmOpen, setIsUpdateConfirmOpen] = useState(false);
 
 
     useEffect(() => {
         loadConfig();
 
-        // Get the real data directory path
+        // 获取真实数据目录路径
         invoke<string>('get_data_dir_path')
-            .then(path => setDataDirPath(path))
+            .then(path => setDataDirPath(normalizeDataDirDisplay(path)))
             .catch(err => console.error('Failed to get data dir:', err));
 
-        // Load update settings
-        invoke<{ auto_check: boolean; last_check_time: number; check_interval_hours: number }>('get_update_settings')
+        // 加载更新设置
+        invoke<{ auto_check: boolean; last_check_time: number; check_interval_hours: number; update_channel?: 'stable' | 'beta' }>('get_update_settings')
             .then(settings => {
                 setFormData(prev => ({
                     ...prev,
                     auto_check_update: settings.auto_check,
-                    update_check_interval: settings.check_interval_hours
+                    update_check_interval: settings.check_interval_hours,
+                    update_channel: settings.update_channel || (appVersion.includes('-') ? 'beta' : 'stable'),
                 }));
             })
             .catch(err => console.error('Failed to load update settings:', err));
 
-        // Get the real autostart-at-login status
+        // 获取真实的开机自启状态
         invoke<boolean>('is_auto_launch_enabled')
             .then(enabled => {
                 setFormData(prev => ({ ...prev, auto_launch: enabled }));
             })
             .catch(err => console.error('Failed to get auto launch status:', err));
 
-        // Get the real app version number
+        // 获取应用真实版本号
         if (isTauri()) {
             import('@tauri-apps/api/app').then(({ getVersion }) => {
                 getVersion().then(v => setAppVersion(v)).catch(() => {});
             });
         }
 
-        // Detect whether installed via Homebrew Cask (Tauri environment only)
+        // 检测是否通过 Homebrew Cask 安装 (仅 Tauri 环境)
         if (isTauri()) {
             invoke<boolean>('check_homebrew_installation')
                 .then(installed => setIsBrewInstalled(installed))
@@ -158,11 +179,11 @@ function Settings() {
         }
     }, [config]);
 
-    // Removed the logic that auto-enabled the debug console - now manually controlled by the user
+    // 删除自动启用调试控制台的逻辑 - 改为用户手动控制
 
     const handleSave = async () => {
         try {
-            // Validation: if the upstream proxy is enabled but no address is filled in, show a prompt
+            // 校验：如果启用了上游代理但没有填写地址，给出提示
             const proxyEnabled = formData.proxy?.upstream_proxy?.enabled;
             const proxyUrl = formData.proxy?.upstream_proxy?.url?.trim();
             if (proxyEnabled && !proxyUrl) {
@@ -173,7 +194,7 @@ function Settings() {
             await saveConfig(formData);
             showToast(t('common.saved'), 'success');
 
-            // If the proxy config was changed, prompt the user that a restart is needed
+            // 如果修改了代理配置，提示用户需要重启
             if (proxyEnabled && proxyUrl) {
                 showToast(t('proxy.config.upstream_proxy.restart_hint'), 'info');
             }
@@ -182,21 +203,52 @@ function Settings() {
         }
     };
 
-    const confirmClearLogs = async () => {
-        try {
-            await invoke('clear_log_cache');
-            showToast(t('settings.advanced.logs_cleared'), 'success');
-        } catch (error) {
-            showToast(`${t('common.error')}: ${error}`, 'error');
-        }
-        setIsClearLogsOpen(false);
-    };
+
 
     const handleOpenDataDir = async () => {
         try {
             await invoke('open_data_folder');
         } catch (error) {
             showToast(`${t('common.error')}: ${error}`, 'error');
+        }
+    };
+
+    const handleSelectDataDir = async () => {
+        try {
+            const selected = await open({
+                directory: true,
+                multiple: false,
+                title: t('settings.advanced.data_dir_select'),
+            });
+            if (!selected || typeof selected !== 'string') {
+                return;
+            }
+            if (selected === dataDirPath) {
+                return;
+            }
+            setPendingDataDir(selected);
+            setIsMigrateDataDirOpen(true);
+        } catch (error) {
+            showToast(`${t('common.error')}: ${error}`, 'error');
+        }
+    };
+
+    const confirmMigrateDataDir = async () => {
+        if (!pendingDataDir || isMigratingDataDir) {
+            return;
+        }
+        setIsMigratingDataDir(true);
+        try {
+            const newPath = await invoke<string>('set_data_dir', { path: pendingDataDir });
+            setDataDirPath(normalizeDataDirDisplay(newPath));
+            setIsMigrateDataDirOpen(false);
+            setPendingDataDir('');
+            showToast(t('settings.advanced.data_dir_migrated'), 'success');
+            showToast(t('settings.advanced.data_dir_restart_hint'), 'info');
+        } catch (error) {
+            showToast(`${t('common.error')}: ${error}`, 'error');
+        } finally {
+            setIsMigratingDataDir(false);
         }
     };
 
@@ -272,7 +324,7 @@ function Settings() {
 
     const handleDetectAntigravityPath = async () => {
         try {
-            const command = isTauri() ? 'get_antigravity_path' : 'get_antigravity_path'; // Backend has been unified
+            const command = isTauri() ? 'get_antigravity_path' : 'get_antigravity_path'; // 后端已统一
             const path = await invoke<string>(command, { bypassConfig: true });
             setFormData({ ...formData, antigravity_executable: path });
             showToast(t('settings.advanced.antigravity_path_detected'), 'success');
@@ -316,6 +368,7 @@ function Settings() {
                 current_version: string;
                 download_url: string;
                 source?: string;
+                channel?: 'stable' | 'beta';
             }>('check_for_updates');
 
             setUpdateInfo({
@@ -324,11 +377,13 @@ function Settings() {
                 currentVersion: result.current_version,
                 downloadUrl: result.download_url,
                 source: result.source,
+                channel: result.channel,
             });
 
             if (result.has_update) {
                 const sourceMsg = result.source && result.source !== 'GitHub API' ? ` (via ${result.source})` : '';
                 showToast(t('settings.about.new_version_available', { version: result.latest_version }) + sourceMsg, 'info');
+                setIsUpdateConfirmOpen(true);
             } else {
                 showToast(t('settings.about.latest_version'), 'success');
             }
@@ -336,6 +391,26 @@ function Settings() {
             showToast(`${t('settings.about.update_check_failed')}: ${error}`, 'error');
         } finally {
             setIsCheckingUpdate(false);
+        }
+    };
+
+    const handleConfirmUpdate = async () => {
+        setIsUpdateConfirmOpen(false);
+        if (isBrewInstalled) {
+            handleBrewUpgrade();
+            return;
+        }
+        if (isTauri()) {
+            try {
+                await emit('app://trigger-update');
+            } catch (err) {
+                console.error('Failed to trigger update event:', err);
+                if (updateInfo?.downloadUrl) {
+                    window.open(updateInfo.downloadUrl, '_blank', 'noopener,noreferrer');
+                }
+            }
+        } else if (updateInfo?.downloadUrl) {
+            window.open(updateInfo.downloadUrl, '_blank', 'noopener,noreferrer');
         }
     };
 
@@ -398,16 +473,16 @@ function Settings() {
     return (
         <div className="h-full w-full overflow-y-auto">
             <div className="p-5 space-y-4 max-w-7xl mx-auto">
-                {/* Top toolbar: tab navigation and save button */}
+                {/* 顶部工具栏：Tab 导航和保存按钮 */}
                 <div className="flex justify-between items-center">
-                    {/* Tab navigation - top nav bar style: outer gray container */}
+                    {/* Tab 导航 - 采用顶部导航栏样式：外层灰色容器 */}
                     <div className="flex items-center gap-1 bg-gray-100 dark:bg-base-200 rounded-full p-1 w-fit">
                         <button
                             className={`px-6 py-2 rounded-full text-sm font-medium transition-all ${activeTab === 'general'
                                 ? 'bg-gray-200 dark:bg-gray-700 text-gray-900 dark:text-gray-100 shadow-sm'
                                 : 'text-gray-600 dark:text-gray-400 hover:text-gray-900 dark:hover:text-gray-200'
                                 }`}
-                            onClick={() => setActiveTab('general')}
+                            onClick={() => startTransition(() => setActiveTab('general'))}
                         >
                             {t('settings.tabs.general')}
                         </button>
@@ -416,7 +491,7 @@ function Settings() {
                                 ? 'bg-gray-200 dark:bg-gray-700 text-gray-900 dark:text-gray-100 shadow-sm'
                                 : 'text-gray-600 dark:text-gray-400 hover:text-gray-900 dark:hover:text-gray-200'
                                 }`}
-                            onClick={() => setActiveTab('account')}
+                            onClick={() => startTransition(() => setActiveTab('account'))}
                         >
                             {t('settings.tabs.account')}
                         </button>
@@ -425,7 +500,7 @@ function Settings() {
                                 ? 'bg-gray-200 dark:bg-gray-700 text-gray-900 dark:text-gray-100 shadow-sm'
                                 : 'text-gray-600 dark:text-gray-400 hover:text-gray-900 dark:hover:text-gray-200'
                                 }`}
-                            onClick={() => setActiveTab('proxy')}
+                            onClick={() => startTransition(() => setActiveTab('proxy'))}
                         >
                             {t('settings.tabs.proxy')}
                         </button>
@@ -434,7 +509,7 @@ function Settings() {
                                 ? 'bg-gray-200 dark:bg-gray-700 text-gray-900 dark:text-gray-100 shadow-sm'
                                 : 'text-gray-600 dark:text-gray-400 hover:text-gray-900 dark:hover:text-gray-200'
                                 }`}
-                            onClick={() => setActiveTab('advanced')}
+                            onClick={() => startTransition(() => setActiveTab('advanced'))}
                         >
                             {t('settings.tabs.advanced')}
                         </button>
@@ -443,7 +518,7 @@ function Settings() {
                                 ? 'bg-gray-200 dark:bg-gray-700 text-gray-900 dark:text-gray-100 shadow-sm'
                                 : 'text-gray-600 dark:text-gray-400 hover:text-gray-900 dark:hover:text-gray-200'
                                 }`}
-                            onClick={() => setActiveTab('debug')}
+                            onClick={() => startTransition(() => setActiveTab('debug'))}
                         >
                             {t('settings.tabs.debug')}
                         </button>
@@ -452,7 +527,7 @@ function Settings() {
                                 ? 'bg-gray-200 dark:bg-gray-700 text-gray-900 dark:text-gray-100 shadow-sm'
                                 : 'text-gray-600 dark:text-gray-400 hover:text-gray-900 dark:hover:text-gray-200'
                                 }`}
-                            onClick={() => setActiveTab('about')}
+                            onClick={() => startTransition(() => setActiveTab('about'))}
                         >
                             {t('settings.tabs.about')}
                         </button>
@@ -467,14 +542,14 @@ function Settings() {
                     </button>
                 </div>
 
-                {/* Settings form */}
+                {/* 设置表单 */}
                 <div className="bg-white dark:bg-base-100 rounded-2xl p-6 shadow-sm border border-gray-100 dark:border-base-200">
-                    {/* General settings */}
+                    {/* 通用设置 */}
                     {activeTab === 'general' && (
                         <div className="space-y-6">
                             <h2 className="text-lg font-semibold text-gray-900 dark:text-base-content">{t('settings.general.title')}</h2>
 
-                            {/* Language selection */}
+                            {/* 语言选择 */}
                             <div>
                                 <label className="block text-sm font-medium text-gray-900 dark:text-base-content mb-2">{t('settings.general.language')}</label>
                                 <select
@@ -483,7 +558,10 @@ function Settings() {
                                     onChange={(e) => {
                                         const newLang = e.target.value;
                                         setFormData({ ...formData, language: newLang });
-                                        i18n.changeLanguage(newLang);
+                                        document.documentElement.dir = newLang === 'ar' ? 'rtl' : 'ltr';
+                                        startTransition(() => {
+                                            i18n.changeLanguage(newLang);
+                                        });
                                         updateLanguage(newLang);
                                     }}
                                 >
@@ -500,7 +578,7 @@ function Settings() {
                                 </select>
                             </div>
 
-                            {/* Theme selection */}
+                            {/* 主题选择 */}
                             <div>
                                 <label className="block text-sm font-medium text-gray-900 dark:text-base-content mb-2">{t('settings.general.theme')}</label>
                                 <select
@@ -518,13 +596,13 @@ function Settings() {
                                 </select>
                             </div>
 
-                            {/* Launch at login */}
+                            {/* 开机自动启动 */}
                             <div>
                                 <div className="flex justify-between items-center mb-2">
                                     <label className="block text-sm font-medium text-gray-900 dark:text-base-content">{t('settings.general.auto_launch')}</label>
                                     {!isTauri() && (
                                         <span className="text-xs text-orange-500 dark:text-orange-400">
-                                            {t('settings.web_mode_limitation', '(Not supported in Web mode)')}
+                                            {t('settings.web_mode_limitation', '(Web 模式不支持)')}
                                         </span>
                                     )}
                                 </div>
@@ -549,7 +627,7 @@ function Settings() {
                                 <p className="text-sm text-gray-500 dark:text-gray-400 mt-2">{t('settings.general.auto_launch_desc')}</p>
                             </div>
 
-                            {/* Automatically check for updates */}
+                            {/* 自动检查更新 */}
                             <>
                                 <div className="flex items-center justify-between p-4 bg-gray-50 dark:bg-base-200 rounded-lg border border-gray-100 dark:border-base-300">
                                     <div>
@@ -582,7 +660,7 @@ function Settings() {
                                     </label>
                                 </div>
 
-                                {/* Check interval */}
+                                {/* 检查间隔 */}
                                 {formData.auto_check_update && (
                                     <div className="ml-4">
                                         <label className="block text-sm font-medium text-gray-900 dark:text-base-content mb-2">{t('settings.general.update_check_interval')}</label>
@@ -611,8 +689,31 @@ function Settings() {
                                         <p className="text-sm text-gray-500 dark:text-gray-400 mt-2">{t('settings.general.update_check_interval_desc')}</p>
                                     </div>
                                 )}
+                            </>
 
-                                {/* Menu display settings */}
+                            {/* 轻量模式 (释放内存) */}
+                            {isTauri() && (
+                                <div className="flex items-center justify-between p-4 bg-gray-50 dark:bg-base-200 rounded-lg border border-gray-100 dark:border-base-300">
+                                    <div>
+                                        <div className="font-medium text-gray-900 dark:text-base-content">{t('settings.general.lightweight_mode')}</div>
+                                        <p className="text-sm text-gray-600 dark:text-gray-400 mt-1">{t('settings.general.lightweight_mode_desc')}</p>
+                                    </div>
+                                    <label className="relative inline-flex items-center cursor-pointer">
+                                        <input
+                                            type="checkbox"
+                                            className="sr-only peer"
+                                            checked={formData.lightweight_mode ?? false}
+                                            onChange={(e) => {
+                                                const enabled = e.target.checked;
+                                                setFormData({ ...formData, lightweight_mode: enabled });
+                                            }}
+                                        />
+                                        <div className="w-11 h-6 bg-gray-200 dark:bg-base-300 peer-focus:outline-none peer-focus:ring-4 peer-focus:ring-blue-300 dark:peer-focus:ring-blue-800 rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border-gray-300 after:border after:rounded-full after:h-5 after:w-5 after:transition-all peer-checked:bg-blue-500"></div>
+                                    </label>
+                                </div>
+                            )}
+
+                                {/* 菜单显示设置 */}
                                 <div className="border-t border-gray-200 dark:border-base-200 pt-6 mt-6">
                                     <h3 className="font-medium text-gray-900 dark:text-base-content mb-3">{t('settings.menu.title')}</h3>
                                     <p className="text-sm text-gray-600 dark:text-gray-400 mb-4">
@@ -644,20 +745,20 @@ function Settings() {
                                                                 ? [...hiddenItems, item.path]
                                                                 : hiddenItems.filter(p => p !== item.path);
 
-                                                            // Optimistic UI update
+                                                            // 乐观更新 UI
                                                             const newConfig = {
                                                                 ...formData,
                                                                 hidden_menu_items: newHiddenItems
                                                             };
                                                             setFormData(newConfig);
 
-                                                            // Attempt to save
+                                                            // 尝试保存
                                                             try {
                                                                 await saveConfig(newConfig);
                                                             } catch (error) {
-                                                                // Save failed, roll back to the original snapshot
+                                                                // 保存失败，回滚到原始快照
                                                                 setFormData(originalConfig);
-                                                                showToast(`Save failed, settings restored: ${error}`, 'error');
+                                                                showToast(`保存失败，已恢复设置: ${error}`, 'error');
                                                             }
                                                         }
                                                     }}
@@ -671,7 +772,7 @@ function Settings() {
                                                         }
                                                     `}
                                                 >
-                                                    {/* Selected marker */}
+                                                    {/* 选中标记 */}
                                                     {isVisible && (
                                                         <div className="absolute top-2 right-2 text-blue-500">
                                                             <CheckCircle2 size={16} fill="currentColor" className="text-white dark:text-base-100" />
@@ -706,14 +807,13 @@ function Settings() {
                                         {t('settings.menu.selected_items_note')}
                                     </p>
                                 </div>
-                            </>
                         </div>
                     )}
 
-                    {/* Account settings */}
+                    {/* 账号设置 */}
                     {activeTab === 'account' && (
                         <div className="space-y-4 animate-in fade-in duration-500">
-                            {/* Auto-refresh quota */}
+                            {/* 自动刷新配额 */}
                             <div className="group bg-white dark:bg-base-100 rounded-xl p-5 border border-gray-100 dark:border-base-200 hover:border-blue-200 transition-all duration-300 shadow-sm">
                                 <div className="flex items-center justify-between">
                                     <div className="flex items-center gap-4">
@@ -762,7 +862,7 @@ function Settings() {
                                 </div>
                             </div>
 
-                            {/* Automatically fetch current account */}
+                            {/* 自动获取当前账号 */}
                             <div className="group bg-white dark:bg-base-100 rounded-xl p-5 border border-gray-100 dark:border-base-200 hover:border-emerald-200 transition-all duration-300 shadow-sm">
                                 <div className="flex items-center justify-between">
                                     <div className="flex items-center gap-4">
@@ -800,7 +900,7 @@ function Settings() {
                                 )}
                             </div>
 
-                            {/* 7-day weekly quota smart warmup (Smart Warmup) */}
+                            {/* 7天周配额智能预热 (Smart Warmup) */}
                             <div className="group bg-white dark:bg-base-100 rounded-xl p-5 border border-gray-100 dark:border-base-200 hover:border-orange-200 transition-all duration-300 shadow-sm">
                                 <SmartWarmup
                                     config={formData.scheduled_warmup}
@@ -820,7 +920,7 @@ function Settings() {
                                 />
                             </div>
 
-                            {/* Quota protection (Quota Protection) */}
+                            {/* 配额保护 (Quota Protection) */}
                             <div className="group bg-white dark:bg-base-100 rounded-xl p-5 border border-gray-100 dark:border-base-200 hover:border-rose-200 transition-all duration-300 shadow-sm">
                                 <QuotaProtection
                                     config={formData.quota_protection}
@@ -828,7 +928,7 @@ function Settings() {
                                         const updates: any = {
                                             quota_protection: newConfig
                                         };
-                                        // Linked logic: when quota protection is enabled, force-enable background auto-refresh (not just warmup)
+                                        // 联动逻辑：开启配额保护时，强制开启后台自动刷新 (不仅仅是预热)
                                         if (newConfig.enabled) {
                                             updates.auto_refresh = true;
                                         }
@@ -849,7 +949,7 @@ function Settings() {
                                 />
                             </div>
 
-                            {/* Pinned quota watch list (Pinned Quota Models) */}
+                            {/* 配额关注列表 (Pinned Quota Models) */}
                             <div className="group bg-white dark:bg-base-100 rounded-xl p-5 border border-gray-100 dark:border-base-200 hover:border-indigo-200 transition-all duration-300 shadow-sm">
                                 <PinnedQuotaModels
                                     config={formData.pinned_quota_models}
@@ -862,11 +962,11 @@ function Settings() {
                         </div>
                     )}
 
-                    {/* Advanced settings */}
+                    {/* 高级设置 */}
                     {activeTab === 'advanced' && (
                         <>
                             <div className="space-y-4">
-                                {/* Default export path */}
+                                {/* 默认导出路径 */}
                                 <div>
                                     <label className="block text-sm font-medium text-gray-900 dark:text-base-content mb-1">{t('settings.advanced.export_path')}</label>
                                     <div className="flex gap-2">
@@ -893,14 +993,14 @@ function Settings() {
                                             </button>
                                         ) : (
                                             <span className="self-center text-xs text-gray-400 dark:text-gray-500 italic px-2">
-                                                {t('settings.web_mode_limitation', '(Not supported in Web mode)')}
+                                                {t('settings.web_mode_limitation', '(Web 模式不支持)')}
                                             </span>
                                         )}
                                     </div>
                                     <p className="text-sm text-gray-500 dark:text-gray-400 mt-2">{t('settings.advanced.default_export_path_desc')}</p>
                                 </div>
 
-                                {/* Data directory */}
+                                {/* 数据目录 */}
                                 <div>
                                     <label className="block text-sm font-medium text-gray-900 dark:text-base-content mb-1">{t('settings.advanced.data_dir')}</label>
                                     <div className="flex gap-2">
@@ -911,22 +1011,31 @@ function Settings() {
                                             readOnly
                                         />
                                         {isTauri() ? (
-                                            <button
-                                                className="px-4 py-2 border border-gray-200 dark:border-base-300 text-gray-700 dark:text-gray-300 rounded-lg hover:bg-gray-50 dark:hover:bg-base-200 hover:text-gray-900 dark:hover:text-base-content transition-colors"
-                                                onClick={handleOpenDataDir}
-                                            >
-                                                {t('settings.advanced.open_btn')}
-                                            </button>
+                                            <>
+                                                <button
+                                                    className="px-4 py-2 border border-gray-200 dark:border-base-300 text-gray-700 dark:text-gray-300 rounded-lg hover:bg-gray-50 dark:hover:bg-base-200 hover:text-gray-900 dark:hover:text-base-content transition-colors"
+                                                    onClick={handleSelectDataDir}
+                                                    disabled={isMigratingDataDir}
+                                                >
+                                                    {t('settings.advanced.select_btn')}
+                                                </button>
+                                                <button
+                                                    className="px-4 py-2 border border-gray-200 dark:border-base-300 text-gray-700 dark:text-gray-300 rounded-lg hover:bg-gray-50 dark:hover:bg-base-200 hover:text-gray-900 dark:hover:text-base-content transition-colors"
+                                                    onClick={handleOpenDataDir}
+                                                >
+                                                    {t('settings.advanced.open_btn')}
+                                                </button>
+                                            </>
                                         ) : (
                                             <span className="self-center text-xs text-gray-400 dark:text-gray-500 italic px-2">
-                                                {t('settings.web_mode_limitation', '(Not supported in Web mode)')}
+                                                {t('settings.web_mode_limitation', '(Web 模式不支持)')}
                                             </span>
                                         )}
                                     </div>
                                     <p className="text-sm text-gray-500 dark:text-gray-400 mt-2">{t('settings.advanced.data_dir_desc')}</p>
                                 </div>
 
-                                {/* Antigravity program path */}
+                                {/* 反重力程序路径 */}
                                 <div>
                                     <label className="block text-sm font-medium text-gray-900 dark:text-base-content mb-1">
                                         {t('settings.advanced.antigravity_path')}
@@ -962,7 +1071,7 @@ function Settings() {
                                             </button>
                                         ) : (
                                             <span className="self-center text-xs text-gray-400 dark:text-gray-500 italic px-2">
-                                                {t('settings.web_mode_limitation', '(Not supported in Web mode)')}
+                                                {t('settings.web_mode_limitation', '(Web 模式不支持)')}
                                             </span>
                                         )}
                                     </div>
@@ -971,7 +1080,7 @@ function Settings() {
                                     </p>
                                 </div>
 
-                                {/* Antigravity CLI (agy) program path */}
+                                {/* Antigravity CLI (agy) 程序路径 */}
                                 <div>
                                     <label className="block text-sm font-medium text-gray-900 dark:text-base-content mb-1">
                                         {t('settings.advanced.antigravity_cli_path', 'Antigravity CLI (agy) Path')}
@@ -981,7 +1090,7 @@ function Settings() {
                                             type="text"
                                             className="flex-1 px-4 py-4 border border-gray-200 dark:border-base-300 rounded-lg bg-gray-50 dark:bg-base-200 text-gray-900 dark:text-base-content font-medium"
                                             value={formData.antigravity_cli_executable || ''}
-                                            placeholder={t('settings.advanced.antigravity_cli_path_placeholder', 'Not set (auto-detection will be used)')}
+                                            placeholder={t('settings.advanced.antigravity_cli_path_placeholder', '未设置 (将使用自动探测)')}
                                             onChange={(e) => setFormData({ ...formData, antigravity_cli_executable: e.target.value })}
                                         />
                                         {formData.antigravity_cli_executable && (
@@ -1007,23 +1116,23 @@ function Settings() {
                                             </button>
                                         ) : (
                                             <span className="self-center text-xs text-gray-400 dark:text-gray-500 italic px-2">
-                                                {t('settings.web_mode_limitation', '(Not supported in Web mode)')}
+                                                {t('settings.web_mode_limitation', '(Web 模式不支持)')}
                                             </span>
                                         )}
                                     </div>
                                     <p className="text-sm text-gray-500 dark:text-gray-400 mt-2">
-                                        {t('settings.advanced.antigravity_cli_path_desc', 'Set the executable path of your command-line client (agy), used to remove account restrictions with one click.')}
+                                        {t('settings.advanced.antigravity_cli_path_desc', '设置您的命令行客户端 (agy) 的可执行文件路径，用于一键解除账号限制。')}
                                     </p>
                                     
-                                    {/* New: one-click patch button to decrypt/patch eligibility restrictions */}
+                                    {/* 新增：解密/修补准入限制一键修补按钮 */}
                                     <div className={`mt-3 flex items-center gap-4 p-3 rounded-lg border ${formData.antigravity_cli_executable ? 'bg-blue-50 dark:bg-blue-950/20 border-blue-100 dark:border-blue-900/30' : 'bg-gray-50 dark:bg-gray-800 border-gray-200 dark:border-gray-700'}`}>
                                         <div className="flex-1">
                                             <h4 className={`text-sm font-semibold ${formData.antigravity_cli_executable ? 'text-blue-900 dark:text-blue-200' : 'text-gray-500 dark:text-gray-400'}`}>
-                                                {t('settings.advanced.patch_eligibility_title', 'Account Eligibility Restriction Removal')}
+                                                {t('settings.advanced.patch_eligibility_title', '账号准入限制解除')}
                                             </h4>
                                             <p className={`text-xs mt-0.5 ${formData.antigravity_cli_executable ? 'text-blue-700 dark:text-blue-300/80' : 'text-gray-400 dark:text-gray-500'}`}>
-                                                {t('settings.advanced.patch_eligibility_desc', 'The new agy binary forcibly blocks unauthorized accounts; this action skips the local eligibility check with one click.')}
-                                                {!formData.antigravity_cli_executable && " (Please set or detect the path above first)"}
+                                                {t('settings.advanced.patch_eligibility_desc', '新版 agy 二进制强制拦截未授权账号，此操作一键跳过本地准入拦截检查。')}
+                                                {!formData.antigravity_cli_executable && " (需先在上方设置或探测路径)"}
                                             </p>
                                         </div>
                                         <button
@@ -1039,12 +1148,12 @@ function Settings() {
                                                 }
                                             }}
                                         >
-                                            {t('settings.advanced.patch_btn', 'One-Click Remove')}
+                                            {t('settings.advanced.patch_btn', '一键解除')}
                                         </button>
                                     </div>
                                 </div>
 
-                                {/* Antigravity IDE program path */}
+                                {/* Antigravity IDE 程序路径 */}
                                 <div>
                                     <label className="block text-sm font-medium text-gray-900 dark:text-base-content mb-1">
                                         {t('settings.advanced.antigravity_ide_path', 'Antigravity IDE Path')}
@@ -1074,7 +1183,7 @@ function Settings() {
                                             </button>
                                         ) : (
                                             <span className="self-center text-xs text-gray-400 dark:text-gray-500 italic px-2">
-                                                {t('settings.web_mode_limitation', '(Not supported in Web mode)')}
+                                                {t('settings.web_mode_limitation', '(Web 模式不支持)')}
                                             </span>
                                         )}
                                     </div>
@@ -1083,7 +1192,7 @@ function Settings() {
                                     </p>
                                 </div>
 
-                                {/* Antigravity program launch arguments */}
+                                {/* 反重力程序启动参数 */}
                                 <div>
                                     <label className="block text-sm font-medium text-gray-900 dark:text-base-content mb-1">
                                         {t('settings.advanced.antigravity_args')}
@@ -1119,23 +1228,9 @@ function Settings() {
                                     </p>
                                 </div>
 
-                                {/* Log cache cleanup */}
-                                <div className="border-t border-gray-200 dark:border-base-200 pt-4">
-                                    <h3 className="font-medium text-gray-900 dark:text-base-content mb-3">{t('settings.advanced.logs_title')}</h3>
-                                    <div className="bg-gray-50 dark:bg-base-200 border border-gray-200 dark:border-base-300 rounded-lg p-3 mb-3">
-                                        <p className="text-sm text-gray-600 dark:text-gray-400">{t('settings.advanced.logs_desc')}</p>
-                                    </div>
-                                    <div className="flex items-center gap-4">
-                                        <button
-                                            className="px-4 py-2 border border-gray-300 dark:border-base-300 text-gray-700 dark:text-gray-300 rounded-lg hover:bg-gray-100 dark:hover:bg-base-200 transition-colors"
-                                            onClick={() => setIsClearLogsOpen(true)}
-                                        >
-                                            {t('settings.advanced.clear_logs')}
-                                        </button>
-                                    </div>
-                                </div>
 
-                                {/* Antigravity cache cleanup */}
+
+                                {/* Antigravity 缓存清理 */}
                                 <div className="border-t border-gray-200 dark:border-base-200 pt-4">
                                     <h3 className="font-medium text-gray-900 dark:text-base-content mb-3">{t('settings.advanced.antigravity_cache_title')}</h3>
                                     <div className="bg-amber-50 dark:bg-amber-900/20 border border-amber-200 dark:border-amber-700/30 rounded-lg p-3 mb-3">
@@ -1237,10 +1332,10 @@ function Settings() {
                     )}
 
 
-                    {/* Debug settings */}
+                    {/* 调试设置 */}
                     {activeTab === 'debug' && (
                         <div className="space-y-4 animate-in fade-in duration-500">
-                            {/* Title and toggle */}
+                            {/* 标题和开关 */}
                             <div className="flex items-center justify-between">
                                 <div>
                                     <h2 className="text-lg font-semibold text-gray-900 dark:text-base-content">
@@ -1264,7 +1359,7 @@ function Settings() {
                                 </label>
                             </div>
 
-                            {/* Console or hint */}
+                            {/* 控制台或提示 */}
                             {isEnabled ? (
                                 <div className="h-[calc(100vh-320px)] min-h-[400px]">
                                     <DebugConsole embedded />
@@ -1284,7 +1379,7 @@ function Settings() {
                         </div>
                     )}
 
-                    {/* Proxy settings */}
+                    {/* 代理设置 */}
                     {activeTab === 'proxy' && (
                         <div className="space-y-4 animate-in fade-in duration-300">
                             <ProxyPoolSettings
@@ -1321,7 +1416,7 @@ function Settings() {
                                 }}
                             />
 
-                            {/* [FIX #1701] Restore global upstream proxy settings */}
+                            {/* [FIX #1701] 恢复全局上游代理设置 */}
                             <div className="group bg-white dark:bg-base-100 rounded-xl p-5 border border-gray-100 dark:border-base-200 hover:border-blue-200 transition-all duration-300 shadow-sm relative overflow-hidden">
                                 <div className="absolute top-0 right-0 w-24 h-24 bg-blue-500/5 -mr-12 -mt-12 rounded-full blur-2xl group-hover:bg-blue-500/10 transition-colors"></div>
                                 <div className="flex items-center justify-between mb-5 relative z-10">
@@ -1507,6 +1602,75 @@ function Settings() {
                                     </div>
                                 </div>
 
+                                {/* Update Channel Selector */}
+                                <div className="flex flex-col items-center gap-2">
+                                    <div className="flex items-center gap-2 text-xs font-medium text-gray-500 dark:text-gray-400">
+                                        <span>{t('settings.about.update_channel')}:</span>
+                                        <div className="inline-flex p-1 bg-gray-100 dark:bg-base-300 rounded-xl border border-gray-200/60 dark:border-base-200">
+                                            <button
+                                                type="button"
+                                                onClick={async () => {
+                                                    try {
+                                                        await invoke('save_update_settings', {
+                                                            settings: {
+                                                                auto_check: formData.auto_check_update ?? true,
+                                                                last_check_time: 0,
+                                                                check_interval_hours: formData.update_check_interval ?? 24,
+                                                                update_channel: 'stable',
+                                                            }
+                                                        });
+                                                        setFormData(prev => ({ ...prev, update_channel: 'stable' }));
+                                                        setUpdateInfo(null);
+                                                        showToast(`${t('settings.about.update_channel')}: ${t('settings.about.channel_stable')}`, 'info');
+                                                    } catch (err) {
+                                                        showToast(`${t('common.error')}: ${err}`, 'error');
+                                                    }
+                                                }}
+                                                className={`px-3 py-1 rounded-lg text-xs font-semibold transition-all ${
+                                                    (formData.update_channel || 'stable') === 'stable'
+                                                        ? 'bg-white dark:bg-base-100 text-blue-600 dark:text-blue-400 shadow-sm'
+                                                        : 'text-gray-600 dark:text-gray-400 hover:text-gray-900 dark:hover:text-white'
+                                                }`}
+                                            >
+                                                {t('settings.about.channel_stable')}
+                                            </button>
+                                            <button
+                                                type="button"
+                                                onClick={async () => {
+                                                    try {
+                                                        await invoke('save_update_settings', {
+                                                            settings: {
+                                                                auto_check: formData.auto_check_update ?? true,
+                                                                last_check_time: 0,
+                                                                check_interval_hours: formData.update_check_interval ?? 24,
+                                                                update_channel: 'beta',
+                                                            }
+                                                        });
+                                                        setFormData(prev => ({ ...prev, update_channel: 'beta' }));
+                                                        setUpdateInfo(null);
+                                                        showToast(`${t('settings.about.update_channel')}: ${t('settings.about.channel_beta')}`, 'info');
+                                                    } catch (err) {
+                                                        showToast(`${t('common.error')}: ${err}`, 'error');
+                                                    }
+                                                }}
+                                                className={`px-3 py-1 rounded-lg text-xs font-semibold transition-all flex items-center gap-1 ${
+                                                    formData.update_channel === 'beta'
+                                                        ? 'bg-white dark:bg-base-100 text-amber-600 dark:text-amber-400 shadow-sm'
+                                                        : 'text-gray-600 dark:text-gray-400 hover:text-gray-900 dark:hover:text-white'
+                                                }`}
+                                            >
+                                                <span>{t('settings.about.channel_beta')}</span>
+                                                <span className="w-1.5 h-1.5 rounded-full bg-amber-500 animate-pulse" />
+                                            </button>
+                                        </div>
+                                    </div>
+                                    {formData.update_channel === 'beta' && (
+                                        <p className="text-[11px] text-amber-600/90 dark:text-amber-400/90">
+                                            {t('settings.about.channel_beta_hint')}
+                                        </p>
+                                    )}
+                                </div>
+
                                 {/* Check for Updates */}
                                 <div className="flex flex-col items-center gap-3">
                                     <button
@@ -1523,11 +1687,16 @@ function Settings() {
                                         <div className="text-center">
                                             {updateInfo.hasUpdate ? (
                                                 <div className="flex flex-col items-center gap-2">
-                                                    <div className="text-sm text-orange-600 dark:text-orange-400 font-medium">
-                                                        {t('settings.about.new_version_available', { version: updateInfo.latestVersion })}
+                                                    <div className="flex items-center gap-1.5 text-sm text-orange-600 dark:text-orange-400 font-medium">
+                                                        <span>{t('settings.about.new_version_available', { version: updateInfo.latestVersion })}</span>
+                                                        {updateInfo.channel === 'beta' && (
+                                                            <span className="px-1.5 py-0.2 text-[10px] font-semibold rounded bg-amber-100 dark:bg-amber-900/40 text-amber-700 dark:text-amber-300 border border-amber-200 dark:border-amber-800">
+                                                                Beta
+                                                            </span>
+                                                        )}
                                                     </div>
-                                                    <div className="flex items-center gap-2">
-                                                        {isBrewInstalled && (
+                                                    <div className="flex items-center gap-2 flex-wrap justify-center">
+                                                        {isBrewInstalled ? (
                                                             <button
                                                                 onClick={() => setIsBrewConfirmOpen(true)}
                                                                 disabled={isBrewUpgrading}
@@ -1542,12 +1711,22 @@ function Settings() {
                                                                     t('settings.about.brew_upgrade')
                                                                 )}
                                                             </button>
+                                                        ) : (
+                                                            isTauri() && (
+                                                                <button
+                                                                    onClick={handleConfirmUpdate}
+                                                                    className="px-4 py-1.5 bg-blue-600 hover:bg-blue-700 text-white text-sm rounded-lg transition-all shadow-sm active:scale-95 flex items-center gap-1.5"
+                                                                >
+                                                                    <RefreshCw className="w-3.5 h-3.5" />
+                                                                    {t('settings.about.upgrade_now_btn', { defaultValue: '立即自动更新' })}
+                                                                </button>
+                                                            )
                                                         )}
                                                         <a
                                                             href={updateInfo.downloadUrl}
                                                             target="_blank"
                                                             rel="noreferrer"
-                                                            className="px-4 py-1.5 bg-orange-500 hover:bg-orange-600 text-white text-sm rounded-lg transition-colors flex items-center gap-1.5"
+                                                            className="px-4 py-1.5 bg-gray-100 hover:bg-gray-200 dark:bg-base-200 dark:hover:bg-base-300 text-gray-700 dark:text-gray-200 text-sm rounded-lg transition-colors flex items-center gap-1.5 border border-gray-200 dark:border-base-300"
                                                         >
                                                             {t('settings.about.download_update')}
                                                             <ExternalLink className="w-3.5 h-3.5" />
@@ -1572,17 +1751,26 @@ function Settings() {
                     }
                 </div >
 
+
+
                 <ModalDialog
-                    isOpen={isClearLogsOpen}
-                    title={t('settings.advanced.clear_logs_title')}
-                    message={t('settings.advanced.clear_logs_msg')}
+                    isOpen={isMigrateDataDirOpen}
+                    title={t('settings.advanced.data_dir_migrate_title')}
                     type="confirm"
-                    confirmText={t('common.clear')}
+                    confirmText={isMigratingDataDir ? t('common.loading') : t('common.confirm')}
                     cancelText={t('common.cancel')}
-                    isDestructive={true}
-                    onConfirm={confirmClearLogs}
-                    onCancel={() => setIsClearLogsOpen(false)}
-                />
+                    onConfirm={confirmMigrateDataDir}
+                    onCancel={() => {
+                        if (!isMigratingDataDir) {
+                            setIsMigrateDataDirOpen(false);
+                            setPendingDataDir('');
+                        }
+                    }}
+                >
+                    <p className="text-sm text-gray-600 dark:text-gray-400 whitespace-pre-line">
+                        {t('settings.advanced.data_dir_migrate_msg', { path: pendingDataDir })}
+                    </p>
+                </ModalDialog>
 
                 {/* Antigravity Cache Clear Modal */}
                 <ModalDialog
@@ -1686,6 +1874,47 @@ function Settings() {
                     <p className="text-sm text-gray-600 dark:text-gray-400">
                         {t('settings.about.brew_upgrade_success')}
                     </p>
+                </ModalDialog>
+
+                {/* 新版本自动更新确认弹窗 */}
+                <ModalDialog
+                    isOpen={isUpdateConfirmOpen}
+                    title={t('settings.about.update_dialog_title', { defaultValue: '发现新版本可用' })}
+                    type="confirm"
+                    confirmText={t('settings.about.upgrade_now_btn', { defaultValue: '立即下载并自动更新' })}
+                    cancelText={t('common.cancel', { defaultValue: '稍后再说' })}
+                    onConfirm={handleConfirmUpdate}
+                    onCancel={() => setIsUpdateConfirmOpen(false)}
+                >
+                    <div className="space-y-3 py-1 text-sm text-gray-700 dark:text-gray-300">
+                        <p className="text-xs text-gray-600 dark:text-gray-400 leading-relaxed">
+                            {t('settings.about.update_confirm_desc', {
+                                defaultValue: '检测到最新版本，点击“立即下载并自动更新”将直接启动自动下载并在准备就绪后覆盖安装生效。',
+                            })}
+                        </p>
+                        <div className="bg-gray-50 dark:bg-base-200 p-3 rounded-lg border border-gray-200 dark:border-base-300 space-y-1.5 font-mono text-xs">
+                            <div className="flex items-center justify-between">
+                                <span className="text-gray-500">{t('settings.about.current_version')}:</span>
+                                <span className="font-semibold text-gray-800 dark:text-gray-200">{updateInfo?.currentVersion || appVersion}</span>
+                            </div>
+                            <div className="flex items-center justify-between">
+                                <span className="text-gray-500">{t('settings.about.latest_version_label', { defaultValue: '最新版本' })}:</span>
+                                <div className="flex items-center gap-1.5">
+                                    <span className="font-bold text-emerald-600 dark:text-emerald-400">{updateInfo?.latestVersion}</span>
+                                    {updateInfo?.channel === 'beta' && (
+                                        <span className="px-1.5 py-0.2 text-[10px] font-semibold rounded bg-amber-100 dark:bg-amber-900/40 text-amber-700 dark:text-amber-300 border border-amber-200 dark:border-amber-800">
+                                            Beta
+                                        </span>
+                                    )}
+                                </div>
+                            </div>
+                            {updateInfo?.source && (
+                                <div className="text-[10px] text-gray-400 text-right pt-1 border-t border-gray-200/50 dark:border-base-300">
+                                    via {updateInfo.source}
+                                </div>
+                            )}
+                        </div>
+                    </div>
                 </ModalDialog>
 
                 {/* Support Modal */}

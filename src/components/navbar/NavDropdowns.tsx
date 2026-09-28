@@ -24,7 +24,7 @@ export function useClickOutside(
     }, [ref, handler]);
 }
 
-// Language dropdown menu component
+// 语言下拉菜单组件
 interface LanguageDropdownProps {
     currentLanguage: string;
     languages: Language[];
@@ -45,8 +45,8 @@ export function LanguageDropdown({
     useClickOutside(menuRef, () => setIsOpen(false));
 
     const handleLanguageChange = (langCode: string) => {
-        onLanguageChange(langCode);
         setIsOpen(false);
+        onLanguageChange(langCode);
     };
 
     return (
@@ -61,9 +61,9 @@ export function LanguageDropdown({
                 </span>
             </button>
 
-            {/* Dropdown menu */}
+            {/* 下拉菜单 (强制右对齐并限制在视口内，彻底解决向右溢出被窗口边缘遮蔽的问题) */}
             {isOpen && (
-                <div className="absolute ltr:right-0 rtl:left-0 mt-2 w-32 bg-white dark:bg-base-200 rounded-xl shadow-lg border border-gray-100 dark:border-base-100 py-1 overflow-hidden animate-in fade-in zoom-in-95 duration-200 ltr:origin-top-right rtl:origin-top-left">
+                <div className="absolute right-0 mt-2 w-36 bg-white dark:bg-base-200 rounded-xl shadow-xl border border-gray-100 dark:border-base-100 py-1 overflow-hidden animate-in fade-in zoom-in-95 duration-200 origin-top-right z-50">
                     {languages.map((lang) => (
                         <button
                             key={lang.code}
@@ -88,13 +88,13 @@ export function LanguageDropdown({
     );
 }
 
-// Nav dropdown menu component (< 375px)
+// 导航下拉菜单组件 (< 375px)
 interface NavigationDropdownProps {
     navItems: NavItem[];
     isActive: (path: string) => boolean;
     getCurrentNavItem: () => NavItem | undefined;
     onNavigate: () => void;
-    showLabel?: boolean; // Whether to show the text label
+    showLabel?: boolean; // 是否显示文字标签
 }
 
 export function NavigationDropdown({
@@ -102,7 +102,7 @@ export function NavigationDropdown({
     isActive,
     getCurrentNavItem,
     onNavigate,
-    showLabel = true // Show text by default
+    showLabel = true // 默认显示文字
 }: NavigationDropdownProps) {
     const [isOpen, setIsOpen] = useState(false);
     const menuRef = useRef<HTMLDivElement>(null);
@@ -117,7 +117,7 @@ export function NavigationDropdown({
     const currentItem = getCurrentNavItem();
     const CurrentIcon = currentItem?.icon;
 
-    // Don't render if there's no current item
+    // 如果没有当前项,不渲染
     if (!currentItem || !CurrentIcon) return null;
 
     return (
@@ -127,7 +127,7 @@ export function NavigationDropdown({
                 className="flex items-center gap-2 px-3 py-2 rounded-full bg-gray-100 dark:bg-base-200 hover:bg-gray-200 dark:hover:bg-base-100 transition-colors"
             >
                 <CurrentIcon className="w-4 h-4 text-gray-700 dark:text-gray-300" />
-                {/* Control text display based on showLabel */}
+                {/* 根据 showLabel 控制文字显示 */}
                 {showLabel && (
                     <span className="text-sm font-medium text-gray-700 dark:text-gray-300">
                         {currentItem.label}
@@ -136,7 +136,7 @@ export function NavigationDropdown({
                 <ChevronDown className={`w-3 h-3 text-gray-700 dark:text-gray-300 transition-transform ${isOpen ? 'rotate-180' : ''}`} />
             </button>
 
-            {/* Dropdown menu */}
+            {/* 下拉菜单 */}
             {isOpen && (
                 <div className="absolute left-1/2 -translate-x-1/2 mt-2 w-48 bg-white dark:bg-[#1a1a1a] rounded-xl shadow-xl border-2 border-gray-200 dark:border-gray-700 py-1 overflow-hidden animate-in fade-in zoom-in-95 duration-200 origin-top">
                     {navItems.map((item) => (
@@ -160,7 +160,7 @@ export function NavigationDropdown({
     );
 }
 
-// More menu component (< 480px)
+// 更多菜单组件 (< 480px)
 interface MoreDropdownProps {
     theme: 'light' | 'dark';
     currentLanguage: string;
@@ -189,8 +189,8 @@ export function MoreDropdown({
     };
 
     const handleLanguageChange = (langCode: string) => {
-        onLanguageChange(langCode);
         setIsOpen(false);
+        onLanguageChange(langCode);
     };
 
     const handleLogout = () => {
@@ -204,15 +204,15 @@ export function MoreDropdown({
             <button
                 onClick={() => setIsOpen(!isOpen)}
                 className="w-10 h-10 rounded-full bg-gray-100 dark:bg-base-200 hover:bg-gray-200 dark:hover:bg-base-100 flex items-center justify-center transition-colors"
-                title={t('nav.more', 'More')}
+                title={t('nav.more', '更多')}
             >
                 <MoreVertical className="w-5 h-5 text-gray-700 dark:text-gray-300" />
             </button>
 
-            {/* Dropdown menu */}
+            {/* 下拉菜单 (强制右对齐防遮蔽) */}
             {isOpen && (
-                <div className="absolute ltr:right-0 rtl:left-0 mt-2 w-40 bg-white dark:bg-base-200 rounded-xl shadow-lg border border-gray-100 dark:border-base-100 py-1 overflow-hidden animate-in fade-in zoom-in-95 duration-200 ltr:origin-top-right rtl:origin-top-left">
-                    {/* Mini view */}
+                <div className="absolute right-0 mt-2 w-44 bg-white dark:bg-base-200 rounded-xl shadow-xl border border-gray-100 dark:border-base-100 py-1 overflow-hidden animate-in fade-in zoom-in-95 duration-200 origin-top-right z-50">
+                    {/* 迷你视图 */}
                     <button
                         onClick={() => {
                             setMiniView(true);
@@ -224,7 +224,7 @@ export function MoreDropdown({
                         <span>{t('nav.mini_view', 'Mini View')}</span>
                     </button>
 
-                    {/* Theme toggle */}
+                    {/* 主题切换 */}
                     <button
                         onClick={handleThemeToggle}
                         className="w-full px-4 py-2.5 text-left text-sm flex items-center gap-3 hover:bg-gray-50 dark:hover:bg-base-100 transition-colors text-gray-700 dark:text-gray-300"
@@ -237,10 +237,10 @@ export function MoreDropdown({
                         <span>{theme === 'light' ? t('nav.theme_to_dark') : t('nav.theme_to_light')}</span>
                     </button>
 
-                    {/* Divider */}
+                    {/* 分隔线 */}
                     <div className="my-1 border-t border-gray-100 dark:border-base-100"></div>
 
-                    {/* Language selection */}
+                    {/* 语言选择 */}
                     {languages.map((lang) => (
                         <button
                             key={lang.code}
@@ -260,7 +260,7 @@ export function MoreDropdown({
                         </button>
                     ))}
 
-                    {/* Logout button - shown in Web mode only */}
+                    {/* 登出按钮 - 仅 Web 模式显示 */}
                     {!isTauri() && (
                         <>
                             <div className="my-1 border-t border-gray-100 dark:border-base-100"></div>
@@ -269,7 +269,7 @@ export function MoreDropdown({
                                 className="w-full px-4 py-2.5 text-left text-sm flex items-center gap-3 hover:bg-red-50 dark:hover:bg-red-900/20 transition-colors text-red-600 dark:text-red-400"
                             >
                                 <LogOut className="w-4 h-4" />
-                                <span>{t('nav.logout', 'Logout')}</span>
+                                <span>{t('nav.logout', '登出')}</span>
                             </button>
                         </>
                     )}

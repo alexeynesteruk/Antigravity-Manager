@@ -59,7 +59,7 @@ function AddAccountDialog({ onAdd, showText = true }: AddAccountDialogProps) {
         const setupListener = async () => {
             unlisten = await listen('oauth-url-generated', (event) => {
                 setOauthUrl(event.payload as string);
-                // Auto-copy to clipboard? Optional; here we just set state so the user can copy it manually
+                // 自动复制到剪贴板? 可选，这里只设置状态让用户手动复制
             });
         };
 
@@ -165,7 +165,7 @@ function AddAccountDialog({ onAdd, showText = true }: AddAccountDialogProps) {
             setStatus('success');
             setMessage(`${actionName} ${t('common.success')}!`);
 
-            // Delay closing so the user sees the success state
+            // 延迟关闭,让用户看到成功状态
             setTimeout(() => {
                 setIsOpen(false);
                 resetState();
@@ -173,17 +173,17 @@ function AddAccountDialog({ onAdd, showText = true }: AddAccountDialogProps) {
         } catch (error) {
             setStatus('error');
 
-            // Improve error message display
+            // 改进错误信息显示
             let errorMsg = String(error);
 
-            // If it's a missing refresh_token error, show the full message (including the solution)
+            // 如果是 refresh_token 缺失错误,显示完整信息(包含解决方案)
             if (errorMsg.includes('Refresh Token') || errorMsg.includes('refresh_token')) {
                 setMessage(errorMsg);
             } else if (errorMsg.includes('Tauri') || errorMsg.toLowerCase().includes('environment') || errorMsg.includes('环境')) {
-                // Environment error
+                // 环境错误
                 setMessage(t('common.environment_error', { error: errorMsg }));
             } else {
-                // Other error
+                // 其他错误
                 setMessage(`${actionName} ${t('common.error')}: ${errorMsg}`);
             }
         }
@@ -198,12 +198,12 @@ function AddAccountDialog({ onAdd, showText = true }: AddAccountDialogProps) {
 
         setStatus('loading');
 
-        // 1. Try to parse the input
+        // 1. 尝试解析输入
         let tokens: string[] = [];
         const input = refreshToken.trim();
 
         try {
-            // Try to parse as JSON
+            // 尝试解析为 JSON
             if (input.startsWith('[') && input.endsWith(']')) {
                 const parsed = JSON.parse(input);
                 if (Array.isArray(parsed)) {
@@ -213,11 +213,11 @@ function AddAccountDialog({ onAdd, showText = true }: AddAccountDialogProps) {
                 }
             }
         } catch (e) {
-            // JSON parsing failed, ignore
+            // JSON 解析失败,忽略
             console.debug('JSON parse failed, falling back to regex', e);
         }
 
-        // 2. If JSON parsing yields no result, try regex extraction (or the input isn't JSON)
+        // 2. 如果 JSON 解析没有结果,尝试正则提取 (或者输入不是 JSON)
         if (tokens.length === 0) {
             const regex = /1\/\/[a-zA-Z0-9_\-]+/g;
             const matches = input.match(regex);
@@ -226,16 +226,16 @@ function AddAccountDialog({ onAdd, showText = true }: AddAccountDialogProps) {
             }
         }
 
-        // Deduplicate
+        // 去重
         tokens = [...new Set(tokens)];
 
         if (tokens.length === 0) {
             setStatus('error');
-            setMessage(t('accounts.add.token.error_token')); // Or prompt "No valid token found"
+            setMessage(t('accounts.add.token.error_token')); // 或者提示"未找到有效 Token"
             return;
         }
 
-        // 3. Batch add
+        // 3. 批量添加
         let successCount = 0;
         let failCount = 0;
 
@@ -250,11 +250,11 @@ function AddAccountDialog({ onAdd, showText = true }: AddAccountDialogProps) {
                 console.error(`Failed to add token ${i + 1}:`, error);
                 failCount++;
             }
-            // Slight delay to avoid being too fast
+            // 稍微延迟一下,避免太快
             await new Promise(r => setTimeout(r, 100));
         }
 
-        // 4. Result feedback
+        // 4. 结果反馈
         if (successCount === tokens.length) {
             setStatus('success');
             setMessage(t('accounts.add.token.batch_success', { count: successCount }));
@@ -263,12 +263,12 @@ function AddAccountDialog({ onAdd, showText = true }: AddAccountDialogProps) {
                 resetState();
             }, 1500);
         } else if (successCount > 0) {
-            // Partial success
-            setStatus('success'); // Still use green, but note partial failure
+            // 部分成功
+            setStatus('success'); // 还是用绿色,但提示部分失败
             setMessage(t('accounts.add.token.batch_partial', { success: successCount, fail: failCount }));
-            // Don't auto-close, let the user see the result
+            // 不自动关闭,让用户看到结果
         } else {
-            // All failed
+            // 全部失败
             setStatus('error');
             setMessage(t('accounts.add.token.batch_fail'));
         }
@@ -279,33 +279,36 @@ function AddAccountDialog({ onAdd, showText = true }: AddAccountDialogProps) {
             setStatus('loading');
             setMessage(t('accounts.add.oauth.btn_start') + '...');
 
-            // 1. Get the URL (pointing to /auth/callback)
+            // 1. 获取 URL (指向 /auth/callback)
             const res = await invoke<any>('prepare_oauth_url');
             const url = typeof res === 'string' ? res : res.url;
 
             if (!url) {
-                throw new Error(t('accounts.add.oauth.error_no_url', 'Failed to obtain the OAuth URL'));
+                throw new Error(t('accounts.add.oauth.error_no_url', 'OAuth URLを取得できませんでした'));
             }
 
-            setOauthUrl(url); // Make sure the link is visible in the UI so the user can copy it manually
+            setOauthUrl(url); // 确保链接在 UI 中可见，方便用户手动复制
 
-            // 2. Open a new tab (per user feedback: a new tab gives a better experience on the Web)
+            // 2. 打开新标签页 (响应用户反馈：Web 端直接使用新标签体验更好)
             const popup = window.open(url, '_blank');
 
             if (!popup) {
                 setStatus('error');
-                setMessage(t('accounts.add.oauth.popup_blocked', 'The popup was blocked'));
+                setMessage(t('accounts.add.oauth.popup_blocked', 'ポップアップがブロックされました'));
                 return;
             }
 
-            // 3. Listen for messages
+            // 3. 监听消息
             const handleMessage = async (event: MessageEvent) => {
-                // Security check: it would be better to validate ORIGIN if defined; for now just check the data type
+                // 安全检查: 严格校验消息来源为当前同源 origin
+                if (event.origin && event.origin !== window.location.origin) {
+                    return;
+                }
                 if (event.data?.type === 'oauth-success') {
                     popup.close();
                     window.removeEventListener('message', handleMessage);
 
-                    // 4. Refresh the list after success
+                    // 4. 成功后刷新列表
                     await fetchAccounts();
 
                     setStatus('success');
@@ -320,12 +323,12 @@ function AddAccountDialog({ onAdd, showText = true }: AddAccountDialogProps) {
 
             window.addEventListener('message', handleMessage);
 
-            // 5. Detect window close (user closed it manually)
+            // 5. 检测窗口关闭 (用户手动关闭)
             const timer = setInterval(() => {
                 if (popup.closed) {
                     clearInterval(timer);
                     window.removeEventListener('message', handleMessage);
-                    if (statusRef.current === 'loading') { // If it's still loading when closed, that means it was canceled
+                    if (statusRef.current === 'loading') { // 如果还在 loading 状态就关闭了，说明取消了
                         setStatus('idle');
                         setMessage('');
                     }
@@ -368,18 +371,18 @@ function AddAccountDialog({ onAdd, showText = true }: AddAccountDialogProps) {
         if (!manualCode.trim()) return;
 
         setStatus('loading');
-        setMessage(t('accounts.add.oauth.manual_submitting', 'Submitting authorization code...'));
+        setMessage(t('accounts.add.oauth.manual_submitting', '認可コードを送信中...'));
 
         try {
             await invoke('submit_oauth_code', { code: manualCode.trim(), state: null });
 
-            // Submission success feedback
+            // 提交成功反馈
             setStatus('success');
-            setMessage(t('accounts.add.oauth.manual_submitted', 'Authorization code submitted. Processing in the backend...'));
+            setMessage(t('accounts.add.oauth.manual_submitted', '認可コードを送信しました。バックエンドで処理中です...'));
 
             setManualCode('');
 
-            // Align with the refresh logic under Web mode
+            // 对齐 Web 模式下的刷新逻辑
             if (!isTauri()) {
                 setTimeout(async () => {
                     await fetchAccounts();
@@ -438,7 +441,7 @@ function AddAccountDialog({ onAdd, showText = true }: AddAccountDialogProps) {
         }
     };
 
-    // Status indicator component
+    // 状态提示组件
     const StatusAlert = () => {
         if (status === 'idle' || !message) return null;
 
@@ -490,7 +493,7 @@ function AddAccountDialog({ onAdd, showText = true }: AddAccountDialogProps) {
                     <div className="bg-white dark:bg-base-100 text-gray-900 dark:text-base-content rounded-2xl shadow-2xl w-full max-w-lg p-6 relative z-[10] m-4 max-h-[90vh] overflow-y-auto">
                         <h3 className="font-bold text-lg mb-4">{t('accounts.add.title')}</h3>
 
-                        {/* Tab navigation - pill style */}
+                        {/* Tab 导航 - 胶囊风格 */}
 
                         <div className="bg-gray-100 dark:bg-base-200 p-1 rounded-xl mb-6 grid grid-cols-3 gap-1">
                             <button
@@ -522,19 +525,19 @@ function AddAccountDialog({ onAdd, showText = true }: AddAccountDialogProps) {
                             </button>
                         </div>
 
-                        {/* Add Web mode hint */}
+                        {/* 添加 Web 模式提示 */}
                         {!isTauri() && (
                             <div className="alert alert-info mb-4 text-xs py-2 flex items-center gap-2 bg-blue-50 dark:bg-blue-900/10 text-blue-600 dark:text-blue-400 border-blue-100 dark:border-blue-800">
                                 <Info className="w-4 h-4" />
-                                <span>{t('accounts.add.oauth.web_hint', 'Google login page will open in a new window')}</span>
+                                <span>{t('accounts.add.oauth.web_hint', '将在新窗口中打开 Google 登录页')}</span>
                             </div>
                         )}
 
-                        {/* Status hint area */}
+                        {/* 状态提示区 */}
                         <StatusAlert />
 
                         <div className="min-h-[200px]">
-                            {/* OAuth authorization */}
+                            {/* OAuth 授权 */}
                             {activeTab === 'oauth' && (
                                 <div className="space-y-6 py-4">
                                     <div className="text-center space-y-3">
@@ -643,7 +646,7 @@ function AddAccountDialog({ onAdd, showText = true }: AddAccountDialogProps) {
                                 </div>
                             )}
 
-                            {/* Import from database */}
+                            {/* 从数据库导入 */}
                             {activeTab === 'import' && (
                                 <div className="space-y-6 py-2">
                                     <div className="space-y-2">

@@ -1,35 +1,40 @@
-// proxy module - API reverse proxy service
+// proxy 模块 - API 反代服务
 
-// Existing modules (retained)
+// 现有模块 (保留)
 pub mod config;
 pub mod project_resolver;
 pub mod security;
 pub mod server;
 pub mod token_manager;
 
-// New architecture modules
-pub mod audio; // Audio processing module
-pub mod cache_manager; // Context Cache management (prefix hash -> cache_id mapping)
-pub mod cli_sync; // CLI config sync (v3.3.35)
-pub mod common; // Common utilities
+// 新架构模块
+pub mod audio; // 音频处理模块
+pub mod cache_manager; // Context Cache 管理 (前缀哈希 → cache_id 映射)
+pub mod cli_sync; // CLI 配置同步 (v3.3.35)
+pub mod common; // 公共工具
 pub mod debug_logger;
-pub mod droid_sync; // Droid (Factory CLI) config sync
-pub mod handlers; // API endpoint handlers
-pub mod http_session_store; // HTTP multi-turn conversation session history store
-pub mod mappers; // Protocol converters
-pub mod middleware; // Axum middleware
-pub mod model_specs; // Model spec management (v4.1.29)
-pub mod monitor; // Monitoring
-pub mod opencode_sync; // OpenCode config sync
+pub mod droid_sync; // Droid (Factory CLI) 配置同步
+pub mod handlers; // API 端点处理器
+pub mod hermes_sync; // Hermes Agent 配置同步
+pub mod http_session_store; // HTTP多轮对话会话历史存储
+pub mod mappers; // 协议转换器
+pub mod middleware; // Axum 中间件
+pub mod model_specs; // 模型规格管理 (v4.1.29)
+pub mod monitor; // 监控
+pub mod openclaw_sync; // OpenClaw 配置同步
+pub mod opencode_sync; // OpenCode 配置同步
+pub mod payload_audit; // 报文审计：头脱敏 / 简要存储
 pub mod providers; // Extra upstream providers (z.ai, etc.)
-pub mod proxy_pool; // Proxy pool manager
-pub mod rate_limit; // Rate limit tracking
-pub mod session_manager; // Session fingerprint management
+pub mod proxy_pool; // 代理池管理器
+pub mod rate_limit; // 限流跟踪
+pub mod session_manager; // 会话指纹管理
 pub mod signature_cache; // Signature Cache (v3.3.16)
-pub mod sticky_config; // Sticky scheduling config
-pub mod upstream; // Upstream client
+pub mod sticky_config; // 粘性调度配置
+pub mod thinking_store; // 服务端完整思考块存储
+pub mod upstream; // 上游客户端
+pub mod video; // 视频处理模块
 pub mod zai_vision_mcp; // Built-in Vision MCP server state
-pub mod zai_vision_tools; // Built-in Vision MCP tools (z.ai vision API) // Debug logging
+pub mod zai_vision_tools; // Built-in Vision MCP tools (z.ai vision API) // 调试日志
 
 pub use config::update_global_system_prompt_config;
 pub use config::update_image_thinking_mode;
@@ -48,3 +53,4 @@ pub use token_manager::TokenManager;
 pub mod tests;
 
 pub mod adapters;
+pub mod pipeline;

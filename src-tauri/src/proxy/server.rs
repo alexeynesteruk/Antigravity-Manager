@@ -9,19 +9,20 @@ use axum::{
     Router,
 };
 use serde::{Deserialize, Serialize};
+use serde_json::json;
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::AtomicUsize;
 use std::sync::{Arc, Mutex, OnceLock};
-use tokio::sync::{oneshot, watch, RwLock};
+use tokio::sync::{watch, RwLock};
 use tracing::{debug, error};
 
-// [FIX] Global pending-reload account queue
-// When update_account_quota updates protected_models, the account ID is added to this queue
-// TokenManager checks and processes these accounts during get_token
+// [FIX] 全局待重新加载账号队列
+// 当 update_account_quota 更新 protected_models 后，将账号 ID 加入此队列
+// TokenManager 在 get_token 时会检查并处理这些账号
 static PENDING_RELOAD_ACCOUNTS: OnceLock<std::sync::RwLock<HashSet<String>>> = OnceLock::new();
 
-// [NEW] Global pending-delete account queue (Issue #1477)
-// When an account is deleted, its ID is added to this queue; TokenManager checks and clears the in-memory cache during get_token
+// [NEW] 全局待删除账号队列 (Issue #1477)
+// 当账号被删除后，将账号 ID 加入此队列，TokenManager 在 get_token 时会检查并清理内存缓存
 static PENDING_DELETE_ACCOUNTS: OnceLock<std::sync::RwLock<HashSet<String>>> = OnceLock::new();
 
 fn get_pending_reload_accounts() -> &'static std::sync::RwLock<HashSet<String>> {
@@ -32,7 +33,7 @@ fn get_pending_delete_accounts() -> &'static std::sync::RwLock<HashSet<String>> 
     PENDING_DELETE_ACCOUNTS.get_or_init(|| std::sync::RwLock::new(HashSet::new()))
 }
 
-/// Trigger the account reload signal (called by update_account_quota)
+/// 触发账号重新加载信号（供 update_account_quota 调用）
 pub fn trigger_account_reload(account_id: &str) {
     if let Ok(mut pending) = get_pending_reload_accounts().write() {
         pending.insert(account_id.to_string());
@@ -43,7 +44,7 @@ pub fn trigger_account_reload(account_id: &str) {
     }
 }
 
-/// Trigger the account delete signal (Issue #1477)
+/// 触发账号删除信号 (Issue #1477)
 pub fn trigger_account_delete(account_id: &str) {
     if let Ok(mut pending) = get_pending_delete_accounts().write() {
         pending.insert(account_id.to_string());
@@ -51,7 +52,7 @@ pub fn trigger_account_delete(account_id: &str) {
     }
 }
 
-/// Get and clear the list of accounts pending reload (called by TokenManager)
+/// 获取并清空待重新加载的账号列表（供 TokenManager 调用）
 pub fn take_pending_reload_accounts() -> Vec<String> {
     if let Ok(mut pending) = get_pending_reload_accounts().write() {
         let accounts: Vec<String> = pending.drain().collect();
@@ -67,7 +68,7 @@ pub fn take_pending_reload_accounts() -> Vec<String> {
     }
 }
 
-/// Get and clear the list of accounts pending deletion (Issue #1477)
+/// 获取并清空待删除的账号列表 (Issue #1477)
 pub fn take_pending_delete_accounts() -> Vec<String> {
     if let Ok(mut pending) = get_pending_delete_accounts().write() {
         let accounts: Vec<String> = pending.drain().collect();
@@ -83,14 +84,14 @@ pub fn take_pending_delete_accounts() -> Vec<String> {
     }
 }
 
-/// Axum application state
+/// Axum 应用状态
 #[derive(Clone)]
 pub struct AppState {
     pub token_manager: Arc<TokenManager>,
     pub custom_mapping: Arc<tokio::sync::RwLock<std::collections::HashMap<String, String>>>,
-    pub request_timeout: u64, // API request timeout (seconds)
+    pub request_timeout: u64, // API 请求超时(秒)
     #[allow(dead_code)]
-    pub thought_signature_map: Arc<tokio::sync::Mutex<std::collections::HashMap<String, String>>>, // Thinking chain signature mapping (ID -> Signature)
+    pub thought_signature_map: Arc<tokio::sync::Mutex<std::collections::HashMap<String, String>>>, // 思维链签名映射 (ID -> Signature)
     #[allow(dead_code)]
     pub upstream_proxy: Arc<tokio::sync::RwLock<crate::proxy::config::UpstreamProxyConfig>>,
     pub upstream: Arc<crate::proxy::upstream::client::UpstreamClient>,
@@ -100,16 +101,16 @@ pub struct AppState {
     pub monitor: Arc<crate::proxy::monitor::ProxyMonitor>,
     pub experimental: Arc<RwLock<crate::proxy::config::ExperimentalConfig>>,
     pub debug_logging: Arc<RwLock<crate::proxy::config::DebugLoggingConfig>>,
-    pub switching: Arc<RwLock<bool>>, // [NEW] Account switching state, used to prevent concurrent switches
-    pub integration: crate::modules::integration::SystemManager, // [NEW] System integration layer implementation
-    pub account_service: Arc<crate::modules::account_service::AccountService>, // [NEW] Account management service layer
-    pub security: Arc<RwLock<crate::proxy::ProxySecurityConfig>>,              // [NEW] Security config state
-    pub cloudflared_state: Arc<crate::commands::cloudflared::CloudflaredState>, // [NEW] Cloudflared plugin state
-    pub is_running: Arc<RwLock<bool>>, // [NEW] Running state flag
-    pub port: u16,                     // [NEW] Local listening port (v4.0.8 fix)
+    pub switching: Arc<RwLock<bool>>, // [NEW] 账号切换状态，用于防止并发切换
+    pub integration: crate::modules::integration::SystemManager, // [NEW] 系统集成层实现
+    pub account_service: Arc<crate::modules::account_service::AccountService>, // [NEW] 账号管理服务层
+    pub security: Arc<RwLock<crate::proxy::ProxySecurityConfig>>,              // [NEW] 安全配置状态
+    pub cloudflared_state: Arc<crate::commands::cloudflared::CloudflaredState>, // [NEW] Cloudflared 插件状态
+    pub is_running: Arc<RwLock<bool>>, // [NEW] 运行状态标识
+    pub port: u16,                     // [NEW] 本地监听端口 (v4.0.8 修复)
     pub proxy_pool_state: Arc<tokio::sync::RwLock<crate::proxy::config::ProxyPoolConfig>>, // [FIX Web Mode]
     pub proxy_pool_manager: Arc<crate::proxy::proxy_pool::ProxyPoolManager>, // [FIX Web Mode]
-    pub only_raw_quota_models: Arc<tokio::sync::RwLock<bool>>, // [NEW] Whether to expose only real quota models
+    pub only_raw_quota_models: Arc<tokio::sync::RwLock<bool>>, // [NEW] 是否只暴露真实配额模型
     pub image_scheduler: Arc<ImageScheduler>,
 }
 
@@ -263,7 +264,7 @@ fn build_image_scheduler(
     ImageScheduler::new(account_ids, per_account_concurrency)
 }
 
-// Implement FromRef for AppState so middleware can extract the security state
+// 为 AppState 实现 FromRef，以便中间件提取 security 状态
 impl axum::extract::FromRef<AppState> for Arc<RwLock<crate::proxy::ProxySecurityConfig>> {
     fn from_ref(state: &AppState) -> Self {
         state.security.clone()
@@ -280,6 +281,7 @@ struct AccountResponse {
     id: String,
     email: String,
     name: Option<String>,
+    priority: u8,
     is_current: bool,
     disabled: bool,
     disabled_reason: Option<String>,
@@ -289,7 +291,7 @@ struct AccountResponse {
     proxy_disabled_at: Option<i64>,
     protected_models: Vec<String>,
     live_limited_models: HashMap<String, crate::models::account::LiveLimitStatus>,
-    /// [NEW] 403 validation-blocked state
+    /// [NEW] 403 验证阻止状态
     validation_blocked: bool,
     validation_blocked_until: Option<i64>,
     validation_blocked_reason: Option<String>,
@@ -330,6 +332,8 @@ struct QuotaBucketDto {
     remaining_fraction: f64,
     reset_time: String,
     #[serde(skip_serializing_if = "Option::is_none")]
+    cycle_tokens: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     display_name: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     description: Option<String>,
@@ -348,6 +352,7 @@ fn quota_group_to_dto(g: &crate::models::quota::QuotaGroup) -> QuotaGroupDto {
                 window: b.window.clone(),
                 remaining_fraction: b.remaining_fraction,
                 reset_time: b.reset_time.clone(),
+                cycle_tokens: b.cycle_tokens,
                 display_name: b.display_name.clone(),
                 description: b.description.clone(),
             })
@@ -369,6 +374,7 @@ fn to_account_response(
         id: account.id.clone(),
         email: account.email.clone(),
         name: account.name.clone(),
+        priority: account.priority,
         is_current: current_id.as_ref() == Some(&account.id),
         disabled: account.disabled,
         disabled_reason: account.disabled_reason.clone(),
@@ -404,10 +410,10 @@ fn to_account_response(
     }
 }
 
-/// Axum server instance
+/// Axum 服务器实例
 #[derive(Clone)]
 pub struct AxumServer {
-    shutdown_tx: Arc<tokio::sync::Mutex<Option<oneshot::Sender<()>>>>,
+    cancel_token: tokio_util::sync::CancellationToken,
     custom_mapping: Arc<tokio::sync::RwLock<std::collections::HashMap<String, String>>>,
     proxy_state: Arc<tokio::sync::RwLock<crate::proxy::config::UpstreamProxyConfig>>,
     upstream: Arc<crate::proxy::upstream::client::UpstreamClient>,
@@ -415,12 +421,12 @@ pub struct AxumServer {
     zai_state: Arc<RwLock<crate::proxy::ZaiConfig>>,
     experimental: Arc<RwLock<crate::proxy::config::ExperimentalConfig>>,
     debug_logging: Arc<RwLock<crate::proxy::config::DebugLoggingConfig>>,
-    #[allow(dead_code)] // Reserved for cloudflared running-state queries and future control
+    #[allow(dead_code)] // 预留给 cloudflared 运行状态查询与后续控制
     pub cloudflared_state: Arc<crate::commands::cloudflared::CloudflaredState>,
     pub is_running: Arc<RwLock<bool>>,
-    pub token_manager: Arc<TokenManager>, // [NEW] Expose TokenManager for reuse by the reverse proxy service
-    pub proxy_pool_state: Arc<tokio::sync::RwLock<crate::proxy::config::ProxyPoolConfig>>, // [NEW] Proxy pool config state
-    pub proxy_pool_manager: Arc<crate::proxy::proxy_pool::ProxyPoolManager>, // [NEW] Expose the proxy pool manager for commands to call
+    pub token_manager: Arc<TokenManager>, // [NEW] 暴露出 TokenManager 供反代服务复用
+    pub proxy_pool_state: Arc<tokio::sync::RwLock<crate::proxy::config::ProxyPoolConfig>>, // [NEW] 代理池配置状态
+    pub proxy_pool_manager: Arc<crate::proxy::proxy_pool::ProxyPoolManager>, // [NEW] 暴露代理池管理器供命令调用
     pub only_raw_quota_models: Arc<tokio::sync::RwLock<bool>>,
 }
 
@@ -428,7 +434,7 @@ impl AxumServer {
     pub async fn update_only_raw_quota_models(&self, only_raw: bool) {
         let mut r = self.only_raw_quota_models.write().await;
         *r = only_raw;
-        tracing::debug!("only_raw_quota_models updated: {}", only_raw);
+        tracing::debug!("only_raw_quota_models 已更新: {}", only_raw);
     }
 
     pub async fn update_mapping(&self, config: &crate::proxy::config::ProxyConfig) {
@@ -436,10 +442,10 @@ impl AxumServer {
             let mut m = self.custom_mapping.write().await;
             *m = config.custom_mapping.clone();
         }
-        tracing::debug!("Model mapping (Custom) fully hot-reloaded");
+        tracing::debug!("模型映射 (Custom) 已全量热更新");
     }
 
-    /// Update the proxy config
+    /// 更新代理配置
     pub async fn update_proxy(&self, new_config: crate::proxy::config::UpstreamProxyConfig) {
         {
             let mut proxy = self.proxy_state.write().await;
@@ -449,10 +455,13 @@ impl AxumServer {
         self.upstream.rebuild_default_client(Some(new_config)).await;
         // Stale per-proxy clients may also be affected (e.g. fallback path)
         self.upstream.clear_client_cache();
+        // 全局共享客户端（token 刷新 / 配额刷新 / 项目解析 / zai / MCP 等）同样是按
+        // 构建时的代理配置定型的，必须一并失效，否则会带着旧代理继续跑。
+        crate::utils::http::invalidate_shared_clients();
         tracing::info!("Upstream proxy config hot-reloaded");
     }
 
-    /// Update the proxy pool config
+    /// 更新代理池配置
     pub async fn update_proxy_pool(&self, new_config: crate::proxy::config::ProxyPoolConfig) {
         {
             let mut pool = self.proxy_pool_state.write().await;
@@ -468,41 +477,41 @@ impl AxumServer {
     pub async fn update_security(&self, config: &crate::proxy::config::ProxyConfig) {
         let mut sec = self.security_state.write().await;
         *sec = crate::proxy::ProxySecurityConfig::from_proxy_config(config);
-        tracing::info!("Reverse proxy security config hot-reloaded");
+        tracing::info!("反代服务安全配置已热更新");
     }
 
     pub async fn update_zai(&self, config: &crate::proxy::config::ProxyConfig) {
         let mut zai = self.zai_state.write().await;
         *zai = config.zai.clone();
-        tracing::info!("z.ai config hot-reloaded");
+        tracing::info!("z.ai 配置已热更新");
     }
 
     pub async fn update_experimental(&self, config: &crate::proxy::config::ProxyConfig) {
         let mut exp = self.experimental.write().await;
         *exp = config.experimental.clone();
-        tracing::info!("Experimental config hot-reloaded");
+        tracing::info!("实验性配置已热更新");
     }
 
     pub async fn update_debug_logging(&self, config: &crate::proxy::config::ProxyConfig) {
         let mut dbg_cfg = self.debug_logging.write().await;
         *dbg_cfg = config.debug_logging.clone();
-        tracing::info!("Debug logging config hot-reloaded");
+        tracing::info!("调试日志配置已热更新");
     }
 
     pub async fn update_user_agent(&self, config: &crate::proxy::config::ProxyConfig) {
         self.upstream
             .set_user_agent_override(config.user_agent_override.clone())
             .await;
-        tracing::info!("User-Agent config hot-reloaded: {:?}", config.user_agent_override);
+        tracing::info!("User-Agent 配置已热更新: {:?}", config.user_agent_override);
     }
 
     pub async fn set_running(&self, running: bool) {
         let mut r = self.is_running.write().await;
         *r = running;
-        tracing::info!("Reverse proxy service running state updated to: {}", running);
+        tracing::info!("反代服务运行状态更新为: {}", running);
     }
 
-    /// Start the Axum server
+    /// 启动 Axum 服务器
     pub async fn start(
         host: String,
         port: u16,
@@ -567,7 +576,7 @@ impl AxumServer {
                     Some(upstream_proxy.clone()),
                     Some(proxy_pool_manager.clone()),
                 ));
-                // Initialize the User-Agent override
+                // 初始化 User-Agent 覆盖
                 if user_agent_override.is_some() {
                     u.set_user_agent_override(user_agent_override).await;
                 }
@@ -594,14 +603,14 @@ impl AxumServer {
             image_scheduler,
         };
 
-        // Build the router - using the new-architecture handlers!
+        // 构建路由 - 使用新架构的 handlers！
         use crate::proxy::handlers;
         use crate::proxy::middleware::{
             admin_auth_middleware, auth_middleware, cors_layer, ip_filter_middleware,
             monitor_middleware, service_status_middleware,
         };
 
-        // 1. Build the main AI proxy routes (following the auth_mode config)
+        // 1. 构建主 AI 代理路由 (遵循 auth_mode 配置)
         let proxy_routes = Router::new()
             .route("/health", get(health_check_handler))
             .route("/healthz", get(health_check_handler))
@@ -619,7 +628,7 @@ impl AxumServer {
                 "/v1/responses",
                 post(handlers::openai::handle_completions)
                     .get(handlers::openai::handle_responses_websocket),
-            ) // Compatible with Codex CLI
+            ) // 兼容 Codex CLI
             .route("/responses", post(handlers::openai::handle_completions))
             .route(
                 "/responses/compact",
@@ -628,15 +637,15 @@ impl AxumServer {
             .route(
                 "/v1/images/generations",
                 post(handlers::openai::handle_images_generations),
-            ) // Image generation API
+            ) // 图像生成 API
             .route(
                 "/v1/images/edits",
                 post(handlers::openai::handle_images_edits),
-            ) // Image editing API
+            ) // 图像编辑 API
             .route(
                 "/v1/audio/transcriptions",
                 post(handlers::audio::handle_audio_transcription),
-            ) // Audio transcription API
+            ) // 音频转录 API
             // Claude Protocol
             .route("/v1/messages", post(handlers::claude::handle_messages))
             .route(
@@ -672,14 +681,23 @@ impl AxumServer {
                 "/v1/models/detect",
                 post(handlers::common::handle_detect_model),
             )
-            .route("/internal/warmup", post(handlers::warmup::handle_warmup)) // Internal warmup endpoint
+            .route("/internal/warmup", post(handlers::warmup::handle_warmup)) // 内部预热端点
             .route("/v1/api/event_logging/batch", post(silent_ok_handler))
             .route("/v1/api/event_logging", post(silent_ok_handler))
-            // Apply layers specific to the AI service
-            // Note: Axum layer execution order runs bottom-up (onion model)
-            // Request: ip_filter -> auth -> monitor -> handler
-            // Response: handler -> monitor -> auth -> ip_filter
-            // monitor must run after auth in order to obtain the UserTokenIdentity
+            .route(
+                "/v1/thinking/end",
+                post(handlers::thinking::handle_end_session),
+            )
+            .route(
+                "/v1/thinking/sessions/:session_id",
+                axum::routing::get(handlers::thinking::handle_session_stats)
+                    .delete(handlers::thinking::handle_delete_session),
+            )
+            // 应用 AI 服务特定的层
+            // 注意：Axum layer 执行顺序是从下往上（洋葱模型）
+            // 请求: ip_filter -> auth -> monitor -> handler
+            // 响应: handler -> monitor -> auth -> ip_filter
+            // monitor 需要在 auth 之后执行才能获取 UserTokenIdentity
             .layer(axum::middleware::from_fn_with_state(
                 state.clone(),
                 monitor_middleware,
@@ -693,7 +711,7 @@ impl AxumServer {
                 ip_filter_middleware,
             ));
 
-        // 2. Build the admin API (auth enforced)
+        // 2. 构建管理 API (强制鉴权)
         let admin_routes = Router::new()
             .route("/health", get(health_check_handler))
             .route(
@@ -752,7 +770,19 @@ impl AxumServer {
                 "/proxy/opencode/status",
                 post(admin_get_opencode_sync_status),
             )
+            .route(
+                "/proxy/opencode/providers",
+                get(admin_get_opencode_providers),
+            )
             .route("/proxy/opencode/sync", post(admin_execute_opencode_sync))
+            .route(
+                "/proxy/opencode/openai-sync",
+                post(admin_execute_opencode_openai_sync),
+            )
+            .route(
+                "/proxy/opencode/remove-provider",
+                post(admin_execute_opencode_remove_provider),
+            )
             .route(
                 "/proxy/opencode/restore",
                 post(admin_execute_opencode_restore),
@@ -763,6 +793,28 @@ impl AxumServer {
                 post(admin_get_opencode_config_content),
             )
             .route("/proxy/opencode/families", get(admin_get_opencode_families))
+            .route("/proxy/hermes/status", post(admin_get_hermes_sync_status))
+            .route("/proxy/hermes/sync", post(admin_execute_hermes_sync))
+            .route("/proxy/hermes/restore", post(admin_execute_hermes_restore))
+            .route("/proxy/hermes/clear", post(admin_execute_hermes_clear))
+            .route(
+                "/proxy/hermes/config",
+                post(admin_get_hermes_config_content),
+            )
+            .route(
+                "/proxy/openclaw/status",
+                post(admin_get_openclaw_sync_status),
+            )
+            .route("/proxy/openclaw/sync", post(admin_execute_openclaw_sync))
+            .route(
+                "/proxy/openclaw/restore",
+                post(admin_execute_openclaw_restore),
+            )
+            .route("/proxy/openclaw/clear", post(admin_execute_openclaw_clear))
+            .route(
+                "/proxy/openclaw/config",
+                post(admin_get_openclaw_config_content),
+            )
             .route("/proxy/droid/status", post(admin_get_droid_sync_status))
             .route("/proxy/droid/sync", post(admin_execute_droid_sync))
             .route("/proxy/droid/restore", post(admin_execute_droid_restore))
@@ -813,6 +865,10 @@ impl AxumServer {
                 post(admin_set_proxy_monitor_enabled),
             )
             .route(
+                "/proxy/monitor/health-logs/toggle",
+                post(admin_set_proxy_capture_health_logs),
+            )
+            .route(
                 "/proxy/cloudflared/status",
                 get(admin_cloudflared_get_status),
             )
@@ -826,7 +882,16 @@ impl AxumServer {
             .route("/proxy/stats", get(admin_get_proxy_stats))
             .route("/logs", get(admin_get_proxy_logs_filtered))
             .route("/logs/count", get(admin_get_proxy_logs_count_filtered))
+            .route("/logs/disk-size", get(admin_get_proxy_db_disk_size))
             .route("/logs/clear", post(admin_clear_proxy_logs))
+            .route(
+                "/proxy/thinking-store/clear",
+                post(admin_clear_thinking_store),
+            )
+            .route(
+                "/proxy/thinking-store/count",
+                get(admin_get_thinking_store_count),
+            )
             .route("/logs/:logId", get(admin_get_proxy_log_detail))
             // Debug Console (Log Bridge)
             .route("/debug/enable", post(admin_enable_debug_console))
@@ -870,7 +935,14 @@ impl AxumServer {
             )
             .route("/accounts/warmup", post(admin_warm_up_all_accounts))
             .route("/accounts/:accountId/warmup", post(admin_warm_up_account))
-            .route("/system/data-dir", get(admin_get_data_dir_path))
+            .route(
+                "/accounts/:accountId/priority",
+                post(admin_update_account_priority),
+            )
+            .route(
+                "/system/data-dir",
+                get(admin_get_data_dir_path).post(admin_set_data_dir),
+            )
             .route("/system/updates/settings", get(admin_get_update_settings))
             .route(
                 "/system/updates/check-status",
@@ -938,40 +1010,40 @@ impl AxumServer {
                 "/user-tokens/:id",
                 delete(admin_delete_user_token).patch(admin_update_user_token),
             )
-            // OAuth (Web) - Admin endpoint
+            // OAuth (Web) - Admin 接口
             .route("/auth/url", get(admin_prepare_oauth_url_web))
-            // Apply the admin-specific auth layer (enforced)
+            // 应用管理特定鉴权层 (强制校验)
             .layer(axum::middleware::from_fn_with_state(
                 state.clone(),
                 admin_auth_middleware,
             ));
 
-        // 3. Combine and apply global layers
-        // Read the body size limit from an environment variable, defaulting to 50MB
+        // 3. 整合并应用全局层
+        // 从环境变量读取 body 大小限制，默认 50MB
         let max_body_size: usize = std::env::var("ABV_MAX_BODY_SIZE")
             .ok()
             .and_then(|s| s.parse().ok())
-            .unwrap_or(100 * 1024 * 1024); // 100MB by default
-        tracing::info!("Request body size limit: {} MB", max_body_size / 1024 / 1024);
+            .unwrap_or(100 * 1024 * 1024); // 默认 100MB
+        tracing::info!("请求体大小限制: {} MB", max_body_size / 1024 / 1024);
 
         let app = Router::new()
             .nest("/api", admin_routes)
             .merge(proxy_routes)
-            // Public routes (no auth required)
+            // 公开路由 (无需鉴权)
             .route("/auth/callback", get(handle_oauth_callback))
-            // Apply the global monitoring and status layer (outer)
+            // 应用全局监控与状态层 (外层)
             .layer(axum::middleware::from_fn_with_state(
                 state.clone(),
                 service_status_middleware,
             ))
             .layer(cors_layer())
-            .layer(DefaultBodyLimit::max(max_body_size)) // Relax the body size limit
+            .layer(DefaultBodyLimit::max(max_body_size)) // 放宽 body 大小限制
             .with_state(state.clone());
 
-        // Static file hosting (used for Headless/Docker mode)
+        // 静态文件托管 (用于 Headless/Docker 模式)
         let dist_path = std::env::var("ABV_DIST_PATH").unwrap_or_else(|_| "dist".to_string());
         let app = if std::path::Path::new(&dist_path).exists() {
-            tracing::info!("Hosting static assets: {}", dist_path);
+            tracing::info!("正在托管静态资源: {}", dist_path);
             app.fallback_service(tower_http::services::ServeDir::new(&dist_path).fallback(
                 tower_http::services::ServeFile::new(format!("{}/index.html", dist_path)),
             ))
@@ -979,19 +1051,22 @@ impl AxumServer {
             app
         };
 
-        // Bind address
-        let addr = format!("{}:{}", host, port);
-        let listener = tokio::net::TcpListener::bind(&addr)
-            .await
-            .map_err(|e| format!("Failed to bind address {}: {}", addr, e))?;
+        // 绑定地址（使用 socket2 开启 SO_REUSEADDR，通配地址自动开启 IPv6/IPv4 双栈支持）
+        let listener = bind_tcp_listener(&host, port)?;
+        let display_host = if host == "0.0.0.0" || host == "::" || host == "[::]" {
+            "0.0.0.0 / [::] (IPv4/IPv6 Dual-Stack)".to_string()
+        } else if host.contains(':') && !host.starts_with('[') {
+            format!("[{}]", host)
+        } else {
+            host.to_string()
+        };
+        tracing::info!("反代服务器启动在 http://{}:{}", display_host, port);
 
-        tracing::info!("Reverse proxy server started at http://{}", addr);
-
-        // Create the shutdown channel
-        let (shutdown_tx, mut shutdown_rx) = oneshot::channel::<()>();
+        // 创建统一取消令牌
+        let cancel_token = tokio_util::sync::CancellationToken::new();
 
         let server_instance = Self {
-            shutdown_tx: Arc::new(tokio::sync::Mutex::new(Some(shutdown_tx))),
+            cancel_token: cancel_token.clone(),
             custom_mapping: custom_mapping_state.clone(),
             proxy_state,
             upstream: state.upstream.clone(),
@@ -1007,7 +1082,8 @@ impl AxumServer {
             only_raw_quota_models: only_raw_quota_models_state,
         };
 
-        // Start the server in a new task
+        let server_cancel_token = cancel_token.clone();
+        // 在新任务中启动服务器
         let handle = tokio::spawn(async move {
             use hyper::server::conn::http1;
             use hyper_util::rt::TokioIo;
@@ -1015,39 +1091,66 @@ impl AxumServer {
 
             loop {
                 tokio::select! {
+                    _ = server_cancel_token.cancelled() => {
+                        tracing::info!("反代服务器收到终止信号，停止监听并释放端口");
+                        break;
+                    }
                     res = listener.accept() => {
                         match res {
                             Ok((stream, remote_addr)) => {
                                 let io = TokioIo::new(stream);
 
-                                // Inject ConnectInfo (used to obtain the real IP)
+                                // 若为 IPv4 映射的 IPv6 地址 (如 ::ffff:192.168.1.1)，将其规范化为原生 IPv4 地址
+                                let normalized_remote_addr = match remote_addr {
+                                    std::net::SocketAddr::V6(v6_addr) => {
+                                        if let Some(v4) = v6_addr.ip().to_ipv4_mapped() {
+                                            std::net::SocketAddr::V4(std::net::SocketAddrV4::new(v4, v6_addr.port()))
+                                        } else {
+                                            std::net::SocketAddr::V6(v6_addr)
+                                        }
+                                    }
+                                    v4_addr => v4_addr,
+                                };
+
+                                // 注入 ConnectInfo (用于获取真实 IP)
                                 use tower::ServiceExt;
                                 use hyper::body::Incoming;
                                 let app_with_info = app.clone().map_request(move |mut req: axum::http::Request<Incoming>| {
-                                    req.extensions_mut().insert(axum::extract::ConnectInfo(remote_addr));
+                                    req.extensions_mut().insert(axum::extract::ConnectInfo(normalized_remote_addr));
                                     req
                                 });
 
                                 let service = TowerToHyperService::new(app_with_info);
+                                let conn_cancel_token = server_cancel_token.clone();
 
                                 tokio::task::spawn(async move {
-                                    if let Err(err) = http1::Builder::new()
+                                    let conn = http1::Builder::new()
                                         .serve_connection(io, service)
-                                        .with_upgrades() // Supports WebSocket (in case it's needed later)
-                                        .await
-                                    {
-                                        debug!("Connection handling ended or errored: {:?}", err);
+                                        .with_upgrades();
+                                    tokio::pin!(conn);
+
+                                    tokio::select! {
+                                        res = conn.as_mut() => {
+                                            if let Err(err) = res {
+                                                debug!("连接处理结束或出错: {:?}", err);
+                                            }
+                                        }
+                                        _ = conn_cancel_token.cancelled() => {
+                                            // 收到全局关闭通知，通知 Hyper 优雅终止连接
+                                            conn.as_mut().graceful_shutdown();
+                                            // 给予请求最多 500ms 缓冲，超时后自动强行断开并关闭底层套接字
+                                            let _ = tokio::time::timeout(std::time::Duration::from_millis(500), conn).await;
+                                        }
                                     }
                                 });
                             }
                             Err(e) => {
-                                error!("Failed to accept connection: {:?}", e);
+                                if server_cancel_token.is_cancelled() {
+                                    break;
+                                }
+                                error!("接收连接失败: {:?}", e);
                             }
                         }
-                    }
-                    _ = &mut shutdown_rx => {
-                        tracing::info!("Reverse proxy server stopped listening");
-                        break;
                     }
                 }
             }
@@ -1056,22 +1159,138 @@ impl AxumServer {
         Ok((server_instance, handle))
     }
 
-    /// Stop the server
+    /// 停止服务器
     pub fn stop(&self) {
-        let tx_mutex = self.shutdown_tx.clone();
-        tokio::spawn(async move {
-            let mut lock = tx_mutex.lock().await;
-            if let Some(tx) = lock.take() {
-                let _ = tx.send(());
-                tracing::info!("Axum server stop signal sent");
-            }
-        });
+        self.cancel_token.cancel();
+        tracing::info!("Axum server 停止信号已发送");
+    }
+
+    /// 检查服务器是否已被停止
+    pub fn is_stopped(&self) -> bool {
+        self.cancel_token.is_cancelled()
     }
 }
 
-// ===== API handlers (legacy code removed, now handled by src/proxy/handlers/*) =====
+/// 绑定单个地址（IPv4 或指定 IPv6 专用）
+fn bind_single_socket(
+    socket_addr: std::net::SocketAddr,
+) -> Result<tokio::net::TcpListener, String> {
+    let domain = if socket_addr.is_ipv6() {
+        socket2::Domain::IPV6
+    } else {
+        socket2::Domain::IPV4
+    };
 
-/// Health check handler
+    let socket = socket2::Socket::new(domain, socket2::Type::STREAM, Some(socket2::Protocol::TCP))
+        .map_err(|e| format!("创建套接字失败 ({}): {}", socket_addr, e))?;
+
+    // 在 Windows 和 Unix 上开启地址复用，避免在服务重启或连接处于 TIME_WAIT 状态时报 10048 端口占用
+    let _ = socket.set_reuse_address(true);
+
+    #[cfg(unix)]
+    let _ = socket.set_reuse_port(true);
+
+    socket
+        .set_nonblocking(true)
+        .map_err(|e| format!("设置非阻塞模式失败 ({}): {}", socket_addr, e))?;
+
+    socket
+        .bind(&socket_addr.into())
+        .map_err(|e| format!("地址 {} 绑定失败: {}", socket_addr, e))?;
+
+    socket
+        .listen(1024)
+        .map_err(|e| format!("监听地址 {} 失败: {}", socket_addr, e))?;
+
+    let std_listener: std::net::TcpListener = socket.into();
+    tokio::net::TcpListener::from_std(std_listener)
+        .map_err(|e| format!("转换为 Tokio TcpListener 失败 ({}): {}", socket_addr, e))
+}
+
+/// 绑定 IPv6 / IPv4 双栈通配监听器 ([::]:port)，实现单套接字同时接收 IPv6 与 IPv4 客户端连接
+fn bind_dual_stack_socket(port: u16) -> Result<tokio::net::TcpListener, String> {
+    use std::net::{Ipv6Addr, SocketAddr, SocketAddrV6};
+
+    let socket = socket2::Socket::new(
+        socket2::Domain::IPV6,
+        socket2::Type::STREAM,
+        Some(socket2::Protocol::TCP),
+    )
+    .map_err(|e| format!("创建 IPv6 双栈套接字失败: {}", e))?;
+
+    // 关键：Windows 默认 only_v6 为 true，必须显式设为 false 才能同时监听 IPv4
+    if let Err(e) = socket.set_only_v6(false) {
+        return Err(format!("开启双栈支持失败 (set_only_v6(false)): {}", e));
+    }
+
+    let _ = socket.set_reuse_address(true);
+
+    #[cfg(unix)]
+    let _ = socket.set_reuse_port(true);
+
+    socket
+        .set_nonblocking(true)
+        .map_err(|e| format!("设置非阻塞模式失败: {}", e))?;
+
+    let addr = SocketAddr::V6(SocketAddrV6::new(Ipv6Addr::UNSPECIFIED, port, 0, 0));
+    socket
+        .bind(&addr.into())
+        .map_err(|e| format!("双栈地址 [::]:{} 绑定失败: {}", port, e))?;
+
+    socket
+        .listen(1024)
+        .map_err(|e| format!("双栈监听 [::]:{} 失败: {}", port, e))?;
+
+    let std_listener: std::net::TcpListener = socket.into();
+    tokio::net::TcpListener::from_std(std_listener)
+        .map_err(|e| format!("转换为 Tokio TcpListener 失败 ([::]:{}): {}", port, e))
+}
+
+/// 绑定 TCP 监听器（启用地址复用，遇通配地址如 0.0.0.0 / :: 时自动开启 IPv6/IPv4 双栈支持）
+fn bind_tcp_listener(host: &str, port: u16) -> Result<tokio::net::TcpListener, String> {
+    let clean_host = host.trim_matches('[').trim_matches(']');
+    let is_wildcard = clean_host == "0.0.0.0" || clean_host == "::";
+
+    if is_wildcard {
+        // 优先尝试以 IPv6 / IPv4 双栈模式绑定 [::]:port
+        match bind_dual_stack_socket(port) {
+            Ok(listener) => {
+                tracing::info!("TCP 监听器就绪: [::]:{} (IPv6 / IPv4 双栈模式)", port);
+                return Ok(listener);
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "IPv6 双栈监听绑定失败 ({})，正在优雅降级到 IPv4 监听 (0.0.0.0:{})",
+                    e,
+                    port
+                );
+            }
+        }
+        // 优雅降级到 IPv4 0.0.0.0
+        let v4_addr =
+            std::net::SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED), port);
+        return bind_single_socket(v4_addr);
+    }
+
+    // 精确地址绑定 (如 127.0.0.1、::1 或特定网卡 IP)
+    use std::net::ToSocketAddrs;
+    let addr_str = if clean_host.contains(':') {
+        format!("[{}]:{}", clean_host, port)
+    } else {
+        format!("{}:{}", clean_host, port)
+    };
+    let socket_addr = addr_str
+        .to_socket_addrs()
+        .map_err(|e| format!("无法解析地址 {}: {}", addr_str, e))?
+        .next()
+        .ok_or_else(|| format!("无法解析地址: {}", addr_str))?;
+
+    bind_single_socket(socket_addr)
+}
+
+// ===== API 处理器 (旧代码已移除，由 src/proxy/handlers/* 接管) =====
+
+/// 健康检查处理器
 async fn health_check_handler() -> Response {
     Json(serde_json::json!({
         "status": "ok",
@@ -1080,16 +1299,16 @@ async fn health_check_handler() -> Response {
     .into_response()
 }
 
-/// Silent success handler (used to intercept telemetry logging, etc.)
+/// 静默成功处理器 (用于拦截遥测日志等)
 async fn silent_ok_handler() -> Response {
     StatusCode::OK.into_response()
 }
 
 // ============================================================================
-// [PHASE 1] Consolidated Admin Handlers
+// [PHASE 1] 整合后的 Admin Handlers
 // ============================================================================
 
-// [Consolidation cleanup] Legacy model definitions and mappers have been moved up
+// [整合清理] 旧模型定义与映射器已上移
 
 async fn admin_list_accounts(
     State(state): State<AppState>,
@@ -1129,6 +1348,7 @@ async fn admin_list_accounts(
                 id: acc.id,
                 email: acc.email,
                 name: acc.name,
+                priority: acc.priority,
                 is_current,
                 disabled: acc.disabled,
                 disabled_reason: acc.disabled_reason,
@@ -1210,6 +1430,7 @@ async fn admin_get_current_account(
                 id: acc.id,
                 email: acc.email,
                 name: acc.name,
+                priority: acc.priority,
                 is_current: true,
                 disabled: acc.disabled,
                 disabled_reason: acc.disabled_reason,
@@ -1255,7 +1476,7 @@ async fn admin_add_account(
             )
         })?;
 
-    // [FIX #1166] Reload TokenManager immediately after an account change
+    // [FIX #1166] 账号变动后立即重新加载 TokenManager
     if let Err(e) = state.token_manager.load_accounts().await {
         logger::log_error(&format!(
             "[API] Failed to reload accounts after adding: {}",
@@ -1286,7 +1507,7 @@ async fn admin_delete_account(
             )
         })?;
 
-    // [FIX #1166] Reload TokenManager immediately after an account change
+    // [FIX #1166] 账号变动后立即重新加载 TokenManager
     if let Err(e) = state.token_manager.load_accounts().await {
         logger::log_error(&format!(
             "[API] Failed to reload accounts after deletion: {}",
@@ -1301,6 +1522,8 @@ async fn admin_delete_account(
 #[serde(rename_all = "camelCase")]
 struct SwitchRequest {
     account_id: String,
+    #[serde(default)]
+    target_ide: Option<String>,
 }
 
 async fn admin_switch_account(
@@ -1325,11 +1548,14 @@ async fn admin_switch_account(
     }
 
     let account_id = payload.account_id.clone();
-    logger::log_info(&format!("[API] Starting account switch: {}", account_id));
+    logger::log_info(&format!(
+        "[API] Starting account switch: {} (target_ide: {:?})",
+        account_id, payload.target_ide
+    ));
 
     let result = state
         .account_service
-        .switch_account(&account_id, None)
+        .switch_account(&account_id, payload.target_ide.as_deref())
         .await;
 
     {
@@ -1341,7 +1567,7 @@ async fn admin_switch_account(
         Ok(()) => {
             logger::log_info(&format!("[API] Account switch successful: {}", account_id));
 
-            // [FIX #1166] Sync in-memory state immediately after account switch
+            // [FIX #1166] 账号切换后立即同步内存状态
             state.token_manager.clear_all_sessions();
             if let Err(e) = state.token_manager.load_accounts().await {
                 logger::log_error(&format!(
@@ -1533,7 +1759,7 @@ async fn admin_bind_device(
 
 #[derive(Deserialize, Debug, Default)]
 #[serde(rename_all = "camelCase")]
-#[allow(dead_code)] // Reserved struct for a logs endpoint
+#[allow(dead_code)] // 预留日志接口结构体
 struct LogsRequest {
     #[serde(default)]
     limit: usize,
@@ -1545,7 +1771,7 @@ struct LogsRequest {
     errors_only: bool,
 }
 
-#[allow(dead_code)] // Reserved logs endpoint
+#[allow(dead_code)] // 预留日志接口
 async fn admin_get_logs(
     Query(params): Query<LogsRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
@@ -1593,7 +1819,7 @@ async fn admin_save_config(
     Json(payload): Json<SaveConfigWrapper>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
     let new_config = payload.config;
-    // 1. Persist
+    // 1. 持久化
     config::save_app_config(&new_config).map_err(|e| {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -1601,49 +1827,79 @@ async fn admin_save_config(
         )
     })?;
 
-    // 2. Hot-reload the in-memory state
-    // Here we directly reuse each internal component's update method
-    // Note: AppState itself holds each component's Arc<RwLock> or a direct reference
+    // 2. 热更新内存状态
+    // 这里我们直接复用内部组件的 update 方法
+    // 注意：AppState 本身持有各个组件的 Arc<RwLock> 或直接持有引用
 
-    // We need a way to obtain the current AxumServer instance to hot-reload it,
-    // or to operate directly on the states inside AppState.
-    // In this refactor, each state already lives inside AppState.
+    // 我们需要一个方式获取到当前的 AxumServer 实例来进行热更新，
+    // 或者直接操作 AppState 里的各状态。
+    // 在本重构中，各个状态已经在 AppState 中了。
 
-    // Update the model mapping
+    // 更新模型映射
     {
         let mut mapping = state.custom_mapping.write().await;
         *mapping = new_config.clone().proxy.custom_mapping;
     }
 
-    // Update the upstream proxy
+    // 更新上游代理
     {
         let mut proxy = state.upstream_proxy.write().await;
         *proxy = new_config.clone().proxy.upstream_proxy;
     }
 
-    // Update the security policy
+    // 更新安全策略
     {
         let mut security = state.security.write().await;
         *security = crate::proxy::ProxySecurityConfig::from_proxy_config(&new_config.proxy);
     }
 
-    // Update the z.ai config
+    // 更新 z.ai 配置
     {
         let mut zai = state.zai.write().await;
         *zai = new_config.clone().proxy.zai;
     }
 
-    // Update the experimental config
+    // 更新实验性配置
     {
         let mut exp = state.experimental.write().await;
         *exp = new_config.clone().proxy.experimental;
     }
 
-    // Update the proxy pool config (hot-reloaded when Web/Docker saves the config)
+    // 更新代理池配置（Web/Docker 保存配置时热更新）
     {
         let mut pool = state.proxy_pool_state.write().await;
         *pool = new_config.clone().proxy.proxy_pool;
     }
+
+    // [FIX Web Mode] 同步全局内存配置（热更新思考预算、系统提示词、图像思考模式、压缩等级、阈值与审计策略）
+    crate::proxy::update_thinking_budget_config(new_config.proxy.thinking_budget.clone());
+    crate::proxy::update_global_system_prompt_config(new_config.proxy.global_system_prompt.clone());
+    crate::proxy::update_image_thinking_mode(new_config.proxy.image_thinking_mode.clone());
+    crate::proxy::config::update_global_compression_level(
+        new_config.proxy.experimental.compression_level.clone(),
+        new_config.proxy.experimental.enable_usage_scaling,
+    );
+    crate::proxy::config::update_global_thresholds(
+        new_config
+            .proxy
+            .experimental
+            .context_compression_threshold_l1,
+        new_config
+            .proxy
+            .experimental
+            .context_compression_threshold_l2,
+        new_config
+            .proxy
+            .experimental
+            .context_compression_threshold_l3,
+    );
+    crate::proxy::config::update_global_audit_config(
+        new_config.proxy.experimental.payload_storage_mode.clone(),
+        new_config.proxy.experimental.log_retention_days,
+        new_config.proxy.experimental.thinking_store_enabled,
+        new_config.proxy.experimental.thinking_retention_days,
+        Some(new_config.proxy.experimental.thinking_max_memory_turns),
+    );
 
     Ok(StatusCode::OK)
 }
@@ -1727,7 +1983,7 @@ async fn admin_trigger_proxy_health_check(
         )
     })?;
 
-    // Return the updated proxy pool config (including health status)
+    // 返回更新后的代理池配置（包含健康状态）
     let config = state.proxy_pool_state.read().await;
     Ok(Json(serde_json::json!({
         "success": true,
@@ -1739,7 +1995,7 @@ async fn admin_trigger_proxy_health_check(
 async fn admin_get_proxy_status(
     State(state): State<AppState>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    // In Headless/Axum mode, if AxumServer is running, it's generally considered running
+    // 在 Headless/Axum 模式下，AxumServer 既然在运行，通常就是 running
     let active_accounts = state.token_manager.len();
 
     let is_running = { *state.is_running.read().await };
@@ -1752,25 +2008,42 @@ async fn admin_get_proxy_status(
 }
 
 async fn admin_start_proxy_service(State(state): State<AppState>) -> impl IntoResponse {
-    // 1. Persist the config (fixes #1166)
+    // 1. 持久化配置 (修复 #1166)
     if let Ok(mut config) = crate::modules::config::load_app_config() {
         config.proxy.auto_start = true;
         let _ = crate::modules::config::save_app_config(&config);
     }
 
-    // 2. Ensure accounts are loaded (in case this is the first startup)
+    // 2. 确保账号已加载 (如果是第一次启动)
     if let Err(e) = state.token_manager.load_accounts().await {
-        logger::log_error(&format!("[API] Failed to enable the service and load accounts: {}", e));
+        logger::log_error(&format!("[API] 启用服务并加载账号失败: {}", e));
     }
 
     let mut running = state.is_running.write().await;
     *running = true;
-    logger::log_info("[API] Reverse proxy service feature enabled (persisted and synced)");
+    logger::log_info("[API] 反代服务功能已启用 (持久化已同步)");
+    StatusCode::OK
+}
+
+async fn admin_set_proxy_capture_health_logs(
+    State(state): State<AppState>,
+    Json(payload): Json<serde_json::Value>,
+) -> impl IntoResponse {
+    let enabled = payload
+        .get("enabled")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+
+    if state.monitor.is_capture_health_logs() != enabled {
+        state.monitor.set_capture_health_logs(enabled);
+        logger::log_info(&format!("[API] 捕获健康检查日志状态已设置为: {}", enabled));
+    }
+
     StatusCode::OK
 }
 
 async fn admin_stop_proxy_service(State(state): State<AppState>) -> impl IntoResponse {
-    // 1. Persist the config (fixes #1166)
+    // 1. 持久化配置 (修复 #1166)
     if let Ok(mut config) = crate::modules::config::load_app_config() {
         config.proxy.auto_start = false;
         let _ = crate::modules::config::save_app_config(&config);
@@ -1778,7 +2051,7 @@ async fn admin_stop_proxy_service(State(state): State<AppState>) -> impl IntoRes
 
     let mut running = state.is_running.write().await;
     *running = false;
-    logger::log_info("[API] Reverse proxy service feature disabled (Axum mode / persisted and synced)");
+    logger::log_info("[API] 反代服务功能已禁用 (Axum 模式 / 持久化已同步)");
     StatusCode::OK
 }
 
@@ -1794,14 +2067,14 @@ async fn admin_update_model_mapping(
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
     let config = payload.config;
 
-    // 1. Update the in-memory state (hot reload)
+    // 1. 更新内存状态 (热更新)
     {
         let mut mapping = state.custom_mapping.write().await;
         *mapping = config.custom_mapping.clone();
     }
 
-    // 2. Persist to disk (fixes #1149)
-    // Load the current config, update the mapping, then save
+    // 2. 持久化到硬盘 (修复 #1149)
+    // 加载当前配置，更新 mapping，然后保存
     let mut app_config = crate::modules::config::load_app_config().map_err(|e| {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -1818,7 +2091,7 @@ async fn admin_update_model_mapping(
         )
     })?;
 
-    logger::log_info("[API] Model mapping hot-reloaded and saved via the API");
+    logger::log_info("[API] 模型映射已通过 API 热更新并保存");
     Ok(StatusCode::OK)
 }
 
@@ -1829,13 +2102,13 @@ async fn admin_generate_api_key() -> impl IntoResponse {
 
 async fn admin_clear_proxy_session_bindings(State(state): State<AppState>) -> impl IntoResponse {
     state.token_manager.clear_all_sessions();
-    logger::log_info("[API] Cleared all session bindings");
+    logger::log_info("[API] 已清除所有会话绑定");
     StatusCode::OK
 }
 
 async fn admin_clear_all_rate_limits(State(state): State<AppState>) -> impl IntoResponse {
     state.token_manager.clear_all_rate_limits();
-    logger::log_info("[API] Cleared all rate limit records");
+    logger::log_info("[API] 已清除所有限流记录");
     StatusCode::OK
 }
 
@@ -1845,7 +2118,7 @@ async fn admin_clear_rate_limit(
 ) -> impl IntoResponse {
     let cleared = state.token_manager.clear_rate_limit(&account_id);
     if cleared {
-        logger::log_info(&format!("[API] Cleared the rate limit records for account {}", account_id));
+        logger::log_info(&format!("[API] 已清除账号 {} 的限流记录", account_id));
         StatusCode::OK
     } else {
         StatusCode::NOT_FOUND
@@ -1876,11 +2149,11 @@ async fn admin_set_preferred_account(
 
 async fn admin_fetch_zai_models(
     Path(_id): Path<String>,
-    Json(payload): Json<serde_json::Value>, // Reuses the parameters sent by the frontend
+    Json(payload): Json<serde_json::Value>, // 复用前端传来的参数
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    // A simple implementation here; if more complex fetch logic is needed, the zai module can be called
-    // Currently, the frontend's fetch_zai_models is essentially also a utility function,
-    // and we can proxy the fetch on the backend via reqwest.
+    // 这里简单实现，如果需要更复杂的抓取逻辑，可以调用 zai 模块
+    // 目前前端 fetch_zai_models 本质上也是一个工具函数，
+    // 我们可以在后端通过 reqwest 代理抓取。
     let zai_config = payload.get("zai").ok_or_else(|| {
         (
             StatusCode::BAD_REQUEST,
@@ -1899,7 +2172,7 @@ async fn admin_fetch_zai_models(
         .and_then(|v| v.as_str())
         .unwrap_or("https://api.z.ai");
 
-    // Try to fetch models from z.ai
+    // 尝试从 z.ai 获取模型
     let client = reqwest::Client::new();
     let resp = client
         .get(format!("{}/v1/models", base_url))
@@ -1924,7 +2197,7 @@ async fn admin_fetch_zai_models(
         )
     })?;
 
-    // Extract the list of model IDs
+    // 提取模型 ID 列表
     let models = data
         .get("data")
         .and_then(|v| v.as_array())
@@ -1950,10 +2223,10 @@ async fn admin_set_proxy_monitor_enabled(
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
 
-    // [FIX #1269] Only log and set when the state actually changes, to avoid a false "restart" impression from repeated triggers
+    // [FIX #1269] 只有在状态真正改变时才记录日志并设置，避免重复触发导致的"重启"错觉
     if state.monitor.is_enabled() != enabled {
         state.monitor.set_enabled(enabled);
-        logger::log_info(&format!("[API] Monitor state set to: {}", enabled));
+        logger::log_info(&format!("[API] 监控状态已设置为: {}", enabled));
     }
 
     StatusCode::OK
@@ -1962,10 +2235,11 @@ async fn admin_set_proxy_monitor_enabled(
 async fn admin_get_proxy_logs_count_filtered(
     Query(params): Query<LogsRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    let res = tokio::task::spawn_blocking(move || {
-        proxy_db::get_logs_count_filtered(&params.filter, params.errors_only)
-    })
-    .await;
+    let res: Result<Result<u64, String>, tokio::task::JoinError> =
+        tokio::task::spawn_blocking(move || {
+            proxy_db::get_logs_count_filtered(&params.filter, params.errors_only)
+        })
+        .await;
 
     match res {
         Ok(Ok(count)) => Ok(Json(count)),
@@ -1985,20 +2259,84 @@ async fn admin_get_proxy_logs_count_filtered(
 async fn admin_clear_proxy_logs() -> impl IntoResponse {
     let _ = tokio::task::spawn_blocking(|| {
         if let Err(e) = proxy_db::clear_logs() {
-            logger::log_error(&format!("[API] Failed to clear reverse proxy logs: {}", e));
+            logger::log_error(&format!("[API] 清除反代日志失败: {}", e));
         }
     })
     .await;
-    logger::log_info("[API] Cleared all reverse proxy logs");
+    logger::log_info("[API] 已清除所有反代日志");
     StatusCode::OK
+}
+
+async fn admin_clear_thinking_store() -> impl IntoResponse {
+    crate::proxy::thinking_store::ThinkingStore::global().clear();
+    crate::proxy::SignatureCache::global().clear();
+    let res = tokio::task::spawn_blocking(crate::modules::proxy_db::clear_all_thinking_data).await;
+    match res {
+        Ok(Ok(deleted)) => {
+            logger::log_info(&format!(
+                "[API] 已清空思考块存储 (共删除 {} 条记录)",
+                deleted
+            ));
+            (StatusCode::OK, Json(json!({ "deleted": deleted })))
+        }
+        Ok(Err(e)) => {
+            logger::log_error(&format!("[API] 清空思考块存储失败: {}", e));
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": e })),
+            )
+        }
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": e.to_string() })),
+        ),
+    }
+}
+
+async fn admin_get_thinking_store_count() -> impl IntoResponse {
+    let res =
+        tokio::task::spawn_blocking(crate::modules::proxy_db::get_thinking_records_count).await;
+    match res {
+        Ok(Ok(count)) => (StatusCode::OK, Json(json!({ "count": count }))),
+        Ok(Err(e)) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": e })),
+        ),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": e.to_string() })),
+        ),
+    }
+}
+
+async fn admin_get_proxy_db_disk_size(
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    let res: Result<Result<u64, String>, tokio::task::JoinError> =
+        tokio::task::spawn_blocking(move || proxy_db::get_proxy_db_disk_bytes()).await;
+
+    match res {
+        Ok(Ok(bytes)) => Ok(Json(bytes)),
+        Ok(Err(e)) => Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse { error: e }),
+        )),
+        Err(e) => Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                error: e.to_string(),
+            }),
+        )),
+    }
 }
 
 async fn admin_get_proxy_log_detail(
     Path(log_id): Path<String>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    let res =
-        tokio::task::spawn_blocking(move || crate::modules::proxy_db::get_log_detail(&log_id))
-            .await;
+    let res: Result<
+        Result<crate::proxy::monitor::ProxyRequestLog, String>,
+        tokio::task::JoinError,
+    > = tokio::task::spawn_blocking(move || crate::modules::proxy_db::get_log_detail(&log_id))
+        .await;
 
     match res {
         Ok(Ok(log)) => Ok(Json(log)),
@@ -2031,7 +2369,10 @@ struct LogsFilterQuery {
 async fn admin_get_proxy_logs_filtered(
     Query(params): Query<LogsFilterQuery>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    let res = tokio::task::spawn_blocking(move || {
+    let res: Result<
+        Result<Vec<crate::proxy::monitor::ProxyRequestLog>, String>,
+        tokio::task::JoinError,
+    > = tokio::task::spawn_blocking(move || {
         crate::modules::proxy_db::get_logs_filtered(
             &params.filter,
             params.errors_only,
@@ -2065,9 +2406,41 @@ async fn admin_get_proxy_stats(
 
 async fn admin_get_data_dir_path() -> impl IntoResponse {
     match crate::modules::account::get_data_dir() {
-        Ok(p) => Json(p.to_string_lossy().to_string()),
+        Ok(p) => Json(crate::modules::account::format_data_dir_path(&p)),
         Err(e) => Json(format!("Error: {}", e)),
     }
+}
+
+#[derive(Deserialize)]
+struct SetDataDirRequest {
+    path: String,
+}
+
+async fn admin_set_data_dir(
+    Json(payload): Json<SetDataDirRequest>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    let path = payload.path;
+    let new_path = tokio::task::spawn_blocking(move || {
+        crate::modules::account::migrate_data_dir(std::path::PathBuf::from(path))
+    })
+    .await
+    .map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                error: e.to_string(),
+            }),
+        )
+    })?
+    .map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse { error: e }),
+        )
+    })?;
+    Ok(Json(crate::modules::account::format_data_dir_path(
+        &new_path,
+    )))
 }
 
 // --- User Token Handlers ---
@@ -2468,18 +2841,18 @@ async fn admin_clear_token_stats() -> impl IntoResponse {
 
     match res {
         Ok(_) => {
-            logger::log_info("[API] Cleared all token usage stats");
+            logger::log_info("[API] 已清除所有 Token 统计数据");
             StatusCode::OK
         }
         Err(e) => {
-            logger::log_error(&format!("[API] Failed to clear token usage stats: {}", e));
+            logger::log_error(&format!("[API] 清除 Token 统计数据失败: {}", e));
             StatusCode::INTERNAL_SERVER_ERROR
         }
     }
 }
 
 async fn admin_get_update_settings() -> impl IntoResponse {
-    // Load settings from the real module
+    // 從真實模組加載設置
     match crate::modules::update_checker::load_update_settings() {
         Ok(s) => Json(serde_json::to_value(s).unwrap_or_default()),
         Err(_) => Json(serde_json::json!({
@@ -2539,7 +2912,7 @@ async fn admin_get_http_api_settings() -> impl IntoResponse {
     Json(serde_json::json!({ "enabled": true, "port": 8045 }))
 }
 
-// [Consolidation cleanup] Redundant imports removed
+// [整合清理] 冗餘導入已移除
 
 #[derive(Deserialize)]
 struct BulkDeleteRequest {
@@ -2576,7 +2949,7 @@ async fn admin_reorder_accounts(
         )
     })?;
 
-    // [FIX #1166] Reload TokenManager immediately after a reorder
+    // [FIX #1166] 排序变动后立即重新加载 TokenManager
     if let Err(e) = state.token_manager.load_accounts().await {
         logger::log_error(&format!(
             "[API] Failed to reload accounts after reorder: {}",
@@ -2615,6 +2988,9 @@ async fn admin_fetch_account_quota(
         )
     })?;
 
+    let mut quota = quota;
+    quota.ensure_subscription_tier();
+
     Ok(Json(quota))
 }
 
@@ -2623,6 +2999,31 @@ async fn admin_fetch_account_quota(
 struct ToggleProxyRequest {
     enable: bool,
     reason: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct AccountPriorityRequest {
+    #[serde(deserialize_with = "crate::models::account::deserialize_priority")]
+    priority: u8,
+}
+
+async fn admin_update_account_priority(
+    State(state): State<AppState>,
+    Path(account_id): Path<String>,
+    Json(payload): Json<AccountPriorityRequest>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    crate::modules::account::update_account_priority(&account_id, payload.priority).map_err(
+        |e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse { error: e }),
+            )
+        },
+    )?;
+    state
+        .token_manager
+        .update_account_priority(&account_id, payload.priority);
+    Ok(StatusCode::OK)
 }
 
 async fn admin_toggle_proxy_status(
@@ -2642,7 +3043,7 @@ async fn admin_toggle_proxy_status(
         )
     })?;
 
-    // Sync to the running reverse proxy service
+    // 同步到运行中的反代服务
     let _ = state.token_manager.reload_account(&account_id).await;
 
     Ok(StatusCode::OK)
@@ -2867,7 +3268,7 @@ struct BindDeviceProfileWrapper {
     profile_wrapper: DeviceProfileApiWrapper,
 }
 
-// DeviceProfile wrapper for the API, supports camelCase input
+// 用于 API 的 DeviceProfile 包装器，支持 camelCase 输入
 #[derive(Deserialize)]
 struct DeviceProfileApiWrapper {
     #[serde(alias = "machineId")]
@@ -2896,7 +3297,7 @@ async fn admin_bind_device_profile_with_profile(
     Path(account_id): Path<String>,
     Json(payload): Json<BindDeviceProfileWrapper>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    // Prefer the account_id in the payload (sent by the frontend); fall back to the path parameter otherwise
+    // 优先使用 payload 中的 account_id（前端发送的），如果没有则使用路径参数
     let target_account_id = if !payload.account_id.is_empty() {
         &payload.account_id
     } else {
@@ -2976,7 +3377,7 @@ async fn admin_import_v1_accounts(
         )
     })?;
 
-    // [FIX #1166] Load immediately after import
+    // [FIX #1166] 导入后立即加载
     let _ = state.token_manager.load_accounts().await;
 
     let current_id = state.account_service.get_current_id().map_err(|e| {
@@ -3002,10 +3403,10 @@ async fn admin_import_from_db(
         )
     })?;
 
-    // [FIX #820] Clear stale session bindings after import
+    // [FIX #820] 导入后清除过期的会话绑定
     state.token_manager.clear_all_sessions();
 
-    // [FIX #1166] Load immediately after import
+    // [FIX #1166] 导入后立即加载
     let _ = state.token_manager.load_accounts().await;
 
     let current_id = state.account_service.get_current_id().map_err(|e| {
@@ -3026,12 +3427,12 @@ async fn admin_import_custom_db(
     State(state): State<AppState>,
     Json(payload): Json<CustomDbRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    // [SECURITY] Disallow directory traversal
+    // [SECURITY] 禁止目录遍历
     if payload.path.contains("..") {
         return Err((
             StatusCode::BAD_REQUEST,
             Json(ErrorResponse {
-                error: "Invalid path: directory traversal is not allowed".to_string(),
+                error: "非法路径: 不允许目录遍历".to_string(),
             }),
         ));
     }
@@ -3045,10 +3446,10 @@ async fn admin_import_custom_db(
             )
         })?;
 
-    // [FIX #820] Clear stale session bindings after import
+    // [FIX #820] 导入后清除过期的会话绑定
     state.token_manager.clear_all_sessions();
 
-    // [FIX #1166] Load immediately after import
+    // [FIX #1166] 导入后立即加载
     let _ = state.token_manager.load_accounts().await;
 
     let current_id = state.account_service.get_current_id().map_err(|e| {
@@ -3074,7 +3475,7 @@ async fn admin_sync_account_from_db(
         return Ok(Json(None));
     }
 
-    // Logic mirrors the sync_account_from_db command
+    // 逻辑参考自 sync_account_from_db command
     let db_refresh_token = match migration::get_refresh_token_from_db(current_target) {
         Ok(token) => token,
         Err(_e) => {
@@ -3111,10 +3512,10 @@ async fn admin_sync_account_from_db(
         )
     })?;
 
-    // [FIX #820] Clear stale session bindings after sync
+    // [FIX #820] 同步后清除过期的会话绑定
     state.token_manager.clear_all_sessions();
 
-    // [FIX #1166] Reload TokenManager immediately after sync
+    // [FIX #1166] 同步后立即重新加载 TokenManager
     let _ = state.token_manager.load_accounts().await;
 
     let current_id = state.account_service.get_current_id().map_err(|e| {
@@ -3367,7 +3768,7 @@ async fn admin_prepare_oauth_url_web(
 
     let state_str = uuid::Uuid::new_v4().to_string();
 
-    // Initialize the authorization flow state, plus the background processor
+    // 初始化授权流状态，以及后台处理器
     let (auth_url, mut code_rx) = crate::modules::oauth_server::prepare_oauth_flow_manually(
         redirect_uri.clone(),
         state_str.clone(),
@@ -3380,7 +3781,7 @@ async fn admin_prepare_oauth_url_web(
         )
     })?;
 
-    // Start a background task to handle callback / manually submitted codes
+    // 启动后台任务处理回调/手动提交的代码
     let token_manager = state.token_manager.clone();
     let redirect_uri_clone = redirect_uri.clone();
     tokio::spawn(async move {
@@ -3389,7 +3790,7 @@ async fn admin_prepare_oauth_url_web(
                 crate::modules::logger::log_info(
                     "Consuming manually submitted OAuth code in background",
                 );
-                // Provide a simplified backend processing flow for the Web callback
+                // 为 Web 回调提供简化的后端处理流程
                 match crate::modules::oauth::exchange_code(&code, &redirect_uri_clone).await {
                     Ok(token_resp) => {
                         // Success! Now add/upsert account
@@ -3447,15 +3848,15 @@ async fn admin_prepare_oauth_url_web(
     })))
 }
 
-/// Helper function: get the OAuth redirect URI
-/// Forces the use of localhost to bypass Google's 2.0 policy blocking IP addresses and non-HTTPS environments.
-/// An external address is used only when ABV_PUBLIC_URL is explicitly set (e.g. the user configured an HTTPS domain).
+/// 辅助函数：获取 OAuth 重定向 URI
+/// 强制使用 localhost，以绕过 Google 2.0 政策对 IP 地址和非 HTTPS 环境的拦截。
+/// 只有在显式设置了 ABV_PUBLIC_URL (例如用户配置了 HTTPS 域名) 时才会使用外部地址。
 fn get_oauth_redirect_uri(port: u16, _host: Option<&str>, _proto: Option<&str>) -> String {
     if let Ok(public_url) = std::env::var("ABV_PUBLIC_URL") {
         let base = public_url.trim_end_matches('/');
         format!("{}/auth/callback", base)
     } else {
-        // Forcibly return localhost. For remote deployments, the user can complete authorization via the backfill feature.
+        // 强制返回 localhost。远程部署时，用户可通过回填功能完成授权。
         format!("http://localhost:{}/auth/callback", port)
     }
 }
@@ -3898,6 +4299,75 @@ async fn admin_execute_opencode_sync(
     })
 }
 
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct OpencodeOpenaiSyncRequest {
+    proxy_url: String,
+    api_key: String,
+    #[serde(default)]
+    provider_id: Option<String>,
+    #[serde(default)]
+    provider_name: Option<String>,
+    models: Option<Vec<crate::proxy::opencode_sync::ModelInput>>,
+}
+
+async fn admin_execute_opencode_openai_sync(
+    Json(payload): Json<OpencodeOpenaiSyncRequest>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    crate::proxy::opencode_sync::execute_opencode_openai_sync(
+        payload.proxy_url,
+        payload.api_key,
+        payload.provider_id,
+        payload.provider_name,
+        payload.models,
+    )
+    .await
+    .map(|_| StatusCode::OK)
+    .map_err(|e| {
+        let status = if crate::proxy::opencode_sync::is_provider_validation_error(&e) {
+            StatusCode::BAD_REQUEST
+        } else {
+            StatusCode::INTERNAL_SERVER_ERROR
+        };
+        (status, Json(ErrorResponse { error: e }))
+    })
+}
+
+async fn admin_get_opencode_providers(
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    crate::proxy::opencode_sync::get_opencode_providers()
+        .await
+        .map(Json)
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse { error: e }),
+            )
+        })
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct OpencodeRemoveProviderRequest {
+    provider_id: String,
+}
+
+async fn admin_execute_opencode_remove_provider(
+    Json(payload): Json<OpencodeRemoveProviderRequest>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    crate::proxy::opencode_sync::execute_opencode_remove_provider(payload.provider_id)
+        .await
+        .map(|_| StatusCode::OK)
+        .map_err(|e| {
+            let status = if crate::proxy::opencode_sync::is_provider_validation_error(&e) {
+                StatusCode::BAD_REQUEST
+            } else {
+                StatusCode::INTERNAL_SERVER_ERROR
+            };
+            (status, Json(ErrorResponse { error: e }))
+        })
+}
+
 async fn admin_execute_opencode_restore(
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
     crate::proxy::opencode_sync::execute_opencode_restore()
@@ -3955,6 +4425,205 @@ async fn admin_execute_opencode_clear(
     crate::proxy::opencode_sync::execute_opencode_clear(payload.proxy_url, payload.clear_legacy)
         .await
         .map(|_| StatusCode::OK)
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse { error: e }),
+            )
+        })
+}
+
+// ── Hermes Agent Sync Admin Handlers ──
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct HermesSyncStatusRequest {
+    #[serde(default)]
+    proxy_url: Option<String>,
+}
+
+async fn admin_get_hermes_sync_status(
+    Json(payload): Json<HermesSyncStatusRequest>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    crate::proxy::hermes_sync::get_hermes_sync_status(payload.proxy_url)
+        .await
+        .map(Json)
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse { error: e }),
+            )
+        })
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct HermesSyncRequest {
+    proxy_url: String,
+    api_key: String,
+    discover_models: bool,
+    #[serde(default)]
+    models: Vec<String>,
+    #[serde(default)]
+    activate: bool,
+    #[serde(default)]
+    default_model: Option<String>,
+}
+
+async fn admin_execute_hermes_sync(
+    Json(payload): Json<HermesSyncRequest>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    crate::proxy::hermes_sync::execute_hermes_sync(
+        payload.proxy_url,
+        payload.api_key,
+        payload.discover_models,
+        payload.models,
+        payload.activate,
+        payload.default_model,
+    )
+    .await
+    .map(|_| StatusCode::OK)
+    .map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse { error: e }),
+        )
+    })
+}
+
+async fn admin_execute_hermes_restore(
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    crate::proxy::hermes_sync::execute_hermes_restore()
+        .await
+        .map(|_| StatusCode::OK)
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse { error: e }),
+            )
+        })
+}
+
+async fn admin_execute_hermes_clear() -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)>
+{
+    crate::proxy::hermes_sync::execute_hermes_clear()
+        .await
+        .map(|_| StatusCode::OK)
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse { error: e }),
+            )
+        })
+}
+
+async fn admin_get_hermes_config_content(
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    crate::proxy::hermes_sync::get_hermes_config_content()
+        .await
+        .map(Json)
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse { error: e }),
+            )
+        })
+}
+
+// ── OpenClaw Sync Admin Handlers ──
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct OpenClawSyncStatusRequest {
+    #[serde(default)]
+    proxy_url: Option<String>,
+}
+
+async fn admin_get_openclaw_sync_status(
+    Json(payload): Json<OpenClawSyncStatusRequest>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    crate::proxy::openclaw_sync::get_openclaw_sync_status(payload.proxy_url)
+        .await
+        .map(Json)
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse { error: e }),
+            )
+        })
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct OpenClawSyncRequest {
+    proxy_url: String,
+    api_key: String,
+    #[serde(default = "default_openclaw_target_version")]
+    target_version: String,
+    #[serde(default)]
+    models: Vec<String>,
+    #[serde(default)]
+    activate: bool,
+    #[serde(default)]
+    default_model: Option<String>,
+}
+
+fn default_openclaw_target_version() -> String {
+    "v2".to_string()
+}
+
+async fn admin_execute_openclaw_sync(
+    Json(payload): Json<OpenClawSyncRequest>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    crate::proxy::openclaw_sync::execute_openclaw_sync(
+        payload.proxy_url,
+        payload.api_key,
+        payload.target_version,
+        payload.models,
+        payload.activate,
+        payload.default_model,
+    )
+    .await
+    .map(|_| StatusCode::OK)
+    .map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse { error: e }),
+        )
+    })
+}
+
+async fn admin_execute_openclaw_restore(
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    crate::proxy::openclaw_sync::execute_openclaw_restore()
+        .await
+        .map(|_| StatusCode::OK)
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse { error: e }),
+            )
+        })
+}
+
+async fn admin_execute_openclaw_clear(
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    crate::proxy::openclaw_sync::execute_openclaw_clear()
+        .await
+        .map(|_| StatusCode::OK)
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse { error: e }),
+            )
+        })
+}
+
+async fn admin_get_openclaw_config_content(
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    crate::proxy::openclaw_sync::get_openclaw_config_content()
+        .await
+        .map(Json)
         .map_err(|e| {
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -4151,5 +4820,66 @@ mod image_scheduler_tests {
         assert!(scheduler.try_acquire("account-1").is_none());
         drop(permit);
         assert_eq!(scheduler.available_slots(), 1);
+    }
+
+    #[test]
+    fn account_priority_web_response_preserves_saved_and_default_values() {
+        let token = crate::models::TokenData::new(
+            "test".into(),
+            "test".into(),
+            3600,
+            None,
+            None,
+            None,
+            false,
+            None,
+        );
+        let mut account = crate::models::Account::new(
+            "test-priority".into(),
+            "test-priority@test.invalid".into(),
+            token,
+        );
+
+        for priority in [7, 50] {
+            account.priority = priority;
+            let payload =
+                serde_json::to_value(super::to_account_response(&account, &None)).unwrap();
+            assert_eq!(payload.get("priority"), Some(&serde_json::json!(priority)));
+        }
+    }
+
+    #[test]
+    fn test_switch_request_deserialization_with_and_without_target_ide() {
+        use super::SwitchRequest;
+        let with_ide: SwitchRequest =
+            serde_json::from_str(r#"{"accountId": "acc_1", "targetIde": "agy"}"#).unwrap();
+        assert_eq!(with_ide.account_id, "acc_1");
+        assert_eq!(with_ide.target_ide.as_deref(), Some("agy"));
+
+        let without_ide: SwitchRequest = serde_json::from_str(r#"{"accountId": "acc_2"}"#).unwrap();
+        assert_eq!(without_ide.account_id, "acc_2");
+        assert_eq!(without_ide.target_ide, None);
+    }
+
+    #[tokio::test]
+    async fn test_bind_tcp_listener_and_reuse() {
+        let port = 18099;
+        let listener1 =
+            super::bind_tcp_listener("127.0.0.1", port).expect("first bind should succeed");
+        drop(listener1);
+        let listener2 = super::bind_tcp_listener("127.0.0.1", port)
+            .expect("immediate re-bind must succeed with SO_REUSEADDR");
+        drop(listener2);
+    }
+
+    #[tokio::test]
+    async fn test_bind_tcp_listener_wildcard_dual_stack() {
+        let port = 18100;
+        let listener = super::bind_tcp_listener("0.0.0.0", port)
+            .expect("wildcard dual-stack bind should succeed");
+        drop(listener);
+        let listener_v6 = super::bind_tcp_listener("::", port)
+            .expect("wildcard v6 dual-stack bind should succeed");
+        drop(listener_v6);
     }
 }

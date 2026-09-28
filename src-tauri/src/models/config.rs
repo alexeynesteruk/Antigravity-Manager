@@ -32,6 +32,14 @@ pub struct AppConfig {
     pub hidden_menu_items: Vec<String>, // Hidden menu item path list
     #[serde(default)]
     pub cloudflared: CloudflaredConfig, // [NEW] Cloudflared configuration
+    #[serde(default)]
+    pub lightweight_mode: bool, // [NEW] Lightweight mode: destroy webview on minimize/close to tray
+    #[serde(default)]
+    pub suggestion_delete_thinking_store: Option<bool>, // [NEW] 建议删除历史思考块缓存开关
+    #[serde(default)]
+    pub thinking_cleanup_dismissed: Option<bool>, // [NEW] 用户是否已确认/忽略该建议
+    #[serde(default)]
+    pub dismissed_thinking_cleanup_version: Option<String>, // [NEW] 用户已确认或忽略建议的目标版本号
 }
 
 /// Scheduled warmup configuration
@@ -149,10 +157,18 @@ pub struct CircuitBreakerConfig {
     /// Default: [60, 300, 1800, 7200]
     #[serde(default = "default_backoff_steps")]
     pub backoff_steps: Vec<u64>,
+
+    /// Optional 5h zero-quota lock; exhausted weekly quota always blocks scheduling.
+    #[serde(default = "default_lock_on_zero_quota")]
+    pub lock_on_zero_quota: bool,
 }
 
 fn default_backoff_steps() -> Vec<u64> {
     vec![60, 300, 1800, 7200]
+}
+
+fn default_lock_on_zero_quota() -> bool {
+    false
 }
 
 impl CircuitBreakerConfig {
@@ -160,6 +176,7 @@ impl CircuitBreakerConfig {
         Self {
             enabled: true,
             backoff_steps: default_backoff_steps(),
+            lock_on_zero_quota: false,
         }
     }
 }
@@ -173,7 +190,7 @@ impl Default for CircuitBreakerConfig {
 impl AppConfig {
     pub fn new() -> Self {
         Self {
-            language: "zh".to_string(),
+            language: crate::modules::i18n::default_language(),
             theme: "system".to_string(),
             auto_refresh: true,
             refresh_interval: 15,
@@ -192,6 +209,10 @@ impl AppConfig {
             circuit_breaker: CircuitBreakerConfig::default(),
             hidden_menu_items: Vec::new(),
             cloudflared: CloudflaredConfig::default(),
+            lightweight_mode: false,
+            suggestion_delete_thinking_store: None,
+            thinking_cleanup_dismissed: None,
+            dismissed_thinking_cleanup_version: None,
         }
     }
 }
@@ -199,5 +220,21 @@ impl AppConfig {
 impl Default for AppConfig {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::AppConfig;
+
+    #[test]
+    fn saved_language_is_preserved_when_loading_config() {
+        let mut config = AppConfig::new();
+        for language in ["en", "zh", "zh-TW", "ru"] {
+            config.language = language.to_string();
+            let saved = serde_json::to_string(&config).unwrap();
+            let restored: AppConfig = serde_json::from_str(&saved).unwrap();
+            assert_eq!(restored.language, language);
+        }
     }
 }
