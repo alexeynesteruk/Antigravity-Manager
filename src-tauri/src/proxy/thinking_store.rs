@@ -2298,6 +2298,23 @@ pub fn place_turn_signature(parts: &mut [Value], fallback_sig: Option<&str>) -> 
         .filter(|s| is_real_signature(s))
         .map(str::to_string);
 
+    // 2b. 首个 functionCall 若不是锚点（如「正文 + functionCall」轮），也必须带签名：
+    //     Gemini 3 对当前轮每一步的首个 functionCall 强制校验签名，缺失即 400
+    //     "Function call is missing a thought_signature"。agy 在此排列下会在
+    //     正文与 functionCall 上携带同一签名。
+    let first_fc = parts
+        .iter()
+        .position(|p| p.get("functionCall").is_some())
+        .filter(|&i| i != anchor);
+    let fc_own_sig = first_fc.and_then(|i| {
+        parts[i]
+            .get("thoughtSignature")
+            .or_else(|| parts[i].get("thought_signature"))
+            .and_then(|s| s.as_str())
+            .filter(|s| is_real_signature(s))
+            .map(str::to_string)
+    });
+
     // 3. 全量清空，保证非锚点 part 的签名字段确实"缺席"
     for part in parts.iter_mut() {
         if let Some(obj) = part.as_object_mut() {
@@ -2312,20 +2329,37 @@ pub fn place_turn_signature(parts: &mut [Value], fallback_sig: Option<&str>) -> 
     }
 
     // 5. 锚点自带优先，缺失时才使用回填来源（跨协议路径）
-    let sig = own_sig.or_else(|| {
-        fallback_sig
-            .filter(|s| is_real_signature(s))
-            .map(str::to_string)
-    })?;
+    let final_sig = own_sig
+        .or_else(|| {
+            fallback_sig
+                .filter(|s| is_real_signature(s))
+                .map(str::to_string)
+        })
+        .map(|sig| {
+            // 权威防裂化：如果签名是原始二进制 protobuf (首字节 0x12)，必须转为标准 Base64 编码后再发送给 Gemini！
+            if sig.as_bytes().first() == Some(&0x12) {
+                use base64::Engine;
+                base64::engine::general_purpose::STANDARD.encode(sig.as_bytes())
+            } else {
+                sig
+            }
+        });
 
-    // 权威防裂化：如果签名是原始二进制 protobuf (首字节 0x12)，必须转为标准 Base64 编码后再发送给 Gemini！
-    let final_sig = if sig.as_bytes().first() == Some(&0x12) {
-        use base64::Engine;
-        base64::engine::general_purpose::STANDARD.encode(sig.as_bytes())
-    } else {
-        sig
-    };
-    parts[anchor]["thoughtSignature"] = json!(final_sig);
+    if let Some(ref sig) = final_sig {
+        parts[anchor]["thoughtSignature"] = json!(sig);
+    }
+
+    // 6. 非锚点的首个 functionCall：自带签名优先，否则沿用本轮签名
+    if let Some(i) = first_fc {
+        if let Some(fc_sig) = fc_own_sig.or_else(|| final_sig.clone()) {
+            parts[i]["thoughtSignature"] = json!(fc_sig);
+            if let Some(id) = parts[i]["functionCall"].get("id").and_then(|v| v.as_str()) {
+                crate::proxy::SignatureCache::global().cache_tool_signature(id, fc_sig.clone());
+            }
+        }
+    }
+
+    let final_sig = final_sig?;
 
     // 反向入库优化：如果锚点是工具调用，反向更新/修补回签名缓存与 SQLite tool_signatures 库！
     if let Some(fc) = parts[anchor].get("functionCall") {
@@ -2995,9 +3029,10 @@ mod tests {
             "Real signature must be restored onto the anchor (first non-thought part)"
         );
 
-        // Index 2 / 3: 工具调用不再盖章 —— 签名字段必须「缺席」，而不是空串
+        // Index 2: 首个 functionCall 必须带签名（否则上游 400 missing thought_signature）
+        // Index 3: 并发调用的其余 functionCall —— 签名字段必须「缺席」，而不是空串
         assert_eq!(parts[2]["functionCall"]["id"], "call_batch_1");
-        assert!(parts[2].get("thoughtSignature").is_none());
+        assert_eq!(parts[2]["thoughtSignature"], real_sig);
         assert_eq!(parts[3]["functionCall"]["id"], "call_batch_2");
         assert!(parts[3].get("thoughtSignature").is_none());
     }
@@ -3056,10 +3091,10 @@ mod tests {
         let parts = contents[0]["parts"].as_array().unwrap();
         assert_eq!(parts[0]["thought"], true);
         assert_eq!(parts[0]["text"], "Thought restored from SQLite");
-        // 锚点 = 该轮第一个非思考 part（这里是可见正文）：真实签名归位到它上面，
-        // 工具调用不再被盖章。
+        // 锚点 = 该轮第一个非思考 part（这里是可见正文）：真实签名归位到它上面；
+        // 首个 functionCall 同样必须带签名。
         assert_eq!(parts[1]["thoughtSignature"], real_sig);
-        assert!(parts[2].get("thoughtSignature").is_none());
+        assert_eq!(parts[2]["thoughtSignature"], real_sig);
     }
 
     #[test]
@@ -4754,6 +4789,52 @@ mod signature_placement_tests {
         assert!(placed.is_none(), "整轮皆思考则本轮无锚点");
         assert!(parts[0].get("thoughtSignature").is_none());
         assert!(parts[1].get("thoughtSignature").is_none());
+    }
+
+    #[test]
+    fn text_then_function_call_keeps_signature_on_the_call() {
+        // agy 实际报文：正文 + functionCall 同一轮，两者携带同一签名。
+        // 剥掉 functionCall 上的签名会触发上游 400
+        // "Function call is missing a thought_signature"。
+        let sig = gemini_sig(10);
+        let mut parts = vec![
+            json!({ "text": "Running the script.", "thoughtSignature": sig }),
+            json!({ "functionCall": { "id": "call_1", "name": "schedule" }, "thoughtSignature": sig }),
+            json!({ "functionCall": { "id": "call_2", "name": "view_file" }, "thoughtSignature": sig }),
+        ];
+        let placed = place_turn_signature(&mut parts, None);
+
+        assert_eq!(placed.as_deref(), Some(sig.as_str()));
+        assert_eq!(parts[0]["thoughtSignature"], sig, "锚点 = 正文");
+        assert_eq!(parts[1]["thoughtSignature"], sig, "首个 functionCall 必须带签名");
+        assert!(parts[2].get("thoughtSignature").is_none(), "并发调用只签首个");
+    }
+
+    #[test]
+    fn unsigned_text_anchor_does_not_drop_function_call_signature() {
+        let sig = gemini_sig(11);
+        let mut parts = vec![
+            json!({ "text": "Running the script." }),
+            json!({ "functionCall": { "id": "call_1", "name": "schedule" }, "thoughtSignature": sig }),
+        ];
+        let placed = place_turn_signature(&mut parts, None);
+
+        assert!(placed.is_none());
+        assert!(parts[0].get("thoughtSignature").is_none());
+        assert_eq!(parts[1]["thoughtSignature"], sig);
+    }
+
+    #[test]
+    fn fallback_signature_reaches_first_function_call_behind_text() {
+        let sig = gemini_sig(12);
+        let mut parts = vec![
+            json!({ "text": "Running the script." }),
+            json!({ "functionCall": { "id": "call_1", "name": "schedule" } }),
+        ];
+        place_turn_signature(&mut parts, Some(sig.as_str()));
+
+        assert_eq!(parts[0]["thoughtSignature"], sig);
+        assert_eq!(parts[1]["thoughtSignature"], sig);
     }
 
     #[test]
