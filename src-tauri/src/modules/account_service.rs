@@ -159,9 +159,9 @@ impl AccountService {
         &self,
         token_res: modules::oauth::TokenResponse,
     ) -> Result<Account, String> {
-        let refresh_token = token_res
-            .refresh_token
-            .ok_or_else(|| "Refresh Token not obtained. Please revoke permissions and try again.".to_string())?;
+        let refresh_token = token_res.refresh_token.ok_or_else(|| {
+            "Refresh Token not obtained. Please revoke permissions and try again.".to_string()
+        })?;
 
         // [FIX #1583] Generate a temporary UUID as the account context
         let temp_account_id = uuid::Uuid::new_v4().to_string();

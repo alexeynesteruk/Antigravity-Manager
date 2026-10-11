@@ -21,11 +21,12 @@ pub async fn handle_audio_transcription(
     let mut prompt = "Generate a transcript of the speech.".to_string();
 
     // 1. Parse multipart/form-data
-    while let Some(field) = multipart
-        .next_field()
-        .await
-        .map_err(|e| (StatusCode::BAD_REQUEST, format!("Failed to parse form: {}", e)))?
-    {
+    while let Some(field) = multipart.next_field().await.map_err(|e| {
+        (
+            StatusCode::BAD_REQUEST,
+            format!("Failed to parse form: {}", e),
+        )
+    })? {
         let name = field.name().unwrap_or("").to_string();
 
         match name.as_str() {
@@ -35,7 +36,12 @@ pub async fn handle_audio_transcription(
                     field
                         .bytes()
                         .await
-                        .map_err(|e| (StatusCode::BAD_REQUEST, format!("Failed to read file: {}", e)))?
+                        .map_err(|e| {
+                            (
+                                StatusCode::BAD_REQUEST,
+                                format!("Failed to read file: {}", e),
+                            )
+                        })?
                         .to_vec(),
                 );
             }
@@ -49,9 +55,13 @@ pub async fn handle_audio_transcription(
         }
     }
 
-    let audio_bytes = audio_data.ok_or((StatusCode::BAD_REQUEST, "Missing audio file".to_string()))?;
+    let audio_bytes =
+        audio_data.ok_or((StatusCode::BAD_REQUEST, "Missing audio file".to_string()))?;
 
-    let file_name = filename.ok_or((StatusCode::BAD_REQUEST, "Unable to get file name".to_string()))?;
+    let file_name = filename.ok_or((
+        StatusCode::BAD_REQUEST,
+        "Unable to get file name".to_string(),
+    ))?;
 
     info!(
         "Received audio transcription request: file={}, size={} bytes, model={}",
@@ -125,7 +135,12 @@ pub async fn handle_audio_transcription(
             Some(account_id.as_str()),
         )
         .await
-        .map_err(|e| (StatusCode::BAD_GATEWAY, format!("Upstream request failed: {}", e)))?
+        .map_err(|e| {
+            (
+                StatusCode::BAD_GATEWAY,
+                format!("Upstream request failed: {}", e),
+            )
+        })?
         .response;
 
     if !response.status().is_success() {
@@ -139,10 +154,12 @@ pub async fn handle_audio_transcription(
         ));
     }
 
-    let result: Value = response
-        .json()
-        .await
-        .map_err(|e| (StatusCode::BAD_GATEWAY, format!("Failed to parse response: {}", e)))?;
+    let result: Value = response.json().await.map_err(|e| {
+        (
+            StatusCode::BAD_GATEWAY,
+            format!("Failed to parse response: {}", e),
+        )
+    })?;
 
     // 9. Extract the text response (unwrap the v1internal response)
     let inner_response = result.get("response").unwrap_or(&result);
@@ -156,7 +173,10 @@ pub async fn handle_audio_transcription(
         .and_then(|t| t.as_str())
         .unwrap_or("");
 
-    info!("Audio transcription complete, returning {} characters", text.len());
+    info!(
+        "Audio transcription complete, returning {} characters",
+        text.len()
+    );
 
     // 10. Return the standard format response
     Ok((

@@ -14,8 +14,9 @@ use serde::{Deserialize, Serialize};
 // account, forcing the user to re-authenticate. Serializing the HTTP call itself, keyed by
 // account (falling back to the refresh_token when no account_id is available yet, e.g. during
 // initial onboarding), closes that race for every current and future caller at once.
-static REFRESH_LOCKS: std::sync::OnceLock<dashmap::DashMap<String, std::sync::Arc<tokio::sync::Mutex<()>>>> =
-    std::sync::OnceLock::new();
+static REFRESH_LOCKS: std::sync::OnceLock<
+    dashmap::DashMap<String, std::sync::Arc<tokio::sync::Mutex<()>>>,
+> = std::sync::OnceLock::new();
 
 fn refresh_lock_key(refresh_token: &str, account_id: Option<&str>) -> String {
     account_id

@@ -254,7 +254,7 @@ mod tests {
             ("gemini-3-pro-low", true),         // normalizes to gemini-3-pro-high
             ("gemini-3-flash", true),           // direct match
             ("gpt-4", false),                   // unsupported model
-            ("gemini-2.5-flash", true),         // in the monitored list (normalizes to gemini-3-flash)
+            ("gemini-2.5-flash", true), // in the monitored list (normalizes to gemini-3-flash)
         ];
 
         for (model_name, expected_monitored) in test_cases {
@@ -285,9 +285,9 @@ mod tests {
         // Simulate quota data
         let quota_data = vec![
             ("claude-opus-4-5-thinking", 50, true), // 50% <= 60%, should trigger protection
-            ("claude-thinking", 60, true),          // 60% <= 60%, should trigger protection (boundary case)
-            ("gemini-3-flash", 61, false),          // 61% > 60%, should not trigger protection
-            ("gemini-3-pro-high", 100, false),      // 100% > 60%, should not trigger protection
+            ("claude-thinking", 60, true), // 60% <= 60%, should trigger protection (boundary case)
+            ("gemini-3-flash", 61, false), // 61% > 60%, should not trigger protection
+            ("gemini-3-pro-high", 100, false), // 100% > 60%, should not trigger protection
         ];
 
         for (model_name, percentage, should_protect) in quota_data {
@@ -405,12 +405,18 @@ mod tests {
         // Account should be filtered when quota protection is enabled
         let is_protected_when_enabled =
             config_enabled.enabled && token.protected_models.contains(&normalized_target);
-        assert!(is_protected_when_enabled, "should be protected when enabled");
+        assert!(
+            is_protected_when_enabled,
+            "should be protected when enabled"
+        );
 
         // Should not filter when quota protection is disabled, even if protected_models has values
         let is_protected_when_disabled =
             config_disabled.enabled && token.protected_models.contains(&normalized_target);
-        assert!(!is_protected_when_disabled, "should not be protected when disabled");
+        assert!(
+            !is_protected_when_disabled,
+            "should not be protected when disabled"
+        );
     }
 
     // ==================================================================================
@@ -608,7 +614,11 @@ mod tests {
             .collect();
 
         // No available accounts
-        assert_eq!(available_accounts.len(), 0, "there should be no available accounts");
+        assert_eq!(
+            available_accounts.len(),
+            0,
+            "there should be no available accounts"
+        );
 
         // In the actual implementation, this returns an error message
         // Verify a quota-protection-related error is returned
@@ -755,7 +765,11 @@ mod tests {
             .filter(|t| !t.protected_models.contains(&target))
             .collect();
 
-        assert_eq!(available.len(), 0, "the account should be filtered after sync");
+        assert_eq!(
+            available.len(),
+            0,
+            "the account should be filtered after sync"
+        );
     }
 
     // ==================================================================================
@@ -914,7 +928,10 @@ mod tests {
                 &account_path,
                 "unknown-model",
             );
-        assert_eq!(unknown_quota, None, "a nonexistent model should return None");
+        assert_eq!(
+            unknown_quota, None,
+            "a nonexistent model should return None"
+        );
 
         // Clean up temp file
         let _ = std::fs::remove_file(&account_path);

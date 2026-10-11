@@ -24,7 +24,9 @@ pub async fn toggle_auto_launch(app: tauri::AppHandle, enable: bool) -> Result<(
                     // (part of "系统找不到指定的文件"). It must stay byte-identical in Chinese because
                     // it is matched against the actual OS-provided error text at runtime, which is not
                     // localized by this app.
-                    crate::modules::logger::log_info("Autostart entry no longer exists, treating as disabled successfully");
+                    crate::modules::logger::log_info(
+                        "Autostart entry no longer exists, treating as disabled successfully",
+                    );
                 } else {
                     return Err(format!("Failed to disable autostart: {}", e));
                 }
