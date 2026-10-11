@@ -251,7 +251,10 @@ pub fn map_claude_model_to_gemini(input: &str) -> String {
     }
 
     // 3. Known prefixes (gemini-, -thinking, veo-) pass-through
-    if canonical.starts_with("gemini-") || canonical.contains("thinking") || canonical.starts_with("veo-") {
+    if canonical.starts_with("gemini-")
+        || canonical.contains("thinking")
+        || canonical.starts_with("veo-")
+    {
         return canonical;
     }
 

@@ -161,7 +161,10 @@ fn warn_if_oversized(base64_len: usize, mime: &str) {
 /// 判定是否属于 Google Veo 视频生成系列模型
 pub fn is_veo_model(model: &str) -> bool {
     let lower = model.to_lowercase();
-    lower.starts_with("veo-") || lower == "veo" || lower.contains("veo-3") || lower.contains("veo-2")
+    lower.starts_with("veo-")
+        || lower == "veo"
+        || lower.contains("veo-3")
+        || lower.contains("veo-2")
 }
 
 /// 归一化 Veo 模型名称为官方标准 ID
@@ -263,12 +266,18 @@ pub fn parse_veo_response(resp: &Value, model_name: &str) -> VideoGenerationResp
 
             if let Some(bytes_b64) = pred.get("bytesBase64Encoded").and_then(|b| b.as_str()) {
                 item.b64_json = Some(bytes_b64.to_string());
-            } else if let Some(uri) = pred.get("gcsUri").or_else(|| pred.get("uri")).and_then(|u| u.as_str()) {
+            } else if let Some(uri) = pred
+                .get("gcsUri")
+                .or_else(|| pred.get("uri"))
+                .and_then(|u| u.as_str())
+            {
                 item.url = Some(uri.to_string());
             } else if let Some(video_obj) = pred.get("video") {
                 if let Some(uri) = video_obj.get("uri").and_then(|u| u.as_str()) {
                     item.url = Some(uri.to_string());
-                } else if let Some(b64) = video_obj.get("bytesBase64Encoded").and_then(|b| b.as_str()) {
+                } else if let Some(b64) =
+                    video_obj.get("bytesBase64Encoded").and_then(|b| b.as_str())
+                {
                     item.b64_json = Some(b64.to_string());
                 }
             }
@@ -285,7 +294,11 @@ pub fn parse_veo_response(resp: &Value, model_name: &str) -> VideoGenerationResp
     if data.is_empty() {
         if let Some(candidates) = resp.get("candidates").and_then(|c| c.as_array()) {
             for cand in candidates {
-                if let Some(parts) = cand.get("content").and_then(|c| c.get("parts")).and_then(|p| p.as_array()) {
+                if let Some(parts) = cand
+                    .get("content")
+                    .and_then(|c| c.get("parts"))
+                    .and_then(|p| p.as_array())
+                {
                     for part in parts {
                         if let Some(inline) = part.get("inlineData") {
                             if let Some(b64) = inline.get("data").and_then(|d| d.as_str()) {
@@ -374,7 +387,10 @@ mod tests {
         };
 
         let payload = build_veo_payload(&req);
-        assert_eq!(payload["instances"][0]["prompt"], "A neon cyberpunk car driving in rain");
+        assert_eq!(
+            payload["instances"][0]["prompt"],
+            "A neon cyberpunk car driving in rain"
+        );
         assert_eq!(payload["parameters"]["aspectRatio"], "16:9");
         assert_eq!(payload["parameters"]["durationSeconds"], 5);
 
@@ -391,7 +407,10 @@ mod tests {
         assert_eq!(parsed.model, "veo-3.1");
         assert_eq!(parsed.object, "video.generation");
         assert_eq!(parsed.data.len(), 1);
-        assert_eq!(parsed.data[0].url.as_deref(), Some("gs://bucket/sample_video.mp4"));
+        assert_eq!(
+            parsed.data[0].url.as_deref(),
+            Some("gs://bucket/sample_video.mp4")
+        );
         assert_eq!(
             parsed.data[0].revised_prompt.as_deref(),
             Some("A neon cyberpunk car driving in heavy rain at night")

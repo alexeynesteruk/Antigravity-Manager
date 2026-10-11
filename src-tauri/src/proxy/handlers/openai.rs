@@ -7645,12 +7645,14 @@ pub async fn handle_videos_generations(
     Json(req): Json<crate::proxy::video::VideoGenerationRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
     if req.prompt.trim().is_empty() {
-        return Err((StatusCode::BAD_REQUEST, "Missing or empty 'prompt' field".to_string()));
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "Missing or empty 'prompt' field".to_string(),
+        ));
     }
 
     let raw_model = req.model.as_deref().unwrap_or("veo-3.1");
-    let target_model = crate::proxy::video::normalize_veo_model(raw_model)
-        .unwrap_or("veo-3.1");
+    let target_model = crate::proxy::video::normalize_veo_model(raw_model).unwrap_or("veo-3.1");
 
     info!(
         model = target_model,
@@ -7692,7 +7694,12 @@ pub async fn handle_videos_generations(
             None,
         )
         .await
-        .map_err(|e| (StatusCode::BAD_GATEWAY, format!("Upstream Veo request failed: {}", e)))?;
+        .map_err(|e| {
+            (
+                StatusCode::BAD_GATEWAY,
+                format!("Upstream Veo request failed: {}", e),
+            )
+        })?;
 
     let status = call_result.response.status();
     if !status.is_success() {
@@ -7703,15 +7710,20 @@ pub async fn handle_videos_generations(
             .unwrap_or_else(|_| "Unknown upstream error".to_string());
         return Err((
             status,
-            format!("Upstream Veo error (HTTP {}): {}", status.as_u16(), err_text),
+            format!(
+                "Upstream Veo error (HTTP {}): {}",
+                status.as_u16(),
+                err_text
+            ),
         ));
     }
 
-    let resp_json: Value = call_result
-        .response
-        .json()
-        .await
-        .map_err(|e| (StatusCode::BAD_GATEWAY, format!("Failed to parse Veo response JSON: {}", e)))?;
+    let resp_json: Value = call_result.response.json().await.map_err(|e| {
+        (
+            StatusCode::BAD_GATEWAY,
+            format!("Failed to parse Veo response JSON: {}", e),
+        )
+    })?;
 
     let video_response = crate::proxy::video::parse_veo_response(&resp_json, target_model);
     Ok(Json(video_response))
