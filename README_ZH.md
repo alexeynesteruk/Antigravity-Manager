@@ -1,5 +1,5 @@
 # Antigravity Tools 🚀
-> 专业级 AI 账号管理与协议代理系统 (v4.8.4)
+> 专业级 AI 账号管理与协议代理系统 (v4.9.6)
 
 <div align="center">
   <img src="public/icon.png" width="100" height="100" alt="Antigravity Tools Logo">
@@ -11,8 +11,10 @@
       <img src="https://img.shields.io/github/v/release/lbjlaq/Antigravity-Manager?color=blue&style=flat-square" alt="GitHub release">
     </a>
     <a href="https://github.com/lbjlaq/Antigravity-Manager">
-      <img src="https://img.shields.io/badge/Version-4.8.4-blue?style=flat-square" alt="Version">
+      <img src="https://img.shields.io/badge/Version-4.9.6-blue?style=flat-square" alt="Version">
     </a>
+    <img src="https://img.shields.io/badge/Tauri-v2-orange?style=flat-square" alt="Tauri">
+    <img src="https://img.shields.io/badge/Backend-Rust-red?style=flat-square" alt="Rust">
     <img src="https://img.shields.io/badge/Frontend-React-61DAFB?style=flat-square" alt="React">
     <img src="https://img.shields.io/badge/License-CC--BY--NC--SA--4.0-lightgrey?style=flat-square" alt="License">
   </p>
@@ -22,11 +24,11 @@
   </a>
 
   <p>
-    <a href="#-核心功能">核心功能</a> • 
-    <a href="#-界面导览">界面导览</a> • 
-    <a href="#-技术架构">技术架构</a> • 
-    <a href="#-安装指南">安装指南</a> • 
-    <a href="#-快速接入">快速接入</a>
+    <a href="#-深度功能解析-detailed-features">核心功能</a> • 
+    <a href="#-界面导览-gui-overview">界面导览</a> • 
+    <a href="#-技术架构-architecture">技术架构</a> • 
+    <a href="#-安装指南-installation">安装指南</a> • 
+    <a href="#-快速接入示例">快速接入</a>
   </p>
 
   <p>
@@ -46,12 +48,9 @@
 | 赞助商 (Sponsor) | 简介 (Description) |
 | :---: | :--- |
 | <img src="docs/images/packycode_logo.png" width="200" alt="PackyCode Logo"> | 感谢 **PackyCode** 对本项目的赞助！PackyCode 是一家可靠高效的 API 中转服务商，提供 Claude Code、Codex、Gemini 等多种服务的中转。PackyCode 为本项目的用户提供了特别优惠：使用[此链接](https://www.packyapi.com/register?aff=Ctrler)注册，并在充值时输入 **“Ctrler”** 优惠码即可享受 **九折优惠**。 |
-| <img src="docs/images/APIKEYFUN.png" width="200" alt="APIKEYFUN Logo"> | 感谢 APIKEY.FUN 赞助本项目！APIKEY.FUN 是一家专业的企业级 AI 中转站，致力于为企业和个人开发者提供稳定、高效、低成本的 AI 模型 API 接入服务。平台支持 Claude、OpenAI、Gemini 等主流热门模型，价格低至官方原价的 7%。通过本项目[专属链接](https://apikey.fan/register?aff=Ctrler)注册，还可享受最高 **充值永久 95 折** 专属优惠。 |
-| <img src="docs/images/claudeapilogo.png" width="200" alt="Claude API Logo"> | 感谢 **Claude API** 对本项目的支持！claudeapi.com 是一家走**官方与 AWS 渠道**接入的 **Claude API** 中转站，专注 Claude，主打高稳定、低延迟，完整支持 Claude Code。为本项目用户提供专属福利：通过[专属链接](https://console.claudeapi.com/register?source=antigravity)注册即送**免费测试额度，零门槛跑通**；充值再享 **95 折**专属优惠(联系客服）。 |
+| <img src="docs/images/APIKEYFUN.png" width="200" alt="APIKEYFUN Logo"> | 感谢 APIKEY.FUN 赞助本项目！APIKEY.FUN 是一家专业的企业级 AI 中转站，致力于为企业和个人开发者提供稳定、高效、低成本的 AI 模型 API 接入服务。平台支持 Claude、OpenAI、Gemini 等主流热门模型，价格低至官方原价的 7%。通过本项目[专属链接](https://apikey.fan/register?aff=AntManager)注册，还可享受最高 **充值永久 95 折** 专属优惠。 |
+| <img src="docs/images/claudeapilogo.png" width="200" alt="Claude API Logo"> | 感谢 **Claude API** 对本项目的支持！claudeapi.com 是一家走**官方与 AWS 渠道**接入的 **Claude API** 中转站，专注 Claude，主打高稳定、低延迟，完整支持 Claude Code。为本项目用户提供专属福利：通过[专属链接](https://console.claudeapi.com/register?source=antigravity)注册即送**免费测试额度，零门槛跑通**；充值再享 **95 折**专属优惠（联系客服）。 |
 | <img src="docs/images/AICodeMirror.jpg" width="200" alt="AICodeMirror Logo"> | 感谢 AICodeMirror 赞助了本项目！AICodeMirror 提供 Claude Code / Codex / Gemini CLI 官方高稳定中转服务，支持企业级高并发、极速开票、7×24 专属技术支持。 Claude Code / Codex / Gemini 官方渠道低至 3.8 / 0.2 / 0.9 折，充值更有折上折！AICodeMirror 为 Antigravity-Manager 的用户提供了特别福利，通过[此链接](https://aicodemirror.ai/register?invitecode=MV5XUM)注册的用户，可享受首充8折，企业客户最高可享 7.5 折！ |
-
-
-
 
 ### ☕ 支持项目 (Support)
 
@@ -84,7 +83,7 @@
 ### 3. 🔌 协议转换与中继 (API Proxy)
 *   **全协议适配 (Multi-Sink)**:
     *   **OpenAI 格式**: 提供 `/v1/chat/completions` 端点，兼容 99% 的现有 AI 应用。
-    *   **Anthropic 格式**: 提供原生 `/v1/messages` 接口，支持 **Claude Code CLI** 的全功能（如思思维链、系统提示词）。
+    *   **Anthropic 格式**: 提供原生 `/v1/messages` 接口，支持 **Claude Code CLI** 的全功能（如思维链、系统提示词）。
     *   **Gemini 格式**: 支持 Google 官方 SDK 直接调用。
 *   **智能状态自愈**: 当请求遇到 `429 (Too Many Requests)` 或 `401 (Expire)` 时，后端会毫秒级触发 **自动重试与静默轮换**，确保业务不中断。
 
@@ -127,7 +126,7 @@ graph TD
     ResponseMapper --> Client
 ```
 
-##  安装指南 (Installation)
+## 📥 安装指南 (Installation)
 
 ### 选项 A: 终端安装 (推荐)
 
@@ -254,10 +253,6 @@ docker compose up -d
 > - **持久化**: 需挂载 `/root/.antigravity_tools` 以保存数据。
 > - **架构**: 支持 x86_64 和 ARM64。
 > **详情见**: [Docker 部署指南 (docker)](./docker/README.md)
-
----
-
-Copyright © 2024-2026 [lbjlaq](https://github.com/lbjlaq)
 
 <details>
 <summary><b>🛠️ 常见问题排查 (Troubleshooting) - 点击展开</b></summary>
@@ -459,7 +454,7 @@ curl -X POST http://127.0.0.1:8045/v1/messages \
 **参数说明**:
 - **`imageSize`**: 直接指定分辨率 (`"1K"` / `"2K"` / `"4K"`)
 - **`quality`**: 通过质量等级推断分辨率 (`"standard"` → 1K, `"medium"` → 2K, `"hd"` → 4K)
-- **优先级**: 如果同时指定 `imageSize` 和 `quality`, 系统会优先使用 `imageSize`
+- **优先级**: 如果同时指定 `imageSize` 和 `quality`，系统会优先使用 `imageSize`
 
 #### 方式三：Chat 接口 + 模型后缀
 ```python
@@ -493,15 +488,17 @@ response = client.chat.completions.create(
 
 ## 📝 更新日志
 
-> 最新版本 **v4.8.4**（2026-09-27）：全链路规范化 Tool Call ID（入站清洗、缓存索引与持久化双向兼容），彻底根治多轮思考工具调用 400 签名缺失报错（Fixes #3529, #3531，感谢 @Mortalit、@ddmixi）；彻底铲除 Claude 适配层破坏性 Base64 解码，支持原生 Protobuf 签名与全链路数据库在位反向自愈写回（In-Place Self-Healing Write-Back）；全面剔除合成的占位思考块，确保每轮首个非思考 Part（正文或工具）作为权威锚点稳定承载签名；新增原生更新检查指令 `check_native_update`、支持动态更新源与外链下载兜底；完善独立 Beta Docker 镜像拉取与 JeikCode 快速接入指南。
+> 最新版本 **v4.9.6**（2026-10-06）——完整重新发布 v4.9.5 内容（v4.9.5 发布流水线因托管 Runner 资源不足被取消、未产出任何 Release 资产，代码完全一致）：根治思考预算无差别覆盖 32768、确立具名模型后缀（`-low`, `-medium`, `-high`）绝对最高优先级并无损回退 Default 模式与解耦 Claude 适配器（PR #3611，Fixes #3610）；Cowork 活跃消息修剪预算由 35k 降至 8k 深度归档，压缩后残余上下文降至 40k~45k tokens，压缩率突破 60%，双轨并轨为全局统一压缩状态机，引入动态净空防抖保障与 Claude 桌面进程生命周期管理，支持旧版补丁琥珀色警示与无损就地升级，macOS 签名容灾回滚保全官方证书链（PR #3604, #3609, #3603）；限制单请求 429 遍历账号池上限至 `min(pool_size, 2)`、引入阶梯退避与 Layer 2 乐观重试重置彻底消除 503 假死熔断，长连接会话 404/429 统一解绑自愈与跨协议成功计数重置，统一 Claude 共享配额保护组（PR #3608, #3606, #3602，Fixes #3506, #3517, #3509）；全面兼容 `antigravity-ide` 命名变体，严格阻断 IDE 穿透查询系统 Keyring，内核级进程识别并隔离 `state.vscdb`（PR #3608, #3600，Fixes #3598）；Gemini JSON Schema 深度清洗过滤非标 enum、实时透传上游流错误（504/503/429），OpenCode 注入 node 执行环境，规范 agy CLI 钥匙环 D-Bus 路径并打通 Web/Headless API 对齐（PR #3601, #3606, #3607，感谢 @cubelikeplayDaniel, @diannaaav）；GNOME Wayland 避免强制降级 X11、自动注入 DMA-BUF 保护并修复透明窗口判定（Fixes #3605, Ref #3581，感谢 @jeikl）。
 
-👉 **[查看完整更新日志 CHANGELOG_ZH.md →](CHANGELOG_ZH.md)**
+👉 **[查看完整更新日志 CHANGELOG.md →](CHANGELOG.md)**
 
 <details>
 <summary><b>👥 核心贡献者 (Contributors) - 点击展开</b></summary>
 
 <a href="https://github.com/lbjlaq"><img src="https://github.com/lbjlaq.png" width="50px" style="border-radius: 50%;" alt="lbjlaq"/></a>
 <a href="https://github.com/jeikl"><img src="https://github.com/jeikl.png" width="50px" style="border-radius: 50%;" alt="jeikl"/></a>
+<a href="https://github.com/cubelikeplayDaniel"><img src="https://github.com/cubelikeplayDaniel.png" width="50px" style="border-radius: 50%;" alt="cubelikeplayDaniel"/></a>
+<a href="https://github.com/diannaaav"><img src="https://github.com/diannaaav.png" width="50px" style="border-radius: 50%;" alt="diannaaav"/></a>
 <a href="https://github.com/XinXin622"><img src="https://github.com/XinXin622.png" width="50px" style="border-radius: 50%;" alt="XinXin622"/></a>
 <a href="https://github.com/llsenyue"><img src="https://github.com/llsenyue.png" width="50px" style="border-radius: 50%;" alt="llsenyue"/></a>
 <a href="https://github.com/salacoste"><img src="https://github.com/salacoste.png" width="50px" style="border-radius: 50%;" alt="salacoste"/></a>
@@ -557,5 +554,5 @@ response = client.chat.completions.create(
 
 <div align="center">
   <p>如果您觉得这个工具有所帮助，欢迎在 GitHub 上点一个 ⭐️</p>
-  <p>Copyright © 2025 Antigravity Team.</p>
+  <p>Copyright © 2024-2026 Antigravity Team.</p>
 </div>

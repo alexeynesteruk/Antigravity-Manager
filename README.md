@@ -1,5 +1,5 @@
 # Antigravity Tools 🚀
-> Professional Account Management & Protocol Proxy System for AI Services (v4.8.4)
+> Professional Account Management & Protocol Proxy System for AI Services (v4.9.6)
 
 <div align="center">
   <img src="public/icon.png" width="100" height="100" alt="Antigravity Tools Logo">
@@ -11,7 +11,7 @@
       <img src="https://img.shields.io/github/v/release/lbjlaq/Antigravity-Manager?color=blue&style=flat-square" alt="GitHub release">
     </a>
     <a href="https://github.com/lbjlaq/Antigravity-Manager">
-      <img src="https://img.shields.io/badge/Version-4.8.4-blue?style=flat-square" alt="Version">
+      <img src="https://img.shields.io/badge/Version-4.9.6-blue?style=flat-square" alt="Version">
     </a>
     <img src="https://img.shields.io/badge/Tauri-v2-orange?style=flat-square" alt="Tauri">
     <img src="https://img.shields.io/badge/Backend-Rust-red?style=flat-square" alt="Rust">
@@ -19,17 +19,21 @@
     <img src="https://img.shields.io/badge/License-CC--BY--NC--SA--4.0-lightgrey?style=flat-square" alt="License">
   </p>
 
+  <a href="https://trendshift.io/repositories/18224?utm_source=repository-badge&utm_medium=badge&utm_campaign=badge-repository-18224" target="_blank" rel="noopener noreferrer">
+    <img src="https://trendshift.io/api/badge/repositories/18224" alt="lbjlaq/Antigravity-Manager | Trendshift" width="250" height="55"/>
+  </a>
+
   <p>
-    <a href="#-features">Features</a> • 
-    <a href="#-gui-overview">GUI Overview</a> • 
-    <a href="#-architecture">Architecture</a> • 
-    <a href="#-installation">Installation</a> • 
-    <a href="#-quick-integration">Integration</a>
+    <a href="#detailed-feature-matrix">Features</a> • 
+    <a href="#gui-overview">GUI Overview</a> • 
+    <a href="#architecture">Architecture</a> • 
+    <a href="#installation">Installation</a> • 
+    <a href="#quick-integration-examples">Integration</a>
   </p>
 
   <p>
-    <a href="./README_ZH.md">简体中文</a> | 
-    <strong>English</strong>
+    <strong>English</strong> | 
+    <a href="./README_ZH.md">简体中文</a>
   </p>
 </div>
 
@@ -44,13 +48,9 @@ By leveraging this app, you can transform common Web Sessions (Google/Anthropic)
 | Sponsor | Description |
 | :---: | :--- |
 | <img src="docs/images/packycode_logo.png" width="200" alt="PackyCode Logo"> | Thanks to **PackyCode** for sponsoring this project! PackyCode is a reliable and efficient API relay service provider, offering relays for various services such as Claude Code, Codex, and Gemini. PackyCode provides a special offer for users of this project: Register using [this link](https://www.packyapi.com/register?aff=Ctrler) and enter the **"Ctrler"** coupon code when topping up to enjoy a **10% discount**. |
-| <img src="docs/images/APIKEYFUN.png" width="200" alt="APIKEYFUN Logo"> | Thanks to **APIKEY.FUN** for sponsoring this project! APIKEY.FUN is a professional enterprise-grade AI relay station, dedicated to providing stable, efficient, and low-cost AI model API access services for enterprise and individual developers. The platform supports mainstream popular models such as Claude, OpenAI, and Gemini, with prices as low as 7% of the official original price. Register through [this exclusive link](https://apikey.fan/register?aff=Ctrler) for this project to enjoy an exclusive offer of up to **permanent 5% off on top-ups**. |
-| <img src="docs/images/claudeapilogo.png" width="200" alt="Claude API Logo"> | Thanks to **Claude API** for supporting this project! claudeapi.com is a **Claude API** relay station built on **official and AWS channels**, focused exclusively on Claude, delivering high stability and low latency with full support for Claude Code. Exclusive offer: register via this [exclusive link](https://console.claudeapi.com/register?source=antigravity) to get **free trial credits — zero setup, get started instantly**; enjoy an extra **5% off** when you top up（Contact Support). |
+| <img src="docs/images/APIKEYFUN.png" width="200" alt="APIKEYFUN Logo"> | Thanks to **APIKEY.FUN** for sponsoring this project! APIKEY.FUN is a professional enterprise-grade AI relay station, dedicated to providing stable, efficient, and low-cost AI model API access services for enterprise and individual developers. The platform supports mainstream popular models such as Claude, OpenAI, and Gemini, with prices as low as 7% of the official original price. Register through [this exclusive link](https://apikey.fan/register?aff=AntManager) for this project to enjoy an exclusive offer of up to **permanent 5% off on top-ups**. |
+| <img src="docs/images/claudeapilogo.png" width="200" alt="Claude API Logo"> | Thanks to **Claude API** for supporting this project! claudeapi.com is a **Claude API** relay station built on **official and AWS channels**, focused exclusively on Claude, delivering high stability and low latency with full support for Claude Code. Exclusive offer: register via this [exclusive link](https://console.claudeapi.com/register?source=antigravity) to get **free trial credits — zero setup, get started instantly**; enjoy an extra **5% off** when you top up (Contact Support). |
 | <img src="docs/images/AICodeMirror.jpg" width="200" alt="AICodeMirror Logo"> | Thanks to **AICodeMirror** for sponsoring this project! AICodeMirror provides official high-stability relay services for Claude Code / Codex / Gemini CLI, supporting enterprise-grade concurrency, fast invoicing, and 24/7 dedicated technical support. Claude Code / Codex / Gemini official channels at 38% / 2% / 9% of original price, with extra discounts on top-ups! AICodeMirror offers special benefits for Antigravity-Manager users: register via [this link](https://aicodemirror.ai/register?invitecode=MV5XUM) to enjoy 20% off your first top-up, and enterprise customers can get up to 25% off! |
-
-
-
-
 
 ### ☕ Support
 
@@ -75,12 +75,12 @@ If you like this project, you might also be interested in:
 *   **Smart Recommendation**: The system uses a real-time algorithm to filter and recommend the "Best Account" based on quota redundancy, supporting **one-click switching**.
 *   **Active Account Snapshot**: Visually displays the specific quota percentage and the last synchronization time of the currently active account.
 
-### 2. 🔐 Professional AI Account Management & Proxy System
+### 2. 🔐 Powerful Account Management
 *   **OAuth 2.0 Authorization (Auto/Manual)**: Pre-generates a copyable authorization URL so you can finish auth in any browser; after the callback, the app auto-completes and saves the account (use “I already authorized, continue” if needed).
 *   **Multi-dimensional Import**: Supports single token entry, JSON batch import, and automatic hot migration from V1 legacy databases.
 *   **Gateway-level Views**: Supports switching between "List" and "Grid" views. Provides 403 Forbidden detection, automatically marking and skipping accounts with permission anomalies.
 
-### 3.  Protocol Conversion & Relay (API Proxy)
+### 3. 🔌 Protocol Conversion & Relay (API Proxy)
 *   **Multi-Protocol Adaptation (Multi-Sink)**:
     *   **OpenAI Format**: Provides `/v1/chat/completions` endpoint, compatible with 99% of existing AI apps.
     *   **Anthropic Format**: Provides native `/v1/messages` interface, supporting all features of **Claude Code CLI** (e.g., chain-of-thought, system prompts).
@@ -97,7 +97,7 @@ If you like this project, you might also be interested in:
 *   **Advanced Image Control**: Supports precise control over image generation tasks via OpenAI `size` (e.g., `1024x1024`, `16:9`) parameters or model name suffixes.
 *   **Enhanced Payload Support**: The backend supports payloads up to **100MB** (configurable), more than enough for 4K HD image recognition and processing.
 
-##  GUI Overview
+## 📸 GUI Overview
 
 | | |
 | :---: | :---: |
@@ -258,10 +258,14 @@ docker compose up -d
 <summary><b>🛠️ Troubleshooting - Click to expand</b></summary>
 
 #### macOS says "App is damaged"?
-Due to macOS security gatekeeper, non-App Store apps might show this. Run this in Terminal to fix:
-```bash
-sudo xattr -rd com.apple.quarantine "/Applications/Antigravity Tools.app"
-```
+Due to macOS security gatekeeper, non-App Store apps might show this. You can fix it with:
+
+1. **Terminal Command** (Recommended):
+   ```bash
+   sudo xattr -rd com.apple.quarantine "/Applications/Antigravity Tools.app"
+   ```
+2. **Homebrew Installation Advantage**:
+   When installing via Homebrew (`brew install --cask antigravity-tools`), quarantine attributes are automatically cleared upon installation for an out-of-the-box experience.
 
 #### Linux window is black or empty?
 On niri, Hyprland, Sway, and similar compositors, older builds forced `GDK_BACKEND=x11` whenever `DISPLAY` was set, and WebKit then drew a black window. Update to a build that includes this fix, or launch once with:
@@ -357,7 +361,7 @@ print(response.choices[0].message.content)
 import openai
 
 client = openai.OpenAI(
-    api_key="***",
+    api_key="sk-antigravity",
     base_url="http://127.0.0.1:8045/v1"
 )
 
@@ -408,7 +412,7 @@ response = client.chat.completions.create(
 # Claude Messages API
 curl -X POST http://127.0.0.1:8045/v1/messages \
   -H "Content-Type: application/json" \
-  -H "x-api-key: ***" \
+  -H "x-api-key: sk-antigravity" \
   -d '{
     "model": "gemini-3-pro-image",
     "size": "1280x720",
@@ -437,7 +441,7 @@ response = client.chat.completions.create(
 # Claude Messages API also supports imageSize
 curl -X POST http://127.0.0.1:8045/v1/messages \
   -H "Content-Type: application/json" \
-  -H "x-api-key: ***" \
+  -H "x-api-key: sk-antigravity" \
   -d '{
     "model": "gemini-3-pro-image",
     "size": "1280x720",
@@ -483,14 +487,17 @@ In clients that support OpenAI protocol (e.g., Cherry Studio), you can configure
 
 ## 📝 Changelog
 
-> Latest version **v4.8.4** (2026-09-27): Universal Tool Call ID canonicalization across pipeline, cache, and DB to eliminate multi-turn tool call 400 'missing thought_signature' errors (Fixes #3529, #3531, thanks to @Mortalit, @ddmixi); completely eliminated destructive Base64 decoding in Claude adapter, added native Protobuf signature support and full-pipeline in-place database write-back self-healing; dropped synthesized placeholder thinking blocks and ensured the first non-thought part in every turn carries the authoritative signature; added `check_native_update` native updater command with dynamic updater endpoints and browser download fallback; added Beta Docker pull instructions and JeikCode integration guide.
+> Latest version **v4.9.6** (2026-10-06) — full republish of v4.9.5 (its release pipeline was cancelled by hosted runner starvation and produced no Release assets; codebase is identical): Eliminates thinking budget 32768 overwriting, enforces absolute highest priority for named model suffixes (`-low`, `-medium`, `-high`), restores default mode fallback, and decouples Claude adapter (PR #3611, Fixes #3610); lowers Cowork pruning budget to 8k deep archive reducing residual context to 40k~45k tokens (60%+ compaction ratio), merges dual compaction state machines, introduces dynamic headroom anti-thrashing, adds Claude desktop process lifecycle management with legacy patch alerts and seamless upgrade, and safeguards macOS binary signing with rollback (PR #3604, #3609, #3603); caps single-request 429 pool traversal to `min(pool_size, 2)` with tiered backoff and Layer 2 optimistic reset to eliminate false 503 circuit-breaker failures, unifies long-lived sticky session unbinding and cross-protocol success counter recovery, and normalizes unified Claude quota protection groups (PR #3608, #3606, #3602, Fixes #3506, #3517, #3509); supports `antigravity-ide` naming variants, blocks Keyring credential leakage, hardens kernel-level process detection, and isolates `state.vscdb` (PR #3608, #3600, Fixes #3598); sanitizes Gemini JSON Schema enums, propagates real-time SSE stream errors (504/503/429), injects node search paths for OpenCode, corrects agy CLI Keyring D-Bus path and aligns Web/Headless APIs (PR #3601, #3606, #3607, thanks to @cubelikeplayDaniel, @diannaaav); resolves GNOME Wayland rendering freezes with DMA-BUF injection and fixes transparent window logic under X11/Xwayland (Fixes #3605, Ref #3581, thanks to @jeikl).
 
-👉 **[View Full Changelog → CHANGELOG.md](CHANGELOG.md)**
+👉 **[View Full Changelog → CHANGELOG_EN.md](CHANGELOG_EN.md)**
 
 <details>
 <summary><b>👥 Contributors - Click to expand</b></summary>
 
 <a href="https://github.com/lbjlaq"><img src="https://github.com/lbjlaq.png" width="50px" style="border-radius: 50%;" alt="lbjlaq"/></a>
+<a href="https://github.com/jeikl"><img src="https://github.com/jeikl.png" width="50px" style="border-radius: 50%;" alt="jeikl"/></a>
+<a href="https://github.com/cubelikeplayDaniel"><img src="https://github.com/cubelikeplayDaniel.png" width="50px" style="border-radius: 50%;" alt="cubelikeplayDaniel"/></a>
+<a href="https://github.com/diannaaav"><img src="https://github.com/diannaaav.png" width="50px" style="border-radius: 50%;" alt="diannaaav"/></a>
 <a href="https://github.com/XinXin622"><img src="https://github.com/XinXin622.png" width="50px" style="border-radius: 50%;" alt="XinXin622"/></a>
 <a href="https://github.com/llsenyue"><img src="https://github.com/llsenyue.png" width="50px" style="border-radius: 50%;" alt="llsenyue"/></a>
 <a href="https://github.com/salacoste"><img src="https://github.com/salacoste.png" width="50px" style="border-radius: 50%;" alt="salacoste"/></a>

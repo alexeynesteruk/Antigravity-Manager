@@ -13,7 +13,7 @@ use tracing::{debug, info};
 // ===== 统一重试与退避策略 =====
 
 /// 重试策略枚举
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RetryStrategy {
     /// 不重试，直接返回错误
     NoRetry,
@@ -218,45 +218,67 @@ pub fn determine_retry_strategy_adaptive(
                 retry_after,
             );
 
-            // 2. 真正的硬配额耗尽检测：仅当没有提供重试延迟且包含确定性枯竭关键字时判定
-            // 绝不能将普通的 RESOURCE_EXHAUSTED 状态字作为硬配额耗尽！
-            let is_hard_quota_exhausted = parsed_delay.is_none()
-                && (lower.contains("quota_exhausted")
-                    || lower.contains("exceeded your current quota")
-                    || lower.contains("insufficient_quota")
-                    || lower.contains("credits")
-                    || lower.contains("zero_quota")
-                    || lower.contains("weekly quota"));
-
-            if is_hard_quota_exhausted {
-                return RetryStrategy::FixedDelay(Duration::from_millis(50));
-            }
-
-            // 3. 单账号模式 (pool_size <= 1)：无法切号，等待是唯一选择
+            // 2. 单账号模式 (pool_size <= 1)：无法切号，若未曾 GraceRetry 则等待，否则降级为固定退避或放弃
+            // 【核心防线】单账号判定必须严格位于任何快切或硬配额判定之前，严禁 50ms 闪电空转刷死
             if pool_size <= 1 {
                 if let Some(delay) = parsed_delay {
                     let actual_ms = delay.actual_wait_ms();
-                    if actual_ms <= 30_000 {
+                    if actual_ms <= 30_000 && allow_grace_retry {
                         tracing::info!(
                             "[Retry] Single account 429: quotaResetDelay detected ({}ms), applying GraceRetry",
                             actual_ms
                         );
                         return RetryStrategy::GraceRetry(Duration::from_millis(actual_ms));
                     } else {
-                        return RetryStrategy::FixedDelay(Duration::from_millis(30_000));
+                        return RetryStrategy::FixedDelay(Duration::from_millis(
+                            actual_ms.min(30_000),
+                        ));
                     }
-                } else {
-                    // 没有给出明确延迟时的保底退避 (单账号等待 3s~5s，杜绝 50ms 闪电耗尽重试)
+                } else if allow_grace_retry {
+                    // 没有给出明确延迟时的保底退避 (单账号等待 3s~10s，杜绝 50ms 闪电耗尽重试)
                     let backoff_ms = (3000 * (attempt + 1) as u64).min(10_000);
                     tracing::info!(
                         "[Retry] Single account 429 without explicit delay: backing off {}ms",
                         backoff_ms
                     );
                     return RetryStrategy::GraceRetry(Duration::from_millis(backoff_ms));
+                } else {
+                    let backoff_ms = (3000 * (attempt + 1) as u64).min(10_000);
+                    return RetryStrategy::FixedDelay(Duration::from_millis(backoff_ms));
                 }
             }
 
-            // 4. 多账号模式 (pool_size > 1)
+            // 3. 多账号模式 (pool_size > 1)：
+            // 账号级硬配额枯竭检测：仅当没有提供重试延迟且包含确定性枯竭关键字时判定
+            // 包含明确的账号额度/周期枯竭字样（如 exceeded your current quota / insufficient_quota / weekly quota / credits 等）
+            // 注意：Google 标准通用 429 的 "resource has been exhausted (e.g. check quota)" 属于无明确延迟的通用流控/TPM拒绝，
+            // 严禁归入硬配额，否则将导致全池快速轮换遍历并引发全池 30 秒级联锁定 (#3506)。
+            let is_hard_quota_exhausted = parsed_delay.is_none()
+                && (lower.contains("exceeded your current quota")
+                    || lower.contains("insufficient_quota")
+                    || lower.contains("credits")
+                    || lower.contains("zero_quota")
+                    || lower.contains("weekly quota")
+                    || lower.contains("daily quota")
+                    || lower.contains("per day")
+                    || (lower.contains("quota_exhausted")
+                        && !lower.contains("resource has been exhausted")));
+
+            // 请求级 429 防穿透保护 (无明确重置时间且非账号硬配额耗尽)：
+            // [FIX #3506] 若遭遇无明确重置时间的请求级 429，最多允许尝试 2 个账号快切逃逸（min(pool_size, 2)）。
+            // 连续 2 个账号失败说明该请求为恶性 Payload、超大 Token 或 IP/提供商级流控，
+            // 必须立即终止进一步轮换，严禁打穿全池导致全池健康账号被锁入 RateLimitExceeded。
+            let is_request_level_429 = parsed_delay.is_none() && !is_hard_quota_exhausted;
+            let request_level_429_max_attempts = pool_size.min(2);
+            if is_request_level_429 && attempt >= request_level_429_max_attempts {
+                tracing::warn!(
+                    "[Retry] Request-level 429 persisted across {} attempts without explicit delay; aborting further rotation to protect remaining {} accounts.",
+                    attempt,
+                    pool_size.saturating_sub(attempt)
+                );
+                return RetryStrategy::NoRetry;
+            }
+
             let is_first_round = attempt < pool_size;
             if is_first_round {
                 // Round 1 (第一轮)：全池闪电快切，毫秒级逃逸至其他健康账号
@@ -567,11 +589,14 @@ pub fn build_token_error_headers<'a>(
     headers
 }
 
+/// 判定是否属于偶发性/瞬态 Token 获取错误（例如超时、锁争抢、系统繁忙）
+pub fn is_transient_token_error(err: &str) -> bool {
+    let lower = err.to_ascii_lowercase();
+    lower.contains("timeout") || lower.contains("too busy") || lower.contains("deadlock")
+}
+
 /// 判断是否为模型不存在/不支持的错误
-pub fn is_model_not_found_error(status: u16, body: &str) -> bool {
-    if status == 404 {
-        return true;
-    }
+pub fn is_model_not_found_error(_status: u16, body: &str) -> bool {
     let lower = body.to_lowercase();
     lower.contains("model not found")
         || lower.contains("unknown model")
@@ -694,6 +719,16 @@ pub fn build_dual_track_error(
         || lower.contains("all accounts exhausted")
         || lower.contains("all accounts unhealthy");
 
+    let is_network_error = lower.contains("http request failed")
+        || lower.contains("failed to connect")
+        || lower.contains("connection refused")
+        || lower.contains("connection reset")
+        || lower.contains("timed out")
+        || lower.contains("timeout")
+        || lower.contains("error trying to connect")
+        || lower.contains("dns error")
+        || lower.contains("all endpoints failed");
+
     let is_not_found = is_model_not_found_error(status_code, error_text);
 
     // 1. 深度解析并反转义上游错误
@@ -710,14 +745,25 @@ pub fn build_dual_track_error(
             "rate_limit_error",
             "all_accounts_limited",
         )
+    } else if is_network_error {
+        (
+            "【网络请求异常（非服务端故障）】".to_string(),
+            format!(
+                "请求上游接口时网络连接失败（非网关服务端故障，请排查网络或代理）：{}",
+                error_text
+            ),
+            "请检查系统代理、上游节点连通性或本地网络设置，确保能正常连接上游服务。".to_string(),
+            "network_error",
+            "upstream_network_error",
+        )
     } else if is_not_found {
         (
-                format!("【模型不存在】[{}]", model),
-                format!("模型 [{}] 在上游端点不存在，或当前绑定的账号暂未开通该模型的访问权限。", model),
-                "请核对模型名称，或在网关配置中的「自定义模型映射」将其重定向至可用模型（如 gemini-2.5-flash）。".to_string(),
-                "invalid_request_error",
-                "model_not_found",
-            )
+            format!("【模型不存在】[{}]", model),
+            format!("模型 [{}] 在上游端点不存在，或当前绑定的账号暂未开通该模型的访问权限。", model),
+            "请核对模型名称，或在网关配置中的「自定义模型映射」将其重定向至可用模型（如 gemini-2.5-flash）。".to_string(),
+            "invalid_request_error",
+            "model_not_found",
+        )
     } else if status_code == 429 || status_code == 529 {
         (
             format!("【上游限流 HTTP {}】", status_code),
@@ -742,17 +788,19 @@ pub fn build_dual_track_error(
     );
 
     // 2. 确定散开到各自协议标准 message 字段的内容：
-    //    若是网关自身限制（无上游参与），则使用网关诊断文本；
+    //    若是网关自身限制或网络异常（无有效上游业务报文参与），则使用网关诊断文本；
     //    若是上游发生的真实报错，100% 保持上游原始报错（raw_upstream_msg），绝不被网关硬编码覆盖！
-    let effective_message = if is_internal_limited || raw_upstream_msg.trim().is_empty() {
-        readable_message.clone()
-    } else {
-        raw_upstream_msg
-    };
+    let effective_message =
+        if is_internal_limited || is_network_error || raw_upstream_msg.trim().is_empty() {
+            readable_message.clone()
+        } else {
+            raw_upstream_msg
+        };
 
     let gateway_error_obj = serde_json::json!({
         "error_code": err_code,
         "model": model,
+        "is_server_error": false,
         "diagnosis": diagnosis,
         "suggestion": suggestion,
         "readable_summary": readable_message
@@ -760,6 +808,7 @@ pub fn build_dual_track_error(
 
     let upstream_error_obj = serde_json::json!({
         "status": status_code,
+        "is_server_error": false,
         "response": parsed_upstream
     });
 
@@ -770,6 +819,7 @@ pub fn build_dual_track_error(
                 "type": err_type,
                 "code": err_code,
                 "message": effective_message,
+                "is_server_error": false,
                 "gateway_error": gateway_error_obj,
                 "upstream_error": upstream_error_obj
             }
@@ -780,6 +830,7 @@ pub fn build_dual_track_error(
                 "type": err_type,
                 "param": serde_json::Value::Null,
                 "code": err_code,
+                "is_server_error": false,
                 "gateway_error": gateway_error_obj,
                 "upstream_error": upstream_error_obj
             }
@@ -789,6 +840,7 @@ pub fn build_dual_track_error(
                 "message": effective_message,
                 "type": err_type,
                 "code": err_code,
+                "is_server_error": false,
                 "gateway_error": gateway_error_obj,
                 "upstream_error": upstream_error_obj
             }
@@ -805,6 +857,7 @@ pub fn build_dual_track_error(
                     "code": status_code,
                     "message": effective_message,
                     "status": upstream_status,
+                    "is_server_error": false,
                     "gateway_error": gateway_error_obj,
                     "upstream_error": upstream_error_obj
                 }
@@ -815,6 +868,7 @@ pub fn build_dual_track_error(
                 "message": effective_message,
                 "type": err_type,
                 "code": err_code,
+                "is_server_error": false,
                 "gateway_error": gateway_error_obj,
                 "upstream_error": upstream_error_obj
             }
@@ -954,5 +1008,36 @@ mod retry_after_tests {
             .as_str()
             .unwrap()
             .contains("网关调度受限"));
+    }
+
+    #[test]
+    fn test_build_dual_track_error_network_error() {
+        let raw_err =
+            "HTTP request failed at https://alkalicognition.googleapis.com: failed to connect";
+        let res = build_dual_track_error("claude", 502, "claude-sonnet-4-6", raw_err);
+        assert_eq!(res["error"]["code"], "upstream_network_error");
+        assert_eq!(res["error"]["gateway_error"]["is_server_error"], false);
+        assert_eq!(res["error"]["is_server_error"], false);
+        assert!(res["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("非服务端故障"));
+    }
+
+    #[test]
+    fn test_is_transient_token_error() {
+        assert!(is_transient_token_error(
+            "Token acquisition timeout (15s) - system too busy or deadlock detected"
+        ));
+        assert!(is_transient_token_error(
+            "Token acquisition timeout (5s) - system too busy or deadlock detected"
+        ));
+        assert!(is_transient_token_error("System too busy"));
+        assert!(is_transient_token_error("Potential deadlock detected"));
+        assert!(!is_transient_token_error("Token pool is empty"));
+        assert!(!is_transient_token_error(
+            "invalid_grant: refresh token revoked"
+        ));
+        assert!(!is_transient_token_error("No available account with quota"));
     }
 }

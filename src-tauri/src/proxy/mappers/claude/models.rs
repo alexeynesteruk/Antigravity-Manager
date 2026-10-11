@@ -1,10 +1,10 @@
-// Claude data models
-// Data models related to the Claude protocol
+// Claude 数据模型
+// Claude 协议相关数据模型
 
 use serde::{Deserialize, Serialize};
 
-/// Claude API request
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// Claude API 请求
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ClaudeRequest {
     pub model: String,
     pub messages: Vec<Message>,
@@ -39,9 +39,12 @@ pub struct ClaudeRequest {
     pub size: Option<String>,
     #[serde(default)]
     pub quality: Option<String>,
+    /// Tool choice for forced or selective tool calling
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_choice: Option<serde_json::Value>,
 }
 
-/// Thinking configuration
+/// Thinking 配置
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ThinkingConfig {
     #[serde(rename = "type")]
@@ -125,6 +128,7 @@ pub enum ContentBlock {
     ToolUse {
         id: String,
         name: String,
+        #[serde(default = "default_empty_object")]
         input: serde_json::Value,
         #[serde(skip_serializing_if = "Option::is_none")]
         signature: Option<String>,
@@ -135,6 +139,7 @@ pub enum ContentBlock {
     #[serde(rename = "tool_result")]
     ToolResult {
         tool_use_id: String,
+        #[serde(default)]
         content: serde_json::Value, // Changed from String to Value to support Array of Blocks
         #[serde(skip_serializing_if = "Option::is_none")]
         is_error: Option<bool>,
@@ -144,14 +149,20 @@ pub enum ContentBlock {
     ServerToolUse {
         id: String,
         name: String,
+        #[serde(default = "default_empty_object")]
         input: serde_json::Value,
     },
 
     #[serde(rename = "web_search_tool_result")]
     WebSearchToolResult {
         tool_use_id: String,
+        #[serde(default)]
         content: serde_json::Value,
     },
+}
+
+fn default_empty_object() -> serde_json::Value {
+    serde_json::Value::Object(serde_json::Map::new())
 }
 
 fn default_base64_type() -> String {
@@ -244,7 +255,7 @@ pub struct OutputConfig {
     pub effort: Option<String>,
 }
 
-/// Claude API response
+/// Claude API 响应
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ClaudeResponse {
     pub id: String,
@@ -272,7 +283,7 @@ pub struct Usage {
     pub server_tool_use: Option<serde_json::Value>,
 }
 
-// ========== Gemini data models ==========
+// ========== Gemini 数据模型 ==========
 
 /// Gemini Content
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -332,7 +343,7 @@ pub struct InlineData {
     pub data: String,
 }
 
-/// Full Gemini response
+/// Gemini 完整响应
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GeminiResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -443,4 +454,57 @@ pub struct SearchEntryPoint {
     #[serde(rename = "renderedContent")]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub rendered_content: Option<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_tool_use_missing_input_deserializes_to_empty_object() {
+        let json_str = r#"{"type": "tool_use", "id": "call_1", "name": "get_time"}"#;
+        let block: ContentBlock = serde_json::from_str(json_str).expect("should deserialize");
+        match block {
+            ContentBlock::ToolUse {
+                id, name, input, ..
+            } => {
+                assert_eq!(id, "call_1");
+                assert_eq!(name, "get_time");
+                assert_eq!(input, serde_json::json!({}));
+            }
+            _ => panic!("Expected ToolUse"),
+        }
+    }
+
+    #[test]
+    fn test_tool_result_missing_content_deserializes_to_null() {
+        let json_str = r#"{"type": "tool_result", "tool_use_id": "call_1"}"#;
+        let block: ContentBlock = serde_json::from_str(json_str).expect("should deserialize");
+        match block {
+            ContentBlock::ToolResult {
+                tool_use_id,
+                content,
+                ..
+            } => {
+                assert_eq!(tool_use_id, "call_1");
+                assert!(content.is_null());
+            }
+            _ => panic!("Expected ToolResult"),
+        }
+    }
+
+    #[test]
+    fn test_message_content_array_with_omitted_fields_matches_untagged_enum() {
+        let json_str = r#"[
+            {"type": "tool_use", "id": "call_1", "name": "get_time"},
+            {"type": "tool_result", "tool_use_id": "call_1"}
+        ]"#;
+        let content: MessageContent = serde_json::from_str(json_str).expect("should deserialize");
+        match content {
+            MessageContent::Array(blocks) => {
+                assert_eq!(blocks.len(), 2);
+            }
+            _ => panic!("Expected MessageContent::Array"),
+        }
+    }
 }

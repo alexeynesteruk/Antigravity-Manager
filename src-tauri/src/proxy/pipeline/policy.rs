@@ -1,28 +1,3 @@
-use serde::{Deserialize, Serialize};
-
-/// 代理所接入与服务的客户端协议类型
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub enum ProxyProtocol {
-    OpenAIChat,
-    OpenAIResponses,
-    AnthropicClaude,
-    GeminiNative,
-}
-
-impl ProxyProtocol {
-    /// 该协议是否信任客户端回传的思考签名
-    /// - OpenAIChat: false (官方规范无签名概念，客户端若夹带也属于不可信，入站统一擦除，由服务端全权参与回填)
-    /// - OpenAIResponses / AnthropicClaude / GeminiNative: true (协议原生支持签名，校验长度与兼容性后采纳)
-    pub fn trusts_client_signature(&self) -> bool {
-        match self {
-            ProxyProtocol::OpenAIChat => false,
-            ProxyProtocol::OpenAIResponses
-            | ProxyProtocol::AnthropicClaude
-            | ProxyProtocol::GeminiNative => true,
-        }
-    }
-}
-
 /// 上游响应与错误在统一流水线中的唯一判定分类
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum UpstreamClassification {
@@ -106,6 +81,16 @@ impl UpstreamClassification {
         matches!(self, UpstreamClassification::RateLimited { .. })
     }
 
+    /// 这个账号不能再被当前会话粘住。401 / 403 / 404 / 429 / 529。
+    pub fn abandons_sticky_account(&self) -> bool {
+        match self {
+            UpstreamClassification::RateLimited { .. } => true,
+            UpstreamClassification::ModelNotFound => true,
+            UpstreamClassification::OtherClientError(401 | 403) => true,
+            _ => false,
+        }
+    }
+
     /// 该分类是否为模型不存在
     pub fn is_model_not_found(&self) -> bool {
         matches!(self, UpstreamClassification::ModelNotFound)
@@ -119,5 +104,31 @@ impl UpstreamClassification {
     /// 该分类是否为网关自身内部消息
     pub fn is_internal_gateway_message(&self) -> bool {
         matches!(self, UpstreamClassification::InternalGatewayMessage)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_abandons_sticky_account_policies() {
+        // 404 ModelNotFound 必须解除粘性绑定，确保会话不会死粘在缺失该模型的账号上
+        let not_found = UpstreamClassification::classify(404, "model not found", None);
+        assert_eq!(not_found, UpstreamClassification::ModelNotFound);
+        assert!(
+            not_found.abandons_sticky_account(),
+            "ModelNotFound must abandon sticky account so session rotates away"
+        );
+
+        // 429 RateLimited 必须解除粘性绑定
+        let rate_limited = UpstreamClassification::classify(429, "rate limited", None);
+        assert!(rate_limited.abandons_sticky_account());
+
+        // 401 & 403 必须解除粘性绑定
+        let unauth = UpstreamClassification::classify(401, "unauthorized", None);
+        assert!(unauth.abandons_sticky_account());
+        let forbidden = UpstreamClassification::classify(403, "forbidden", None);
+        assert!(forbidden.abandons_sticky_account());
     }
 }

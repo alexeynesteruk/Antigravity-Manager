@@ -75,27 +75,44 @@ where
                         Ok(chunk) => {
                             buffer.extend_from_slice(&chunk);
 
-                            // Process complete lines
                             while let Some(pos) = buffer.iter().position(|&b| b == b'\n') {
                                 let line_raw = buffer.split_to(pos + 1);
-                                if let Ok(line_str) = std::str::from_utf8(&line_raw) {
-                                    let line = line_str.trim();
-                                    if line.is_empty() { continue; }
+                                let line_str = String::from_utf8_lossy(&line_raw);
+                                let line = line_str.trim();
+                                if line.is_empty() { continue; }
 
-                                    if let Some(sse_chunks) = process_sse_line(line, &mut state, &trace_id, &email) {
-                                        for sse_chunk in sse_chunks {
-                                            yield Ok(sse_chunk);
-                                        }
+                                if let Some(sse_chunks) = process_sse_line(line, &mut state, &trace_id, &email) {
+                                    for sse_chunk in sse_chunks {
+                                        yield Ok(sse_chunk);
                                     }
                                 }
                             }
                         }
                         Err(e) => {
+                            let session = state
+                                .session_id
+                                .clone()
+                                .unwrap_or_else(|| "-".to_string());
+                            let report = crate::proxy::mappers::error_classifier::report_stream_error(
+                                "claude",
+                                "create_claude_sse_stream",
+                                &e,
+                                format!(
+                                    "trace={} session={} messages={} buffer_bytes={}",
+                                    trace_id,
+                                    session,
+                                    message_count,
+                                    buffer.len()
+                                ),
+                            );
                             let error_json = serde_json::json!({
                                 "type": "error",
                                 "error": {
-                                    "type": "overloaded_error",
-                                    "message": format!("Stream error: {}", e)
+                                    "type": report.classified.error_type,
+                                    "message": report.client_message(),
+                                    "function": report.function,
+                                    "call_site": report.call_site(),
+                                    "params": report.params,
                                 }
                             });
                             yield Ok(state.emit("error", error_json));
@@ -108,10 +125,35 @@ where
                     // [FIX #Bug1] Timeout - send keepalive ping but track consecutive count
                     consecutive_pings += 1;
                     if consecutive_pings >= MAX_CONSECUTIVE_PINGS {
-                        tracing::error!(
-                            "[{}] Stream idle for {}s ({}x 20s timeout), terminating",
-                            trace_id, consecutive_pings * 20, consecutive_pings
+                        let idle_secs = consecutive_pings * 20;
+                        let session = state
+                            .session_id
+                            .clone()
+                            .unwrap_or_else(|| "-".to_string());
+                        let report = crate::proxy::mappers::error_classifier::report_stream_error(
+                            "claude",
+                            "create_claude_sse_stream",
+                            &"stream idle timeout",
+                            format!(
+                                "trace={} session={} messages={} idle_secs={} consecutive_pings={}",
+                                trace_id,
+                                session,
+                                message_count,
+                                idle_secs,
+                                consecutive_pings
+                            ),
                         );
+                        let error_json = serde_json::json!({
+                            "type": "error",
+                            "error": {
+                                "type": report.classified.error_type,
+                                "message": report.client_message(),
+                                "function": report.function,
+                                "call_site": report.call_site(),
+                                "params": report.params,
+                            }
+                        });
+                        yield Ok(state.emit("error", error_json));
                         break;
                     }
                     tracing::debug!(
@@ -126,14 +168,13 @@ where
         // [FIX #1732] Mandatory Flush remaining buffer on stream termination
         // Prevents hangs when the last SSE chunk doesn't end with a newline (network fragmentation)
         if !buffer.is_empty() {
-             if let Ok(line_str) = std::str::from_utf8(&buffer) {
-                 let line = line_str.trim();
-                 if !line.is_empty() {
-                     tracing::debug!("[{}] SSE Termination: Flushing remaining {} bytes in buffer", trace_id, buffer.len());
-                     if let Some(sse_chunks) = process_sse_line(line, &mut state, &trace_id, &email) {
-                         for sse_chunk in sse_chunks {
-                             yield Ok(sse_chunk);
-                         }
+             let line_str = String::from_utf8_lossy(&buffer);
+             let line = line_str.trim();
+             if !line.is_empty() {
+                 tracing::debug!("[{}] SSE Termination: Flushing remaining {} bytes in buffer", trace_id, buffer.len());
+                 if let Some(sse_chunks) = process_sse_line(line, &mut state, &trace_id, &email) {
+                     for sse_chunk in sse_chunks {
+                         yield Ok(sse_chunk);
                      }
                  }
              }

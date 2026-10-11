@@ -25,41 +25,61 @@ const ALIAS_TO_CANONICAL: Record<string, { id: string; name: string; group: stri
     'gemini-3.7-flash-low': { id: 'gemini-3.7-flash-low', name: 'gemini-3.7-flash-low', group: 'Gemini 3' },
     'gemini-3.7-flash-tiered': { id: 'gemini-3.7-flash-tiered', name: 'gemini-3.7-flash-tiered', group: 'Gemini 3' },
 
-    // Gemini 3.5 & 3.0
+    // Gemini 3.6
+    'gemini-3.6-flash': { id: 'gemini-3.6-flash', name: 'gemini-3.6-flash', group: 'Gemini 3' },
+    'gemini-3.6-flash-high': { id: 'gemini-3.6-flash-high', name: 'gemini-3.6-flash-high', group: 'Gemini 3' },
+    'gemini-3.6-flash-medium': { id: 'gemini-3.6-flash-medium', name: 'gemini-3.6-flash-medium', group: 'Gemini 3' },
+    'gemini-3.6-flash-low': { id: 'gemini-3.6-flash-low', name: 'gemini-3.6-flash-low', group: 'Gemini 3' },
+    'gemini-3.6-flash-tiered': { id: 'gemini-3.6-flash-tiered', name: 'gemini-3.6-flash-tiered', group: 'Gemini 3' },
+
+    // Gemini 3.5 & Pro & Image & Lite
     'gemini-3.5-flash': { id: 'gemini-3.5-flash', name: 'gemini-3.5-flash', group: 'Gemini 3' },
-    'gemini-3.5-flash-high': { id: 'gemini-3.5-flash-high', name: 'gemini-3.5-flash-high', group: 'Gemini 3' },
-    'gemini-3.5-flash-medium': { id: 'gemini-3.5-flash-medium', name: 'gemini-3.5-flash-medium', group: 'Gemini 3' },
     'gemini-3.5-flash-low': { id: 'gemini-3.5-flash-low', name: 'gemini-3.5-flash-low', group: 'Gemini 3' },
-    'gemini-3-flash-agent': { id: 'gemini-3.5-flash-high', name: 'gemini-3.5-flash-high', group: 'Gemini 3' },
-    'gemini-3-flash': { id: 'gemini-3-flash', name: 'gemini-3-flash', group: 'Gemini 3' },
-    'gemini-3.1-pro': { id: 'gemini-3.1-pro', name: 'gemini-3.1-pro', group: 'Gemini 3' },
+    'gemini-3.5-flash-extra-low': { id: 'gemini-3.5-flash-extra-low', name: 'gemini-3.5-flash-extra-low', group: 'Gemini 3' },
     'gemini-3.1-pro-high': { id: 'gemini-3.1-pro-high', name: 'gemini-3.1-pro-high', group: 'Gemini 3' },
     'gemini-3.1-pro-low': { id: 'gemini-3.1-pro-low', name: 'gemini-3.1-pro-low', group: 'Gemini 3' },
-    'gemini-3.1-pro-preview': { id: 'gemini-3.1-pro', name: 'gemini-3.1-pro', group: 'Gemini 3' },
-    'gemini-pro-agent': { id: 'gemini-3.1-pro-high', name: 'gemini-3.1-pro-high', group: 'Gemini 3' },
-    'gemini-pro': { id: 'gemini-3.1-pro', name: 'gemini-3.1-pro', group: 'Gemini 3' },
     'gemini-3.1-flash-lite': { id: 'gemini-3.1-flash-lite', name: 'gemini-3.1-flash-lite', group: 'Gemini 3' },
     'gemini-flash-lite': { id: 'gemini-3.1-flash-lite', name: 'gemini-3.1-flash-lite', group: 'Gemini 3' },
     'gemini-3.1-flash-image': { id: 'gemini-3.1-flash-image', name: 'gemini-3.1-flash-image', group: 'Gemini 3' },
     'gemini-3-pro-image': { id: 'gemini-3-pro-image', name: 'gemini-3-pro-image', group: 'Gemini 3' },
 
-    // Gemini 2.5
-    'gemini-2.5-pro': { id: 'gemini-2.5-pro', name: 'gemini-2.5-pro', group: 'Gemini 2.5' },
-    'gemini-2.5-flash': { id: 'gemini-2.5-flash', name: 'gemini-2.5-flash', group: 'Gemini 2.5' },
-    'gemini-2.5-flash-lite': { id: 'gemini-2.5-flash-lite', name: 'gemini-2.5-flash-lite', group: 'Gemini 2.5' },
-    'gemini-2.5-flash-thinking': { id: 'gemini-2.5-flash-thinking', name: 'gemini-2.5-flash-thinking', group: 'Gemini 2.5' },
-
-    // Claude
+    // Claude (基准线 >= 4.6)
     'claude-sonnet-4-6': { id: 'claude-sonnet-4-6', name: 'claude-sonnet-4-6', group: 'Claude' },
     'claude-sonnet-4-6-thinking': { id: 'claude-sonnet-4-6-thinking', name: 'claude-sonnet-4-6-thinking', group: 'Claude' },
     'claude-opus-4-6': { id: 'claude-opus-4-6', name: 'claude-opus-4-6', group: 'Claude' },
     'claude-opus-4-6-thinking': { id: 'claude-opus-4-6-thinking', name: 'claude-opus-4-6-thinking', group: 'Claude' },
-    'claude-sonnet-4-5': { id: 'claude-sonnet-4-5', name: 'claude-sonnet-4-5', group: 'Claude' },
-    'claude-sonnet-4-5-thinking': { id: 'claude-sonnet-4-5-thinking', name: 'claude-sonnet-4-5-thinking', group: 'Claude' },
-    'claude-opus-4-5-thinking': { id: 'claude-opus-4-5-thinking', name: 'claude-opus-4-5-thinking', group: 'Claude' },
-    'claude-haiku-4-5': { id: 'claude-haiku-4-5', name: 'claude-haiku-4-5', group: 'Claude' },
-    'claude-haiku-4': { id: 'claude-haiku-4', name: 'claude-haiku-4', group: 'Claude' },
+
+    // OpenAI (以官方为准)
+    'gpt-oss-120b-medium': { id: 'gpt-oss-120b-medium', name: 'gpt-oss-120b-medium', group: 'Other' },
 };
+
+function isCompliantModel(key: string): boolean {
+    const m = key.toLowerCase().trim();
+    if (m.startsWith('chat_') || m.includes('internal') || m.includes('-exp')) {
+        return false;
+    }
+    // 特许放行的官方白名单模型
+    if (
+        m === 'gemini-pro-agent' ||
+        m === 'gemini-3-flash-agent' ||
+        m === 'gemini-3-flash' ||
+        m === 'tab_flash_lite_preview' ||
+        m === 'tab_jump_flash_lite_preview' ||
+        m === 'gemini-3.1-flash-lite' ||
+        m === 'gemini-3.5-flash-lite'
+    ) {
+        return true;
+    }
+    // 淘汰 2.5 系列
+    if (m.includes('2.5') || m.includes('2-5')) {
+        return false;
+    }
+    // Claude 淘汰 4.6 以下
+    if (m.includes('claude')) {
+        return m.includes('4-6') || m.includes('4.6');
+    }
+    return true;
+}
 
 export const useProxyModels = () => {
     const { accounts, fetchAccounts } = useAccountStore();
@@ -89,6 +109,9 @@ export const useProxyModels = () => {
         for (const account of accounts) {
             for (const m of account.quota?.models ?? []) {
                 const rawKey = m.name.toLowerCase();
+                if (!isCompliantModel(rawKey)) {
+                    continue;
+                }
                 
                 // Map sub-tier and legacy aliases to the primary canonical model
                 const mapped = ALIAS_TO_CANONICAL[rawKey];
@@ -112,6 +135,35 @@ export const useProxyModels = () => {
                         icon,
                     });
                 }
+            }
+        }
+
+        // 1.5 动态档位后缀剥离与裸模型派生（与后端算法完全对齐，纯通用数据驱动）
+        const derivedBares: string[] = [];
+        for (const id of uniqueModelsMap.keys()) {
+            for (const suffix of ['-tiered', '-high', '-medium', '-low', '-extra-low']) {
+                if (id.endsWith(suffix)) {
+                    const base = id.slice(0, -suffix.length);
+                    if (base && isCompliantModel(base) && !uniqueModelsMap.has(base)) {
+                        derivedBares.push(base);
+                    }
+                }
+            }
+        }
+        for (const base of derivedBares) {
+            if (!uniqueModelsMap.has(base)) {
+                const group = inferModelGroup(base);
+                const cfgEntry = Object.entries(MODEL_CONFIG).find(
+                    ([cfgId, cfg]) => cfgId.toLowerCase() === base.toLowerCase() || cfg.protectedKey?.toLowerCase() === base.toLowerCase()
+                );
+                const CfgIcon = cfgEntry?.[1].Icon;
+                const icon = CfgIcon ? <CfgIcon size={16} /> : (group === 'Claude' ? <Sparkles size={16} className="text-purple-400" /> : <Bot size={16} className="text-blue-400" />);
+                uniqueModelsMap.set(base, {
+                    id: base,
+                    name: base,
+                    group,
+                    icon,
+                });
             }
         }
 

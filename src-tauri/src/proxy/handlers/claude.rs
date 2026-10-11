@@ -21,13 +21,320 @@ use crate::proxy::mappers::claude::{
     transform_response, ClaudeRequest,
 };
 use crate::proxy::mappers::context_manager::ContextManager;
-use crate::proxy::mappers::estimation_calibrator::get_calibrator;
 use crate::proxy::mappers::gemini::SUMMARY_REQUEST_TIMEOUT_SECS;
 use crate::proxy::model_specs;
 use crate::proxy::server::AppState;
 use crate::proxy::upstream::client::mask_email;
 use axum::http::HeaderMap;
-use std::sync::{atomic::Ordering, Arc}; // [NEW]
+use dashmap::DashMap;
+use std::sync::{Arc, LazyLock};
+
+/// 基于代际租约与滑动窗口的压缩免死状态机 (Compaction Immunity Lease)
+/// 替代原无类型 DashSet 单次原子核销机制，天然支持并发请求、工具调用与网络重试；
+/// 初始处于未激活保护态（支持长达 300s 电脑休眠唤醒），在首个业务请求接入后激活 30s 滑动窗口，
+/// 支持窗口期内的所有并发请求与工具调用安全放行；滑动窗口超时后彻底销毁，
+/// 根除“一次压缩终身免死无法再次自愈” (Fixes #3563)。
+#[derive(Debug, Clone)]
+struct CompactionImmunityLease {
+    created_at: std::time::Instant,
+    last_touched: std::time::Instant,
+    consumed: bool,
+}
+
+static COMPACTION_IMMUNITY_LEASES: LazyLock<DashMap<String, CompactionImmunityLease>> =
+    LazyLock::new(DashMap::new);
+
+const COMPACTION_IMMUNITY_INITIAL_TTL_SECS: u64 = 300;
+const COMPACTION_IMMUNITY_WINDOW_SECS: u64 = 30;
+
+/// 压缩模式类型：区分手动 ./compact 指令驱动与自动超限自愈门禁驱动
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CoworkCompactKind {
+    Manual,
+    Auto,
+}
+
+/// Claude Cowork 统一压缩执行状态池 (Session -> 状态信息)
+/// 手动与自动压缩共享一套压缩标记与状态生命周期，防止冲突、竞争与双重 400 假报警
+#[derive(Debug, Clone)]
+pub struct CoworkCompactState {
+    pub kind: CoworkCompactKind,
+    pub before_tokens: u32,
+    pub ts: std::time::Instant,
+    pub summary_done: bool,
+    pub target_limit: u32,
+}
+
+pub static COWORK_COMPACT_SESSIONS: LazyLock<DashMap<String, CoworkCompactState>> =
+    LazyLock::new(DashMap::new);
+pub const MAX_COMPACT_SESSIONS_CAPACITY: usize = 1000;
+
+/// 近期触发压缩（手动或自动）的会话集合 (Session -> 触发时刻)，用于跨轮次对齐
+pub static PENDING_COMPACT_SESSIONS: LazyLock<DashMap<String, std::time::Instant>> =
+    LazyLock::new(DashMap::new);
+
+/// 检查会话当前是否处于压缩流程中（无论是手动还是自动压缩，统一判断并在超时后主动清理）
+pub fn is_session_in_compaction(session_key: &str) -> bool {
+    if let Some(entry) = COWORK_COMPACT_SESSIONS.get(session_key) {
+        if entry.ts.elapsed().as_secs() < 300 {
+            true
+        } else {
+            drop(entry);
+            COWORK_COMPACT_SESSIONS.remove(session_key);
+            false
+        }
+    } else {
+        false
+    }
+}
+
+pub fn prune_compact_sessions_if_needed() {
+    if COWORK_COMPACT_SESSIONS.len() >= MAX_COMPACT_SESSIONS_CAPACITY {
+        let now = std::time::Instant::now();
+        COWORK_COMPACT_SESSIONS.retain(|_, state| now.duration_since(state.ts).as_secs() < 300);
+        if COWORK_COMPACT_SESSIONS.len() >= MAX_COMPACT_SESSIONS_CAPACITY {
+            COWORK_COMPACT_SESSIONS.clear();
+        }
+    }
+}
+
+/// 刚刚完成 compact 的会话防重放缓存 (Session -> (完成时间戳, 回显文本, 剩余Token量))
+pub static COWORK_JUST_COMPACTED_CACHE: LazyLock<
+    DashMap<String, (std::time::Instant, String, u32)>,
+> = LazyLock::new(DashMap::new);
+pub const MAX_JUST_COMPACTED_CACHE_CAPACITY: usize = 1000;
+
+pub fn prune_just_compacted_cache_if_needed() {
+    if COWORK_JUST_COMPACTED_CACHE.len() >= MAX_JUST_COMPACTED_CACHE_CAPACITY {
+        let purge_now = std::time::Instant::now();
+        COWORK_JUST_COMPACTED_CACHE
+            .retain(|_, (ts, _, _)| purge_now.duration_since(*ts).as_secs() < 60);
+        if COWORK_JUST_COMPACTED_CACHE.len() >= MAX_JUST_COMPACTED_CACHE_CAPACITY {
+            COWORK_JUST_COMPACTED_CACHE.clear();
+        }
+    }
+}
+
+/// 深度检测请求前几条消息是否包含 post-compaction continuation 接续标记
+/// 遍历前 3 条消息中所有的 Text 内容块，彻底解决 <system-reminder> 块遮挡接续标记导致漏检的问题
+pub fn detect_post_compaction_continuation(request: &ClaudeRequest) -> bool {
+    for m in request.messages.iter().take(3) {
+        match &m.content {
+            crate::proxy::mappers::claude::models::MessageContent::String(s) => {
+                if crate::proxy::mappers::common_utils::is_post_compaction_continuation_text(s) {
+                    return true;
+                }
+            }
+            crate::proxy::mappers::claude::models::MessageContent::Array(blocks) => {
+                for b in blocks {
+                    if let crate::proxy::mappers::claude::models::ContentBlock::Text { text } = b {
+                        if crate::proxy::mappers::common_utils::is_post_compaction_continuation_text(
+                            text,
+                        ) {
+                            return true;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    false
+}
+
+/// 计算自动压缩的有效安全阈值：
+/// 必须至少保留 target_limit + 25,000 的安全净空，防止压缩后上下文紧贴阈值瞬间再触发死循环 (autocompact_thrashing)
+pub fn calculate_effective_auto_compact_threshold(user_threshold: u32, target_limit: u32) -> u32 {
+    let min_safe_threshold = target_limit.saturating_add(25_000);
+    user_threshold.max(50_000).max(min_safe_threshold)
+}
+
+/// 判定请求是否为用户在 Cowork 客户端输入的手动 ./compact 指令
+fn is_manual_compact_command(request: &ClaudeRequest) -> bool {
+    let mut text_opt = None;
+    for m in request.messages.iter().rev() {
+        if m.role == "user" {
+            let t = match &m.content {
+                MessageContent::String(s) => s.clone(),
+                MessageContent::Array(blocks) => {
+                    let mut s = String::new();
+                    for b in blocks {
+                        if let crate::proxy::mappers::claude::models::ContentBlock::Text { text } =
+                            b
+                        {
+                            s.push_str(text);
+                            s.push(' ');
+                        }
+                    }
+                    s
+                }
+            };
+            text_opt = Some(t);
+            break;
+        }
+    }
+    if let Some(text) = text_opt {
+        static SYSTEM_REMINDER_RE: LazyLock<regex::Regex> = LazyLock::new(|| {
+            regex::Regex::new(r"(?s)<system-reminder>.*?</system-reminder>").unwrap()
+        });
+        let cleaned = SYSTEM_REMINDER_RE.replace_all(&text, "");
+        for line in cleaned.lines() {
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            let lower = trimmed.to_lowercase();
+            if lower == "./compact"
+                || lower == ".\\compact"
+                || lower == "./compact."
+                || lower == "/compact"
+                || lower.starts_with("./compact ")
+            {
+                return true;
+            }
+            break;
+        }
+    }
+    false
+}
+
+/// 计算 Claude 请求中非对话历史的固定开销 (Fixed Overhead: System Prompt + Tool 声明)
+/// 用于动态计算可解的目标上限 (target_limit = max(fixed_overhead + 15000, 35000))
+fn calculate_claude_fixed_overhead(request: &ClaudeRequest) -> u32 {
+    let mut overhead = 0u32;
+    if let Some(sys) = &request.system {
+        match sys {
+            crate::proxy::mappers::claude::models::SystemPrompt::String(s) => {
+                overhead += crate::proxy::pipeline::estimator::estimate_tokens_from_str(s);
+            }
+            crate::proxy::mappers::claude::models::SystemPrompt::Array(blocks) => {
+                for block in blocks {
+                    overhead +=
+                        crate::proxy::pipeline::estimator::estimate_tokens_from_str(&block.text);
+                }
+            }
+        }
+    }
+    if let Some(tools) = &request.tools {
+        for tool in tools {
+            let name_len =
+                crate::proxy::pipeline::estimator::estimate_tokens_from_str(&tool.get_name());
+            let desc_len = tool
+                .description
+                .as_deref()
+                .map(crate::proxy::pipeline::estimator::estimate_tokens_from_str)
+                .unwrap_or(0);
+            let schema_len = tool
+                .input_schema
+                .as_ref()
+                .map(crate::proxy::pipeline::estimator::estimate_tokens)
+                .unwrap_or(0);
+            overhead += name_len + desc_len + schema_len + 30;
+        }
+    }
+    overhead
+}
+
+/// 构造 Anthropic 原生 SSE 流式响应体，回显真实 Compacted 结果
+fn make_compact_sse_response(text: &str, model: &str, input_tokens: u32) -> String {
+    let msg_id = format!(
+        "msg_compact_{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or(0)
+    );
+    let mut out = String::new();
+
+    let start_event = json!({
+        "type": "message_start",
+        "message": {
+            "id": msg_id,
+            "type": "message",
+            "role": "assistant",
+            "content": [],
+            "model": model,
+            "stop_reason": serde_json::Value::Null,
+            "stop_sequence": serde_json::Value::Null,
+            "usage": {
+                "input_tokens": input_tokens.max(1),
+                "output_tokens": 1
+            }
+        }
+    });
+    out.push_str(&format!(
+        "event: message_start\ndata: {}\n\n",
+        serde_json::to_string(&start_event).unwrap_or_default()
+    ));
+
+    let cbs_event = json!({
+        "type": "content_block_start",
+        "index": 0,
+        "content_block": {"type": "text", "text": ""}
+    });
+    out.push_str(&format!(
+        "event: content_block_start\ndata: {}\n\n",
+        serde_json::to_string(&cbs_event).unwrap_or_default()
+    ));
+
+    let cbd_event = json!({
+        "type": "content_block_delta",
+        "index": 0,
+        "delta": {"type": "text_delta", "text": text}
+    });
+    out.push_str(&format!(
+        "event: content_block_delta\ndata: {}\n\n",
+        serde_json::to_string(&cbd_event).unwrap_or_default()
+    ));
+
+    let cbst_event = json!({
+        "type": "content_block_stop",
+        "index": 0
+    });
+    out.push_str(&format!(
+        "event: content_block_stop\ndata: {}\n\n",
+        serde_json::to_string(&cbst_event).unwrap_or_default()
+    ));
+
+    let md_event = json!({
+        "type": "message_delta",
+        "delta": {"stop_reason": "end_turn", "stop_sequence": serde_json::Value::Null},
+        "usage": {"output_tokens": 15}
+    });
+    out.push_str(&format!(
+        "event: message_delta\ndata: {}\n\n",
+        serde_json::to_string(&md_event).unwrap_or_default()
+    ));
+
+    out.push_str("event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n");
+    out
+}
+
+/// 构造 Anthropic 原生非流式 JSON 响应体
+fn make_compact_json_response(text: &str, model: &str, input_tokens: u32) -> Value {
+    let msg_id = format!(
+        "msg_compact_{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or(0)
+    );
+    json!({
+        "id": msg_id,
+        "type": "message",
+        "role": "assistant",
+        "model": model,
+        "content": [{
+            "type": "text",
+            "text": text
+        }],
+        "stop_reason": "end_turn",
+        "stop_sequence": serde_json::Value::Null,
+        "usage": {
+            "input_tokens": input_tokens.max(1),
+            "output_tokens": 15
+        }
+    })
+}
 
 // ===== Task #6: OpenCode variants thinking config mapping =====
 // Helper structs for parsing thinking hints from raw JSON
@@ -83,13 +390,14 @@ fn extract_thinking_hint(body: &Value) -> ThinkingHint {
         hint.budget_tokens = Some(budget as u32);
     }
 
-    // Try to extract level from thinkingLevel / reasoning_effort / output_config.effort
+    // Try to extract level from thinkingLevel / reasoning_effort / output_config.effort / thinking.effort
     if let Some(level) = body
         .get("thinkingLevel")
         .or_else(|| body.get("thinking_level"))
         .or_else(|| body.get("reasoning_effort"))
         .or_else(|| body.get("reasoningEffort"))
         .or_else(|| body.get("output_config").and_then(|o| o.get("effort")))
+        .or_else(|| body.get("thinking").and_then(|t| t.get("effort")))
         .and_then(|l| l.as_str())
     {
         hint.level = Some(level.to_lowercase());
@@ -131,10 +439,15 @@ fn apply_thinking_hints(
 
     // If budget is provided, set/override thinking config
     if let Some(budget) = hint.budget_tokens {
+        let existing_effort = request
+            .thinking
+            .as_ref()
+            .and_then(|t| t.effort.clone())
+            .or_else(|| hint.level.clone());
         request.thinking = Some(crate::proxy::mappers::claude::models::ThinkingConfig {
             type_: "enabled".to_string(),
             budget_tokens: Some(budget),
-            effort: None,
+            effort: existing_effort,
         });
         tracing::debug!(
             "[{}] Applied thinking hint: budget_tokens={}",
@@ -422,6 +735,33 @@ fn apply_variant(
     Some(spec)
 }
 
+/// [FIX #3593] 检查 Claude 流数据块是否包含错误事件
+/// 在 Peek 预读阶段识别流错误（如上游断连、错误帧），触发账号轮换重试，避免将错误误判为合法首包导致 500
+fn claude_stream_chunk_has_error_event(bytes: &[u8]) -> bool {
+    let text = String::from_utf8_lossy(bytes);
+    let mut saw_error_event = false;
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if trimmed == "event: error" {
+            saw_error_event = true;
+        } else if let Some(data) = trimmed.strip_prefix("data:") {
+            if saw_error_event {
+                return true;
+            }
+            if let Ok(payload) = serde_json::from_str::<Value>(data.trim()) {
+                if payload.get("type").and_then(Value::as_str) == Some("error")
+                    || payload.get("error").is_some_and(|e| !e.is_null())
+                {
+                    return true;
+                }
+            }
+        } else if trimmed.is_empty() {
+            saw_error_event = false;
+        }
+    }
+    false
+}
+
 /// 处理 Claude messages 请求
 ///
 /// 处理 Chat 消息请求流程
@@ -430,6 +770,9 @@ pub async fn handle_messages(
     headers: HeaderMap,
     upstream_recorder: Option<
         axum::extract::Extension<crate::proxy::monitor::UpstreamRequestBodyHolder>,
+    >,
+    user_identity: Option<
+        axum::extract::Extension<crate::proxy::middleware::auth::UserTokenIdentity>,
     >,
     Json(body): Json<Value>,
 ) -> Response {
@@ -464,12 +807,6 @@ pub async fn handle_messages(
         );
     }
 
-    // Decide whether this request should be handled by z.ai (Anthropic passthrough) or the existing Google flow.
-    let zai = state.zai.read().await.clone();
-    let zai_enabled =
-        zai.enabled && !matches!(zai.dispatch_mode, crate::proxy::ZaiDispatchMode::Off);
-    let google_accounts = state.token_manager.len();
-
     // [CRITICAL REFACTOR] 优先解析请求以获取模型信息(用于智能兜底判断)
     let mut request: crate::proxy::mappers::claude::models::ClaudeRequest =
         match serde_json::from_value(body.clone()) {
@@ -488,6 +825,24 @@ pub async fn handle_messages(
                     .into_response();
             }
         };
+
+    // 0. 自定义映射优先拦截 (用户自定义路由与热更新规则拥有最高优先级，避免被后续变体推断抹平原模型意图)
+    let custom_target = {
+        let custom_mapping = state.custom_mapping.read().await;
+        crate::proxy::common::model_mapping::resolve_custom_model_route(
+            &request.model,
+            &*custom_mapping,
+        )
+    };
+    if let Some(target) = custom_target {
+        tracing::info!(
+            "[{}] [CustomMapping] 命中用户自定义映射规则: {} -> {}",
+            trace_id,
+            request.model,
+            target
+        );
+        request.model = target;
+    }
 
     // [Variant] Resolve canonical model + variant → real model + real params.
     let model_lower = request.model.to_lowercase();
@@ -553,12 +908,17 @@ pub async fn handle_messages(
             .map(|v| v as u32)
     };
 
-    let effort_hint = request
-        .output_config
-        .as_ref()
-        .and_then(|config| config.effort.clone())
-        .or_else(|| request.thinking.as_ref().and_then(|t| t.effort.clone()))
-        .or_else(|| thinking_hint.level.clone());
+    // 当客户端显式关闭思考或预算为 0 时（如 Claude Desktop 自动模式安全门禁），意图对齐至 low 档位，确保命中低开销模型
+    let effort_hint = if client_disabled {
+        Some("low".to_string())
+    } else {
+        request
+            .output_config
+            .as_ref()
+            .and_then(|config| config.effort.clone())
+            .or_else(|| request.thinking.as_ref().and_then(|t| t.effort.clone()))
+            .or_else(|| thinking_hint.level.clone())
+    };
     let effort_tier =
         crate::proxy::common::variant_mapping::tier_from_effort(effort_hint.as_deref());
     let canonical_model = request.model.clone();
@@ -606,73 +966,22 @@ pub async fn handle_messages(
         .await;
     }
 
-    // [Issue #703 Fix] 智能兜底判断:需要归一化模型名用于配额保护检查
-    let normalized_model =
-        crate::proxy::common::model_mapping::normalize_to_standard_id(&request.model)
-            .unwrap_or_else(|| request.model.clone());
-
-    let use_zai = if !zai_enabled {
-        false
-    } else {
-        match zai.dispatch_mode {
-            crate::proxy::ZaiDispatchMode::Off => false,
-            crate::proxy::ZaiDispatchMode::Exclusive => true,
-            crate::proxy::ZaiDispatchMode::Fallback => {
-                if google_accounts == 0 {
-                    // 没有 Google 账号,使用兜底
-                    tracing::info!(
-                        "[{}] No Google accounts available, using fallback provider",
-                        trace_id
-                    );
-                    true
-                } else {
-                    // [Issue #703 Fix] 智能判断:检查是否有可用的 Google 账号
-                    let has_available = state
-                        .token_manager
-                        .has_available_account("claude", &normalized_model)
-                        .await;
-                    if !has_available {
-                        tracing::info!(
-                            "[{}] All Google accounts unavailable (rate-limited or quota-protected for {}), using fallback provider",
-                            trace_id,
-                            request.model
-                        );
-                    }
-                    !has_available
-                }
-            }
-            crate::proxy::ZaiDispatchMode::Pooled => {
-                // Treat z.ai as exactly one extra slot in the pool.
-                // No strict guarantees: it may get 0 requests if selection never hits.
-                let total = google_accounts.saturating_add(1).max(1);
-                let slot = state.provider_rr.fetch_add(1, Ordering::Relaxed) % total;
-                slot == 0
-            }
-        }
-    };
-
     // [Stage 1 Timing] 初始会话清洗计时
     let clean_start = std::time::Instant::now();
 
     // [CRITICAL FIX] 预先清理所有消息中的 cache_control 字段 (Issue #744)
-    // 必须在序列化之前处理，以确保 z.ai 和 Google Flow 都不受历史消息缓存标记干扰
     clean_cache_control_from_messages(&mut request.messages);
 
     // [FIX #813] 合并连续的同角色消息 (Consecutive User Messages)
-    // 这对于 z.ai (Anthropic 直接转发) 路径至关重要，因为原始结构必须符合协议
     merge_consecutive_messages(&mut request.messages);
 
     // Get model family for signature validation
-    let target_family = if use_zai {
-        Some("claude")
+    let mapped_model =
+        crate::proxy::common::model_mapping::map_claude_model_to_gemini(&request.model);
+    let target_family = if mapped_model.contains("gemini") {
+        Some("gemini")
     } else {
-        let mapped_model =
-            crate::proxy::common::model_mapping::map_claude_model_to_gemini(&request.model);
-        if mapped_model.contains("gemini") {
-            Some("gemini")
-        } else {
-            Some("claude")
-        }
+        Some("claude")
     };
 
     // [CRITICAL FIX] 过滤并修复 Thinking 块签名 (Enhanced with family check)
@@ -685,59 +994,6 @@ pub async fn handle_messages(
     // 若在此处注入 "[System: Tool execution completed...]" 等合成消息，会导致对话历史前缀在轮次间突变，
     // 进而彻底破坏 Google Gemini 上游的 Prompt Caching（缓存崩塌）。
 
-    let experimental_cfg = state.experimental.read().await;
-    let compression_level = if experimental_cfg.compression_level == "disabled" {
-        if experimental_cfg.enable_usage_scaling {
-            "high".to_string()
-        } else {
-            "disabled".to_string()
-        }
-    } else {
-        experimental_cfg.compression_level.clone()
-    };
-
-    if compression_level != "disabled" {
-        // [ACC-P RTK] Low, Medium, High 等级均对传入的工具返回日志执行静态 RTK 去噪折叠
-        for msg in &mut request.messages {
-            crate::proxy::mappers::context_manager::ContextManager::clean_tool_message(msg);
-        }
-
-        // [ACC-P Caveman] Medium, High 等级对除最近 4 条（~2轮）以外的旧对话常驻执行 Caveman 提纯
-        if compression_level == "medium" || compression_level == "high" {
-            let total_msgs = request.messages.len();
-            let start_protection_idx = total_msgs.saturating_sub(4);
-            for (i, msg) in request.messages.iter_mut().enumerate() {
-                if i >= start_protection_idx {
-                    continue;
-                }
-                if msg.role == "user" || msg.role == "assistant" {
-                    match &mut msg.content {
-                        crate::proxy::mappers::claude::models::MessageContent::String(s) => {
-                            let cleaned =
-                                crate::proxy::mappers::caveman_cleaner::CavemanCleaner::clean(s);
-                            if cleaned != *s {
-                                *s = cleaned;
-                            }
-                        }
-                        crate::proxy::mappers::claude::models::MessageContent::Array(blocks) => {
-                            for block in blocks {
-                                if let crate::proxy::mappers::claude::models::ContentBlock::Text {
-                                    text,
-                                } = block
-                                {
-                                    let cleaned = crate::proxy::mappers::caveman_cleaner::CavemanCleaner::clean(text);
-                                    if cleaned != *text {
-                                        *text = cleaned;
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-
     // ===== [Issue #467 Fix] 拦截 Claude Code Warmup 请求 =====
     // Claude Code 会每 10 秒发送一次 warmup 请求来保持连接热身，
     // 这些请求会消耗大量配额。检测到 warmup 请求后直接返回模拟响应。
@@ -749,42 +1005,464 @@ pub async fn handle_messages(
         return create_warmup_response(&request, request.stream);
     }
 
-    if use_zai {
-        // 重新序列化修复后的请求体
-        let mut new_body = match serde_json::to_value(&request) {
-            Ok(v) => v,
-            Err(e) => {
-                tracing::error!("Failed to serialize fixed request for z.ai: {}", e);
-                return StatusCode::INTERNAL_SERVER_ERROR.into_response();
-            }
-        };
-
-        // Inject cache_control into the XML summary message if it is a Forked session
-        inject_cache_control_to_forked_summary(&mut new_body);
-
-        if let Some(ref recorder) = upstream_recorder {
-            recorder.set_value(&new_body);
-        }
-
-        return crate::proxy::providers::zai_anthropic::forward_anthropic_json(
-            &state,
-            axum::http::Method::POST,
-            "/v1/messages",
-            &headers,
-            new_body,
-            request.messages.len(), // [NEW v4.0.0] Pass message count
-        )
-        .await;
-    }
-
-    // Google Flow 继续使用 request 对象
-    // (后续代码不需要再次 filter_invalid_thinking_blocks)
-
     // [NEW] 获取上下文控制配置
     let experimental = state.experimental.read().await;
     let scaling_enabled = experimental.enable_usage_scaling;
-    let threshold_l1 = experimental.context_compression_threshold_l1;
-    let threshold_l3 = experimental.context_compression_threshold_l3;
+
+    // [全链路会话生命周期与自愈分流体系 (Pipeline First)]
+    // 提取会话唯一标识（优先提取产品专属会话头或内容锚点）
+    let session_key =
+        crate::proxy::thinking_store::stable_session_winner(&headers, Some(&original_body), None)
+            .unwrap_or_else(|| {
+                let anchor =
+                    crate::proxy::session_manager::SessionManager::extract_session_id(&request);
+                crate::proxy::thinking_store::derive_winner_session_id("anon", None, &anchor)
+            });
+
+    // 维持状态机容量，执行条目级细粒度 TTL 清理，彻底避免粗暴全量 clear() 导致的 herd invalidation
+    if COMPACTION_IMMUNITY_LEASES.len() > 1000 {
+        let now = std::time::Instant::now();
+        COMPACTION_IMMUNITY_LEASES.retain(|_, lease| {
+            if !lease.consumed {
+                now.duration_since(lease.created_at).as_secs()
+                    < COMPACTION_IMMUNITY_INITIAL_TTL_SECS
+            } else {
+                now.duration_since(lease.last_touched).as_secs() < COMPACTION_IMMUNITY_WINDOW_SECS
+            }
+        });
+    }
+
+    // 分流 A: 客户端原生发起的压缩总结请求 (Compaction Summary Request) -> 生命线直通放行，绝对不误杀
+    let is_compaction_header = headers
+        .get("x-stainless-helper")
+        .and_then(|h| h.to_str().ok())
+        .map_or(false, |v| v.contains("compaction"));
+
+    // 检查是否有任何消息或 System Prompt 命中摘要特征
+    let has_compaction_message = request.messages.iter().rev().take(5).any(|m| {
+        let text = match &m.content {
+            crate::proxy::mappers::claude::models::MessageContent::String(s) => s.as_str(),
+            crate::proxy::mappers::claude::models::MessageContent::Array(blocks) => blocks
+                .iter()
+                .rev()
+                .find_map(|b| match b {
+                    crate::proxy::mappers::claude::models::ContentBlock::Text { text } => {
+                        Some(text.as_str())
+                    }
+                    _ => None,
+                })
+                .unwrap_or(""),
+        };
+        crate::proxy::mappers::common_utils::is_compaction_request_text(text)
+    });
+
+    let has_compaction_system = request.system.as_ref().map_or(false, |sys| {
+        let sys_text = match sys {
+            crate::proxy::mappers::claude::models::SystemPrompt::String(s) => s.as_str(),
+            crate::proxy::mappers::claude::models::SystemPrompt::Array(arr) => {
+                arr.first().map(|b| b.text.as_str()).unwrap_or("")
+            }
+        };
+        crate::proxy::mappers::common_utils::is_compaction_request_text(sys_text)
+    });
+
+    let is_compaction_request =
+        is_compaction_header || has_compaction_message || has_compaction_system;
+
+    if is_compaction_request {
+        // [Compaction Immunity Lease] 为该会话发放免死租约，支持并发接续与重试
+        let now = std::time::Instant::now();
+        COMPACTION_IMMUNITY_LEASES.insert(
+            session_key.clone(),
+            CompactionImmunityLease {
+                created_at: now,
+                last_touched: now,
+                consumed: false,
+            },
+        );
+
+        // 跨轮次关联对齐：遍历近期处于 compacting 状态的会话，同步发放租约并确认为已完成摘要
+        // 解决客户端摘要请求因 tools/system 变动导致 extract_session_id 发生哈希偏移的问题
+        PENDING_COMPACT_SESSIONS.retain(|_, ts| now.duration_since(*ts).as_secs() < 120);
+        for entry in PENDING_COMPACT_SESSIONS.iter() {
+            let pending_sid = entry.key();
+            COMPACTION_IMMUNITY_LEASES.insert(
+                pending_sid.clone(),
+                CompactionImmunityLease {
+                    created_at: now,
+                    last_touched: now,
+                    consumed: false,
+                },
+            );
+            if let Some(mut state) = COWORK_COMPACT_SESSIONS.get_mut(pending_sid) {
+                state.summary_done = true;
+            }
+        }
+
+        if let Some(mut state) = COWORK_COMPACT_SESSIONS.get_mut(&session_key) {
+            state.summary_done = true;
+        }
+        tracing::info!(
+            "[{}] [Lifecycle] Compaction summary request detected for session {}, issued immunity lease",
+            trace_id, session_key
+        );
+    }
+
+    // 检查是否包含接续标记 (Post-Compaction Continuation)
+    let is_continuation_detected = detect_post_compaction_continuation(&request);
+
+    // 分流 B: 已完成压缩提纯的会话接续 (Post-Compaction Continuation)
+    // 采用代际租约状态机 (CompactionImmunityLease):
+    // 1. 严格守卫 !is_compaction_request：压缩摘要请求自身绝对不自毁刚刚发放的免死租约；
+    // 2. 首个接续请求接入后激活 30 秒滑动窗口，窗口内放行该会话的所有并发请求、工具调用与网络重试；
+    // 3. 空闲超过 30 秒后即刻核销失效，后续若再次超限将正常触发下一轮自愈，彻底杜绝终身免死 (Fixes #3563)。
+    let is_post_compaction = if !is_compaction_request {
+        if let Some(mut lease) = COMPACTION_IMMUNITY_LEASES.get_mut(&session_key) {
+            let now = std::time::Instant::now();
+            let valid = if !lease.consumed {
+                now.duration_since(lease.created_at).as_secs()
+                    < COMPACTION_IMMUNITY_INITIAL_TTL_SECS
+            } else {
+                now.duration_since(lease.last_touched).as_secs() < COMPACTION_IMMUNITY_WINDOW_SECS
+            };
+            if valid {
+                lease.consumed = true;
+                lease.last_touched = now;
+                tracing::info!(
+                    "[{}] [Lifecycle] Active immunity lease for session {}, granted 1M passthrough (sliding window active)",
+                    trace_id, session_key
+                );
+                true
+            } else {
+                drop(lease);
+                COMPACTION_IMMUNITY_LEASES.remove(&session_key);
+                false
+            }
+        } else if is_continuation_detected {
+            // 接续标记保底：若检测到接续标记但无活跃租约，发放滑动窗口租约
+            let now = std::time::Instant::now();
+            COMPACTION_IMMUNITY_LEASES.insert(
+                session_key.clone(),
+                CompactionImmunityLease {
+                    created_at: now,
+                    last_touched: now,
+                    consumed: true,
+                },
+            );
+            tracing::info!(
+                "[{}] [Lifecycle] Continuation detected for session {}, minted sliding window lease",
+                trace_id, session_key
+            );
+            true
+        } else {
+            false
+        }
+    } else {
+        false
+    };
+
+    // 若检测到已进入接续阶段且并非摘要请求自身，从统一压缩池中回收结算并归入防重放缓存
+    if (is_post_compaction || is_continuation_detected) && !is_compaction_request {
+        if let Some((_, state)) = COWORK_COMPACT_SESSIONS.remove(&session_key) {
+            let est_tokens = crate::proxy::pipeline::estimate_tokens(&original_body);
+            let saved_tok = state.before_tokens.saturating_sub(est_tokens);
+            let saved_k = (saved_tok as f64 / 1000.0).round() as u32;
+            let reply_text = if saved_k > 0 {
+                format!("Compacted conversation · saved {}k tokens", saved_k)
+            } else {
+                "Compacted conversation".to_string()
+            };
+            PENDING_COMPACT_SESSIONS.remove(&session_key);
+            prune_just_compacted_cache_if_needed();
+            COWORK_JUST_COMPACTED_CACHE.insert(
+                session_key.clone(),
+                (std::time::Instant::now(), reply_text, est_tokens),
+            );
+            tracing::info!(
+                "[{}] [Lifecycle] Harvested completed {:?} compact for session {} ({} -> {} tokens, saved {}k)",
+                trace_id, state.kind, session_key, state.before_tokens, est_tokens, saved_k
+            );
+        }
+    }
+
+    // 检查是否为手动 ./compact 穿透指令
+    let is_manual_compact = is_manual_compact_command(&request);
+
+    // 检查是否正处于压缩流程中（手动或自动），若是则自动豁免 auto_compact 门禁，彻底解耦双重 400 撞车！
+    let is_in_compaction = is_session_in_compaction(&session_key);
+
+    // 分流 C (优先分流): 手动 ./compact 指令拦截与闭环响应 (具有最高调度优先级，彻底短路自动门禁抢跑)
+    if experimental.enable_cowork_manual_compact && is_manual_compact {
+        let now = std::time::Instant::now();
+        let req_model = request.model.clone();
+        let est_tokens = crate::proxy::pipeline::estimate_tokens(&original_body);
+
+        // 情况 A: 60秒内刚完成过 compact，命中防重放缓存
+        if let Some(entry) = COWORK_JUST_COMPACTED_CACHE.get(&session_key) {
+            let (cached_ts, ref cached_text, cached_tokens) = *entry;
+            if now.duration_since(cached_ts).as_secs() < 60 {
+                tracing::info!(
+                    "[{}] [Manual-Compact] Cache hit for session {}, returning: {}",
+                    trace_id,
+                    session_key,
+                    cached_text
+                );
+                if request.stream {
+                    let sse = make_compact_sse_response(cached_text, &req_model, cached_tokens);
+                    return (
+                        StatusCode::OK,
+                        [
+                            (header::CONTENT_TYPE, "text/event-stream; charset=utf-8"),
+                            (header::CACHE_CONTROL, "no-cache"),
+                            (header::CONNECTION, "keep-alive"),
+                        ],
+                        sse,
+                    )
+                        .into_response();
+                } else {
+                    let json_val =
+                        make_compact_json_response(cached_text, &req_model, cached_tokens);
+                    return (
+                        StatusCode::OK,
+                        [(header::CONTENT_TYPE, "application/json")],
+                        Json(json_val),
+                    )
+                        .into_response();
+                }
+            } else {
+                drop(entry);
+                COWORK_JUST_COMPACTED_CACHE.remove(&session_key);
+            }
+        }
+
+        // 情况 B: 判断是否真正完成了压缩并处于重试阶段
+        let mut is_truly_compacted = false;
+        let mut before_tok = 0u32;
+
+        if let Some(entry) = COWORK_COMPACT_SESSIONS.get(&session_key) {
+            // 防死锁：超过 300 秒过期自动重置
+            if now.duration_since(entry.ts).as_secs() >= 300 {
+                drop(entry);
+                COWORK_COMPACT_SESSIONS.remove(&session_key);
+            } else {
+                before_tok = entry.before_tokens;
+                let summary_already_done = entry.summary_done;
+
+                // 条件: 摘要请求已完成，或带接续标记/豁免，或上下文 tokens 明显回落（回落至 85% 以下）
+                if summary_already_done
+                    || is_post_compaction
+                    || is_continuation_detected
+                    || (before_tok > 0 && est_tokens < (before_tok * 85 / 100))
+                {
+                    is_truly_compacted = true;
+                }
+            }
+        }
+
+        if is_truly_compacted {
+            let saved_tok = before_tok.saturating_sub(est_tokens);
+            let saved_k = (saved_tok as f64 / 1000.0).round() as u32;
+            let reply_text = if saved_k > 0 {
+                format!("Compacted conversation · saved {}k tokens", saved_k)
+            } else {
+                "Compacted conversation".to_string()
+            };
+
+            COWORK_COMPACT_SESSIONS.remove(&session_key);
+            PENDING_COMPACT_SESSIONS.remove(&session_key);
+            prune_just_compacted_cache_if_needed();
+            COWORK_JUST_COMPACTED_CACHE
+                .insert(session_key.clone(), (now, reply_text.clone(), est_tokens));
+            COMPACTION_IMMUNITY_LEASES.remove(&session_key);
+
+            tracing::info!(
+                "[{}] [Manual-Compact] Successfully compacted for session {} ({} -> {} tokens, saved {}k)! Returning 200 OK",
+                trace_id, session_key, before_tok, est_tokens, saved_k
+            );
+
+            if request.stream {
+                let sse = make_compact_sse_response(&reply_text, &req_model, est_tokens);
+                return (
+                    StatusCode::OK,
+                    [
+                        (header::CONTENT_TYPE, "text/event-stream; charset=utf-8"),
+                        (header::CACHE_CONTROL, "no-cache"),
+                        (header::CONNECTION, "keep-alive"),
+                    ],
+                    sse,
+                )
+                    .into_response();
+            } else {
+                let json_val = make_compact_json_response(&reply_text, &req_model, est_tokens);
+                return (
+                    StatusCode::OK,
+                    [(header::CONTENT_TYPE, "application/json")],
+                    Json(json_val),
+                )
+                    .into_response();
+            }
+        }
+
+        // 情况 C: 初次捕获 ./compact 指令，或处于客户端网络级即时重试阶段
+        // 持续响应 400 假报警，直到驱动客户端彻底触发 Reactive Compact
+        prune_compact_sessions_if_needed();
+        let fixed_overhead = calculate_claude_fixed_overhead(&request);
+        let target_limit = (fixed_overhead + 15_000).max(35_000);
+
+        if !COWORK_COMPACT_SESSIONS.contains_key(&session_key) {
+            COWORK_COMPACT_SESSIONS.insert(
+                session_key.clone(),
+                CoworkCompactState {
+                    kind: CoworkCompactKind::Manual,
+                    before_tokens: est_tokens,
+                    ts: now,
+                    summary_done: false,
+                    target_limit,
+                },
+            );
+        } else if let Some(mut entry) = COWORK_COMPACT_SESSIONS.get_mut(&session_key) {
+            entry.ts = now;
+            if entry.before_tokens == 0 {
+                entry.before_tokens = est_tokens;
+            }
+            entry.target_limit = target_limit;
+        }
+        PENDING_COMPACT_SESSIONS.insert(session_key.clone(), now);
+
+        // 防御性校验：若当前 tokens 已经处于 target_limit 之内，直接返回 200 成功响应，
+        // 绝不发射 400 假报警，彻底杜绝客户端 Fst / fIt 算出负/零 initialTokenGap 触发 compactionImpossible
+        if est_tokens <= target_limit {
+            let reply_text = "Compacted conversation · already at minimal context".to_string();
+            tracing::info!(
+                "[{}] [Manual-Compact] Session {} context ({} tokens) is already <= target_limit ({}), returning 200 OK directly",
+                trace_id, session_key, est_tokens, target_limit
+            );
+            if request.stream {
+                let sse = make_compact_sse_response(&reply_text, &req_model, est_tokens);
+                return (
+                    StatusCode::OK,
+                    [
+                        (header::CONTENT_TYPE, "text/event-stream; charset=utf-8"),
+                        (header::CACHE_CONTROL, "no-cache"),
+                        (header::CONNECTION, "keep-alive"),
+                    ],
+                    sse,
+                )
+                    .into_response();
+            } else {
+                let json_val = make_compact_json_response(&reply_text, &req_model, est_tokens);
+                return (
+                    StatusCode::OK,
+                    [(header::CONTENT_TYPE, "application/json")],
+                    Json(json_val),
+                )
+                    .into_response();
+            }
+        }
+
+        let report_tokens = est_tokens.max(target_limit + 10_000);
+        let err_msg = format!(
+            "prompt is too long: {} tokens > {} maximum",
+            report_tokens, target_limit
+        );
+        tracing::warn!(
+            "[{}] [Manual-Compact] Intercepted ./compact for session {} (tokens={}, fixed_overhead={}), responding with 400 fake alarm (gap target: {} tokens) to trigger deep client-side compact",
+            trace_id, session_key, est_tokens, fixed_overhead, target_limit
+        );
+
+        return (
+            StatusCode::BAD_REQUEST,
+            [(header::CONTENT_TYPE, "application/json")],
+            Json(json!({
+                "type": "error",
+                "error": {
+                    "type": "invalid_request_error",
+                    "message": err_msg
+                }
+            })),
+        )
+            .into_response();
+    }
+
+    // 分流 D: 超限自愈假报警触发门禁 (必须自定义开启 + 双重确权 + 非手动指令 + 非正在压缩中)
+    // 铁律：普通 Agent 与未开启配置时，绝对不拦截，100% 享受 Gemini 百万超长上下文！
+    if experimental.enable_cowork_auto_compact
+        && !is_compaction_request
+        && !is_post_compaction
+        && !is_continuation_detected
+        && !is_manual_compact
+        && !is_in_compaction
+    {
+        let is_cowork = request.tools.as_ref().map_or(false, |tools| {
+            tools.iter().any(|t| {
+                let n = t.get_name();
+                n.starts_with("mcp__cowork") || n.starts_with("mcp__workspace")
+            })
+        });
+
+        if is_cowork {
+            let fixed_overhead = calculate_claude_fixed_overhead(&request);
+            let target_limit = (fixed_overhead + 15_000).max(35_000);
+            let effective_threshold = calculate_effective_auto_compact_threshold(
+                experimental.cowork_compact_threshold,
+                target_limit,
+            );
+            let est_tokens = crate::proxy::pipeline::estimate_tokens(&original_body);
+
+            // 负 Gap 与净空防御门禁：必须满足 est_tokens >= effective_threshold 且 est_tokens > target_limit
+            if est_tokens >= effective_threshold && est_tokens > target_limit {
+                tracing::warn!(
+                    "[{}] [Cowork-Gatekeeper] Cowork session reached {} tokens >= effective threshold {} (target_limit: {}), triggering native reactive compact",
+                    trace_id,
+                    est_tokens,
+                    effective_threshold,
+                    target_limit
+                );
+                prune_compact_sessions_if_needed();
+                let now = std::time::Instant::now();
+                COWORK_COMPACT_SESSIONS.insert(
+                    session_key.clone(),
+                    CoworkCompactState {
+                        kind: CoworkCompactKind::Auto,
+                        before_tokens: est_tokens,
+                        ts: now,
+                        summary_done: false,
+                        target_limit,
+                    },
+                );
+                PENDING_COMPACT_SESSIONS.insert(session_key.clone(), now);
+                let report_tokens = est_tokens.max(target_limit + 10_000);
+                let err_msg = format!(
+                    "prompt is too long: {} tokens > {} maximum",
+                    report_tokens, target_limit
+                );
+                return (
+                    StatusCode::BAD_REQUEST,
+                    [("content-type", "application/json")],
+                    Json(json!({
+                        "type": "error",
+                        "error": {
+                            "type": "invalid_request_error",
+                            "message": err_msg
+                        }
+                    })),
+                )
+                    .into_response();
+            }
+        }
+    }
+
+    if is_compaction_request {
+        tracing::info!(
+            "[{}] [Lifecycle] Compaction summary request detected, passing through to upstream",
+            trace_id
+        );
+    } else if is_post_compaction {
+        tracing::debug!(
+            "[{}] [Lifecycle] Post-compaction continuation session detected, granted upstream 1M immunity",
+            trace_id
+        );
+    }
 
     // 获取最新一条“有意义”的消息内容（用于日志记录和后台任务检测）
     // 策略：反向遍历，首先筛选出所有角色为 "user" 的消息，然后从中找到第一条非 "Warmup" 且非空的文本消息
@@ -935,9 +1613,10 @@ pub async fn handle_messages(
         let norm_start = std::time::Instant::now();
 
         // 2. 模型路由解析
-        let mapped_model = crate::proxy::common::model_mapping::resolve_model_route(
+        let mapped_model = crate::proxy::common::model_mapping::resolve_model_route_with_effort(
             &request_for_body.model,
             &*state.custom_mapping.read().await,
+            effort_hint.as_deref(),
         );
         last_mapped_model = Some(mapped_model.clone());
 
@@ -958,37 +1637,46 @@ pub async fn handle_messages(
             None,                       // body
         );
 
-        // 0. 尝试提取 session_id 用于粘性调度 (Phase 2/3)
-        // 使用 SessionManager 生成稳定的会话指纹，优先以显式会话头对齐跨协议 store_key
-        let explicit_sid = headers
-            .get("x-session-id")
-            .or_else(|| headers.get("x-jeikcode-session-id"))
-            .and_then(|v| v.to_str().ok())
-            .map(|s| s.trim())
-            .filter(|s| !s.is_empty());
-        let fallback_sid = if let Some(sid) = explicit_sid {
-            sid.to_string()
-        } else {
-            crate::proxy::session_manager::SessionManager::extract_session_id(&request_for_body)
-        };
-        let session_scope = crate::proxy::thinking_store::SessionScope::from_headers_and_body(
+        // 内容锚点只进思维库。账号粘性与上游 sessionId 用 affinity_key。
+        let anchor =
+            crate::proxy::session_manager::SessionManager::extract_session_id(&request_for_body);
+        let session_scope = crate::proxy::thinking_store::SessionScope::resolve(
             &headers,
             Some(&original_body),
-            fallback_sid,
+            None,
+            anchor,
+            user_identity
+                .as_ref()
+                .map(|identity| identity.token_id.as_str()),
         );
-        let session_id_str = session_scope.store_key.clone();
+        let store_key = session_scope.store_key.clone();
+        let affinity_key = session_scope.affinity_key.clone();
         let client_session_id = session_scope.client_id.clone();
-        let session_id = Some(session_id_str.as_str());
+        let session_id = Some(affinity_key.as_str());
 
-        let (access_token, project_id, email, account_id, _wait_ms) = match token_manager
+        let mut token_result = token_manager
             .get_token(
                 &config.request_type,
                 force_rotate,
                 session_id,
                 &config.final_model,
             )
-            .await
-        {
+            .await;
+
+        if let Err(ref e) = token_result {
+            if crate::proxy::handlers::common::is_transient_token_error(e) {
+                tracing::warn!(
+                    "Token acquisition transient error ({}), retrying once with force_rotate...",
+                    e
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                token_result = token_manager
+                    .get_token(&config.request_type, true, session_id, &config.final_model)
+                    .await;
+            }
+        }
+
+        let (access_token, project_id, email, account_id, _wait_ms) = match token_result {
             Ok(t) => t,
             Err(e) => {
                 let safe_message = if e.contains("invalid_grant") {
@@ -1017,138 +1705,6 @@ pub async fn handle_messages(
         // 方案 A：移除后台任务静默降级策略，请求直通客户端指定的模型，与 OpenAI 协议保持一致
         let mut request_with_mapped = request_for_body.clone();
 
-        // ===== [3-Layer Progressive Compression + Calibrated Estimation] Context Management =====
-        // [ENHANCED] 整合 3.3.47 的三层压缩框架 + PR #925 的动态校准机制
-        // [NEW] 只有当 scaling_enabled 为 true 时才执行压缩逻辑 (联动机制)
-        // Layer 1 (60%): Tool message trimming - Does NOT break cache
-        // Layer 2 (75%): Thinking purification - Breaks cache but preserves signatures
-        // Layer 3 (90%): Fork conversation + XML summary - Ultimate optimization
-        let mut compression_applied = false;
-
-        if !retried_without_thinking && compression_level == "high" {
-            // 新增 scaling_enabled 联动判断
-            // 1. Determine context limit (Flash: ~1M, Pro: ~2M)
-            let context_limit = if mapped_model.contains("flash") {
-                1_000_000
-            } else {
-                2_000_000
-            };
-
-            // 2. [ENHANCED] 使用校准器提高估算准确度 (PR #925)
-            let raw_estimated = ContextManager::estimate_token_usage(&request_with_mapped);
-            let calibrator = get_calibrator();
-            let mut estimated_usage = calibrator.calibrate(raw_estimated);
-            let mut usage_ratio = estimated_usage as f32 / context_limit as f32;
-
-            info!(
-                "[{}] [ContextManager] Context pressure: {:.1}% (raw: {}, calibrated: {} / {}), Calibration factor: {:.2}",
-                trace_id, usage_ratio * 100.0, raw_estimated, estimated_usage, context_limit, calibrator.get_factor()
-            );
-
-            // ===== Layer 1: Tool Message Trimming (L1 threshold) =====
-            // Borrowed from Practical-Guide-to-Context-Engineering
-            // Advantage: Completely cache-friendly (only removes messages, doesn't modify content)
-            if usage_ratio > threshold_l1 && !compression_applied {
-                if ContextManager::trim_tool_messages(&mut request_with_mapped.messages, 5) {
-                    info!(
-                        "[{}] [Layer-1] Tool trimming triggered (usage: {:.1}%, threshold: {:.1}%)",
-                        trace_id,
-                        usage_ratio * 100.0,
-                        threshold_l1 * 100.0
-                    );
-                    compression_applied = true;
-
-                    // Re-estimate after trimming (with calibration)
-                    let new_raw = ContextManager::estimate_token_usage(&request_with_mapped);
-                    let new_usage = calibrator.calibrate(new_raw);
-                    let new_ratio = new_usage as f32 / context_limit as f32;
-
-                    info!(
-                        "[{}] [Layer-1] Compression result: {:.1}% → {:.1}% (saved {} tokens)",
-                        trace_id,
-                        usage_ratio * 100.0,
-                        new_ratio * 100.0,
-                        estimated_usage - new_usage
-                    );
-
-                    // If compression is sufficient, skip further layers
-                    if new_ratio < 0.7 {
-                        estimated_usage = new_usage;
-                        usage_ratio = new_ratio;
-                        // Success, no need for Layer 2
-                    } else {
-                        // Still high pressure, update for Layer 2
-                        usage_ratio = new_ratio;
-                        compression_applied = false; // Allow Layer 2 to run
-                    }
-                }
-            }
-
-            // ===== Layer 3: Fork Conversation + XML Summary (L3 threshold) =====
-            // Ultimate optimization: Generate structured summary and start fresh conversation
-            // Advantage: Completely cache-friendly (append-only), extreme compression ratio
-            if usage_ratio > threshold_l3 && !compression_applied {
-                info!(
-                    "[{}] [Layer-3] Context pressure ({:.1}%) exceeded threshold ({:.1}%), attempting Fork+Summary",
-                    trace_id, usage_ratio * 100.0, threshold_l3 * 100.0
-                );
-
-                // Clone token_manager Arc to avoid borrow issues
-                let token_manager_clone = token_manager.clone();
-
-                match try_compress_with_summary(
-                    &request_with_mapped,
-                    &trace_id,
-                    &token_manager_clone,
-                    &state.upstream,
-                )
-                .await
-                {
-                    Ok(forked_request) => {
-                        info!(
-                            "[{}] [Layer-3] Fork successful: {} → {} messages",
-                            trace_id,
-                            request_with_mapped.messages.len(),
-                            forked_request.messages.len()
-                        );
-
-                        request_with_mapped = forked_request;
-                        // Re-estimate after fork (with calibration)
-                        let new_raw = ContextManager::estimate_token_usage(&request_with_mapped);
-                        let new_usage = calibrator.calibrate(new_raw);
-                        let new_ratio = new_usage as f32 / context_limit as f32;
-
-                        info!(
-                            "[{}] [Layer-3] Compression result: {:.1}% → {:.1}% (saved {} tokens)",
-                            trace_id,
-                            usage_ratio * 100.0,
-                            new_ratio * 100.0,
-                            estimated_usage - new_usage
-                        );
-                    }
-                    Err(e) => {
-                        error!(
-                            "[{}] [Layer-3] Fork+Summary failed: {}, falling back to error response",
-                            trace_id, e
-                        );
-
-                        // Return friendly error to user
-                        return (
-                            StatusCode::BAD_REQUEST,
-                            Json(json!({
-                                "type": "error",
-                                "error": {
-                                    "type": "invalid_request_error",
-                                    "message": format!("Context too long and automatic compression failed: {}", e),
-                                    "suggestion": "Please use /compact or /clear command in Claude Code, or switch to a model with larger context window."
-                                }
-                            }))
-                        ).into_response();
-                    }
-                }
-            }
-        }
-
         // [FIX] Estimate AFTER purification to get accurate token count for calibrator learning
         let raw_estimated = ContextManager::estimate_token_usage(&request_with_mapped);
 
@@ -1164,7 +1720,8 @@ pub async fn handle_messages(
                 &project_id,
                 retried_without_thinking,
                 Some(account_id.as_str()),
-                &session_id_str,
+                &store_key,
+                &affinity_key,
                 token_obj.as_ref(),
             ) {
                 Ok((b, timing)) => {
@@ -1288,7 +1845,7 @@ pub async fn handle_messages(
             .call_v1_internal_with_headers(
                 method,
                 &access_token,
-                gemini_body,
+                gemini_body.clone(),
                 query,
                 extra_headers.clone(),
                 Some(account_id.as_str()),
@@ -1348,8 +1905,9 @@ pub async fn handle_messages(
 
         // 成功
         if status.is_success() {
+            token_manager.commit_session(&affinity_key, &account_id);
             // [智能限流] 请求成功，重置该账号的连续失败计数
-            token_manager.mark_account_success(&email);
+            token_manager.mark_account_success(&account_id);
 
             // Determine context limit based on model
             let context_limit = crate::proxy::mappers::claude::utils::get_context_limit_for_model(
@@ -1376,6 +1934,23 @@ pub async fn handle_messages(
                     meta,
                 );
 
+                // [Auto-Heal] 纯思考空回复流式自愈门禁 (Pipeline First)
+                let auto_heal_ctx = crate::proxy::pipeline::auto_heal::ThinkingAutoHealContext {
+                    upstream: upstream.clone(),
+                    method,
+                    access_token: access_token.clone(),
+                    original_body: gemini_body.clone(),
+                    query_string: query,
+                    extra_headers: extra_headers.clone(),
+                    account_id: Some(account_id.clone()),
+                    trace_id: trace_id.clone(),
+                };
+                let gemini_stream =
+                    crate::proxy::pipeline::auto_heal::wrap_stream_with_empty_thinking_auto_heal(
+                        Box::pin(gemini_stream),
+                        auto_heal_ctx,
+                    );
+
                 let current_message_count = request_with_mapped.messages.len();
 
                 // [FIX #MCP] Extract registered tool names for MCP fuzzy matching
@@ -1392,7 +1967,7 @@ pub async fn handle_messages(
                     gemini_stream,
                     trace_id.clone(),
                     email.clone(),
-                    Some(session_id_str.clone()),
+                    Some(store_key.clone()),
                     scaling_enabled,
                     context_limit,
                     Some(raw_estimated), // [FIX] Pass estimated tokens for calibrator learning
@@ -1425,6 +2000,18 @@ pub async fn handle_messages(
                             if text.trim().starts_with(":") {
                                 debug!("[{}] Skipping peek heartbeat: {}", trace_id, text.trim());
                                 continue;
+                            }
+
+                            // [FIX #3593] 识别 Peek 阶段的错误事件，触发账号轮换重试而非误判为首包
+                            if claude_stream_chunk_has_error_event(&bytes) {
+                                tracing::warn!(
+                                    "[{}] Error event detected during peek: {}, retrying...",
+                                    trace_id,
+                                    text.trim()
+                                );
+                                last_error = format!("Error event during peek: {}", text.trim());
+                                retry_this_account = true;
+                                break;
                             }
 
                             // We found real data!
@@ -1550,11 +2137,14 @@ pub async fn handle_messages(
                                         .unwrap();
                                 }
                                 Err(e) => {
-                                    return (
-                                        StatusCode::INTERNAL_SERVER_ERROR,
-                                        format!("Stream collection error: {}", e),
-                                    )
-                                        .into_response();
+                                    tracing::warn!(
+                                        "[{}] Stream collection error (possibly upstream interrupted): {}, retrying with another account...",
+                                        trace_id,
+                                        e
+                                    );
+                                    last_error = format!("Stream collection error: {}", e);
+                                    force_rotate = true;
+                                    continue;
                                 }
                             }
                         }
@@ -1619,7 +2209,7 @@ pub async fn handle_messages(
 
                 // 转换
                 // [FIX #765] Pass session_id and model_name for signature caching
-                let s_id_owned = session_id.map(|s| s.to_string());
+                let s_id_owned = Some(store_key.clone());
                 // [FIX #3379] Extract registered tool names for non-streaming leakage recovery
                 let ns_registered_tool_names: Vec<String> = request_with_mapped
                     .tools
@@ -1722,8 +2312,25 @@ pub async fn handle_messages(
         );
 
         if classification.is_model_not_found() {
+            // [NEW] 针对特定账号记录单模型临时熔断（例如该 PRO 账号未开通 Claude 5.5），绝不连坐其他模型
+            token_manager.mark_model_unsupported(
+                &account_id,
+                &request_with_mapped.model,
+                Some(900),
+            );
+
+            // 如果账号池中还有其他未尝试的候选账号，则顺畅换号重试，而不是直接放弃报错
+            if attempt < pool_size {
+                tracing::warn!(
+                    "[{}] 上游报错模型不可用 (HTTP {})，已标记账号 {} 对模型 [{}] 临时熔断，继续换号重试 ({}/{})...",
+                    trace_id, status_code, email, request_with_mapped.model, attempt, pool_size
+                );
+                force_rotate = true;
+                continue;
+            }
+
             tracing::warn!(
-                "[{}] Pipeline: Target model [{}] not found on upstream (HTTP {}). Terminating retry loop without account lockout.",
+                "[{}] Pipeline: Target model [{}] not found on upstream (HTTP {}). Pool exhausted without account-level lockout.",
                 trace_id, request_with_mapped.model, status_code
             );
             let dual_err = crate::proxy::handlers::common::build_dual_track_error(
@@ -1753,16 +2360,13 @@ pub async fn handle_messages(
                     Some(&request_with_mapped.model),
                 )
                 .await;
-
-            token_manager
-                .unbind_session_and_clear_last_used(session_id)
-                .await;
-            if let Some(sid) = session_id {
-                debug!(
-                    "[{}] Unbound session {} from account {} due to status {}",
-                    trace_id, sid, email, status_code
-                );
-            }
+        }
+        if classification.abandons_sticky_account() {
+            token_manager.abandon_session(&affinity_key, &account_id);
+            debug!(
+                "[{}] Unbound session {} from account {} due to status {}",
+                trace_id, affinity_key, email, status_code
+            );
         }
 
         // 4. 处理 400 错误 (Thinking 签名失效 或 块顺序错误)
@@ -1832,9 +2436,7 @@ pub async fn handle_messages(
 
             // 精准定向净化 ThinkingStore 中当前 session 的异构污染签名，保留思考文本与健康历史签名，
             // 彻底防止重试阶段再次把坏签名还原回 contents
-            crate::proxy::thinking_store::ThinkingStore::global()
-                .purge_corrupted_signatures(&session_id_str, &mapped_model);
-            crate::proxy::SignatureCache::global().delete_session_signature(&client_session_id);
+            session_scope.purge_signatures(&mapped_model);
 
             // [FIX Prompt-Cache] 严禁在重试路径中注入合成消息 (close_tool_loop_for_thinking)！
             // 保持历史消息真实纯净，由 InboundThinkingPipeline 与 finalize_gemini_contents_thinking 统一兜底签名与占位。
@@ -1907,8 +2509,7 @@ pub async fn handle_messages(
         // 之后该 sessionId 的所有请求都 400 "input token count exceeds ... 1048576"。
         // 给 (账号, 对话) 的 sessionId 升代并立即重试:新 sessionId = 上游全新会话,对话无感恢复。
         if status_code == 400 && error_text.contains("exceeds the maximum number of tokens") {
-            let fingerprint = session_id_str.as_str();
-            let generation = crate::proxy::common::session::bump_session(&account_id, fingerprint);
+            let generation = crate::proxy::common::session::bump_session(&account_id, &store_key);
             tracing::warn!(
                 "[Claude] Upstream session token accumulation exceeded 1M on account {}. sessionId bumped to generation {}, retrying with a fresh upstream session.",
                 email, generation
@@ -2095,31 +2696,56 @@ pub async fn handle_list_models(State(state): State<AppState>) -> impl IntoRespo
     }))
 }
 
-/// 计算 tokens (占位符)
-pub async fn handle_count_tokens(
+/// Claude Models API: GET /v1/models/claude/{model}
+/// 检索指定模型的详细元数据
+pub async fn handle_retrieve_model(
     State(state): State<AppState>,
-    headers: HeaderMap,
-    Json(body): Json<Value>,
-) -> Response {
-    let zai = state.zai.read().await.clone();
-    let zai_enabled =
-        zai.enabled && !matches!(zai.dispatch_mode, crate::proxy::ZaiDispatchMode::Off);
+    axum::extract::Path(model): axum::extract::Path<String>,
+) -> impl IntoResponse {
+    use crate::proxy::common::model_mapping::find_dynamic_model;
 
-    if zai_enabled {
-        return crate::proxy::providers::zai_anthropic::forward_anthropic_json(
-            &state,
-            axum::http::Method::POST,
-            "/v1/messages/count_tokens",
-            &headers,
-            body,
-            0, // [NEW v4.0.0] Tokens count doesn't need rewind detection
+    let only_raw = *state.only_raw_quota_models.read().await;
+    if let Some(matched_id) = find_dynamic_model(
+        &state.custom_mapping,
+        Some(&state.token_manager),
+        only_raw,
+        &model,
+    )
+    .await
+    {
+        (
+            StatusCode::OK,
+            Json(json!({
+                "type": "model",
+                "id": matched_id.clone(),
+                "display_name": matched_id,
+                "created_at": "2024-10-22T00:00:00Z"
+            })),
         )
-        .await;
+            .into_response()
+    } else {
+        (
+            StatusCode::NOT_FOUND,
+            Json(json!({
+                "type": "error",
+                "error": {
+                    "type": "not_found_error",
+                    "message": format!("model: {}", model)
+                }
+            })),
+        )
+            .into_response()
     }
+}
+
+/// 计算 tokens (Anthropic 官方 Messages Count Tokens API)
+/// 接入 Pipeline 协议无关通用估算引擎与全局高并发内容哈希缓存，
+/// 严格遵循官方 Schema 仅返回 input_tokens，彻底移除非标冗余 output_tokens 字段。
+pub async fn handle_count_tokens(_headers: HeaderMap, Json(body): Json<Value>) -> Response {
+    let input_tokens = crate::proxy::pipeline::estimate_tokens(&body);
 
     Json(json!({
-        "input_tokens": 0,
-        "output_tokens": 0
+        "input_tokens": input_tokens
     }))
     .into_response()
 }
@@ -2509,7 +3135,7 @@ async fn call_gemini_sync(
 ///
 /// This function:
 /// 1. Extracts the last valid thinking signature
-/// 2. Calls a cheap model (gemini-2.5-flash-lite) to generate XML summary
+/// 2. Calls a cheap model (gemini-3.1-flash-lite via internal-background-task) to generate XML summary
 /// 3. Creates a new message sequence with summary as prefix
 /// 4. Preserves the signature in the summary
 /// 5. Returns the forked request
@@ -2571,6 +3197,7 @@ async fn try_compress_with_summary(
         output_config: None,
         size: None,
         quality: None,
+        tool_choice: None,
     };
 
     debug!(
@@ -2650,6 +3277,7 @@ async fn try_compress_with_summary(
         output_config: original_request.output_config.clone(),
         size: original_request.size.clone(),
         quality: original_request.quality.clone(),
+        tool_choice: original_request.tool_choice.clone(),
     })
 }
 
@@ -2710,6 +3338,7 @@ mod warmup_tests {
             output_config: None,
             size: None,
             quality: None,
+            tool_choice: None,
         };
         assert!(is_warmup_request(&exact_req));
 
@@ -2732,6 +3361,7 @@ mod warmup_tests {
             output_config: None,
             size: None,
             quality: None,
+            tool_choice: None,
         };
         assert!(!is_warmup_request(&real_question_req));
 
@@ -2758,7 +3388,579 @@ mod warmup_tests {
             output_config: None,
             size: None,
             quality: None,
+            tool_choice: None,
         };
         assert!(!is_warmup_request(&tool_error_req));
+    }
+
+    #[test]
+    fn test_is_manual_compact_command() {
+        use crate::proxy::mappers::claude::models::{ContentBlock, Message, MessageContent};
+
+        // 1. 标准 ./compact 字符串
+        let req1 = ClaudeRequest {
+            model: "claude-3-7-sonnet".to_string(),
+            messages: vec![Message {
+                role: "user".to_string(),
+                content: MessageContent::String("./compact".to_string()),
+            }],
+            system: None,
+            max_tokens: Some(100),
+            stream: false,
+            temperature: None,
+            top_p: None,
+            top_k: None,
+            tools: None,
+            thinking: None,
+            metadata: None,
+            output_config: None,
+            size: None,
+            quality: None,
+            tool_choice: None,
+        };
+        assert!(is_manual_compact_command(&req1));
+
+        // 2. 带 system-reminder 干扰的 ./compact
+        let req2 = ClaudeRequest {
+            model: "claude-3-7-sonnet".to_string(),
+            messages: vec![Message {
+                role: "user".to_string(),
+                content: MessageContent::String(
+                    "<system-reminder>some reminder</system-reminder>\n\n./compact".to_string(),
+                ),
+            }],
+            system: None,
+            max_tokens: Some(100),
+            stream: false,
+            temperature: None,
+            top_p: None,
+            top_k: None,
+            tools: None,
+            thinking: None,
+            metadata: None,
+            output_config: None,
+            size: None,
+            quality: None,
+            tool_choice: None,
+        };
+        assert!(is_manual_compact_command(&req2));
+
+        // 3. Array 结构的 ContentBlock 文本
+        let req3 = ClaudeRequest {
+            model: "claude-3-7-sonnet".to_string(),
+            messages: vec![Message {
+                role: "user".to_string(),
+                content: MessageContent::Array(vec![ContentBlock::Text {
+                    text: "./compact please summarize".to_string(),
+                }]),
+            }],
+            system: None,
+            max_tokens: Some(100),
+            stream: false,
+            temperature: None,
+            top_p: None,
+            top_k: None,
+            tools: None,
+            thinking: None,
+            metadata: None,
+            output_config: None,
+            size: None,
+            quality: None,
+            tool_choice: None,
+        };
+        assert!(is_manual_compact_command(&req3));
+
+        // 4. 普通用户提问，不应误判
+        let req4 = ClaudeRequest {
+            model: "claude-3-7-sonnet".to_string(),
+            messages: vec![Message {
+                role: "user".to_string(),
+                content: MessageContent::String("How to use compact method in Ruby?".to_string()),
+            }],
+            system: None,
+            max_tokens: Some(100),
+            stream: false,
+            temperature: None,
+            top_p: None,
+            top_k: None,
+            tools: None,
+            thinking: None,
+            metadata: None,
+            output_config: None,
+            size: None,
+            quality: None,
+            tool_choice: None,
+        };
+        assert!(!is_manual_compact_command(&req4));
+    }
+
+    #[test]
+    fn test_make_compact_responses() {
+        let text = "Compacted conversation · saved 289k tokens";
+        let sse = make_compact_sse_response(text, "claude-3-7-sonnet", 45100);
+        assert!(sse.contains("event: message_start"));
+        assert!(sse.contains("Compacted conversation · saved 289k tokens"));
+        assert!(sse.contains("\"input_tokens\":45100"));
+
+        let json = make_compact_json_response(text, "claude-3-7-sonnet", 45100);
+        assert_eq!(json["role"], "assistant");
+        assert_eq!(json["content"][0]["text"], text);
+        assert_eq!(json["usage"]["input_tokens"], 45100);
+    }
+
+    #[test]
+    fn test_calculate_claude_fixed_overhead_and_solvable_target_limit() {
+        use crate::proxy::mappers::claude::models::{SystemBlock, SystemPrompt, Tool};
+
+        let req = ClaudeRequest {
+            model: "claude-3-7-sonnet".to_string(),
+            messages: vec![],
+            system: Some(SystemPrompt::Array(vec![SystemBlock {
+                block_type: "text".to_string(),
+                text: "You are Claude Code, an AI assistant.".to_string(),
+            }])),
+            tools: Some(vec![
+                Tool {
+                    type_: None,
+                    name: Some("Bash".to_string()),
+                    description: Some("Execute bash command".to_string()),
+                    input_schema: None,
+                },
+                Tool {
+                    type_: None,
+                    name: Some("Read".to_string()),
+                    description: Some("Read file".to_string()),
+                    input_schema: None,
+                },
+            ]),
+            ..Default::default()
+        };
+
+        let overhead = calculate_claude_fixed_overhead(&req);
+        assert!(overhead > 0);
+        let target_limit = (overhead + 15_000).max(35_000);
+        assert!(target_limit >= 35_000);
+        assert!(target_limit >= overhead + 15_000);
+    }
+
+    #[test]
+    fn test_compact_session_orphan_timeout_eviction() {
+        let session_key = "test_orphan_session_eviction".to_string();
+        COWORK_COMPACT_SESSIONS.insert(
+            session_key.clone(),
+            CoworkCompactState {
+                kind: CoworkCompactKind::Manual,
+                before_tokens: 100_000,
+                ts: std::time::Instant::now() - std::time::Duration::from_secs(301),
+                summary_done: false,
+                target_limit: 35_000,
+            },
+        );
+
+        let is_in_compaction_active = is_session_in_compaction(&session_key);
+
+        assert!(
+            !is_in_compaction_active,
+            "Expired orphan session must not be considered in compaction"
+        );
+        assert!(
+            !COWORK_COMPACT_SESSIONS.contains_key(&session_key),
+            "Expired orphan session must be evicted from map"
+        );
+    }
+
+    #[test]
+    fn test_just_compacted_cache_expiration_and_capacity_cap() {
+        let session_key = "test_expired_compacted_session".to_string();
+        COWORK_JUST_COMPACTED_CACHE.insert(
+            session_key.clone(),
+            (
+                std::time::Instant::now() - std::time::Duration::from_secs(65),
+                "Compacted conversation".to_string(),
+                20_000,
+            ),
+        );
+
+        let now = std::time::Instant::now();
+        if let Some(entry) = COWORK_JUST_COMPACTED_CACHE.get(&session_key) {
+            let (cached_ts, _, _) = *entry;
+            if now.duration_since(cached_ts).as_secs() < 60 {
+                panic!("Should not hit cache for expired entry");
+            } else {
+                drop(entry);
+                COWORK_JUST_COMPACTED_CACHE.remove(&session_key);
+            }
+        }
+
+        assert!(
+            !COWORK_JUST_COMPACTED_CACHE.contains_key(&session_key),
+            "Expired entry must be actively removed from COWORK_JUST_COMPACTED_CACHE"
+        );
+
+        // Test capacity cap behavior
+        for i in 0..1005 {
+            let k = format!("cap_test_session_{}", i);
+            COWORK_JUST_COMPACTED_CACHE.insert(
+                k,
+                (
+                    std::time::Instant::now() - std::time::Duration::from_secs(70),
+                    "Compacted conversation".to_string(),
+                    10_000,
+                ),
+            );
+        }
+
+        if COWORK_JUST_COMPACTED_CACHE.len() >= MAX_JUST_COMPACTED_CACHE_CAPACITY {
+            let purge_now = std::time::Instant::now();
+            COWORK_JUST_COMPACTED_CACHE
+                .retain(|_, (ts, _, _)| purge_now.duration_since(*ts).as_secs() < 60);
+            if COWORK_JUST_COMPACTED_CACHE.len() >= MAX_JUST_COMPACTED_CACHE_CAPACITY {
+                COWORK_JUST_COMPACTED_CACHE.clear();
+            }
+        }
+
+        assert!(
+            COWORK_JUST_COMPACTED_CACHE.len() <= MAX_JUST_COMPACTED_CACHE_CAPACITY,
+            "Cache length must not exceed maximum capacity"
+        );
+    }
+
+    #[test]
+    fn test_compaction_immunity_lease_lifecycle() {
+        let session_key = "test_lease_lifecycle".to_string();
+        let now = std::time::Instant::now();
+        COMPACTION_IMMUNITY_LEASES.insert(
+            session_key.clone(),
+            CompactionImmunityLease {
+                created_at: now,
+                last_touched: now,
+                consumed: false,
+            },
+        );
+
+        // Turn 1: Initial passthrough activates sliding window
+        let is_compaction_req = false;
+        let mut passed = false;
+        if !is_compaction_req {
+            if let Some(mut lease) = COMPACTION_IMMUNITY_LEASES.get_mut(&session_key) {
+                let check_now = std::time::Instant::now();
+                let valid = if !lease.consumed {
+                    check_now.duration_since(lease.created_at).as_secs()
+                        < COMPACTION_IMMUNITY_INITIAL_TTL_SECS
+                } else {
+                    check_now.duration_since(lease.last_touched).as_secs()
+                        < COMPACTION_IMMUNITY_WINDOW_SECS
+                };
+                if valid {
+                    lease.consumed = true;
+                    lease.last_touched = check_now;
+                    passed = true;
+                }
+            }
+        }
+        assert!(passed, "Turn 1 must pass through and activate lease");
+        assert!(
+            COMPACTION_IMMUNITY_LEASES
+                .get(&session_key)
+                .unwrap()
+                .consumed,
+            "Lease must be marked as consumed"
+        );
+
+        // Turn 2: Concurrent request / tool call within 30s sliding window passes through
+        passed = false;
+        if !is_compaction_req {
+            if let Some(mut lease) = COMPACTION_IMMUNITY_LEASES.get_mut(&session_key) {
+                let check_now = std::time::Instant::now();
+                let valid = if !lease.consumed {
+                    check_now.duration_since(lease.created_at).as_secs()
+                        < COMPACTION_IMMUNITY_INITIAL_TTL_SECS
+                } else {
+                    check_now.duration_since(lease.last_touched).as_secs()
+                        < COMPACTION_IMMUNITY_WINDOW_SECS
+                };
+                if valid {
+                    lease.last_touched = check_now;
+                    passed = true;
+                }
+            }
+        }
+        assert!(
+            passed,
+            "Concurrent turn within sliding window must pass through"
+        );
+
+        // Expired lease after window is evicted
+        if let Some(mut lease) = COMPACTION_IMMUNITY_LEASES.get_mut(&session_key) {
+            lease.last_touched = std::time::Instant::now() - std::time::Duration::from_secs(35);
+        }
+        passed = false;
+        if !is_compaction_req {
+            if let Some(lease) = COMPACTION_IMMUNITY_LEASES.get_mut(&session_key) {
+                let check_now = std::time::Instant::now();
+                let valid = if !lease.consumed {
+                    check_now.duration_since(lease.created_at).as_secs()
+                        < COMPACTION_IMMUNITY_INITIAL_TTL_SECS
+                } else {
+                    check_now.duration_since(lease.last_touched).as_secs()
+                        < COMPACTION_IMMUNITY_WINDOW_SECS
+                };
+                if valid {
+                    passed = true;
+                } else {
+                    drop(lease);
+                    COMPACTION_IMMUNITY_LEASES.remove(&session_key);
+                }
+            }
+        }
+        assert!(!passed, "Expired lease must not pass through");
+        assert!(
+            !COMPACTION_IMMUNITY_LEASES.contains_key(&session_key),
+            "Expired lease must be removed"
+        );
+    }
+
+    #[test]
+    fn test_claude_stream_chunk_has_error_event() {
+        // Normal text chunk
+        let normal = b"event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"type\":\"message\",\"role\":\"assistant\",\"content\":[]}}\n\n";
+        assert!(!claude_stream_chunk_has_error_event(normal));
+
+        // Normal text delta containing word 'error' in user text
+        let delta = b"event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"there is an error in code\"}}\n\n";
+        assert!(!claude_stream_chunk_has_error_event(delta));
+
+        // Error event from create_claude_sse_stream
+        let error_chunk = b"event: error\ndata: {\"error\":{\"call_site\":\"src/proxy/mappers/claude/mod.rs:98\",\"function\":\"create_claude_sse_stream\",\"message\":\"Stream interrupted\",\"params\":\"trace=xxx\",\"type\":\"stream_error\"},\"type\":\"error\"}\n\n";
+        assert!(claude_stream_chunk_has_error_event(error_chunk));
+
+        // Bare error event
+        let bare_error = b"data: {\"type\":\"error\",\"error\":{\"message\":\"fail\"}}\n\n";
+        assert!(claude_stream_chunk_has_error_event(bare_error));
+
+        // Heartbeat ping
+        let heartbeat = b": ping\n\n";
+        assert!(!claude_stream_chunk_has_error_event(heartbeat));
+    }
+
+    #[test]
+    fn test_calculate_claude_fixed_overhead_includes_schema_and_description() {
+        use crate::proxy::mappers::claude::models::Tool;
+
+        let req_without_schema = ClaudeRequest {
+            model: "claude-3-7-sonnet".to_string(),
+            messages: vec![],
+            system: None,
+            tools: Some(vec![Tool {
+                type_: None,
+                name: Some("test_tool".to_string()),
+                description: None,
+                input_schema: None,
+            }]),
+            ..Default::default()
+        };
+        let overhead_small = calculate_claude_fixed_overhead(&req_without_schema);
+
+        let large_schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "param1": {"type": "string", "description": "A very detailed description of parameter one that takes up lots of tokens"},
+                "param2": {"type": "array", "items": {"type": "string"}, "description": "Another parameter with deep nested definitions"},
+                "param3": {"type": "object", "properties": {"nested": {"type": "boolean"}}}
+            },
+            "required": ["param1"]
+        });
+
+        let req_with_schema = ClaudeRequest {
+            model: "claude-3-7-sonnet".to_string(),
+            messages: vec![],
+            system: None,
+            tools: Some(vec![Tool {
+                type_: None,
+                name: Some("test_tool".to_string()),
+                description: Some("This is a comprehensive description of the tool that explains its purpose and behavior in great detail.".to_string()),
+                input_schema: Some(large_schema),
+            }]),
+            ..Default::default()
+        };
+        let overhead_large = calculate_claude_fixed_overhead(&req_with_schema);
+
+        assert!(
+            overhead_large > overhead_small + 50,
+            "Overhead must properly include tool descriptions and input_schemas"
+        );
+    }
+
+    #[test]
+    fn test_compact_sessions_capacity_and_prune() {
+        for i in 0..1010 {
+            COWORK_COMPACT_SESSIONS.insert(
+                format!("test_cap_session_{}", i),
+                CoworkCompactState {
+                    kind: CoworkCompactKind::Auto,
+                    before_tokens: 50_000,
+                    ts: std::time::Instant::now() - std::time::Duration::from_secs(350),
+                    summary_done: false,
+                    target_limit: 35_000,
+                },
+            );
+        }
+
+        prune_compact_sessions_if_needed();
+        assert!(
+            COWORK_COMPACT_SESSIONS.len() <= MAX_COMPACT_SESSIONS_CAPACITY,
+            "Pruning must enforce capacity limit and evict timed-out entries"
+        );
+    }
+
+    #[test]
+    fn test_compaction_lease_expiration_does_not_fall_back_to_weak_continuation() {
+        let session_key = "test_lease_no_weak_fallback".to_string();
+        COMPACTION_IMMUNITY_LEASES.insert(
+            session_key.clone(),
+            CompactionImmunityLease {
+                created_at: std::time::Instant::now() - std::time::Duration::from_secs(100),
+                last_touched: std::time::Instant::now() - std::time::Duration::from_secs(50),
+                consumed: true,
+            },
+        );
+
+        let is_compaction_request = false;
+        let is_post_compaction = if !is_compaction_request {
+            if let Some(mut lease) = COMPACTION_IMMUNITY_LEASES.get_mut(&session_key) {
+                let now = std::time::Instant::now();
+                let valid = if !lease.consumed {
+                    now.duration_since(lease.created_at).as_secs()
+                        < COMPACTION_IMMUNITY_INITIAL_TTL_SECS
+                } else {
+                    now.duration_since(lease.last_touched).as_secs()
+                        < COMPACTION_IMMUNITY_WINDOW_SECS
+                };
+                if valid {
+                    lease.consumed = true;
+                    lease.last_touched = now;
+                    true
+                } else {
+                    drop(lease);
+                    COMPACTION_IMMUNITY_LEASES.remove(&session_key);
+                    false
+                }
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+
+        assert!(
+            !is_post_compaction,
+            "Expired lease must strictly return false without granting permanent immunity"
+        );
+        assert!(!COMPACTION_IMMUNITY_LEASES.contains_key(&session_key));
+    }
+
+    #[test]
+    fn test_detect_post_compaction_continuation_multi_block() {
+        use crate::proxy::mappers::claude::models::{ContentBlock, Message, MessageContent};
+
+        // Case 1: First block is <system-reminder>, second block is continuation text
+        let req_multi_block = ClaudeRequest {
+            model: "claude-3-7-sonnet".to_string(),
+            messages: vec![Message {
+                role: "user".to_string(),
+                content: MessageContent::Array(vec![
+                    ContentBlock::Text {
+                        text: "<system-reminder>Some system reminder</system-reminder>".to_string(),
+                    },
+                    ContentBlock::Text {
+                        text: "This session is being continued from a previous conversation that ran out of context.".to_string(),
+                    },
+                ]),
+            }],
+            ..Default::default()
+        };
+
+        assert!(
+            detect_post_compaction_continuation(&req_multi_block),
+            "Multi-block continuation must be detected even when preceded by system reminder"
+        );
+
+        // Case 2: Negative case
+        let req_normal = ClaudeRequest {
+            model: "claude-3-7-sonnet".to_string(),
+            messages: vec![Message {
+                role: "user".to_string(),
+                content: MessageContent::String("Hello, how are you?".to_string()),
+            }],
+            ..Default::default()
+        };
+        assert!(!detect_post_compaction_continuation(&req_normal));
+    }
+
+    #[test]
+    fn test_calculate_effective_auto_compact_threshold_guarantees_headroom() {
+        // User sets threshold to 50k, but large tool overhead makes target_limit 53k
+        let user_threshold = 50_000;
+        let target_limit = 53_000;
+        let effective = calculate_effective_auto_compact_threshold(user_threshold, target_limit);
+
+        // Effective threshold must be at least target_limit + 25,000 = 78,000
+        assert_eq!(effective, 78_000);
+        assert!(effective >= target_limit + 25_000);
+
+        // If user threshold is generous (e.g. 120k), user threshold is respected
+        let generous_threshold = 120_000;
+        assert_eq!(
+            calculate_effective_auto_compact_threshold(generous_threshold, target_limit),
+            120_000
+        );
+    }
+
+    #[test]
+    fn test_unified_compaction_state_machine_prevents_collision() {
+        let session_key = "test_unified_compaction_collision".to_string();
+
+        // 1. Auto-compaction triggers, registers in unified state
+        let target_limit = 45_000;
+        COWORK_COMPACT_SESSIONS.insert(
+            session_key.clone(),
+            CoworkCompactState {
+                kind: CoworkCompactKind::Auto,
+                before_tokens: 90_000,
+                ts: std::time::Instant::now(),
+                summary_done: false,
+                target_limit,
+            },
+        );
+
+        // 2. Both manual and auto compact recognize the session is in compaction
+        assert!(is_session_in_compaction(&session_key));
+
+        // 3. Summary request arrives, marks summary_done
+        if let Some(mut state) = COWORK_COMPACT_SESSIONS.get_mut(&session_key) {
+            state.summary_done = true;
+        }
+
+        // 4. Continuation arrives with reduced context (e.g. 42_000 tokens)
+        let est_tokens = 42_000;
+        if let Some((_, state)) = COWORK_COMPACT_SESSIONS.remove(&session_key) {
+            let saved = state.before_tokens.saturating_sub(est_tokens);
+            assert_eq!(saved, 48_000);
+            COWORK_JUST_COMPACTED_CACHE.insert(
+                session_key.clone(),
+                (
+                    std::time::Instant::now(),
+                    format!("Compacted conversation · saved {}k tokens", saved / 1000),
+                    est_tokens,
+                ),
+            );
+        }
+
+        // 5. Active compaction state is cleared, cache is populated
+        assert!(!is_session_in_compaction(&session_key));
+        assert!(COWORK_JUST_COMPACTED_CACHE.contains_key(&session_key));
+
+        // Clean up
+        COWORK_JUST_COMPACTED_CACHE.remove(&session_key);
     }
 }

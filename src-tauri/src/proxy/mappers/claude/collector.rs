@@ -1,5 +1,5 @@
-// Stream collector - converts an SSE stream into a complete JSON response
-// Used for automatic conversion of non-Stream requests
+// Stream 收集器 - 将 SSE 流转换为完整的 JSON 响应
+// 用于非 Stream 请求的自动转换
 
 use super::models::*;
 use bytes::Bytes;
@@ -7,17 +7,17 @@ use futures::StreamExt;
 use serde_json::{json, Value};
 use std::io;
 
-/// SSE event type
+/// SSE 事件类型
 #[derive(Debug, Clone)]
 struct SseEvent {
     event_type: String,
     data: Value,
 }
 
-/// Parse an SSE line
+/// 解析 SSE 行
 fn parse_sse_line(line: &str) -> Option<(String, String)> {
     if let Some(colon_pos) = line.find(':') {
-        let key = &line[..colon_pos];
+        let key = line[..colon_pos].trim();
         let value = line[colon_pos + 1..].trim_start();
         Some((key.to_string(), value.to_string()))
     } else {
@@ -25,26 +25,42 @@ fn parse_sse_line(line: &str) -> Option<(String, String)> {
     }
 }
 
-/// Collect an SSE Stream into a complete Claude Response
+/// 将 SSE Stream 收集为完整的 Claude Response
 ///
-/// This function receives an SSE byte stream, parses all events, and reconstructs a complete ClaudeResponse object.
-/// This lets non-Stream clients transparently benefit from Stream mode's quota advantages.
+/// 此函数接收一个 SSE 字节流，解析所有事件，并重建完整的 ClaudeResponse 对象。
+/// 这使得非 Stream 客户端可以透明地享受 Stream 模式的配额优势。
 pub async fn collect_stream_to_json<S>(mut stream: S) -> Result<ClaudeResponse, String>
 where
     S: futures::Stream<Item = Result<Bytes, io::Error>> + Unpin,
 {
+    use bytes::BytesMut;
+
     let mut events = Vec::new();
     let mut current_event_type = String::new();
     let mut current_data = String::new();
+    let mut line_buffer = BytesMut::new();
 
-    // 1. Collect all SSE events
+    // 1. 收集所有 SSE 事件（采用字节级行缓冲，杜绝非 ASCII 字符或大数据包跨 chunk 切割损坏）
     while let Some(chunk_result) = stream.next().await {
-        let chunk = chunk_result.map_err(|e| format!("Stream error: {}", e))?;
-        let text = String::from_utf8_lossy(&chunk);
+        let chunk = chunk_result.map_err(|e| {
+            crate::proxy::mappers::error_classifier::report_stream_error(
+                "claude-collector",
+                "collect_stream_to_json",
+                &e,
+                "protocol=claude",
+            )
+            .client_message()
+        })?;
 
-        for line in text.lines() {
+        line_buffer.extend_from_slice(&chunk);
+
+        while let Some(pos) = line_buffer.iter().position(|&b| b == b'\n') {
+            let line_raw = line_buffer.split_to(pos + 1);
+            let line_str = String::from_utf8_lossy(&line_raw);
+            let line = line_str.trim_end_matches(&['\r', '\n'][..]);
+
             if line.is_empty() {
-                // An empty line marks the end of an event
+                // 空行表示当前 SSE 事件结束
                 if !current_data.is_empty() {
                     if let Ok(data) = serde_json::from_str::<Value>(&current_data) {
                         events.push(SseEvent {
@@ -58,14 +74,45 @@ where
             } else if let Some((key, value)) = parse_sse_line(line) {
                 match key.as_str() {
                     "event" => current_event_type = value,
-                    "data" => current_data = value,
+                    "data" => {
+                        if !current_data.is_empty() {
+                            current_data.push('\n');
+                        }
+                        current_data.push_str(&value);
+                    }
                     _ => {}
                 }
             }
         }
     }
 
-    // 2. Reconstruct the ClaudeResponse
+    // 处理流结束时缓冲区剩余数据（若末行缺少换行符）
+    if !line_buffer.is_empty() {
+        let line_str = String::from_utf8_lossy(&line_buffer);
+        let line = line_str.trim_end_matches(&['\r', '\n'][..]);
+        if let Some((key, value)) = parse_sse_line(line) {
+            match key.as_str() {
+                "event" => current_event_type = value,
+                "data" => {
+                    if !current_data.is_empty() {
+                        current_data.push('\n');
+                    }
+                    current_data.push_str(&value);
+                }
+                _ => {}
+            }
+        }
+        if !current_data.is_empty() {
+            if let Ok(data) = serde_json::from_str::<Value>(&current_data) {
+                events.push(SseEvent {
+                    event_type: current_event_type,
+                    data,
+                });
+            }
+        }
+    }
+
+    // 2. 重建 ClaudeResponse
     let mut response = ClaudeResponse {
         id: "msg_unknown".to_string(),
         type_: "message".to_string(),
@@ -83,7 +130,7 @@ where
         },
     };
 
-    // Used to accumulate content blocks
+    // 用于累积内容块
     let mut current_text = String::new();
     let mut current_thinking = String::new();
     let mut current_signature: Option<String> = None;
@@ -93,7 +140,7 @@ where
     for event in events {
         match event.event_type.as_str() {
             "message_start" => {
-                // Extract basic info
+                // 提取基本信息
                 if let Some(message) = event.data.get("message") {
                     if let Some(id) = message.get("id").and_then(|v| v.as_str()) {
                         response.id = id.to_string();
@@ -171,7 +218,7 @@ where
             }
 
             "content_block_stop" => {
-                // Finalize the current block
+                // 完成当前块
                 if !current_text.is_empty() {
                     response.content.push(ContentBlock::Text {
                         text: current_text.clone(),
@@ -185,7 +232,7 @@ where
                     });
                     current_thinking.clear();
                 } else if let Some(tool_use) = current_tool_use.take() {
-                    // Build the tool_use block
+                    // 构建 tool_use 块
                     let id = tool_use
                         .get("id")
                         .and_then(|v| v.as_str())
@@ -227,12 +274,12 @@ where
             }
 
             "message_stop" => {
-                // Stream ended
+                // Stream 结束
                 break;
             }
 
             "error" => {
-                // Error event
+                // 错误事件
                 let error_data = event.data.get("error").unwrap_or(&event.data);
                 let message = error_data
                     .get("message")
@@ -242,7 +289,7 @@ where
             }
 
             _ => {
-                // Ignore unknown event types
+                // 忽略未知事件类型
             }
         }
     }
@@ -264,7 +311,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_collect_simple_text_response() {
-        // Simulate a simple text-response SSE stream
+        // 模拟一个简单的文本响应 SSE 流
         let sse_data = vec![
             "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_123\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"claude-3-5-sonnet\",\"content\":[],\"stop_reason\":null,\"usage\":{\"input_tokens\":10,\"output_tokens\":0}}}\n\n",
             "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
@@ -298,10 +345,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_collect_thinking_response_with_signature() {
-        // Simulate an SSE stream containing a Thinking Block and a signature
+        // 模拟一个包含 Thinking Block 和签名的 SSE 流
         let sse_data = vec![
             "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_think\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"claude-3-7-sonnet\",\"content\":[],\"stop_reason\":null,\"usage\":{\"input_tokens\":10,\"output_tokens\":0}}}\n\n",
-            // content_block_start contains a signature
+            // content_block_start 中包含 signature
             "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"thinking\",\"thinking\":\"\", \"signature\": \"sig_123456\"}}\n\n",
             "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\"I am \"}}\n\n",
             "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\"thinking\"}}\n\n",
@@ -328,7 +375,7 @@ mod tests {
         } = &response.content[0]
         {
             assert_eq!(thinking, "I am thinking");
-            // Verify that the signature was extracted correctly
+            // 验证签名是否被正确提取
             assert_eq!(signature.as_deref(), Some("sig_123456"));
         } else {
             panic!("Expected Thinking block");
@@ -373,7 +420,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_collect_empty_stream_fallback() {
-        // [FIX #3359] Simulate an empty content stream containing only message_start and message_stop (e.g. a single-dot probe request)
+        // [FIX #3359] 模拟仅包含 message_start 和 message_stop 的空内容流（如单点探测请求）
         let sse_data = vec![
             "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_empty\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"gemini-3.7-flash\",\"content\":[],\"stop_reason\":null,\"usage\":{\"input_tokens\":1,\"output_tokens\":0}}}\n\n",
             "event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":0}}\n\n",
@@ -396,6 +443,45 @@ mod tests {
             assert_eq!(text, ".");
         } else {
             panic!("Expected fallback Text block");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_collect_multibyte_chunk_split_with_cyrillic() {
+        // [FIX #3593] 模拟俄语等多字节 UTF-8 字符在 TCP chunk 边界被硬生生切成两半的极端场景
+        let cyrillic_word = "Привет, мир! 🚀"; // 俄语 + emoji
+        let sse_data = vec![
+            "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_cyrillic\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"claude-3-7-sonnet\",\"content\":[],\"stop_reason\":null,\"usage\":{\"input_tokens\":10,\"output_tokens\":20}}}\n\n".to_string(),
+            "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n".to_string(),
+            format!("event: content_block_delta\ndata: {{\"type\":\"content_block_delta\",\"index\":0,\"delta\":{{\"type\":\"text_delta\",\"text\":\"{}\"}}}}\n\n", cyrillic_word),
+            "event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n".to_string(),
+            "event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":20}}\n\n".to_string(),
+            "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n".to_string(),
+        ];
+        let full_sse = sse_data.join("");
+        let bytes = full_sse.into_bytes();
+        // 刻意在中间每一个可能切开多字节 UTF-8 的奇怪位置（如每 17 个字节）切一块
+        let chunk_size = 17;
+        let mut chunks = Vec::new();
+        for chunk in bytes.chunks(chunk_size) {
+            chunks.push(Ok::<Bytes, io::Error>(Bytes::copy_from_slice(chunk)));
+        }
+
+        let byte_stream = stream::iter(chunks);
+        let result = collect_stream_to_json(byte_stream).await;
+        assert!(
+            result.is_ok(),
+            "Collector must successfully assemble chopped chunks: {:?}",
+            result.err()
+        );
+
+        let response = result.unwrap();
+        assert_eq!(response.id, "msg_cyrillic");
+        assert_eq!(response.content.len(), 1);
+        if let ContentBlock::Text { text } = &response.content[0] {
+            assert_eq!(text, cyrillic_word);
+        } else {
+            panic!("Expected text block");
         }
     }
 }

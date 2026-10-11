@@ -51,8 +51,7 @@ pub fn resolve_effective_target(
         is_ide = false;
     } else if let Some(exe_str) = ide_exe_path {
         // 原生经典版不存在，检查是否存在 IDE 可执行文件
-        let path_lower = exe_str.to_lowercase();
-        if path_lower.contains("antigravity ide") || path_lower.contains("antigravity-ide") {
+        if process::is_antigravity_ide_str(exe_str) {
             is_ide = true;
         }
     }
@@ -231,6 +230,10 @@ impl SystemIntegration for DesktopIntegration {
 
         if target_ide == Some("agy") {
             write_to_system_keyring(account)?;
+            // A successful write (or a file fallback) is not proof that the CLI
+            // will read this account from the system credential store.
+            let stored = read_from_system_keyring_only()?;
+            verify_agy_credentials(&account.token.refresh_token, &stored.refresh_token)?;
 
             if let Ok(storage_path) = device::get_storage_path(target_ide) {
                 if let Some(ref profile) = account.device_profile {
@@ -241,12 +244,12 @@ impl SystemIntegration for DesktopIntegration {
             let is_running = process::is_process_running_by_name("agy");
             let msg = if is_running {
                 format!(
-                    "Account {} activated. Agy is running, token will be picked up automatically.",
+                    "Credentials for {} saved and verified. Running agy sessions may still use and write back their previous credentials.",
                     account.email
                 )
             } else {
                 format!(
-                    "Account {} activated. Token is ready for your next CLI command.",
+                    "Credentials for {} saved and verified for the next CLI command.",
                     account.email
                 )
             };
@@ -259,7 +262,7 @@ impl SystemIntegration for DesktopIntegration {
         // 1. 智能决策：判断目标是 Antigravity IDE (VS Code 定制版) 还是 Antigravity 经典版 (原生桌面端)
         let classic_running = process::is_antigravity_running(None);
         let ide_running = process::is_antigravity_running(Some("ide"));
-        let classic_exe = process::get_antigravity_executable_path(None);
+        let classic_exe = process::get_antigravity_executable_path(Some("classic"));
         let ide_exe = process::get_antigravity_executable_path(Some("ide"));
         let ide_exe_str = ide_exe.as_ref().map(|p| p.to_string_lossy().to_string());
 
@@ -387,11 +390,22 @@ impl SystemIntegration for DesktopIntegration {
             process::close_antigravity(20, effective_target)?;
         }
 
-        process::start_antigravity_with_fallback_path(
+        if let Err(e) = process::start_antigravity_with_fallback_path(
             effective_target,
             active_exe_path.as_deref(),
             active_args.as_deref(),
-        )?;
+        ) {
+            // 若切号前外部客户端原本就没有处于运行状态，且启动失败原因是找不到客户端可执行文件
+            // （例如纯反代服务模式、未安装 GUI 客户端或无头环境）：
+            // 此时凭据和配置已经写入成功，降级处理并记录信息，避免让整个切号操作报错中断。
+            if !running && process::is_client_executable_missing(&e) {
+                crate::modules::logger::log_info(
+                    "[Desktop] Client executable not found and was not running before switch; credentials applied successfully.",
+                );
+            } else {
+                return Err(e);
+            }
+        }
 
         // 4. 更新托盘
         let _ = crate::modules::tray::update_tray_menus(&self.app_handle);
@@ -412,8 +426,13 @@ impl SystemIntegration for DesktopIntegration {
 /// 辅助方法：向宿主操作系统的 Keychain/Credentials Manager 写入 Token
 fn write_to_system_keyring(account: &crate::models::Account) -> Result<(), String> {
     // 1. 构建 Token 的 JSON Payload，并将过期时间戳格式化为符合 RFC3339 的带微秒格式
-    let expiry_datetime = chrono::DateTime::from_timestamp(account.token.expiry_timestamp, 0)
-        .unwrap_or_else(|| chrono::Utc::now());
+    let expiry_secs = if account.token.expiry_timestamp > 10_000_000_000 {
+        account.token.expiry_timestamp / 1000
+    } else {
+        account.token.expiry_timestamp
+    };
+    let expiry_datetime =
+        chrono::DateTime::from_timestamp(expiry_secs, 0).unwrap_or_else(|| chrono::Utc::now());
     let expiry_str = expiry_datetime.to_rfc3339_opts(chrono::SecondsFormat::Micros, true);
 
     #[derive(serde::Serialize)]
@@ -428,6 +447,8 @@ fn write_to_system_keyring(account: &crate::models::Account) -> Result<(), Strin
     struct KeyringPayload {
         token: KeyringTokenDetails,
         auth_method: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        id_token: Option<String>,
     }
 
     let payload_json = serde_json::to_string(&KeyringPayload {
@@ -438,6 +459,7 @@ fn write_to_system_keyring(account: &crate::models::Account) -> Result<(), Strin
             expiry: expiry_str,
         },
         auth_method: "consumer".to_string(),
+        id_token: account.token.id_token.clone(),
     })
     .map_err(|e| format!("Failed to serialize keyring JSON: {}", e))?;
 
@@ -646,7 +668,10 @@ fn write_to_system_keyring(account: &crate::models::Account) -> Result<(), Strin
         };
 
         // 1. 优先尝试写入 'login' 集合（agy CLI 所需）
-        let login_res = store_to_collection(Some("login"), payload_json.as_bytes());
+        let login_res = store_to_collection(
+            Some("/org/freedesktop/secrets/collection/login"),
+            payload_json.as_bytes(),
+        );
 
         // 2. 同时写入默认集合（保证其他依赖 default collection 的系统工具也能读取）
         let default_res = store_to_collection(None, payload_json.as_bytes());
@@ -681,7 +706,7 @@ fn write_to_system_keyring(account: &crate::models::Account) -> Result<(), Strin
     Ok(())
 }
 
-/// 辅助方法：同步写入本地文件凭据 (~/.gemini/oauth_creds.json 以及 ~/.gemini/google_accounts.json)
+/// 辅助方法：同步写入本地文件凭据 (~/.gemini/antigravity-cli/antigravity-oauth-token 以及 ~/.gemini/oauth_creds.json)
 /// 用于在 SSH 会话、容器环境或无系统 Keyring / D-Bus 的场景下保障 CLI/工具的凭据兼容性
 fn write_to_file_credentials(account: &crate::models::Account) -> Result<(), String> {
     let home = match dirs::home_dir() {
@@ -700,6 +725,78 @@ fn write_to_file_credentials(account: &crate::models::Account) -> Result<(), Str
         }
     }
 
+    // 1. 同步写入 Antigravity CLI (agy) 原生文件凭据: ~/.gemini/antigravity-cli/antigravity-oauth-token
+    // 兼容 SSH 会话、tmux、Docker 容器以及无 D-Bus 桌面环境
+    let agy_cli_dir = gemini_dir.join("antigravity-cli");
+    if !agy_cli_dir.exists() {
+        if let Err(e) = std::fs::create_dir_all(&agy_cli_dir) {
+            crate::modules::logger::log_warn(&format!(
+                "[Desktop] Failed to create antigravity-cli directory: {}",
+                e
+            ));
+        }
+    }
+
+    let expiry_secs = if account.token.expiry_timestamp > 10_000_000_000 {
+        account.token.expiry_timestamp / 1000
+    } else {
+        account.token.expiry_timestamp
+    };
+    let expiry_datetime =
+        chrono::DateTime::from_timestamp(expiry_secs, 0).unwrap_or_else(|| chrono::Utc::now());
+    let expiry_str = expiry_datetime.to_rfc3339_opts(chrono::SecondsFormat::Micros, true);
+
+    #[derive(serde::Serialize)]
+    struct AgyTokenDetails {
+        access_token: String,
+        token_type: String,
+        refresh_token: String,
+        expiry: String,
+    }
+
+    #[derive(serde::Serialize)]
+    struct AgyOAuthTokenFile {
+        token: AgyTokenDetails,
+        auth_method: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        id_token: Option<String>,
+    }
+
+    let agy_token = AgyOAuthTokenFile {
+        token: AgyTokenDetails {
+            access_token: account.token.access_token.clone(),
+            token_type: "Bearer".to_string(),
+            refresh_token: account.token.refresh_token.clone(),
+            expiry: expiry_str,
+        },
+        auth_method: "consumer".to_string(),
+        id_token: account.token.id_token.clone(),
+    };
+
+    let agy_token_path = agy_cli_dir.join("antigravity-oauth-token");
+    if let Ok(agy_json_str) = serde_json::to_string_pretty(&agy_token) {
+        if let Err(e) = std::fs::write(&agy_token_path, agy_json_str) {
+            crate::modules::logger::log_warn(&format!(
+                "[Desktop] Failed to write antigravity-oauth-token: {}",
+                e
+            ));
+        } else {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = std::fs::set_permissions(
+                    &agy_token_path,
+                    std::fs::Permissions::from_mode(0o600),
+                );
+            }
+            crate::modules::logger::log_info(&format!(
+                "[Desktop] Successfully synced file-based credentials to ~/.gemini/antigravity-cli/antigravity-oauth-token for: {}",
+                account.email
+            ));
+        }
+    }
+
+    // 2. 同步写入 Gemini CLI 凭据 (~/.gemini/oauth_creds.json 以及 ~/.gemini/google_accounts.json)
     let expiry_ms = if account.token.expiry_timestamp > 10_000_000_000 {
         account.token.expiry_timestamp
     } else {
@@ -774,13 +871,31 @@ fn write_to_file_credentials(account: &crate::models::Account) -> Result<(), Str
     Ok(())
 }
 
-/// 辅助方法：从本地文件凭据 (~/.gemini/oauth_creds.json) 读取 Token 作为跨平台回退
+/// 辅助方法：从本地文件凭据读取 Token 作为跨平台回退
 fn read_from_file_credentials() -> Result<crate::modules::migration::ImportedOAuthState, String> {
     let home =
         dirs::home_dir().ok_or_else(|| "Failed to resolve user home directory".to_string())?;
+
+    // 1. 优先尝试从 Antigravity CLI (agy) 原生文件凭据读取
+    let agy_token_path = home
+        .join(".gemini")
+        .join("antigravity-cli")
+        .join("antigravity-oauth-token");
+    if agy_token_path.exists() {
+        if let Ok(content) = fs::read_to_string(&agy_token_path) {
+            if let Ok(state) = parse_keyring_payload(&content) {
+                return Ok(state);
+            }
+        }
+    }
+
+    // 2. 回退到 ~/.gemini/oauth_creds.json
     let creds_path = home.join(".gemini").join("oauth_creds.json");
     if !creds_path.exists() {
-        return Err("No ~/.gemini/oauth_creds.json found".to_string());
+        return Err(
+            "No file-based credentials found (~/.gemini/antigravity-cli/antigravity-oauth-token or ~/.gemini/oauth_creds.json)"
+                .to_string(),
+        );
     }
     let content = fs::read_to_string(&creds_path)
         .map_err(|e| format!("Failed to read oauth_creds.json: {}", e))?;
@@ -800,6 +915,28 @@ fn read_from_file_credentials() -> Result<crate::modules::migration::ImportedOAu
 
 /// 辅助方法：从宿主操作系统的 Keychain/Credentials Manager 读取 Token
 pub fn read_from_system_keyring() -> Result<crate::modules::migration::ImportedOAuthState, String> {
+    read_system_credentials(true)
+}
+
+/// Read only the system store: stale fallback files must not confirm an agy switch.
+pub(crate) fn read_from_system_keyring_only(
+) -> Result<crate::modules::migration::ImportedOAuthState, String> {
+    read_system_credentials(false)
+}
+
+fn verify_agy_credentials(expected: &str, stored: &str) -> Result<(), String> {
+    if expected.is_empty() || expected != stored {
+        return Err(
+            "Stored agy credentials do not match the selected account; the switch was not confirmed."
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
+fn read_system_credentials(
+    allow_file_fallback: bool,
+) -> Result<crate::modules::migration::ImportedOAuthState, String> {
     #[cfg(target_os = "macos")]
     {
         use base64::{engine::general_purpose::STANDARD, Engine as _};
@@ -816,8 +953,10 @@ pub fn read_from_system_keyring() -> Result<crate::modules::migration::ImportedO
             .map_err(|e| format!("Failed to execute security command: {}", e))?;
 
         if !output.status.success() {
-            if let Ok(file_state) = read_from_file_credentials() {
-                return Ok(file_state);
+            if allow_file_fallback {
+                if let Ok(file_state) = read_from_file_credentials() {
+                    return Ok(file_state);
+                }
             }
             return Err("No credential found in macOS Keychain".to_string());
         }
@@ -884,8 +1023,10 @@ pub fn read_from_system_keyring() -> Result<crate::modules::migration::ImportedO
         unsafe {
             let res = CredReadW(target_wide.as_ptr(), 1, 0, &mut cred_ptr);
             if res == 0 || cred_ptr.is_null() {
-                if let Ok(file_state) = read_from_file_credentials() {
-                    return Ok(file_state);
+                if allow_file_fallback {
+                    if let Ok(file_state) = read_from_file_credentials() {
+                        return Ok(file_state);
+                    }
                 }
                 return Err("No credential found in Windows Credential Manager".to_string());
             }
@@ -910,8 +1051,10 @@ pub fn read_from_system_keyring() -> Result<crate::modules::migration::ImportedO
         {
             Ok(out) => out,
             Err(e) => {
-                if let Ok(file_state) = read_from_file_credentials() {
-                    return Ok(file_state);
+                if allow_file_fallback {
+                    if let Ok(file_state) = read_from_file_credentials() {
+                        return Ok(file_state);
+                    }
                 }
                 if e.kind() == std::io::ErrorKind::NotFound {
                     return Err(
@@ -928,8 +1071,10 @@ pub fn read_from_system_keyring() -> Result<crate::modules::migration::ImportedO
         };
 
         if !output.status.success() {
-            if let Ok(file_state) = read_from_file_credentials() {
-                return Ok(file_state);
+            if allow_file_fallback {
+                if let Ok(file_state) = read_from_file_credentials() {
+                    return Ok(file_state);
+                }
             }
             return Err("No credential found in Linux secret-tool".to_string());
         }
@@ -1085,6 +1230,15 @@ mod tests {
     use super::*;
 
     #[test]
+    fn agy_credentials_require_an_exact_nonempty_readback() {
+        assert!(verify_agy_credentials("selected-token", "selected-token").is_ok());
+        assert!(verify_agy_credentials("", "").is_err());
+        let error = verify_agy_credentials("selected-token", "other-token").unwrap_err();
+        assert!(!error.contains("selected-token"));
+        assert!(!error.contains("other-token"));
+    }
+
+    #[test]
     fn test_parse_keyring_payload_nested_token() {
         let payload = r#"{
             "token": {
@@ -1193,6 +1347,17 @@ mod tests {
         );
         assert!(is_ide);
         assert_eq!(effective, Some("ide"));
+
+        // 测试下划线命名 antigravity_ide
+        let (is_ide_underscore, effective_underscore) = resolve_effective_target(
+            None,
+            false,
+            false,
+            false,
+            Some("/usr/local/bin/antigravity_ide"),
+        );
+        assert!(is_ide_underscore);
+        assert_eq!(effective_underscore, Some("ide"));
     }
 
     #[test]

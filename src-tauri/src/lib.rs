@@ -75,6 +75,46 @@ fn should_enable_tray() -> bool {
     true
 }
 
+/// Login-item launches pass `--minimized`. Quiet startup applies only to that launch.
+fn apply_login_launch_policy(app: &tauri::App) {
+    let launched_by_login = std::env::args().any(|arg| arg == "--minimized");
+    if !launched_by_login {
+        return;
+    }
+
+    let config = modules::load_app_config().unwrap_or_default();
+    if !config.quiet_autostart {
+        info!("Login launch will show the main window because quiet startup is off");
+        return;
+    }
+
+    let tray_enabled = app
+        .try_state::<AppRuntimeFlags>()
+        .map(|flags| flags.tray_enabled)
+        .unwrap_or(true);
+    if !tray_enabled {
+        info!("Quiet startup skipped because the tray is unavailable; showing the main window");
+        if let Some(window) = app.get_webview_window("main") {
+            let _ = window.show();
+        }
+        return;
+    }
+
+    modules::startup_quiet::arm();
+    if config.lightweight_mode {
+        info!("Quiet login launch will enter lightweight mode once the event loop is ready");
+        modules::startup_quiet::request_lightweight_on_ready();
+    } else {
+        info!("Quiet login launch will keep the main window hidden in the tray");
+        #[cfg(target_os = "macos")]
+        {
+            let _ = app
+                .handle()
+                .set_activation_policy(tauri::ActivationPolicy::Accessory);
+        }
+    }
+}
+
 fn credential_state(value: &str) -> &'static str {
     if value.trim().is_empty() {
         "not set"
@@ -87,12 +127,14 @@ fn credential_state(value: &str) -> &'static str {
 fn nvidia_proprietary_loaded() -> bool {
     std::path::Path::new("/dev/nvidia0").exists()
         || std::path::Path::new("/proc/driver/nvidia/version").exists()
+        || std::path::Path::new("/sys/module/nvidia").exists()
 }
 
 #[cfg(target_os = "linux")]
 fn configure_linux_graphics() {
     use linux_graphics::{
-        desktop_is_wlroots_family, should_disable_webkit_dmabuf, should_force_x11_backend,
+        desktop_is_gnome, desktop_is_kde, desktop_is_wlroots_family, should_disable_webkit_dmabuf,
+        should_force_x11_backend,
     };
 
     let is_wayland = is_wayland_session();
@@ -113,14 +155,19 @@ fn configure_linux_graphics() {
         has_x11_display,
         &desktop,
     ) {
-        // Force X11 backend under GNOME/KDE Wayland to avoid a GTK shm crash.
+        // Force X11 backend under GNOME/legacy Wayland to avoid a GTK shm crash.
         std::env::set_var("GDK_BACKEND", "x11");
         warn!(
             "Forcing GDK_BACKEND=x11 for stability on Wayland. Set ANTIGRAVITY_FORCE_WAYLAND=1 to keep Wayland backend."
         );
-    } else if is_wayland && !gdk_already_set && desktop_is_wlroots_family(&desktop) {
+    } else if is_wayland
+        && !gdk_already_set
+        && (desktop_is_wlroots_family(&desktop)
+            || desktop_is_kde(&desktop)
+            || desktop_is_gnome(&desktop))
+    {
         info!(
-            "Keeping native Wayland GDK backend on {} (Xwayland DISPLAY is not a reason to force X11).",
+            "Keeping native Wayland GDK backend on {} (avoiding Xwayland WebKitGTK frame freeze / transparent window).",
             desktop
         );
     }
@@ -472,27 +519,34 @@ pub fn run() {
                 });
             }
 
-            // Linux: Workaround for transparent window crash/freeze
-            // The transparent window feature is unstable on Linux with WebKitGTK
-            // We disable the visual alpha channel to prevent softbuffer-related crashes
+            // Linux: Workaround for transparent window crash/freeze under X11/Xwayland.
+            // The transparent window feature is unstable on Linux WebKitGTK under X11/Xwayland.
+            // We disable the visual alpha channel when running on X11 to prevent softbuffer-related crashes/invisible windows.
             #[cfg(target_os = "linux")]
             {
                 use tauri::Manager;
-                if is_wayland_session() {
-                    info!("Linux Wayland session detected; skipping transparent window workaround");
-                } else if let Some(window) = app.get_webview_window("main") {
-                    // Access GTK window and disable transparency at the GTK level
-                    if let Ok(gtk_window) = window.gtk_window() {
-                        use gtk::prelude::WidgetExt;
-                        // Remove the visual's alpha channel to disable transparency
-                        if let Some(screen) = gtk_window.screen() {
-                            // Use non-composited visual if available
-                            if let Some(visual) = screen.system_visual() {
-                                gtk_window.set_visual(Some(&visual));
+                let running_x11 = std::env::var("GDK_BACKEND")
+                    .map(|v| v.eq_ignore_ascii_case("x11"))
+                    .unwrap_or(false)
+                    || !is_wayland_session();
+
+                if running_x11 {
+                    if let Some(window) = app.get_webview_window("main") {
+                        // Access GTK window and disable transparency at the GTK level
+                        if let Ok(gtk_window) = window.gtk_window() {
+                            use gtk::prelude::WidgetExt;
+                            // Remove the visual's alpha channel to disable transparency
+                            if let Some(screen) = gtk_window.screen() {
+                                // Use non-composited visual if available
+                                if let Some(visual) = screen.system_visual() {
+                                    gtk_window.set_visual(Some(&visual));
+                                }
+                                info!("Linux X11: Applied transparent window workaround (disabled alpha channel)");
                             }
-                            info!("Linux: Applied transparent window workaround");
                         }
                     }
+                } else {
+                    info!("Linux native Wayland session detected; keeping Wayland visual");
                 }
             }
 
@@ -562,6 +616,8 @@ pub fn run() {
 
             // [PHASE 1] Already merged into the Axum port (8045), no longer starting a separate 19527 port
             info!("Management API integrated into main proxy server (port 8045)");
+
+            apply_login_launch_policy(app);
 
             Ok(())
         })
@@ -645,6 +701,8 @@ pub fn run() {
             commands::get_antigravity_cache_paths,
             commands::open_data_folder,
             commands::get_data_dir_path,
+            commands::get_internal_error_log_path,
+            commands::get_internal_error_log_disk_size,
             commands::set_data_dir,
             commands::migrate_data_dir,
             commands::show_main_window,
@@ -686,7 +744,6 @@ pub fn run() {
             commands::proxy::update_model_mapping,
             commands::proxy::check_proxy_health,
             commands::proxy::get_proxy_pool_config,
-            commands::proxy::fetch_zai_models,
             commands::proxy::get_proxy_scheduling_config,
             commands::proxy::update_proxy_scheduling_config,
             commands::proxy::clear_proxy_session_bindings,
@@ -788,11 +845,24 @@ pub fn run() {
             commands::query_transit_info,
             // Patch commands
             commands::patch_agy_binary,
+            commands::list_claude_installations,
+            commands::check_claude_cowork_patch,
+            commands::apply_claude_cowork_patch,
+            commands::revert_claude_cowork_patch,
+            commands::is_claude_desktop_running,
+            commands::close_claude_desktop,
+            commands::launch_claude_desktop,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
         .run(|app_handle, event| {
             match event {
+                tauri::RunEvent::Ready => {
+                    if modules::startup_quiet::take_lightweight_on_ready() {
+                        info!("Entering lightweight mode for quiet login launch");
+                        let _ = modules::lightweight::enter_lightweight_mode_without_saving(app_handle);
+                    }
+                }
                 // Prevent app from exiting when window is destroyed in lightweight mode
                 tauri::RunEvent::ExitRequested { api, .. } => {
                     let tray_enabled = app_handle
