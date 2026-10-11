@@ -22,7 +22,8 @@ import {
     Edit2,
     Save,
     Share2,
-    Bot
+    Bot,
+    Timer
 } from 'lucide-react';
 import { AppConfig, ProxyConfig, StickySessionConfig, ExperimentalConfig } from '../types/config';
 import HelpTooltip from '../components/common/HelpTooltip';
@@ -33,11 +34,13 @@ import { useProxyModels } from '../hooks/useProxyModels';
 import GroupedSelect, { SelectOption } from '../components/common/GroupedSelect';
 import { CliSyncCard } from '../components/proxy/CliSyncCard';
 import { listAccounts } from '../services/accountService';
+import { motion } from 'framer-motion';
 import CircuitBreaker from '../components/settings/CircuitBreaker';
 import GlobalSystemPrompt from '../components/settings/GlobalSystemPrompt';
 import ImageThinkingMode from '../components/settings/ImageThinkingMode';
 import ThinkingBudget from '../components/settings/ThinkingBudget';
 import MultimodalSettings from '../components/settings/MultimodalSettings';
+import StreamTimeoutSettings from '../components/settings/StreamTimeoutSettings';
 import AgentSettings from '../components/settings/AgentSettings';
 import { CircuitBreakerConfig } from '../types/config';
 
@@ -1475,7 +1478,12 @@ print(response.choices[0].message.content)`;
     };
 
     return (
-        <div className="h-full w-full overflow-y-auto overflow-x-hidden">
+        <motion.div
+            initial={{ opacity: 0, y: 10 }}
+            animate={{ opacity: 1, y: 0 }}
+            transition={{ duration: 0.2, ease: "easeOut" }}
+            className="h-full w-full overflow-y-auto overflow-x-hidden"
+        >
             <div className="p-5 space-y-4 max-w-7xl mx-auto">
 
                 {/* Loading State */}
@@ -2010,6 +2018,19 @@ print(response.choices[0].message.content)`;
                         {/* TAB: 模型配置 (models) */}
                         {activeMenuTab === 'models' && (
                             <div className="p-4 space-y-4">
+                                {/* 流式超时设置 (Stream Timeout Settings) - 默认收起 */}
+                                <CollapsibleCard
+                                    title={t('proxy.config.stream_timeout_settings.title', { defaultValue: '流式超时设置 (Stream Timeout Settings)' })}
+                                    icon={<Timer size={18} className="text-blue-500" />}
+                                    defaultExpanded={false}
+                                >
+                                    <StreamTimeoutSettings
+                                        config={appConfig.proxy.stream_timeouts}
+                                        onChange={(timeoutConfig) => updateProxyConfig({ stream_timeouts: timeoutConfig })}
+                                        onSave={handleSaveProxySettings}
+                                    />
+                                </CollapsibleCard>
+
                                 {/* 思考设置 (Thinking & Reasoning Settings) - 默认收起 */}
                                 <CollapsibleCard
                                     title={t('proxy.config.thinking_settings.title', { defaultValue: '思考设置 (Thinking Settings)' })}
@@ -2031,6 +2052,10 @@ print(response.choices[0].message.content)`;
                                         thinkingRetentionDays={appConfig.proxy.experimental?.thinking_retention_days ?? 15}
                                         onThinkingRetentionDaysChange={(days: number) =>
                                             updateExperimentalConfig({ thinking_retention_days: days })
+                                        }
+                                        globalCompactionStripEnabled={appConfig.proxy.experimental?.enable_global_compaction_strip === true}
+                                        onGlobalCompactionStripChange={(enabled) =>
+                                            updateExperimentalConfig({ enable_global_compaction_strip: enabled })
                                         }
                                     />
                                 </CollapsibleCard>
@@ -2598,7 +2623,7 @@ print(response.choices[0].message.content)`;
                         </div>
                     </div>
                 </ModalDialog>
-            </div >
-        </div >
+            </div>
+        </motion.div>
     );
 }

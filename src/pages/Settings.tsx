@@ -18,6 +18,7 @@ import { emit } from '@tauri-apps/api/event';
 
 import DebugConsole from '../components/debug/DebugConsole';
 import ProxyPoolSettings from '../components/settings/ProxyPoolSettings';
+import { motion } from 'framer-motion';
 
 function normalizeDataDirDisplay(path: string): string {
     const trimmed = path.trim();
@@ -37,11 +38,11 @@ function normalizeDataDirDisplay(path: string): string {
 }
 
 function Settings() {
-    const { t, i18n } = useTranslation();
+    const { t } = useTranslation();
     const { config, loadConfig, saveConfig, updateLanguage, updateTheme } = useConfigStore();
     const { enable, disable, isEnabled } = useDebugConsole();
     const [activeTab, setActiveTab] = useState<'general' | 'account' | 'proxy' | 'advanced' | 'debug' | 'about'>('general');
-    const [appVersion, setAppVersion] = useState<string>('4.9.6');
+    const [appVersion, setAppVersion] = useState<string>('4.9.7-beta.7');
     const [formData, setFormData] = useState<AppConfig>({
         language: 'zh',
         theme: 'system',
@@ -471,7 +472,12 @@ function Settings() {
     };
 
     return (
-        <div className="h-full w-full overflow-y-auto">
+        <motion.div
+            initial={{ opacity: 0, y: 10 }}
+            animate={{ opacity: 1, y: 0 }}
+            transition={{ duration: 0.2, ease: "easeOut" }}
+            className="h-full w-full overflow-y-auto"
+        >
             <div className="p-5 space-y-4 max-w-7xl mx-auto">
                 {/* 顶部工具栏：Tab 导航和保存按钮 */}
                 <div className="flex justify-between items-center">
@@ -558,10 +564,6 @@ function Settings() {
                                     onChange={(e) => {
                                         const newLang = e.target.value;
                                         setFormData({ ...formData, language: newLang });
-                                        document.documentElement.dir = newLang === 'ar' ? 'rtl' : 'ltr';
-                                        startTransition(() => {
-                                            i18n.changeLanguage(newLang);
-                                        });
                                         updateLanguage(newLang);
                                     }}
                                 >
@@ -575,6 +577,8 @@ function Settings() {
                                     <option value="ko">한국어</option>
                                     <option value="ru">Русский</option>
                                     <option value="ar">العربية</option>
+                                    <option value="es">Español</option>
+                                    <option value="my">Bahasa Melayu</option>
                                 </select>
                             </div>
 
@@ -2000,8 +2004,8 @@ function Settings() {
                     </div>
                     <div className="modal-backdrop bg-black/60 backdrop-blur-md fixed inset-0 z-[-1]" onClick={() => setIsSupportModalOpen(false)}></div>
                 </div>
-            </div >
-        </div >
+            </div>
+        </motion.div>
     );
 }
 

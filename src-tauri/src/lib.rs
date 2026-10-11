@@ -167,7 +167,7 @@ fn configure_linux_graphics() {
             || desktop_is_gnome(&desktop))
     {
         info!(
-            "Keeping native Wayland GDK backend on {} (avoiding Xwayland WebKitGTK frame freeze / transparent window).",
+            "Keeping native Wayland GDK backend on {} (avoiding Xwayland WebKitGTK frame freeze).",
             desktop
         );
     }
@@ -519,36 +519,6 @@ pub fn run() {
                 });
             }
 
-            // Linux: Workaround for transparent window crash/freeze under X11/Xwayland.
-            // The transparent window feature is unstable on Linux WebKitGTK under X11/Xwayland.
-            // We disable the visual alpha channel when running on X11 to prevent softbuffer-related crashes/invisible windows.
-            #[cfg(target_os = "linux")]
-            {
-                use tauri::Manager;
-                let running_x11 = std::env::var("GDK_BACKEND")
-                    .map(|v| v.eq_ignore_ascii_case("x11"))
-                    .unwrap_or(false)
-                    || !is_wayland_session();
-
-                if running_x11 {
-                    if let Some(window) = app.get_webview_window("main") {
-                        // Access GTK window and disable transparency at the GTK level
-                        if let Ok(gtk_window) = window.gtk_window() {
-                            use gtk::prelude::WidgetExt;
-                            // Remove the visual's alpha channel to disable transparency
-                            if let Some(screen) = gtk_window.screen() {
-                                // Use non-composited visual if available
-                                if let Some(visual) = screen.system_visual() {
-                                    gtk_window.set_visual(Some(&visual));
-                                }
-                                info!("Linux X11: Applied transparent window workaround (disabled alpha channel)");
-                            }
-                        }
-                    }
-                } else {
-                    info!("Linux native Wayland session detected; keeping Wayland visual");
-                }
-            }
 
             let runtime_flags = app.state::<AppRuntimeFlags>();
             if runtime_flags.tray_enabled {
