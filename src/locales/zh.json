@@ -1771,6 +1771,9 @@
   },
   "token_stats": {
     "title": "Token 消费统计",
+    "minute": "分钟",
+    "minute_1h": "1小时 (1m)",
+    "minute_24h": "24小时 (5m)",
     "hourly": "小时",
     "daily": "日",
     "weekly": "周",

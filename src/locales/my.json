@@ -1650,6 +1650,9 @@
     },
     "token_stats": {
         "title": "Statistik Penggunaan Token",
+        "minute": "Minit",
+        "minute_1h": "1j (1m)",
+        "minute_24h": "24j (5m)",
         "hourly": "Jam",
         "daily": "Hari",
         "weekly": "Minggu",

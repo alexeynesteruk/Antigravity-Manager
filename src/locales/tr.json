@@ -1711,6 +1711,9 @@
     },
     "token_stats": {
         "title": "Token İstatistikleri",
+        "minute": "Dakikalık",
+        "minute_1h": "1 sa (1 dk)",
+        "minute_24h": "24 sa (5 dk)",
         "hourly": "Saatlik",
         "daily": "Günlük",
         "weekly": "Haftalık",

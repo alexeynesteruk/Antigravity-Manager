@@ -1684,6 +1684,9 @@
   },
   "token_stats": {
     "title": "トークン統計",
+    "minute": "分単位",
+    "minute_1h": "1時間 (1分)",
+    "minute_24h": "24時間 (5分)",
     "hourly": "時間単位",
     "daily": "日単位",
     "weekly": "週単位",

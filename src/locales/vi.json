@@ -1727,6 +1727,9 @@
     },
     "token_stats": {
         "title": "Thống kê Token",
+        "minute": "Hàng phút",
+        "minute_1h": "1 giờ (1p)",
+        "minute_24h": "24 giờ (5p)",
         "hourly": "Hàng giờ",
         "daily": "Hàng ngày",
         "weekly": "Hàng tuần",

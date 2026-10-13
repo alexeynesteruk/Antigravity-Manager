@@ -49,7 +49,7 @@ interface AppleBentoViewProps {
     viewMode: 'model' | 'account';
     metricType: 'tokens' | 'cost';
     chartType: 'bar' | 'area';
-    timeRange: 'hourly' | 'daily' | 'weekly' | 'all';
+    timeRange: 'minute' | 'hourly' | 'daily' | 'weekly' | 'all';
     totalEstimatedCost: number;
     cacheMetrics: { hitRate: number; savings: number };
     formatNumber: (n: number) => string;
@@ -1057,6 +1057,10 @@ export const AppleBentoView: React.FC<AppleBentoViewProps> = ({
                                     dataKey="period"
                                     tick={{ fontSize: 10, fill: '#8e8e93', fontFamily: 'monospace' }}
                                     tickFormatter={(val) => {
+                                        if (timeRange === 'minute') {
+                                            const parts = val.split(' ');
+                                            return parts.length > 1 ? parts[1] : val;
+                                        }
                                         if (timeRange === 'hourly') return val.split(' ')[1] || val;
                                         if (timeRange === 'daily') return val.split('-').slice(1).join('/');
                                         if (timeRange === 'weekly') {
@@ -1100,6 +1104,10 @@ export const AppleBentoView: React.FC<AppleBentoViewProps> = ({
                                     dataKey="period"
                                     tick={{ fontSize: 10, fill: '#8e8e93', fontFamily: 'monospace' }}
                                     tickFormatter={(val) => {
+                                        if (timeRange === 'minute') {
+                                            const parts = val.split(' ');
+                                            return parts.length > 1 ? parts[1] : val;
+                                        }
                                         if (timeRange === 'hourly') return val.split(' ')[1] || val;
                                         if (timeRange === 'daily') return val.split('-').slice(1).join('/');
                                         if (timeRange === 'weekly') {

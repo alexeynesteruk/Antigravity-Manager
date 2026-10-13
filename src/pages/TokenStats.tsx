@@ -131,11 +131,13 @@ export const DEFAULT_PRICING: Record<string, ModelPricingRule> = {
 const PRICING_STORAGE_KEY = 'antigravity_model_pricing_v2026';
 const DASHBOARD_MODE_KEY = 'antigravity_token_stats_dashboard_mode';
 const TIME_RANGE_KEY = 'antigravity_token_stats_time_range';
+const MINUTE_SPAN_KEY = 'antigravity_token_stats_minute_span';
 const VIEW_MODE_KEY = 'antigravity_token_stats_view_mode';
 const CHART_TYPE_KEY = 'antigravity_token_stats_chart_type';
 const METRIC_TYPE_KEY = 'antigravity_token_stats_metric_type';
 
-type TimeRange = 'hourly' | 'daily' | 'weekly' | 'all';
+type MinuteSpan = '1h' | '24h';
+type TimeRange = 'minute' | 'hourly' | 'daily' | 'weekly' | 'all';
 type ViewMode = 'model' | 'account';
 type DashboardMode = 'cockpit' | 'insights' | 'classic';
 type MetricType = 'tokens' | 'cost';
@@ -197,9 +199,17 @@ const TokenStats: React.FC = () => {
     const [timeRange, setTimeRange] = useState<TimeRange>(() => {
         try {
             const saved = localStorage.getItem(TIME_RANGE_KEY);
-            if (saved === 'hourly' || saved === 'daily' || saved === 'weekly' || saved === 'all') return saved;
+            if (saved === 'minute' || saved === 'hourly' || saved === 'daily' || saved === 'weekly' || saved === 'all') return saved;
         } catch (e) {}
         return 'daily';
+    });
+
+    const [minuteSpan, setMinuteSpan] = useState<MinuteSpan>(() => {
+        try {
+            const saved = localStorage.getItem(MINUTE_SPAN_KEY);
+            if (saved === '1h' || saved === '24h') return saved;
+        } catch (e) {}
+        return '1h';
     });
 
     const switchTimeRange = useCallback((range: TimeRange) => {
@@ -209,8 +219,19 @@ const TokenStats: React.FC = () => {
         } catch (e) {}
     }, []);
 
+    const switchMinuteSpan = useCallback((span: MinuteSpan) => {
+        setMinuteSpan(span);
+        try {
+            localStorage.setItem(MINUTE_SPAN_KEY, span);
+        } catch (e) {}
+    }, []);
+
     const formatPeriodAxisTick = useCallback(
         (val: string): string => {
+            if (timeRange === 'minute') {
+                const parts = val.split(' ');
+                return parts.length > 1 ? parts[1] : val;
+            }
             if (timeRange === 'hourly') return val.split(' ')[1] || val;
             if (timeRange === 'daily') return val.split('-').slice(1).join('/');
             if (timeRange === 'weekly') {
@@ -396,6 +417,14 @@ const TokenStats: React.FC = () => {
             let classicDataPromise: Promise<TokenStatsAggregated[]>;
 
             switch (timeRange) {
+                case 'minute':
+                    const minutes = minuteSpan === '1h' ? 60 : 1440;
+                    const stepMinutes = minuteSpan === '1h' ? 1 : 5;
+                    hours = minuteSpan === '1h' ? 1 : 24;
+                    modelTrend = await invoke<ModelTrendPoint[]>('get_token_stats_model_trend_minute', { minutes, stepMinutes });
+                    accountTrend = await invoke<AccountTrendPoint[]>('get_token_stats_account_trend_minute', { minutes, stepMinutes });
+                    classicDataPromise = invoke<TokenStatsAggregated[]>('get_token_stats_minute', { minutes, stepMinutes });
+                    break;
                 case 'hourly':
                     hours = 24;
                     modelTrend = await invoke<ModelTrendPoint[]>('get_token_stats_model_trend_hourly', { hours: 24 });
@@ -557,7 +586,7 @@ const TokenStats: React.FC = () => {
 
     useEffect(() => {
         fetchData();
-    }, [timeRange]);
+    }, [timeRange, minuteSpan]);
 
     // 计算单个模型的有效单价 ($ / Token)
     const getModelEffectiveRate = useCallback((modelName: string): number => {
@@ -817,6 +846,17 @@ const TokenStats: React.FC = () => {
                         {/* 时间段选择药丸 */}
                         <div className="flex bg-gray-100 dark:bg-base-200 border border-gray-200 dark:border-base-300 rounded-xl p-1 shadow-sm">
                             <button
+                                onClick={() => switchTimeRange('minute')}
+                                className={`px-2.5 sm:px-3 py-1.5 rounded-lg text-xs font-medium transition-all flex items-center gap-1.5 ${
+                                    timeRange === 'minute'
+                                        ? 'bg-white dark:bg-base-100 text-gray-900 dark:text-base-content shadow-sm'
+                                        : 'text-gray-500 dark:text-gray-400 hover:text-gray-900 dark:hover:text-base-content'
+                                }`}
+                            >
+                                <Zap className="w-3.5 h-3.5" />
+                                {t('token_stats.minute', '分钟')}
+                            </button>
+                            <button
                                 onClick={() => switchTimeRange('hourly')}
                                 className={`px-2.5 sm:px-3 py-1.5 rounded-lg text-xs font-medium transition-all flex items-center gap-1.5 ${
                                     timeRange === 'hourly'
@@ -861,6 +901,32 @@ const TokenStats: React.FC = () => {
                                 {t('token_stats.all_time', '全部历史')}
                             </button>
                         </div>
+
+                        {/* 分钟级跨度细分选择器 (1h / 24h) */}
+                        {timeRange === 'minute' && (
+                            <div className="flex bg-gray-100 dark:bg-base-200 border border-gray-200 dark:border-base-300 rounded-xl p-1 shadow-sm">
+                                <button
+                                    onClick={() => switchMinuteSpan('1h')}
+                                    className={`px-2.5 py-1.5 rounded-lg text-xs font-mono font-medium transition-all ${
+                                        minuteSpan === '1h'
+                                            ? 'bg-white dark:bg-base-100 text-gray-900 dark:text-base-content shadow-sm font-semibold'
+                                            : 'text-gray-500 dark:text-gray-400 hover:text-gray-900 dark:hover:text-base-content'
+                                    }`}
+                                >
+                                    {t('token_stats.minute_1h', '1小时 (1m)')}
+                                </button>
+                                <button
+                                    onClick={() => switchMinuteSpan('24h')}
+                                    className={`px-2.5 py-1.5 rounded-lg text-xs font-mono font-medium transition-all ${
+                                        minuteSpan === '24h'
+                                            ? 'bg-white dark:bg-base-100 text-gray-900 dark:text-base-content shadow-sm font-semibold'
+                                            : 'text-gray-500 dark:text-gray-400 hover:text-gray-900 dark:hover:text-base-content'
+                                    }`}
+                                >
+                                    {t('token_stats.minute_24h', '24小时 (5m)')}
+                                </button>
+                            </div>
+                        )}
 
                         {/* 单价配置按钮 */}
                         <button

@@ -30,7 +30,7 @@ interface CyberCockpitViewProps {
     timelineData?: any[];
     modelShareItems: ModelShareItem[];
     accountData: AccountTokenStats[];
-    timeRange: 'hourly' | 'daily' | 'weekly' | 'all';
+    timeRange: 'minute' | 'hourly' | 'daily' | 'weekly' | 'all';
     totalEstimatedCost: number;
     cacheMetrics: { hitRate: number; savings: number };
     formatNumber: (n: number) => string;
@@ -292,7 +292,9 @@ export const CyberCockpitView: React.FC<CyberCockpitViewProps> = ({
                                 <span>
                                     {t('token_stats.cockpit_period_label', '周期')}:{' '}
                                     <strong className="text-gray-900 dark:text-white">
-                                        {timeRange === 'hourly'
+                                        {timeRange === 'minute'
+                                            ? t('token_stats.minute', '分钟')
+                                            : timeRange === 'hourly'
                                             ? t('token_stats.hourly', '小时')
                                             : timeRange === 'daily'
                                             ? t('token_stats.daily', '日')

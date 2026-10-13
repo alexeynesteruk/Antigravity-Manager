@@ -1720,6 +1720,9 @@
   },
   "token_stats": {
     "title": "Estatísticas de Consumo de Tokens",
+    "minute": "Minuto",
+    "minute_1h": "1h (1m)",
+    "minute_24h": "24h (5m)",
     "hourly": "Hora",
     "daily": "Dia",
     "weekly": "Semana",

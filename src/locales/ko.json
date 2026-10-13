@@ -1684,6 +1684,9 @@
   },
   "token_stats": {
     "title": "토큰 사용 통계",
+    "minute": "분",
+    "minute_1h": "1시간 (1분)",
+    "minute_24h": "24시간 (5분)",
     "hourly": "시간",
     "daily": "일",
     "weekly": "주",
