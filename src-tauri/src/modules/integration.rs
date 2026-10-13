@@ -352,6 +352,15 @@ impl SystemIntegration for DesktopIntegration {
 
         if !hot_switch && running {
             process::close_antigravity(20, effective_target)?;
+            // 完整重启路径必须在彻底终止主进程之后重新断言写入凭据，
+            // 消除外部客户端退出钩子在关机瞬间回写陈旧 Session Token 的竞态
+            apply_account_credentials(
+                account,
+                effective_target,
+                is_ide,
+                active_exe_path.as_deref(),
+            )?;
+            credentials_applied = true;
         }
         if effective_target != target_ide
             && target_ide.is_some()
@@ -360,7 +369,7 @@ impl SystemIntegration for DesktopIntegration {
             process::close_antigravity(20, target_ide)?;
         }
 
-        // 凭据写入（热切号已在终止子进程之前完成，避免重复写入；完整重启路径保持「先杀后写」）
+        // 若此前从未写入凭据（例如客户端未处于运行状态）：此时写入凭据
         if !credentials_applied {
             apply_account_credentials(
                 account,
@@ -388,6 +397,13 @@ impl SystemIntegration for DesktopIntegration {
                 "[Desktop] Hot switch degraded: language_server did not respawn within timeout; performing a full restart.",
             );
             process::close_antigravity(20, effective_target)?;
+            // 彻底杀死主窗口后重新断言写入凭据，消除退出钩子回写旧 token
+            let _ = apply_account_credentials(
+                account,
+                effective_target,
+                is_ide,
+                active_exe_path.as_deref(),
+            );
         }
 
         if let Err(e) = process::start_antigravity_with_fallback_path(

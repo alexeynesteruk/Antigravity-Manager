@@ -2876,16 +2876,35 @@ impl TokenManager {
                                 // 清除所有限流记录
                                 self.rate_limit_tracker.clear_for_optimistic_reset();
 
-                                // 再次尝试选择账号 (必须重新校验剩余限流状态，严禁放行周配额耗尽等长锁定账号)
-                                let final_token = tokens_snapshot.iter().find(|t| {
-                                    !attempted.contains(&t.account_id)
-                                        && !self.rate_limit_tracker.is_rate_limited(
-                                            &t.account_id,
-                                            Some(&normalized_target),
-                                        )
-                                        && !(quota_protection_enabled
-                                            && t.protected_models.contains(&normalized_target))
-                                });
+                                // 再次尝试选择账号 (优先选用未限流且对目标模型具备正配额的账号，严禁直接放行 0% 额度账号)
+                                let final_token = tokens_snapshot
+                                    .iter()
+                                    .find(|t| {
+                                        !attempted.contains(&t.account_id)
+                                            && !self.rate_limit_tracker.is_rate_limited(
+                                                &t.account_id,
+                                                Some(&normalized_target),
+                                            )
+                                            && !(quota_protection_enabled
+                                                && t.protected_models.contains(&normalized_target))
+                                            && t.model_quotas
+                                                .get(&normalized_target)
+                                                .copied()
+                                                .unwrap_or(0)
+                                                > 0
+                                    })
+                                    .or_else(|| {
+                                        tokens_snapshot.iter().find(|t| {
+                                            !attempted.contains(&t.account_id)
+                                                && !self.rate_limit_tracker.is_rate_limited(
+                                                    &t.account_id,
+                                                    Some(&normalized_target),
+                                                )
+                                                && !(quota_protection_enabled
+                                                    && t.protected_models
+                                                        .contains(&normalized_target))
+                                        })
+                                    });
 
                                 if let Some(t) = final_token {
                                     tracing::info!(
@@ -2908,14 +2927,33 @@ impl TokenManager {
                                 wait_sec
                             );
                             self.rate_limit_tracker.clear_for_optimistic_reset();
-                            let final_token = tokens_snapshot.iter().find(|t| {
-                                !attempted.contains(&t.account_id)
-                                    && !self
-                                        .rate_limit_tracker
-                                        .is_rate_limited(&t.account_id, Some(&normalized_target))
-                                    && !(quota_protection_enabled
-                                        && t.protected_models.contains(&normalized_target))
-                            });
+                            let final_token = tokens_snapshot
+                                .iter()
+                                .find(|t| {
+                                    !attempted.contains(&t.account_id)
+                                        && !self.rate_limit_tracker.is_rate_limited(
+                                            &t.account_id,
+                                            Some(&normalized_target),
+                                        )
+                                        && !(quota_protection_enabled
+                                            && t.protected_models.contains(&normalized_target))
+                                        && t.model_quotas
+                                            .get(&normalized_target)
+                                            .copied()
+                                            .unwrap_or(0)
+                                            > 0
+                                })
+                                .or_else(|| {
+                                    tokens_snapshot.iter().find(|t| {
+                                        !attempted.contains(&t.account_id)
+                                            && !self.rate_limit_tracker.is_rate_limited(
+                                                &t.account_id,
+                                                Some(&normalized_target),
+                                            )
+                                            && !(quota_protection_enabled
+                                                && t.protected_models.contains(&normalized_target))
+                                    })
+                                });
 
                             if let Some(t) = final_token {
                                 tracing::info!(
@@ -3561,6 +3599,9 @@ impl TokenManager {
                 reset_time_str,
                 cap
             );
+            if reason == crate::proxy::rate_limit::RateLimitReason::QuotaExhausted {
+                self.mark_model_quota_depleted(account_id, model_to_lock.as_deref());
+            }
             self.rate_limit_tracker.set_lockout_until_iso_with_cap(
                 account_id,
                 &reset_time_str,
@@ -3622,6 +3663,19 @@ impl TokenManager {
         tracing::info!("账号 {} 正在实时刷新配额...", email);
         match crate::modules::quota::fetch_quota(&access_token, email, Some(&account_id)).await {
             Ok((quota_data, _project_id)) => {
+                // [NEW] 实时刷新成功后，立即同步最新配额数据至内存 token.model_quotas 缓存
+                if let Some(mut token) = self.tokens.get_mut(&account_id) {
+                    for m in &quota_data.models {
+                        let norm_name =
+                            crate::proxy::common::model_mapping::normalize_to_standard_id(&m.name)
+                                .unwrap_or_else(|| m.name.clone());
+                        token.model_quotas.insert(norm_name, m.percentage as i32);
+                        token
+                            .model_quotas
+                            .insert(m.name.clone(), m.percentage as i32);
+                    }
+                }
+
                 // 3. 从最新配额中提取匹配模型的 reset_time
                 let normalized_model = model
                     .as_deref()
@@ -3859,10 +3913,40 @@ impl TokenManager {
             TrackerParserMode::Current,
         );
 
+        if reason == crate::proxy::rate_limit::RateLimitReason::QuotaExhausted {
+            self.mark_model_quota_depleted(&account_id, model_to_track);
+        }
+
         status == 429
             && recorded.is_some()
             && !has_explicit_retry_time
             && reason == crate::proxy::rate_limit::RateLimitReason::QuotaExhausted
+    }
+
+    /// [NEW] 将指定账号的目标模型配额在内存中即时标记为 0%
+    /// 当上游返回明确的配额耗尽 (QuotaExhausted / 429) 时，立即响应式更新内存缓存，
+    /// 确保后续轮次的粘性会话与固定账号无感自动切换 (Fixes #3639) 能够立刻生效。
+    pub fn mark_model_quota_depleted(&self, account_or_email: &str, model: Option<&str>) {
+        let account_id = self
+            .email_to_account_id(account_or_email)
+            .unwrap_or_else(|| account_or_email.to_string());
+        if let Some(mut token) = self.tokens.get_mut(&account_id) {
+            if let Some(m) = model {
+                let norm = crate::proxy::common::model_mapping::normalize_to_standard_id(m)
+                    .unwrap_or_else(|| m.to_string());
+                token.model_quotas.insert(norm, 0);
+                token.model_quotas.insert(m.to_string(), 0);
+            } else {
+                for v in token.model_quotas.values_mut() {
+                    *v = 0;
+                }
+            }
+            tracing::debug!(
+                "[Auto-Switch #3639] Reactively marked model quota depleted (0%) for account {} [model: {:?}]",
+                account_id,
+                model
+            );
+        }
     }
 
     pub async fn refresh_quota_lock_after_fast_mark(&self, email: &str, model: Option<&str>) {
@@ -3975,6 +4059,9 @@ impl TokenManager {
         }
 
         let reason = classify_rate_limit_reason(error_body);
+        if reason == crate::proxy::rate_limit::RateLimitReason::QuotaExhausted {
+            self.mark_model_quota_depleted(&account_id, model_to_track);
+        }
         if reason != crate::proxy::rate_limit::RateLimitReason::QuotaExhausted {
             self.record_rate_limit_atomic(
                 &account_id,
@@ -7419,5 +7506,66 @@ mod tests {
             "0% 配额账号即便临期也绝不得被提权选中"
         );
         assert_eq!(email, "has_quota@test.com");
+    }
+
+    #[test]
+    fn test_mark_model_quota_depleted_updates_memory_cache() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let manager = TokenManager::new(temp_dir.path().to_path_buf());
+
+        let account_id = "acc_depletion_test";
+        let target_model = "gemini-3.8-flash-high";
+        let norm_target =
+            crate::proxy::common::model_mapping::normalize_to_standard_id(target_model)
+                .unwrap_or_else(|| target_model.to_string());
+
+        let mut quotas = HashMap::new();
+        quotas.insert(norm_target.clone(), 100);
+        quotas.insert(target_model.to_string(), 100);
+
+        let mut token = create_test_token("deplete@test.com", Some("PRO"), 1.0, None, Some(100));
+        token.account_id = account_id.to_string();
+        token.model_quotas = quotas;
+
+        manager.tokens.insert(account_id.to_string(), token);
+
+        // Verify initial state
+        assert_eq!(
+            manager
+                .tokens
+                .get(account_id)
+                .unwrap()
+                .model_quotas
+                .get(&norm_target)
+                .copied(),
+            Some(100)
+        );
+
+        // Mark depleted reactively
+        manager.mark_model_quota_depleted(account_id, Some(target_model));
+
+        // Verify that memory cache immediately reflects 0% for both canonical and raw names
+        assert_eq!(
+            manager
+                .tokens
+                .get(account_id)
+                .unwrap()
+                .model_quotas
+                .get(&norm_target)
+                .copied(),
+            Some(0),
+            "Normalized standard model quota must be reactively updated to 0%"
+        );
+        assert_eq!(
+            manager
+                .tokens
+                .get(account_id)
+                .unwrap()
+                .model_quotas
+                .get(target_model)
+                .copied(),
+            Some(0),
+            "Raw requested model quota must be reactively updated to 0%"
+        );
     }
 }

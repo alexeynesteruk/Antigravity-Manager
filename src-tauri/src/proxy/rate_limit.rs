@@ -916,11 +916,10 @@ impl RateLimitTracker {
     pub fn clear_for_optimistic_reset(&self) {
         let now = SystemTime::now();
         self.limits.retain(|_, info| {
+            // 乐观重置旨在清除瞬态流控与并发限制 (RateLimitExceeded / Concurrency)。
+            // 对于明确的配额耗尽 (QuotaExhausted)，无论其重置周期长短，只要 reset_time 仍在将来，
+            // 绝不可被乐观重置误清，防止将已知 0 配额的账号重新放行回流。
             info.reason == RateLimitReason::QuotaExhausted
-                && info
-                    .reset_time
-                    .duration_since(info.detected_at)
-                    .is_ok_and(|duration| duration > Duration::from_secs(MAX_LOCKOUT_SECONDS))
                 && info.reset_time.duration_since(now).is_ok()
         });
     }
@@ -1083,6 +1082,43 @@ mod tests {
         assert!(
             tracker.get_remaining_wait("acc-inferred-reset", Some("gemini-3-pro-image")) <= 300
         );
+    }
+
+    #[test]
+    fn test_clear_for_optimistic_reset_preserves_capped_and_uncapped_quota_exhausted() {
+        let tracker = RateLimitTracker::new();
+        let now = SystemTime::now();
+
+        // 1. QuotaExhausted with capped 300s duration (reset_time in future)
+        tracker.limits.insert(
+            "acc-quota-capped:gemini-3-flash".to_string(),
+            RateLimitInfo {
+                reset_time: now + Duration::from_secs(250),
+                retry_after_sec: 250,
+                detected_at: now - Duration::from_secs(50),
+                reason: RateLimitReason::QuotaExhausted,
+                model: Some("gemini-3-flash".to_string()),
+            },
+        );
+
+        // 2. Transient RateLimitExceeded (concurrency delay)
+        tracker.limits.insert(
+            "acc-transient:gemini-3-flash".to_string(),
+            RateLimitInfo {
+                reset_time: now + Duration::from_secs(5),
+                retry_after_sec: 5,
+                detected_at: now,
+                reason: RateLimitReason::RateLimitExceeded,
+                model: Some("gemini-3-flash".to_string()),
+            },
+        );
+
+        tracker.clear_for_optimistic_reset();
+
+        // QuotaExhausted MUST be preserved to prevent routing to dead accounts
+        assert!(tracker.is_rate_limited("acc-quota-capped", Some("gemini-3-flash")));
+        // Transient RateLimitExceeded MUST be cleared to relieve concurrency blocks
+        assert!(!tracker.is_rate_limited("acc-transient", Some("gemini-3-flash")));
     }
 
     #[test]
