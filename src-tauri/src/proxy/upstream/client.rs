@@ -2,6 +2,7 @@
 // 基于高性能通讯接口封装
 
 use dashmap::DashMap;
+use once_cell::sync::Lazy;
 use rquest::{header, Client, Response, StatusCode};
 use serde_json::Value;
 use std::sync::Arc;
@@ -81,17 +82,147 @@ const V1_INTERNAL_BASE_URL_DAILY: &str = "https://daily-cloudcode-pa.googleapis.
 const V1_INTERNAL_BASE_URL_SANDBOX: &str =
     "https://daily-cloudcode-pa.sandbox.googleapis.com/v1internal";
 
-const V1_INTERNAL_BASE_URL_FALLBACKS: [&str; 3] = [
+pub const V1_INTERNAL_BASE_URL_FALLBACKS: [&str; 3] = [
     V1_INTERNAL_BASE_URL_DAILY, // 优先级 1: Daily (官方 IDE 原生唯一主力端点，稳定支持思维链与工具调用)
     V1_INTERNAL_BASE_URL_SANDBOX, // 优先级 2: Sandbox (沙箱备用；部分地区对合规账号返回终止性 400)
     V1_INTERNAL_BASE_URL_PROD,  // 优先级 3: Prod (生产兜底，易触发 429)
 ];
+
+/// 提取端点的主机名或规范标识，使不同 API 路径（如 :loadCodeAssist、:fetchAvailableModels、v1internal）
+/// 能共享底层主机的健康度状态，避免同一死端点在不同业务模块重复超时。
+pub fn extract_endpoint_host(url_or_host: &str) -> &str {
+    let s = if let Some(stripped) = url_or_host.strip_prefix("https://") {
+        stripped
+    } else if let Some(stripped) = url_or_host.strip_prefix("http://") {
+        stripped
+    } else {
+        url_or_host
+    };
+    let host_part = s.split('/').next().unwrap_or(s);
+    host_part.split(':').next().unwrap_or(host_part)
+}
+
+/// 判断 HTTP 状态码是否属于应当尝试下一个候选端点的临时/可重试故障。
+pub fn should_try_next_endpoint(status: StatusCode) -> bool {
+    UpstreamClient::should_try_next_endpoint(status)
+}
+
+/// 端点健康追踪器：记录故障端点与冷却期，动态优化上游端点 Fallback 顺序，避免无状态重复踩坑。
+#[derive(Debug, Clone)]
+pub struct EndpointHealthTracker {
+    /// 记录最近一次故障的时间戳 (host -> Instant)
+    failures: Arc<DashMap<String, std::time::Instant>>,
+    /// 冷却观察期 (默认 60s)
+    cooldown: std::time::Duration,
+}
+
+static GLOBAL_ENDPOINT_HEALTH: Lazy<EndpointHealthTracker> =
+    Lazy::new(EndpointHealthTracker::default);
+
+/// 获取全局端点健康追踪器实例（跨模块共享，包括主网关请求、项目解析 loadCodeAssist、配额查询）
+pub fn get_global_endpoint_health() -> &'static EndpointHealthTracker {
+    &GLOBAL_ENDPOINT_HEALTH
+}
+
+impl EndpointHealthTracker {
+    pub fn new(cooldown: std::time::Duration) -> Self {
+        Self {
+            failures: Arc::new(DashMap::new()),
+            cooldown,
+        }
+    }
+
+    /// 标记端点调用失败（记录当前时间戳，以 host 聚合）
+    pub fn mark_failure(&self, endpoint: &str) {
+        let host = extract_endpoint_host(endpoint);
+        let now = std::time::Instant::now();
+        self.failures.insert(host.to_string(), now);
+        tracing::warn!(
+            host = %host,
+            endpoint = %endpoint,
+            cooldown_secs = ?self.cooldown.as_secs(),
+            "Marked upstream endpoint host as unhealthy (entering cooldown)"
+        );
+    }
+
+    /// 标记端点调用成功（清除故障标记，立即恢复健康）
+    pub fn mark_success(&self, endpoint: &str) {
+        let host = extract_endpoint_host(endpoint);
+        if self.failures.remove(host).is_some() {
+            tracing::info!(
+                host = %host,
+                endpoint = %endpoint,
+                "Upstream endpoint host recovered and marked healthy"
+            );
+        }
+    }
+
+    /// 检查指定端点当前是否健康（无故障记录，或已超出冷却期）
+    #[allow(dead_code)]
+    pub fn is_healthy(&self, endpoint: &str) -> bool {
+        let host = extract_endpoint_host(endpoint);
+        if let Some(entry) = self.failures.get(host) {
+            let last_fail = *entry.value();
+            if last_fail.elapsed() >= self.cooldown {
+                drop(entry);
+                self.failures.remove(host);
+                true
+            } else {
+                false
+            }
+        } else {
+            true
+        }
+    }
+
+    /// 根据各端点健康状况与冷却期，动态排列优先级顺序。
+    /// - 健康端点排在最前，保持原有的相对优先级；
+    /// - 处于冷却期内的端点排在后部，按故障发生时间由远及近（最早失败的相对排在前面，优先探活）；
+    /// - 永远保留所有端点，确保在全故障极端情况下仍能兜底尝试。
+    pub fn get_ordered_endpoints<'a>(&self, default_endpoints: &[&'a str]) -> Vec<&'a str> {
+        let mut healthy = Vec::new();
+        let mut unhealthy = Vec::new();
+
+        for &ep in default_endpoints {
+            let host = extract_endpoint_host(ep);
+            if let Some(entry) = self.failures.get(host) {
+                let last_fail = *entry.value();
+                if last_fail.elapsed() >= self.cooldown {
+                    drop(entry);
+                    self.failures.remove(host);
+                    healthy.push(ep);
+                } else {
+                    unhealthy.push((ep, last_fail));
+                }
+            } else {
+                healthy.push(ep);
+            }
+        }
+
+        // 不健康的端点：按照失败时间从早到晚排序（先失败的更早尝试探活）
+        unhealthy.sort_by_key(|&(_, time)| time);
+
+        let mut result = healthy;
+        for (ep, _) in unhealthy {
+            result.push(ep);
+        }
+
+        result
+    }
+}
+
+impl Default for EndpointHealthTracker {
+    fn default() -> Self {
+        Self::new(std::time::Duration::from_secs(60))
+    }
+}
 
 pub struct UpstreamClient {
     default_client: RwLock<Client>,
     proxy_pool: Option<Arc<crate::proxy::proxy_pool::ProxyPoolManager>>,
     client_cache: DashMap<String, Client>, // proxy_id -> Client
     user_agent_override: RwLock<Option<String>>,
+    endpoint_health: EndpointHealthTracker,
 }
 
 impl UpstreamClient {
@@ -124,6 +255,7 @@ impl UpstreamClient {
             proxy_pool,
             client_cache: DashMap::new(),
             user_agent_override: RwLock::new(None),
+            endpoint_health: get_global_endpoint_health().clone(),
         }
     }
 
@@ -174,9 +306,11 @@ impl UpstreamClient {
         let builder = Client::builder()
             .emulation(rquest_util::Emulation::Chrome123)
             // Connection settings (优化连接复用，减少建立开销)
-            .connect_timeout(Duration::from_secs(20))
+            // [OPTIMIZATION] 建连仅涉及 TCP/TLS 握手，从 20s 缩短至 5s，快速识别死端点，防止多级重试累积 40s 超时
+            .connect_timeout(Duration::from_secs(5))
             .pool_max_idle_per_host(20) // 每主机最多 20 个空闲连接 (对齐官方指纹)
-            .pool_idle_timeout(Duration::from_secs(90)) // 空闲连接保持 90 秒
+            // [FIX] 空闲连接从 90s 缩短至 45s，避免 GFE 在 45~60s 静默掐断空闲 TCP 后客户端复用死连接引发 error reading a body
+            .pool_idle_timeout(Duration::from_secs(45))
             // [FIX #3593 / #3571] 彻底恢复 Chrome 123 原生协议行为：
             // 1. 实测证实 Google GFE 对客户端 HTTP/2 PING 帧静默丢弃、不回复 PING ACK，
             //    导致 hyper2 在 keep_alive_timeout 到期时本地自杀式掐死连接并抛出 error reading a body from connection；
@@ -302,7 +436,7 @@ impl UpstreamClient {
     }
 
     /// Determine if we should try next endpoint (fallback logic)
-    fn should_try_next_endpoint(status: StatusCode) -> bool {
+    pub fn should_try_next_endpoint(status: StatusCode) -> bool {
         status == StatusCode::REQUEST_TIMEOUT
             || status == StatusCode::NOT_FOUND
             || status.is_server_error()
@@ -459,10 +593,15 @@ impl UpstreamClient {
             let mut fallback_attempts: Vec<FallbackAttemptLog> = Vec::new();
             let mut should_retry_without_header = false;
 
-            // 遍历所有端点，失败时自动切换
-            for (idx, base_url) in V1_INTERNAL_BASE_URL_FALLBACKS.iter().enumerate() {
+            // 动态健康度排序：优先尝试健康端点，跳过处于冷却期的故障端点，避免无状态重复累积 40s 超时
+            let candidate_endpoints = self
+                .endpoint_health
+                .get_ordered_endpoints(&V1_INTERNAL_BASE_URL_FALLBACKS);
+
+            // 遍历候选端点，失败时自动切换
+            for (idx, base_url) in candidate_endpoints.iter().enumerate() {
                 let url = Self::build_url(base_url, method, query_string);
-                let has_next = idx + 1 < V1_INTERNAL_BASE_URL_FALLBACKS.len();
+                let has_next = idx + 1 < candidate_endpoints.len();
 
                 let body_bytes = serde_json::to_vec(&body).map_err(|e| e.to_string())?;
 
@@ -486,12 +625,13 @@ impl UpstreamClient {
                     Ok(resp) => {
                         let status = resp.status();
                         if status.is_success() {
+                            self.endpoint_health.mark_success(base_url);
                             if idx > 0 {
                                 tracing::info!(
                                     "✓ Upstream fallback succeeded | Endpoint: {} | Status: {} | Next endpoints available: {}",
                                     base_url,
                                     status,
-                                    V1_INTERNAL_BASE_URL_FALLBACKS.len() - idx - 1
+                                    candidate_endpoints.len() - idx - 1
                                 );
                             } else {
                                 tracing::debug!(
@@ -522,6 +662,7 @@ impl UpstreamClient {
 
                         // 如果有下一个端点且当前错误可重试，则切换
                         if has_next && Self::should_try_next_endpoint(status) {
+                            self.endpoint_health.mark_failure(base_url);
                             let err_msg = format!("Upstream {} returned {}", base_url, status);
                             tracing::warn!(
                                 "Upstream endpoint returned {} at {} (method={}), trying next endpoint",
@@ -546,6 +687,7 @@ impl UpstreamClient {
                         });
                     }
                     Err(e) => {
+                        self.endpoint_health.mark_failure(base_url);
                         let msg = format!("HTTP request failed at {}: {}", base_url, e);
                         tracing::debug!("{}", msg);
                         // [NEW] 记录网络错误的降级尝试
@@ -584,25 +726,6 @@ impl UpstreamClient {
             return Err(final_err);
         }
     }
-
-    /// 调用 v1internal API（带 429 重试,支持闭包）
-    ///
-    /// 带容错和重试的核心请求逻辑
-    ///
-    /// # Arguments
-    /// * `method` - API method (e.g., "generateContent")
-    /// * `query_string` - Optional query string (e.g., "?alt=sse")
-    /// * `get_credentials` - 闭包，获取凭证（支持账号轮换）
-    /// * `build_body` - 闭包，接收 project_id 构建请求体
-    /// * `max_attempts` - 最大重试次数
-    ///
-    /// # Returns
-    /// HTTP Response
-    // 已移除弃用的重试方法 (call_v1_internal_with_retry)
-
-    // 已移除弃用的辅助方法 (parse_retry_delay)
-
-    // 已移除弃用的辅助方法 (parse_duration_ms)
 
     /// 获取可用模型列表
     ///
@@ -661,7 +784,11 @@ impl UpstreamClient {
         let client = self.get_client(account_id).await;
         let mut last_error = String::new();
 
-        for base_url in V1_INTERNAL_BASE_URL_FALLBACKS.iter() {
+        let candidate_endpoints = self
+            .endpoint_health
+            .get_ordered_endpoints(&V1_INTERNAL_BASE_URL_FALLBACKS);
+
+        for base_url in candidate_endpoints.iter() {
             let url = Self::build_url(base_url, method, None);
 
             let response = match client
@@ -675,6 +802,7 @@ impl UpstreamClient {
             {
                 Ok(response) => response,
                 Err(e) => {
+                    self.endpoint_health.mark_failure(base_url);
                     tracing::warn!(
                         endpoint = %url,
                         error = %e,
@@ -699,6 +827,7 @@ impl UpstreamClient {
                     );
                     return Err(last_error);
                 }
+                self.endpoint_health.mark_failure(base_url);
                 tracing::warn!(
                     endpoint = %url,
                     status = %status,
@@ -707,6 +836,7 @@ impl UpstreamClient {
                 continue;
             }
 
+            self.endpoint_health.mark_success(base_url);
             return response
                 .json()
                 .await
@@ -727,6 +857,7 @@ impl UpstreamClient {
 }
 
 /// 派生确定性 UUID 格式的客户端窗口 Session ID (RFC 4122 v4 格式)
+#[allow(dead_code)]
 fn derive_session_uuid(seed: &str) -> String {
     use sha2::{Digest, Sha256};
     let mut hasher = Sha256::new();
@@ -762,5 +893,155 @@ mod tests {
             url2,
             "https://cloudcode-pa.googleapis.com/v1internal:streamGenerateContent?alt=sse"
         );
+    }
+
+    #[test]
+    fn test_endpoint_health_all_healthy_preserves_order() {
+        let tracker = EndpointHealthTracker::new(Duration::from_secs(60));
+        let endpoints = ["ep1", "ep2", "ep3"];
+        let ordered = tracker.get_ordered_endpoints(&endpoints);
+        assert_eq!(ordered, vec!["ep1", "ep2", "ep3"]);
+    }
+
+    #[test]
+    fn test_endpoint_health_single_failure_moves_to_back() {
+        let tracker = EndpointHealthTracker::new(Duration::from_secs(60));
+        let endpoints = ["daily", "sandbox", "prod"];
+        tracker.mark_failure("daily");
+
+        let ordered = tracker.get_ordered_endpoints(&endpoints);
+        assert_eq!(ordered, vec!["sandbox", "prod", "daily"]);
+    }
+
+    #[test]
+    fn test_endpoint_health_two_failures_prioritizes_healthy() {
+        let tracker = EndpointHealthTracker::new(Duration::from_secs(60));
+        let endpoints = ["daily", "sandbox", "prod"];
+        tracker.mark_failure("daily");
+        tracker.mark_failure("sandbox");
+
+        let ordered = tracker.get_ordered_endpoints(&endpoints);
+        assert_eq!(ordered[0], "prod");
+        assert_eq!(ordered.len(), 3);
+        assert!(ordered.contains(&"daily"));
+        assert!(ordered.contains(&"sandbox"));
+    }
+
+    #[test]
+    fn test_endpoint_health_success_clears_failure() {
+        let tracker = EndpointHealthTracker::new(Duration::from_secs(60));
+        let endpoints = ["daily", "sandbox", "prod"];
+        tracker.mark_failure("daily");
+        assert_eq!(
+            tracker.get_ordered_endpoints(&endpoints),
+            vec!["sandbox", "prod", "daily"]
+        );
+
+        tracker.mark_success("daily");
+        assert_eq!(
+            tracker.get_ordered_endpoints(&endpoints),
+            vec!["daily", "sandbox", "prod"]
+        );
+    }
+
+    #[test]
+    fn test_endpoint_health_all_failed_preserves_all_endpoints() {
+        let tracker = EndpointHealthTracker::new(Duration::from_secs(60));
+        let endpoints = ["daily", "sandbox", "prod"];
+        tracker.mark_failure("daily");
+        tracker.mark_failure("sandbox");
+        tracker.mark_failure("prod");
+
+        let ordered = tracker.get_ordered_endpoints(&endpoints);
+        assert_eq!(ordered.len(), 3);
+        assert!(ordered.contains(&"daily"));
+        assert!(ordered.contains(&"sandbox"));
+        assert!(ordered.contains(&"prod"));
+    }
+
+    #[test]
+    fn test_endpoint_health_cooldown_expiry() {
+        let tracker = EndpointHealthTracker::new(Duration::from_millis(10));
+        let endpoints = ["daily", "sandbox", "prod"];
+        tracker.mark_failure("daily");
+        assert_eq!(
+            tracker.get_ordered_endpoints(&endpoints),
+            vec!["sandbox", "prod", "daily"]
+        );
+
+        std::thread::sleep(Duration::from_millis(20));
+        assert_eq!(
+            tracker.get_ordered_endpoints(&endpoints),
+            vec!["daily", "sandbox", "prod"]
+        );
+    }
+
+    #[test]
+    fn test_extract_endpoint_host() {
+        assert_eq!(
+            extract_endpoint_host("https://daily-cloudcode-pa.googleapis.com/v1internal"),
+            "daily-cloudcode-pa.googleapis.com"
+        );
+        assert_eq!(
+            extract_endpoint_host(
+                "https://daily-cloudcode-pa.googleapis.com/v1internal:loadCodeAssist"
+            ),
+            "daily-cloudcode-pa.googleapis.com"
+        );
+        assert_eq!(
+            extract_endpoint_host(
+                "https://daily-cloudcode-pa.sandbox.googleapis.com/v1internal:fetchAvailableModels"
+            ),
+            "daily-cloudcode-pa.sandbox.googleapis.com"
+        );
+        assert_eq!(
+            extract_endpoint_host(
+                "https://cloudcode-pa.googleapis.com/v1internal:streamGenerateContent?alt=sse"
+            ),
+            "cloudcode-pa.googleapis.com"
+        );
+        assert_eq!(
+            extract_endpoint_host("daily-cloudcode-pa.googleapis.com"),
+            "daily-cloudcode-pa.googleapis.com"
+        );
+    }
+
+    #[test]
+    fn test_endpoint_health_cross_api_sharing() {
+        let tracker = EndpointHealthTracker::new(Duration::from_secs(60));
+        let base_endpoints = [
+            "https://daily-cloudcode-pa.googleapis.com/v1internal",
+            "https://daily-cloudcode-pa.sandbox.googleapis.com/v1internal",
+            "https://cloudcode-pa.googleapis.com/v1internal",
+        ];
+        let load_project_endpoints = [
+            "https://daily-cloudcode-pa.googleapis.com/v1internal:loadCodeAssist",
+            "https://daily-cloudcode-pa.sandbox.googleapis.com/v1internal:loadCodeAssist",
+            "https://cloudcode-pa.googleapis.com/v1internal:loadCodeAssist",
+        ];
+
+        // 模拟 loadCodeAssist 发现 daily 和 sandbox 故障
+        tracker.mark_failure("https://daily-cloudcode-pa.googleapis.com/v1internal:loadCodeAssist");
+        tracker.mark_failure(
+            "https://daily-cloudcode-pa.sandbox.googleapis.com/v1internal:loadCodeAssist",
+        );
+
+        // 验证主聊天请求端点立即动态重排，优先走健康的 prod
+        let ordered_base = tracker.get_ordered_endpoints(&base_endpoints);
+        assert_eq!(
+            ordered_base[0],
+            "https://cloudcode-pa.googleapis.com/v1internal"
+        );
+
+        // 验证其他 API (如 loadCodeAssist 本身) 也同步重排
+        let ordered_load = tracker.get_ordered_endpoints(&load_project_endpoints);
+        assert_eq!(
+            ordered_load[0],
+            "https://cloudcode-pa.googleapis.com/v1internal:loadCodeAssist"
+        );
+
+        // 模拟 prod 成功
+        tracker.mark_success("https://cloudcode-pa.googleapis.com/v1internal:loadCodeAssist");
+        assert!(tracker.is_healthy("https://cloudcode-pa.googleapis.com/v1internal"));
     }
 }

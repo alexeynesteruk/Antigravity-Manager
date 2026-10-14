@@ -966,6 +966,12 @@ export default function ThinkingBudget({
                                             "💡 Tiered 自由模型说明：该模型专为谷歌动态自适应打造。设置为 -1 时，模型根据问题难度自动分配思考量；若指定具体数值（如 30000+），可突破 High 档位解锁 Max 极限思考。",
                                     })}
                                 </div>
+                                <div className="p-3 bg-amber-50/70 dark:bg-amber-900/20 border border-amber-200/80 dark:border-amber-800/40 rounded-xl text-xs text-amber-800 dark:text-amber-200 leading-relaxed">
+                                    {t("proxy.config.thinking_budget.gemini_soft_budget_note", {
+                                        defaultValue:
+                                            "⚠️ 思考预算特性说明：Google Gemini 上游将 thinkingBudget 视为启发式偏好（Soft Target）。面对超长 Prompt、复杂代码推演或 Agent 任务时，上游推理引擎会自动深入展开思考链，可能突破所设数值；设置为 0 则彻底关闭思考。",
+                                    })}
+                                </div>
                             </div>
                         ) : (
                             <p className="text-xs text-gray-500 dark:text-gray-400 italic">

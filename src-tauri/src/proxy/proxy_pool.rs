@@ -86,6 +86,8 @@ impl ProxyPoolManager {
     ) -> Client {
         let mut builder = Client::builder()
             .emulation(Emulation::Chrome123)
+            .connect_timeout(Duration::from_secs(5))
+            .pool_idle_timeout(Duration::from_secs(45))
             .timeout(Duration::from_secs(timeout_secs));
 
         // Try to get the proxy config
@@ -148,6 +150,8 @@ impl ProxyPoolManager {
     ) -> Client {
         let mut builder = Client::builder()
             // No Emulation setting; use the plain base TLS fingerprint
+            .connect_timeout(Duration::from_secs(5))
+            .pool_idle_timeout(Duration::from_secs(45))
             .timeout(Duration::from_secs(timeout_secs));
 
         // Try to get the proxy config
@@ -591,6 +595,8 @@ impl ProxyPoolManager {
         let client_result = Client::builder()
             .proxy(proxy_cfg.proxy)
             .emulation(Emulation::Chrome123)
+            .connect_timeout(Duration::from_secs(5))
+            .pool_idle_timeout(Duration::from_secs(45))
             .timeout(Duration::from_secs(10))
             .user_agent("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36")
             .build();

@@ -1231,6 +1231,7 @@ impl InboundThinkingPipeline {
             if let Some(budget) = final_budget {
                 if budget == 0 {
                     tc = json!({
+                        "includeThoughts": false,
                         "thinkingBudget": 0
                     });
                 } else {
@@ -1340,6 +1341,9 @@ impl InboundThinkingPipeline {
                     .and_then(Value::as_object_mut)
                 {
                     tc.insert("thinkingBudget".to_string(), json!(final_budget));
+                    if final_budget == 0 {
+                        tc.insert("includeThoughts".to_string(), json!(false));
+                    }
                 }
             }
         }
@@ -1407,31 +1411,25 @@ impl InboundThinkingPipeline {
         let mut canonical_contents = req_obj.remove("contents").unwrap_or(json!([]));
 
         // [Gatekeeper 2026-09-29 / 2026-09-30 Pipeline First] Gemini 目标出站终审安全自愈门禁：
-        // Google Gemini 3+ 规则：全会话历史与活跃轮次中的所有工具调用 (Function Calling)
+        // Google Gemini 3+ 与 Google v1internal 规则：全会话历史与活跃轮次中的所有工具调用 (Function Calling)
         // 均被 Google AST 校验器严格强制检查 thoughtSignature。
-        // 若任意历史或活跃轮次的某个 functionCall 缺少签名，出站前统一自动注入官方合法哨兵 SENTINEL_SIGNATURE，彻底杜绝上游 400！
-        let is_claude_model = target_model.to_lowercase().contains("claude")
-            || crate::models::OfficialModelCatalog::get(target_model)
-                .map(|m| m.is_claude())
-                .unwrap_or(false);
-        if !is_claude_model || target_model.to_lowercase().contains("gemini") {
-            if let Some(contents_arr) = canonical_contents.as_array_mut() {
-                for content in contents_arr.iter_mut() {
-                    if let Some(parts) = content.get_mut("parts").and_then(|p| p.as_array_mut()) {
-                        for part in parts.iter_mut() {
-                            if part.get("functionCall").is_some() {
-                                let has_sig = part
-                                    .get("thoughtSignature")
-                                    .or_else(|| part.get("thought_signature"))
-                                    .and_then(|s| s.as_str())
-                                    .map_or(false, |s| !s.trim().is_empty());
-                                if !has_sig {
-                                    tracing::warn!(
-                                        "[Gatekeeper] Found functionCall missing thoughtSignature in turn, auto-injecting sentinel!"
-                                    );
-                                    part["thoughtSignature"] =
-                                        json!(crate::proxy::thinking_store::SENTINEL_SIGNATURE);
-                                }
+        // 若任意历史或活跃轮次的某个 functionCall 缺少签名，出站前统一自动注入官方合法哨兵 SENTINEL_SIGNATURE，彻底杜绝上游 400 (Fixes #3202, #3229)！
+        if let Some(contents_arr) = canonical_contents.as_array_mut() {
+            for content in contents_arr.iter_mut() {
+                if let Some(parts) = content.get_mut("parts").and_then(|p| p.as_array_mut()) {
+                    for part in parts.iter_mut() {
+                        if part.get("functionCall").is_some() {
+                            let has_sig = part
+                                .get("thoughtSignature")
+                                .or_else(|| part.get("thought_signature"))
+                                .and_then(|s| s.as_str())
+                                .map_or(false, |s| !s.trim().is_empty());
+                            if !has_sig {
+                                tracing::warn!(
+                                    "[Gatekeeper] Found functionCall missing thoughtSignature in turn, auto-injecting sentinel!"
+                                );
+                                part["thoughtSignature"] =
+                                    json!(crate::proxy::thinking_store::SENTINEL_SIGNATURE);
                             }
                         }
                     }
@@ -1710,10 +1708,33 @@ impl InboundThinkingPipeline {
         // 6. sessionId 提取
         let canonical_sid = req_obj.remove("sessionId");
 
-        // 7. safetySettings (仅当客户端显式传递且非空时保留，官方默认不携带，杜绝伪造 4 项 OFF)
-        let canonical_safety = req_obj
-            .remove("safetySettings")
-            .filter(|v| v.as_array().map_or(false, |a| !a.is_empty()));
+        // 7. safetySettings (仅当客户端显式传递且非空时保留，官方默认不携带，杜绝伪造 4 项 OFF；同时过滤非标准分类，Fixes #3195)
+        let canonical_safety = req_obj.remove("safetySettings").and_then(|v| {
+            if let Value::Array(arr) = v {
+                const VALID_CATEGORIES: &[&str] = &[
+                    "HARM_CATEGORY_HARASSMENT",
+                    "HARM_CATEGORY_HATE_SPEECH",
+                    "HARM_CATEGORY_SEXUALLY_EXPLICIT",
+                    "HARM_CATEGORY_DANGEROUS_CONTENT",
+                    "HARM_CATEGORY_CIVIC_INTEGRITY",
+                ];
+                let filtered: Vec<Value> = arr
+                    .into_iter()
+                    .filter(|item| {
+                        item.get("category")
+                            .and_then(Value::as_str)
+                            .map_or(false, |cat| VALID_CATEGORIES.contains(&cat))
+                    })
+                    .collect();
+                if filtered.is_empty() {
+                    None
+                } else {
+                    Some(Value::Array(filtered))
+                }
+            } else {
+                None
+            }
+        });
 
         // 8. 严格对齐官方 Topology 键序:
         // contents -> systemInstruction -> tools -> labels -> generationConfig -> sessionId -> safetySettings -> 其余
@@ -3653,5 +3674,65 @@ mod tests {
             Some(crate::proxy::thinking_store::SENTINEL_SIGNATURE),
             "Gatekeeper must inject sentinel signature for non-Claude models (Defect 10)"
         );
+    }
+
+    #[test]
+    fn test_gatekeeper_sentinel_injected_for_claude_model_function_call_issue_3202() {
+        let mut inner_req = json!({
+            "contents": [
+                {
+                    "role": "model",
+                    "parts": [
+                        {
+                            "functionCall": {
+                                "name": "default_api:Bash",
+                                "args": {"command": "git status"}
+                            }
+                        }
+                    ]
+                }
+            ]
+        });
+
+        InboundThinkingPipeline::align_google_request_prefix_topology_with_model(
+            &mut inner_req,
+            "claude-sonnet-4-6",
+            None,
+        );
+
+        let fc_part = &inner_req["contents"][0]["parts"][0];
+        assert_eq!(
+            fc_part.get("thoughtSignature").and_then(|v| v.as_str()),
+            Some(crate::proxy::thinking_store::SENTINEL_SIGNATURE),
+            "Gatekeeper 必须为 Claude 模型的工具调用补全哨兵签名，防止 Google 400 报错 (Fixes #3202)"
+        );
+    }
+
+    #[test]
+    fn test_gatekeeper_filters_unsupported_safety_categories_issue_3195() {
+        let mut inner_req = json!({
+            "contents": [
+                {
+                    "role": "user",
+                    "parts": [{"text": "hello"}]
+                }
+            ],
+            "safetySettings": [
+                { "category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_NONE" },
+                { "category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_NONE" },
+                { "category": "HARM_CATEGORY_INVALID_DEPRECATED_CUSTOM", "threshold": "BLOCK_NONE" }
+            ]
+        });
+
+        InboundThinkingPipeline::align_google_request_prefix_topology_with_model(
+            &mut inner_req,
+            "gemini-3.1-pro-high",
+            None,
+        );
+
+        let safety = inner_req["safetySettings"].as_array().unwrap();
+        assert_eq!(safety.len(), 2, "不支持的分类必须被过滤");
+        assert_eq!(safety[0]["category"], "HARM_CATEGORY_HARASSMENT");
+        assert_eq!(safety[1]["category"], "HARM_CATEGORY_HATE_SPEECH");
     }
 }

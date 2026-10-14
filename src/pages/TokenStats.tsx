@@ -30,11 +30,14 @@ import {
     Database,
     BarChart3,
     Sparkles,
+    Terminal,
 } from 'lucide-react';
 import { motion } from 'framer-motion';
-import { ActivityHeatmapCard, DayUsagePoint } from '../components/token_stats/ActivityHeatmapCard';
-import { HourlyTrendBarCard, HourlyUsagePoint } from '../components/token_stats/HourlyTrendBarCard';
-import { TopModelsShareCard, ModelShareItem } from '../components/token_stats/TopModelsShareCard';
+import type { DayUsagePoint } from '../components/token_stats/ActivityHeatmapCard';
+import type { HourlyUsagePoint } from '../components/token_stats/HourlyTrendBarCard';
+import type { ModelShareItem } from '../components/token_stats/TopModelsShareCard';
+import { AppleBentoView } from '../components/token_stats/AppleBentoView';
+import { CyberCockpitView } from '../components/token_stats/CyberCockpitView';
 import { PricingModal } from '../components/token_stats/PricingModal';
 
 export interface TokenStatsAggregated {
@@ -42,6 +45,7 @@ export interface TokenStatsAggregated {
     total_input_tokens: number;
     total_output_tokens: number;
     total_cached_tokens: number;
+    total_reasoning_tokens?: number;
     total_tokens: number;
     request_count: number;
     uncached_input_tokens?: number;
@@ -52,6 +56,7 @@ export interface AccountTokenStats {
     total_input_tokens: number;
     total_output_tokens: number;
     total_cached_tokens: number;
+    total_reasoning_tokens?: number;
     total_tokens: number;
     request_count: number;
 }
@@ -61,6 +66,7 @@ export interface ModelTokenStats {
     total_input_tokens: number;
     total_output_tokens: number;
     total_cached_tokens: number;
+    total_reasoning_tokens?: number;
     total_tokens: number;
     request_count: number;
 }
@@ -79,6 +85,7 @@ export interface TokenStatsSummary {
     total_input_tokens: number;
     total_output_tokens: number;
     total_cached_tokens: number;
+    total_reasoning_tokens?: number;
     total_tokens: number;
     total_requests: number;
     unique_accounts: number;
@@ -91,22 +98,33 @@ export interface ModelPricingRule {
 }
 
 export const DEFAULT_PRICING: Record<string, ModelPricingRule> = {
+    // Google Gemini 3.x & 2.x
+    'gemini-3.8-flash': { input: 0.75, output: 3.75, cached: 0.075 },
     'gemini-3.7-flash': { input: 0.75, output: 3.75, cached: 0.075 },
     'gemini-3.6-flash': { input: 0.75, output: 3.75, cached: 0.075 },
     'gemini-3.5-flash': { input: 0.75, output: 3.75, cached: 0.075 },
+    'gemini-3-flash': { input: 0.75, output: 3.75, cached: 0.075 },
     'gemini-2.5-flash': { input: 0.75, output: 3.75, cached: 0.075 },
+    'gemini-2.0-flash': { input: 0.10, output: 0.40, cached: 0.025 },
     'gemini-3.1-pro': { input: 2.00, output: 12.00, cached: 0.20 },
     'gemini-3-pro': { input: 2.00, output: 12.00, cached: 0.20 },
     'gemini-2.5-pro': { input: 2.00, output: 12.00, cached: 0.20 },
+    // Anthropic Claude 4.x & 3.x
     'claude-sonnet-4-6': { input: 3.00, output: 15.00, cached: 0.30 },
-    'claude-sonnet-4.6': { input: 3.00, output: 15.00, cached: 0.30 },
+    'claude-sonnet-4-5': { input: 3.00, output: 15.00, cached: 0.30 },
     'claude-3-7-sonnet': { input: 3.00, output: 15.00, cached: 0.30 },
     'claude-3-5-sonnet': { input: 3.00, output: 15.00, cached: 0.30 },
     'claude-opus-4-6': { input: 5.00, output: 25.00, cached: 0.50 },
-    'claude-opus-4.6': { input: 5.00, output: 25.00, cached: 0.50 },
+    'claude-opus-4-5': { input: 5.00, output: 25.00, cached: 0.50 },
     'claude-3-opus': { input: 5.00, output: 25.00, cached: 0.50 },
     'claude-haiku-4': { input: 0.80, output: 4.00, cached: 0.08 },
     'claude-3-5-haiku': { input: 0.80, output: 4.00, cached: 0.08 },
+    // OpenAI Models
+    'gpt-4o': { input: 2.50, output: 10.00, cached: 1.25 },
+    'gpt-4o-mini': { input: 0.15, output: 0.60, cached: 0.075 },
+    'o3-mini': { input: 1.10, output: 4.40, cached: 0.55 },
+    'o1': { input: 15.00, output: 60.00, cached: 7.50 },
+    // Default Fallback
     'default': { input: 1.00, output: 5.00, cached: 0.10 },
 };
 
@@ -119,7 +137,7 @@ const METRIC_TYPE_KEY = 'antigravity_token_stats_metric_type';
 
 type TimeRange = 'hourly' | 'daily' | 'weekly' | 'all';
 type ViewMode = 'model' | 'account';
-type DashboardMode = 'insights' | 'classic';
+type DashboardMode = 'cockpit' | 'insights' | 'classic';
 type MetricType = 'tokens' | 'cost';
 
 const TOP_COLORS = ['#d97757', '#4f85e8', '#10a37f', '#a855f7', '#f59e0b', '#71717a'];
@@ -162,6 +180,20 @@ const getSqliteWeekBucket = (dateStr: string): string => {
 
 const TokenStats: React.FC = () => {
     const { t } = useTranslation();
+
+    const formatPeriodLabel = useCallback(
+        (val: string): string => {
+            if (!val) return '';
+            const parts = String(val).split('-W');
+            if (parts.length > 1) {
+                const weekNum = parseInt(parts[1], 10);
+                return t('token_stats.year_week', 'Week {{week}}, {{year}}', { year: parts[0], week: weekNum });
+            }
+            return val;
+        },
+        [t]
+    );
+
     const [timeRange, setTimeRange] = useState<TimeRange>(() => {
         try {
             const saved = localStorage.getItem(TIME_RANGE_KEY);
@@ -176,6 +208,24 @@ const TokenStats: React.FC = () => {
             localStorage.setItem(TIME_RANGE_KEY, range);
         } catch (e) {}
     }, []);
+
+    const formatPeriodAxisTick = useCallback(
+        (val: string): string => {
+            if (timeRange === 'hourly') return val.split(' ')[1] || val;
+            if (timeRange === 'daily') return val.split('-').slice(1).join('/');
+            if (timeRange === 'weekly') {
+                const parts = val.split('-W');
+                if (parts.length > 1) {
+                    const weekNum = parseInt(parts[1], 10);
+                    return t('token_stats.week_number', 'Week {{week}}', { week: weekNum });
+                }
+                return val;
+            }
+            if (timeRange === 'all') return val.split('-').slice(1).join('/');
+            return val;
+        },
+        [timeRange, t]
+    );
 
     const [viewMode, setViewMode] = useState<ViewMode>(() => {
         try {
@@ -225,9 +275,10 @@ const TokenStats: React.FC = () => {
     const [dashboardMode, setDashboardMode] = useState<DashboardMode>(() => {
         try {
             const saved = localStorage.getItem(DASHBOARD_MODE_KEY);
-            if (saved === 'classic' || saved === 'insights') return saved;
+            if (saved === 'cockpit' || saved === 'insights' || saved === 'classic') return saved;
+            if (saved === 'apple') return 'insights';
         } catch (e) {}
-        return 'insights';
+        return 'cockpit';
     });
 
     const switchDashboardMode = useCallback((mode: DashboardMode) => {
@@ -264,10 +315,25 @@ const TokenStats: React.FC = () => {
     const [showPricingModal, setShowPricingModal] = useState(false);
 
     const getPricing = useCallback((modelName: string): ModelPricingRule => {
-        const key = modelName.toLowerCase();
+        let key = modelName.toLowerCase().trim();
+        // 1. 直接精确命中
         if (pricing[key]) return pricing[key];
+
+        // 2. 剥除档位后缀进行规范化匹配 (如 -low, -high, -medium, -tiered, -extra-low, -xhigh, -lite, -default)
+        const stripped = key.replace(/-(tiered|max|xhigh|high|medium|default|low|extra-low|lite)$/, '');
+        if (pricing[stripped]) return pricing[stripped];
+
+        // 3. 点分与破折号互通匹配 (如 claude-sonnet-4.6 与 claude-sonnet-4-6)
+        const normalizedKey = key.replace(/\./g, '-');
+        const normalizedStripped = stripped.replace(/\./g, '-');
+        if (pricing[normalizedKey]) return pricing[normalizedKey];
+        if (pricing[normalizedStripped]) return pricing[normalizedStripped];
+
+        // 4. 子串模式匹配（排除 default）
         for (const [pattern, rule] of Object.entries(pricing)) {
-            if (pattern !== 'default' && key.includes(pattern)) {
+            if (pattern === 'default') continue;
+            const normPattern = pattern.toLowerCase().replace(/\./g, '-');
+            if (key.includes(pattern) || normalizedKey.includes(normPattern) || normalizedStripped.includes(normPattern)) {
                 return rule;
             }
         }
@@ -493,14 +559,6 @@ const TokenStats: React.FC = () => {
         fetchData();
     }, [timeRange]);
 
-    // 计算 24 小时预估金额
-    const hourly24hEstimatedCost = useMemo(() => {
-        if (!summary || summary.total_tokens === 0) return 0;
-        const avgTokenRate = totalEstimatedCost / summary.total_tokens;
-        const past24hTokens = hourlyTrendData.reduce((sum, h) => sum + (h.total_tokens || 0), 0);
-        return past24hTokens * avgTokenRate;
-    }, [summary, totalEstimatedCost, hourlyTrendData]);
-
     // 计算单个模型的有效单价 ($ / Token)
     const getModelEffectiveRate = useCallback((modelName: string): number => {
         const stats = modelData.find(m => m.model === modelName);
@@ -580,11 +638,11 @@ const TokenStats: React.FC = () => {
         const sortedPayload = [...payload].sort((a: any, b: any) => b.value - a.value);
 
         return (
-            <div className="bg-white/95 dark:bg-[#181a20]/95 backdrop-blur-md p-3 rounded-xl shadow-xl border border-gray-200 dark:border-white/[0.08] text-xs z-[100] min-w-[190px] pointer-events-none text-gray-900 dark:text-white">
-                <p className="font-semibold text-gray-800 dark:text-white/90 mb-2 border-b border-gray-200 dark:border-white/[0.08] pb-1.5 font-mono text-[11px]">
-                    {label}
+            <div className="bg-white/95 dark:bg-base-100/95 backdrop-blur-md p-3 rounded-xl shadow-xl border border-gray-200 dark:border-base-200 text-xs z-[100] min-w-[190px] pointer-events-none text-gray-900 dark:text-base-content">
+                <p className="font-semibold text-gray-800 dark:text-base-content mb-2 border-b border-gray-200 dark:border-base-200 pb-1.5 font-mono text-[11px]">
+                    {formatPeriodLabel(label)}
                 </p>
-                <div className="max-h-[200px] overflow-y-auto space-y-1.5 pr-1 scrollbar-thin scrollbar-thumb-gray-200 dark:scrollbar-thumb-white/10">
+                <div className="max-h-[200px] overflow-y-auto space-y-1.5 pr-1 scrollbar-thin scrollbar-thumb-gray-200 dark:scrollbar-thumb-base-300">
                     {sortedPayload.map((entry: any, index: number) => {
                         const name = entry.name;
                         const displayName = viewMode === 'model' ? name : name.split('@')[0];
@@ -592,11 +650,11 @@ const TokenStats: React.FC = () => {
                             <div key={index} className="flex items-center justify-between gap-4">
                                 <div className="flex items-center gap-2 overflow-hidden">
                                     <div className="w-2 h-2 rounded-full flex-shrink-0" style={{ backgroundColor: entry.color }} />
-                                    <span className="text-gray-500 dark:text-white/60 truncate max-w-[120px]" title={name}>
+                                    <span className="text-gray-500 dark:text-gray-400 truncate max-w-[120px]" title={name}>
                                         {displayName}
                                     </span>
                                 </div>
-                                <span className="font-mono font-medium text-gray-800 dark:text-white/90">
+                                <span className="font-mono font-medium text-gray-800 dark:text-base-content">
                                     {metricType === 'cost' ? formatCurrency(entry.value) : formatNumber(entry.value)}
                                 </span>
                             </div>
@@ -614,9 +672,9 @@ const TokenStats: React.FC = () => {
         if (!row) return null;
 
         return (
-            <div className="bg-white/95 dark:bg-[#181a20]/95 backdrop-blur-md p-2.5 rounded-xl shadow-xl border border-gray-200 dark:border-white/[0.08] text-xs z-[100] min-w-[180px] pointer-events-none text-gray-900 dark:text-white">
-                <p className="font-semibold text-gray-800 dark:text-gray-200 mb-1.5 border-b border-gray-200 dark:border-white/[0.08] pb-1.5 font-mono">
-                    {label}
+            <div className="bg-white/95 dark:bg-base-100/95 backdrop-blur-md p-2.5 rounded-xl shadow-xl border border-gray-200 dark:border-base-200 text-xs z-[100] min-w-[180px] pointer-events-none text-gray-900 dark:text-base-content">
+                <p className="font-semibold text-gray-800 dark:text-base-content mb-1.5 border-b border-gray-200 dark:border-base-200 pb-1.5 font-mono">
+                    {formatPeriodLabel(label)}
                 </p>
                 <div className="space-y-1">
                     {payload.map((item: any, idx: number) => (
@@ -673,13 +731,13 @@ const TokenStats: React.FC = () => {
         if (!active || !payload || !payload.length) return null;
         const entry = payload[0];
         return (
-            <div className="bg-white/95 dark:bg-[#181a20]/95 backdrop-blur-md p-2.5 rounded-xl shadow-xl border border-gray-200 dark:border-white/[0.08] text-xs z-[100] pointer-events-none text-gray-900 dark:text-white">
+            <div className="bg-white/95 dark:bg-base-100/95 backdrop-blur-md p-2.5 rounded-xl shadow-xl border border-gray-200 dark:border-base-200 text-xs z-[100] pointer-events-none text-gray-900 dark:text-base-content">
                 <div className="flex items-center gap-2">
                     <div className="w-2 h-2 rounded-full" style={{ backgroundColor: entry.payload.color || entry.color }} />
-                    <span className="text-gray-500 dark:text-white/60 truncate max-w-[150px]">
+                    <span className="text-gray-500 dark:text-gray-400 truncate max-w-[150px]">
                         {entry.payload.fullEmail || entry.name}:
                     </span>
-                    <span className="font-mono font-medium text-gray-800 dark:text-white">
+                    <span className="font-mono font-medium text-gray-800 dark:text-base-content">
                         {formatNumber(entry.value)}
                     </span>
                 </div>
@@ -688,13 +746,19 @@ const TokenStats: React.FC = () => {
     };
 
     return (
-        <div className="h-full w-full overflow-y-auto bg-gray-50/50 dark:bg-[#0a0a0c] text-gray-800 dark:text-white/90">
+        <div className={`h-full w-full text-gray-800 dark:text-base-content [scrollbar-gutter:stable] ${
+            dashboardMode === 'cockpit' ? 'overflow-hidden flex flex-col' : 'overflow-y-auto'
+        }`}>
             <motion.div
                 initial={{ opacity: 0, y: 4 }}
                 animate={{ opacity: 1, y: 0 }}
                 transition={{ duration: 0.15, ease: [0.16, 1, 0.3, 1] }}
                 style={{ willChange: 'opacity, transform' }}
-                className="p-4 sm:p-6 space-y-5 max-w-7xl mx-auto"
+                className={`w-full max-w-7xl mx-auto p-4 sm:p-5 ${
+                    dashboardMode === 'cockpit'
+                        ? 'h-full flex flex-col gap-3 overflow-hidden'
+                        : 'space-y-4'
+                }`}
             >
                 {/* 顶部标题与多功能工具栏 */}
                 <div className="flex flex-col md:flex-row items-start md:items-center justify-between gap-4">
@@ -713,14 +777,25 @@ const TokenStats: React.FC = () => {
                     </div>
 
                     <div className="flex flex-wrap items-center gap-2.5">
-                        {/* 双看板模式切换器 (Pill Toggle: 深度洞察 / 经典看板) */}
-                        <div className="flex bg-gray-100 dark:bg-[#16181d] border border-gray-200 dark:border-white/[0.08] rounded-xl p-1 shadow-sm">
+                        {/* 三看板模式切换器 (Pill Toggle: 赛博大盘 / 深度洞察 / 经典看板) */}
+                        <div className="flex bg-gray-100 dark:bg-base-200 border border-gray-200 dark:border-base-300 rounded-xl p-1 shadow-sm">
+                            <button
+                                onClick={() => switchDashboardMode('cockpit')}
+                                className={`px-3 py-1.5 rounded-lg text-xs font-medium transition-all flex items-center gap-1.5 ${
+                                    dashboardMode === 'cockpit'
+                                        ? 'bg-white dark:bg-base-100 text-emerald-600 dark:text-emerald-400 shadow-sm font-semibold'
+                                        : 'text-gray-500 dark:text-gray-400 hover:text-gray-900 dark:hover:text-base-content'
+                                }`}
+                            >
+                                <Terminal className="w-3.5 h-3.5 text-emerald-500 dark:text-emerald-400" />
+                                {t('token_stats.mode_cockpit', '总览看板')}
+                            </button>
                             <button
                                 onClick={() => switchDashboardMode('insights')}
                                 className={`px-3 py-1.5 rounded-lg text-xs font-medium transition-all flex items-center gap-1.5 ${
                                     dashboardMode === 'insights'
-                                        ? 'bg-white dark:bg-white/[0.12] text-blue-600 dark:text-white shadow-sm'
-                                        : 'text-gray-500 dark:text-white/50 hover:text-gray-900 dark:hover:text-white/80'
+                                        ? 'bg-white dark:bg-base-100 text-amber-600 dark:text-amber-400 shadow-sm font-semibold'
+                                        : 'text-gray-500 dark:text-gray-400 hover:text-gray-900 dark:hover:text-base-content'
                                 }`}
                             >
                                 <Sparkles className="w-3.5 h-3.5 text-amber-500 dark:text-amber-400" />
@@ -730,8 +805,8 @@ const TokenStats: React.FC = () => {
                                 onClick={() => switchDashboardMode('classic')}
                                 className={`px-3 py-1.5 rounded-lg text-xs font-medium transition-all flex items-center gap-1.5 ${
                                     dashboardMode === 'classic'
-                                        ? 'bg-white dark:bg-white/[0.12] text-blue-600 dark:text-white shadow-sm'
-                                        : 'text-gray-500 dark:text-white/50 hover:text-gray-900 dark:hover:text-white/80'
+                                        ? 'bg-white dark:bg-base-100 text-blue-600 dark:text-blue-400 shadow-sm font-semibold'
+                                        : 'text-gray-500 dark:text-gray-400 hover:text-gray-900 dark:hover:text-base-content'
                                 }`}
                             >
                                 <BarChart3 className="w-3.5 h-3.5 text-blue-500 dark:text-blue-400" />
@@ -740,13 +815,13 @@ const TokenStats: React.FC = () => {
                         </div>
 
                         {/* 时间段选择药丸 */}
-                        <div className="flex bg-gray-100 dark:bg-[#16181d] border border-gray-200 dark:border-white/[0.08] rounded-xl p-1 shadow-sm">
+                        <div className="flex bg-gray-100 dark:bg-base-200 border border-gray-200 dark:border-base-300 rounded-xl p-1 shadow-sm">
                             <button
                                 onClick={() => switchTimeRange('hourly')}
                                 className={`px-2.5 sm:px-3 py-1.5 rounded-lg text-xs font-medium transition-all flex items-center gap-1.5 ${
                                     timeRange === 'hourly'
-                                        ? 'bg-white dark:bg-white/[0.12] text-gray-900 dark:text-white shadow-sm'
-                                        : 'text-gray-500 dark:text-white/50 hover:text-gray-900 dark:hover:text-white/80'
+                                        ? 'bg-white dark:bg-base-100 text-gray-900 dark:text-base-content shadow-sm'
+                                        : 'text-gray-500 dark:text-gray-400 hover:text-gray-900 dark:hover:text-base-content'
                                 }`}
                             >
                                 <Clock className="w-3.5 h-3.5" />
@@ -756,8 +831,8 @@ const TokenStats: React.FC = () => {
                                 onClick={() => switchTimeRange('daily')}
                                 className={`px-2.5 sm:px-3 py-1.5 rounded-lg text-xs font-medium transition-all flex items-center gap-1.5 ${
                                     timeRange === 'daily'
-                                        ? 'bg-white dark:bg-white/[0.12] text-gray-900 dark:text-white shadow-sm'
-                                        : 'text-gray-500 dark:text-white/50 hover:text-gray-900 dark:hover:text-white/80'
+                                        ? 'bg-white dark:bg-base-100 text-gray-900 dark:text-base-content shadow-sm'
+                                        : 'text-gray-500 dark:text-gray-400 hover:text-gray-900 dark:hover:text-base-content'
                                 }`}
                             >
                                 <Calendar className="w-3.5 h-3.5" />
@@ -767,8 +842,8 @@ const TokenStats: React.FC = () => {
                                 onClick={() => switchTimeRange('weekly')}
                                 className={`px-2.5 sm:px-3 py-1.5 rounded-lg text-xs font-medium transition-all flex items-center gap-1.5 ${
                                     timeRange === 'weekly'
-                                        ? 'bg-white dark:bg-white/[0.12] text-gray-900 dark:text-white shadow-sm'
-                                        : 'text-gray-500 dark:text-white/50 hover:text-gray-900 dark:hover:text-white/80'
+                                        ? 'bg-white dark:bg-base-100 text-gray-900 dark:text-base-content shadow-sm'
+                                        : 'text-gray-500 dark:text-gray-400 hover:text-gray-900 dark:hover:text-base-content'
                                 }`}
                             >
                                 <CalendarDays className="w-3.5 h-3.5" />
@@ -778,8 +853,8 @@ const TokenStats: React.FC = () => {
                                 onClick={() => switchTimeRange('all')}
                                 className={`px-2.5 sm:px-3 py-1.5 rounded-lg text-xs font-medium transition-all flex items-center gap-1.5 ${
                                     timeRange === 'all'
-                                        ? 'bg-white dark:bg-white/[0.12] text-gray-900 dark:text-white shadow-sm'
-                                        : 'text-gray-500 dark:text-white/50 hover:text-gray-900 dark:hover:text-white/80'
+                                        ? 'bg-white dark:bg-base-100 text-gray-900 dark:text-base-content shadow-sm'
+                                        : 'text-gray-500 dark:text-gray-400 hover:text-gray-900 dark:hover:text-base-content'
                                 }`}
                             >
                                 <History className="w-3.5 h-3.5" />
@@ -791,7 +866,7 @@ const TokenStats: React.FC = () => {
                         <button
                             onClick={() => setShowPricingModal(true)}
                             title={t('token_stats.custom_pricing', '自定义单价')}
-                            className="p-2 rounded-xl bg-white dark:bg-[#16181d] border border-gray-200 dark:border-white/[0.08] text-gray-600 dark:text-white/70 hover:text-gray-900 dark:hover:text-white hover:bg-gray-100 dark:hover:bg-white/[0.06] transition-colors shadow-sm"
+                            className="p-2 rounded-xl bg-white dark:bg-base-200 border border-gray-200 dark:border-base-300 text-gray-600 dark:text-gray-300 hover:text-gray-900 dark:hover:text-white hover:bg-gray-100 dark:hover:bg-base-100 transition-colors shadow-sm"
                         >
                             <Settings2 className="w-4 h-4" />
                         </button>
@@ -807,372 +882,75 @@ const TokenStats: React.FC = () => {
                     </div>
                 </div>
 
-                {/* ==================== 1. 深度洞察看板 (Insights View) ==================== */}
-                {dashboardMode === 'insights' && (
-                    <>
-                        {/* 核心指标微卡片（4卡片设计，双主题适配） */}
-                        {summary && (
-                            <div className="grid grid-cols-2 md:grid-cols-4 gap-3.5">
-                                {/* 总 Token */}
-                                <div className="bg-white dark:bg-[#121316] border border-gray-200/80 dark:border-white/[0.08] rounded-2xl p-4 shadow-sm hover:border-gray-300 dark:hover:border-white/[0.15] transition-all flex flex-col justify-between">
-                                    <div className="flex items-center justify-between text-gray-500 dark:text-white/50 text-xs">
-                                        <span>{t('token_stats.total_tokens', '总 Token')}</span>
-                                        <div className="p-1.5 rounded-lg bg-gray-100 dark:bg-white/[0.04]">
-                                            <Zap className="w-3.5 h-3.5 text-gray-600 dark:text-white/70" />
-                                        </div>
-                                    </div>
-                                    <div className="mt-2 text-2xl font-bold font-mono tracking-tight text-gray-900 dark:text-white">
-                                        {formatNumber(summary.total_tokens)}
-                                    </div>
-                                    <div className="text-[11px] text-gray-400 dark:text-white/40 mt-1 font-mono">
-                                        {t('token_stats.input_short', '入')} {formatNumber(summary.total_input_tokens)} · {t('token_stats.output_short', '出')} {formatNumber(summary.total_output_tokens)}
-                                    </div>
-                                </div>
-
-                                {/* 估算价值 */}
-                                <div className="bg-white dark:bg-[#121316] border border-gray-200/80 dark:border-white/[0.08] rounded-2xl p-4 shadow-sm hover:border-gray-300 dark:hover:border-white/[0.15] transition-all flex flex-col justify-between">
-                                    <div className="flex items-center justify-between text-emerald-600 dark:text-emerald-400/80 text-xs">
-                                        <span className="font-medium">{t('token_stats.estimated_value', '估算价值')}</span>
-                                        <div className="p-1.5 rounded-lg bg-emerald-50 dark:bg-emerald-500/10">
-                                            <DollarSign className="w-3.5 h-3.5 text-emerald-600 dark:text-emerald-400" />
-                                        </div>
-                                    </div>
-                                    <div className="mt-2 text-2xl font-bold font-mono tracking-tight text-emerald-600 dark:text-emerald-400">
-                                        ${totalEstimatedCost.toFixed(2)}
-                                    </div>
-                                    <div className="text-[11px] text-gray-400 dark:text-white/40 mt-1 flex items-center justify-between">
-                                        <span>{t('token_stats.pricing_accumulated', '单价快照累计')}</span>
-                                        <button
-                                            onClick={() => setShowPricingModal(true)}
-                                            className="text-[10px] text-emerald-600 dark:text-emerald-400 hover:underline"
-                                        >
-                                            {t('token_stats.configure_pricing', '配置单价')}
-                                        </button>
-                                    </div>
-                                </div>
-
-                                {/* 缓存命中 */}
-                                <div className="bg-white dark:bg-[#121316] border border-gray-200/80 dark:border-white/[0.08] rounded-2xl p-4 shadow-sm hover:border-gray-300 dark:hover:border-white/[0.15] transition-all flex flex-col justify-between">
-                                    <div className="flex items-center justify-between text-sky-600 dark:text-sky-400/80 text-xs">
-                                        <span className="font-medium">{t('token_stats.cached_token', '缓存命中')}</span>
-                                        <div className="p-1.5 rounded-lg bg-sky-50 dark:bg-sky-500/10">
-                                            <Database className="w-3.5 h-3.5 text-sky-600 dark:text-sky-400" />
-                                        </div>
-                                    </div>
-                                    <div className="mt-2 text-2xl font-bold font-mono tracking-tight text-sky-600 dark:text-sky-400 flex items-baseline gap-2">
-                                        <span>{formatNumber(summary.total_cached_tokens)}</span>
-                                        <span className="text-xs font-normal px-1.5 py-0.5 rounded-full bg-sky-50 dark:bg-sky-500/10 border border-sky-200 dark:border-sky-500/20 text-sky-600 dark:text-sky-300">
-                                            {cacheMetrics.hitRate.toFixed(1)}%
-                                        </span>
-                                    </div>
-                                    <div className="text-[11px] text-gray-400 dark:text-white/40 mt-1 font-mono">
-                                        {t('token_stats.estimated_savings', { amount: cacheMetrics.savings.toFixed(2) })}
-                                    </div>
-                                </div>
-
-                                {/* 活跃生态 */}
-                                <div className="bg-white dark:bg-[#121316] border border-gray-200/80 dark:border-white/[0.08] rounded-2xl p-4 shadow-sm hover:border-gray-300 dark:hover:border-white/[0.15] transition-all flex flex-col justify-between">
-                                    <div className="flex items-center justify-between text-purple-600 dark:text-purple-400/80 text-xs">
-                                        <span className="font-medium">{t('token_stats.active_ecosystem', '活跃生态')}</span>
-                                        <div className="p-1.5 rounded-lg bg-purple-50 dark:bg-purple-500/10">
-                                            <Users className="w-3.5 h-3.5 text-purple-600 dark:text-purple-400" />
-                                        </div>
-                                    </div>
-                                    <div className="mt-2 text-2xl font-bold font-mono tracking-tight text-gray-900 dark:text-white flex items-baseline gap-3">
-                                        <span>{summary.unique_accounts} <span className="text-xs text-gray-400 dark:text-white/50 font-normal">{t('token_stats.accounts_unit', '账号')}</span></span>
-                                        <span className="text-purple-600 dark:text-purple-400">{modelData.length} <span className="text-xs text-gray-400 dark:text-white/50 font-normal">{t('token_stats.models_unit', '模型')}</span></span>
-                                    </div>
-                                    <div className="text-[11px] text-gray-400 dark:text-white/40 mt-1 font-mono">
-                                        {t('token_stats.total_requests_count', { count: summary.total_requests })}
-                                    </div>
-                                </div>
-                            </div>
-                        )}
-
-                        {/* 核心亮点：活动热力图 + 24小时极简圆角柱条 */}
-                        <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
-                            <ActivityHeatmapCard
-                                dailyData={heatmapData}
-                                totalEstimatedCost={totalEstimatedCost}
-                                formatNumber={formatNumber}
-                            />
-                            <HourlyTrendBarCard
-                                hourlyData={hourlyTrendData}
-                                totalEstimatedCost={hourly24hEstimatedCost}
-                                formatNumber={formatNumber}
-                            />
-                        </div>
-
-                        {/* 主力模型占比条形卡片 + 趋势图 */}
-                        <div className="grid grid-cols-1 xl:grid-cols-12 gap-4">
-                            <div className="xl:col-span-5">
-                                <TopModelsShareCard
-                                    models={modelShareItems}
-                                    formatNumber={formatNumber}
-                                />
-                            </div>
-
-                            <div className="xl:col-span-7 bg-white dark:bg-[#121316] rounded-2xl p-4 sm:p-5 border border-gray-200/80 dark:border-white/[0.08] shadow-sm flex flex-col justify-between">
-                                <div className="flex flex-wrap items-center justify-between gap-2 mb-3">
-                                    <div className="flex items-center gap-2">
-                                        {chartType === 'bar' ? (
-                                            <BarChart3 className="w-4 h-4 text-blue-500 dark:text-blue-400 opacity-90" />
-                                        ) : (
-                                            <TrendingUp className="w-4 h-4 text-blue-500 dark:text-blue-400 opacity-90" />
-                                        )}
-                                        <span className="text-[13px] font-semibold text-gray-900 dark:text-white/90 tracking-wide">
-                                            {viewMode === 'model'
-                                                ? metricType === 'cost'
-                                                    ? t('token_stats.model_cost_trend', '分模型金额趋势')
-                                                    : t('token_stats.model_trend', '分模型使用趋势')
-                                                : metricType === 'cost'
-                                                    ? t('token_stats.account_cost_trend', '分账号金额趋势')
-                                                    : t('token_stats.account_trend', '分账号使用趋势')}
-                                        </span>
-                                    </div>
-
-                                    <div className="flex flex-wrap items-center gap-2">
-                                        {/* 图表形态切换器：柱状图 / 面积图 */}
-                                        <div className="flex bg-gray-100 dark:bg-[#1a1d24] border border-gray-200 dark:border-white/[0.08] rounded-xl p-0.5">
-                                            <button
-                                                onClick={() => switchChartType('bar')}
-                                                title={t('token_stats.chart_type_bar', '柱状')}
-                                                className={`px-2 py-1 text-xs font-medium rounded-lg transition-all flex items-center gap-1 ${
-                                                    chartType === 'bar'
-                                                        ? 'bg-white dark:bg-white/[0.12] text-gray-900 dark:text-white shadow-sm'
-                                                        : 'text-gray-500 dark:text-white/50 hover:text-gray-900 dark:hover:text-white/80'
-                                                }`}
-                                            >
-                                                <BarChart3 className="w-3.5 h-3.5" />
-                                                <span>{t('token_stats.chart_type_bar', '柱状')}</span>
-                                            </button>
-                                            <button
-                                                onClick={() => switchChartType('area')}
-                                                title={t('token_stats.chart_type_area', '面积')}
-                                                className={`px-2 py-1 text-xs font-medium rounded-lg transition-all flex items-center gap-1 ${
-                                                    chartType === 'area'
-                                                        ? 'bg-white dark:bg-white/[0.12] text-gray-900 dark:text-white shadow-sm'
-                                                        : 'text-gray-500 dark:text-white/50 hover:text-gray-900 dark:hover:text-white/80'
-                                                }`}
-                                            >
-                                                <TrendingUp className="w-3.5 h-3.5" />
-                                                <span>{t('token_stats.chart_type_area', '面积')}</span>
-                                            </button>
-                                        </div>
-
-                                        {/* Token / 金额 维度切换器 */}
-                                        <div className="flex bg-gray-100 dark:bg-[#1a1d24] border border-gray-200 dark:border-white/[0.08] rounded-xl p-0.5">
-                                            <button
-                                                onClick={() => switchMetricType('tokens')}
-                                                className={`px-2 py-1 text-xs font-medium rounded-lg transition-all flex items-center gap-1 ${
-                                                    metricType === 'tokens'
-                                                        ? 'bg-white dark:bg-white/[0.12] text-gray-900 dark:text-white shadow-sm'
-                                                        : 'text-gray-500 dark:text-white/50 hover:text-gray-900 dark:hover:text-white/80'
-                                                }`}
-                                            >
-                                                <Zap className="w-3.5 h-3.5" />
-                                                <span>{t('token_stats.metric_tokens', 'Token')}</span>
-                                            </button>
-                                            <button
-                                                onClick={() => switchMetricType('cost')}
-                                                className={`px-2 py-1 text-xs font-medium rounded-lg transition-all flex items-center gap-1 ${
-                                                    metricType === 'cost'
-                                                        ? 'bg-white dark:bg-white/[0.12] text-emerald-600 dark:text-emerald-400 shadow-sm font-semibold'
-                                                        : 'text-gray-500 dark:text-white/50 hover:text-gray-900 dark:hover:text-white/80'
-                                                }`}
-                                            >
-                                                <DollarSign className="w-3.5 h-3.5" />
-                                                <span>{t('token_stats.metric_cost', '金额')}</span>
-                                            </button>
-                                        </div>
-
-                                        {/* 模型 / 账号 维度切换器 */}
-                                        <div className="flex bg-gray-100 dark:bg-[#1a1d24] border border-gray-200 dark:border-white/[0.08] rounded-xl p-0.5">
-                                            <button
-                                                onClick={() => switchViewMode('model')}
-                                                className={`px-2.5 py-1 text-xs font-medium rounded-lg transition-all ${
-                                                    viewMode === 'model'
-                                                        ? 'bg-white dark:bg-white/[0.12] text-gray-900 dark:text-white shadow-sm'
-                                                        : 'text-gray-500 dark:text-white/50 hover:text-gray-900 dark:hover:text-white/80'
-                                                }`}
-                                            >
-                                                {t('token_stats.by_model', '按模型')}
-                                            </button>
-                                            <button
-                                                onClick={() => switchViewMode('account')}
-                                                className={`px-2.5 py-1 text-xs font-medium rounded-lg transition-all ${
-                                                    viewMode === 'account'
-                                                        ? 'bg-white dark:bg-white/[0.12] text-gray-900 dark:text-white shadow-sm'
-                                                        : 'text-gray-500 dark:text-white/50 hover:text-gray-900 dark:hover:text-white/80'
-                                                }`}
-                                            >
-                                                {t('token_stats.by_account_view', '按账号')}
-                                            </button>
-                                        </div>
-                                    </div>
-                                </div>
-
-                                <div className="h-60" ref={trendChartContainerRef}>
-                                    {modelTrendData.length > 0 && allModels.length > 0 ? (
-                                        <ResponsiveContainer width="100%" height="100%">
-                                            {chartType === 'bar' ? (
-                                                <BarChart
-                                                    data={viewMode === 'model' ? displayModelTrendData : displayAccountTrendData}
-                                                    onMouseMove={handleTrendChartMouseMove}
-                                                    onMouseLeave={() => setTooltipPosition(undefined)}
-                                                >
-                                                    <CartesianGrid strokeDasharray="3 3" vertical={false} stroke="rgba(150, 150, 150, 0.15)" />
-                                                    <XAxis
-                                                        dataKey="period"
-                                                        tick={{ fontSize: 10, fill: '#888888', fontFamily: 'monospace' }}
-                                                        tickFormatter={(val) => {
-                                                            if (timeRange === 'hourly') return val.split(' ')[1] || val;
-                                                            if (timeRange === 'daily') return val.split('-').slice(1).join('/');
-                                                            if (timeRange === 'weekly') {
-                                                                const parts = val.split('-W');
-                                                                return parts.length > 1 ? `W${parts[1]}` : val;
-                                                            }
-                                                            if (timeRange === 'all') return val.split('-').slice(1).join('/');
-                                                            return val;
-                                                        }}
-                                                        axisLine={false}
-                                                        tickLine={false}
-                                                        dy={5}
-                                                    />
-                                                    <YAxis
-                                                        tick={{ fontSize: 10, fill: '#888888', fontFamily: 'monospace' }}
-                                                        tickFormatter={(val) => metricType === 'cost' ? formatCurrency(val) : formatNumber(val)}
-                                                        axisLine={false}
-                                                        tickLine={false}
-                                                    />
-                                                    <Tooltip
-                                                        content={<CustomTrendTooltip />}
-                                                        cursor={{ fill: 'rgba(150, 150, 150, 0.08)' }}
-                                                        allowEscapeViewBox={{ x: true, y: true }}
-                                                        position={tooltipPosition}
-                                                    />
-                                                    {displayModelKeysOrAccounts(viewMode, allModels, allAccounts).map((item, index) => {
-                                                        const items = displayModelKeysOrAccounts(viewMode, allModels, allAccounts);
-                                                        const isTop = index === items.length - 1;
-                                                        return (
-                                                            <Bar
-                                                                key={item}
-                                                                dataKey={item}
-                                                                stackId="stack"
-                                                                fill={TOP_COLORS[index % TOP_COLORS.length]}
-                                                                radius={isTop ? [3, 3, 0, 0] : [0, 0, 0, 0]}
-                                                                maxBarSize={30}
-                                                                isAnimationActive={false}
-                                                            />
-                                                        );
-                                                    })}
-                                                </BarChart>
-                                            ) : (
-                                                <AreaChart
-                                                    data={viewMode === 'model' ? displayModelTrendData : displayAccountTrendData}
-                                                    onMouseMove={handleTrendChartMouseMove}
-                                                    onMouseLeave={() => setTooltipPosition(undefined)}
-                                                >
-                                                    <defs>
-                                                        {displayModelKeysOrAccounts(viewMode, allModels, allAccounts).map((item, idx) => (
-                                                            <linearGradient key={`grad-${item}`} id={`color-${idx}`} x1="0" y1="0" x2="0" y2="1">
-                                                                <stop offset="5%" stopColor={TOP_COLORS[idx % TOP_COLORS.length]} stopOpacity={0.4} />
-                                                                <stop offset="95%" stopColor={TOP_COLORS[idx % TOP_COLORS.length]} stopOpacity={0.0} />
-                                                            </linearGradient>
-                                                        ))}
-                                                    </defs>
-                                                    <CartesianGrid strokeDasharray="3 3" vertical={false} stroke="rgba(150, 150, 150, 0.15)" />
-                                                    <XAxis
-                                                        dataKey="period"
-                                                        tick={{ fontSize: 10, fill: '#888888', fontFamily: 'monospace' }}
-                                                        tickFormatter={(val) => {
-                                                            if (timeRange === 'hourly') return val.split(' ')[1] || val;
-                                                            if (timeRange === 'daily') return val.split('-').slice(1).join('/');
-                                                            if (timeRange === 'weekly') {
-                                                                const parts = val.split('-W');
-                                                                return parts.length > 1 ? `W${parts[1]}` : val;
-                                                            }
-                                                            if (timeRange === 'all') return val.split('-').slice(1).join('/');
-                                                            return val;
-                                                        }}
-                                                        axisLine={false}
-                                                        tickLine={false}
-                                                        dy={5}
-                                                    />
-                                                    <YAxis
-                                                        tick={{ fontSize: 10, fill: '#888888', fontFamily: 'monospace' }}
-                                                        tickFormatter={(val) => metricType === 'cost' ? formatCurrency(val) : formatNumber(val)}
-                                                        axisLine={false}
-                                                        tickLine={false}
-                                                    />
-                                                    <Tooltip
-                                                        content={<CustomTrendTooltip />}
-                                                        cursor={{ stroke: 'rgba(150, 150, 150, 0.3)', strokeWidth: 1, strokeDasharray: '4 4' }}
-                                                        allowEscapeViewBox={{ x: true, y: true }}
-                                                        position={tooltipPosition}
-                                                    />
-                                                    {displayModelKeysOrAccounts(viewMode, allModels, allAccounts).map((item, index) => (
-                                                        <Area
-                                                            key={item}
-                                                            type="monotone"
-                                                            dataKey={item}
-                                                            stackId="1"
-                                                            stroke={TOP_COLORS[index % TOP_COLORS.length]}
-                                                            strokeWidth={1.5}
-                                                            fill={`url(#color-${index})`}
-                                                            isAnimationActive={false}
-                                                        />
-                                                    ))}
-                                                </AreaChart>
-                                            )}
-                                        </ResponsiveContainer>
-                                    ) : (
-                                        <div className="h-full flex items-center justify-center text-gray-400 dark:text-white/30 text-xs">
-                                            {loading ? t('common.loading', '加载中...') : t('token_stats.no_data', '暂无数据')}
-                                        </div>
-                                    )}
-                                </div>
-
-                                {/* 底部紧凑图例 */}
-                                <div className="flex items-center flex-wrap gap-3 pt-3 border-t border-gray-100 dark:border-white/[0.06] text-[11px] font-mono">
-                                    {displayModelKeysOrAccounts(viewMode, allModels, allAccounts).map((item, index) => (
-                                        <div key={item} className="flex items-center gap-1.5 text-gray-600 dark:text-white/60">
-                                            <div
-                                                className="w-2 h-2 rounded-full"
-                                                style={{ backgroundColor: TOP_COLORS[index % TOP_COLORS.length] }}
-                                            />
-                                            <span className="truncate max-w-[120px]">
-                                                {viewMode === 'model' ? item : item.split('@')[0]}
-                                            </span>
-                                        </div>
-                                    ))}
-                                </div>
-                            </div>
-                        </div>
-                    </>
+                {/* ==================== 0. 赛博大盘模式 (Cyber Cockpit View) ==================== */}
+                {dashboardMode === 'cockpit' && (
+                    <div className="flex-1 min-h-0 overflow-hidden">
+                        <CyberCockpitView
+                            summary={summary}
+                            hourlyData={hourlyTrendData}
+                            timelineData={classicChartData}
+                            modelShareItems={modelShareItems}
+                            accountData={accountData}
+                            timeRange={timeRange}
+                            totalEstimatedCost={totalEstimatedCost}
+                            cacheMetrics={cacheMetrics}
+                            formatNumber={formatNumber}
+                            formatCurrency={formatCurrency}
+                            setShowPricingModal={setShowPricingModal}
+                        />
+                    </div>
                 )}
 
-                {/* ==================== 2. 经典看板模式 (Classic View) ==================== */}
+                {/* ==================== 1. 深度洞察看板 (Apple Bento View) ==================== */}
+                {dashboardMode === 'insights' && (
+                    <AppleBentoView
+                        summary={summary}
+                        dailyData={heatmapData}
+                        hourlyData={hourlyTrendData}
+                        timelineData={classicChartData}
+                        modelShareItems={modelShareItems}
+                        accountData={accountData}
+                        displayModelTrendData={displayModelTrendData}
+                        displayAccountTrendData={displayAccountTrendData}
+                        allModels={allModels}
+                        allAccounts={allAccounts}
+                        viewMode={viewMode}
+                        metricType={metricType}
+                        chartType={chartType}
+                        timeRange={timeRange}
+                        totalEstimatedCost={totalEstimatedCost}
+                        cacheMetrics={cacheMetrics}
+                        formatNumber={formatNumber}
+                        formatCurrency={formatCurrency}
+                        switchChartType={switchChartType}
+                        switchMetricType={switchMetricType}
+                        switchViewMode={switchViewMode}
+                        setShowPricingModal={setShowPricingModal}
+                        customTooltip={CustomTrendTooltip}
+                    />
+                )}
+
+                {/* ==================== 3. 经典看板模式 (Classic View) ==================== */}
                 {dashboardMode === 'classic' && (
                     <>
                         {/* 6 个经典独立指标卡片 */}
                         {summary && (
                             <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-6 gap-3.5">
                                 {/* 总 Token */}
-                                <div className="bg-white dark:bg-[#121316] rounded-2xl p-4 shadow-sm border border-gray-200/80 dark:border-white/[0.08] flex flex-col justify-between">
-                                    <div className="flex items-center gap-2 text-gray-500 dark:text-white/50 text-xs mb-2">
-                                        <div className="p-1.5 rounded-lg bg-gray-100 dark:bg-white/[0.05]">
-                                            <Zap className="w-3.5 h-3.5 text-gray-600 dark:text-white/70" />
+                                <div className="bg-white dark:bg-base-100 rounded-2xl p-4 shadow-sm border border-gray-200/80 dark:border-base-200 flex flex-col justify-between">
+                                    <div className="flex items-center gap-2 text-gray-500 dark:text-gray-400 text-xs mb-2">
+                                        <div className="p-1.5 rounded-lg bg-gray-100 dark:bg-base-200">
+                                            <Zap className="w-3.5 h-3.5 text-gray-600 dark:text-gray-300" />
                                         </div>
                                         <span>{t('token_stats.total_tokens', '总 Token')}</span>
                                     </div>
-                                    <div className="text-2xl font-bold font-mono tracking-tight text-gray-900 dark:text-white">
+                                    <div className="text-2xl font-bold font-mono tracking-tight text-gray-900 dark:text-base-content">
                                         {formatNumber(summary.total_tokens)}
                                     </div>
                                 </div>
 
                                 {/* 输入 Token */}
-                                <div className="bg-white dark:bg-[#121316] rounded-2xl p-4 shadow-sm border border-gray-200/80 dark:border-white/[0.08] flex flex-col justify-between">
+                                <div className="bg-white dark:bg-base-100 rounded-2xl p-4 shadow-sm border border-gray-200/80 dark:border-base-200 flex flex-col justify-between">
                                     <div className="flex items-center gap-2 text-blue-600 dark:text-blue-400 text-xs mb-2">
                                         <div className="p-1.5 rounded-lg bg-blue-50 dark:bg-blue-500/10">
                                             <TrendingUp className="w-3.5 h-3.5 text-blue-600 dark:text-blue-400" />
@@ -1185,7 +963,7 @@ const TokenStats: React.FC = () => {
                                 </div>
 
                                 {/* 输出 Token */}
-                                <div className="bg-white dark:bg-[#121316] rounded-2xl p-4 shadow-sm border border-gray-200/80 dark:border-white/[0.08] flex flex-col justify-between">
+                                <div className="bg-white dark:bg-base-100 rounded-2xl p-4 shadow-sm border border-gray-200/80 dark:border-base-200 flex flex-col justify-between">
                                     <div className="flex items-center gap-2 text-purple-600 dark:text-purple-400 text-xs mb-2">
                                         <div className="p-1.5 rounded-lg bg-purple-50 dark:bg-purple-500/10">
                                             <TrendingUp className="w-3.5 h-3.5 rotate-180 text-purple-600 dark:text-purple-400" />
@@ -1198,7 +976,7 @@ const TokenStats: React.FC = () => {
                                 </div>
 
                                 {/* 缓存命中 */}
-                                <div className="bg-white dark:bg-[#121316] rounded-2xl p-4 shadow-sm border border-gray-200/80 dark:border-white/[0.08] flex flex-col justify-between">
+                                <div className="bg-white dark:bg-base-100 rounded-2xl p-4 shadow-sm border border-gray-200/80 dark:border-base-200 flex flex-col justify-between">
                                     <div className="flex items-center gap-2 text-sky-600 dark:text-sky-400 text-xs mb-2">
                                         <div className="p-1.5 rounded-lg bg-sky-50 dark:bg-sky-500/10">
                                             <Database className="w-3.5 h-3.5 text-sky-600 dark:text-sky-400" />
@@ -1211,7 +989,7 @@ const TokenStats: React.FC = () => {
                                 </div>
 
                                 {/* 活跃账号 */}
-                                <div className="bg-white dark:bg-[#121316] rounded-2xl p-4 shadow-sm border border-gray-200/80 dark:border-white/[0.08] flex flex-col justify-between">
+                                <div className="bg-white dark:bg-base-100 rounded-2xl p-4 shadow-sm border border-gray-200/80 dark:border-base-200 flex flex-col justify-between">
                                     <div className="flex items-center gap-2 text-emerald-600 dark:text-emerald-400 text-xs mb-2">
                                         <div className="p-1.5 rounded-lg bg-emerald-50 dark:bg-emerald-500/10">
                                             <Users className="w-3.5 h-3.5 text-emerald-600 dark:text-emerald-400" />
@@ -1224,7 +1002,7 @@ const TokenStats: React.FC = () => {
                                 </div>
 
                                 {/* 使用模型 */}
-                                <div className="bg-white dark:bg-[#121316] rounded-2xl p-4 shadow-sm border border-gray-200/80 dark:border-white/[0.08] flex flex-col justify-between">
+                                <div className="bg-white dark:bg-base-100 rounded-2xl p-4 shadow-sm border border-gray-200/80 dark:border-base-200 flex flex-col justify-between">
                                     <div className="flex items-center gap-2 text-amber-600 dark:text-amber-400 text-xs mb-2">
                                         <div className="p-1.5 rounded-lg bg-amber-50 dark:bg-amber-500/10">
                                             <Cpu className="w-3.5 h-3.5 text-amber-600 dark:text-amber-400" />
@@ -1239,7 +1017,7 @@ const TokenStats: React.FC = () => {
                         )}
 
                         {/* 全宽趋势图 (Full-Width Trend Chart) */}
-                        <div className="bg-white dark:bg-[#121316] rounded-2xl p-4 sm:p-5 border border-gray-200/80 dark:border-white/[0.08] shadow-sm flex flex-col justify-between">
+                        <div className="bg-white dark:bg-base-100 rounded-2xl p-4 sm:p-5 border border-gray-200/80 dark:border-base-200 shadow-sm flex flex-col justify-between">
                             <div className="flex flex-wrap items-center justify-between gap-2 mb-3">
                                 <div className="flex items-center gap-2">
                                     {chartType === 'bar' ? (
@@ -1247,7 +1025,7 @@ const TokenStats: React.FC = () => {
                                     ) : (
                                         <TrendingUp className="w-4 h-4 text-blue-500 dark:text-blue-400 opacity-90" />
                                     )}
-                                    <span className="text-[13px] font-semibold text-gray-900 dark:text-white/90 tracking-wide">
+                                    <span className="text-[13px] font-semibold text-gray-900 dark:text-base-content tracking-wide">
                                         {viewMode === 'model'
                                             ? metricType === 'cost'
                                                 ? t('token_stats.model_cost_trend', '分模型金额趋势')
@@ -1260,13 +1038,13 @@ const TokenStats: React.FC = () => {
 
                                 <div className="flex flex-wrap items-center gap-2">
                                     {/* 柱状 / 面积 切换 */}
-                                    <div className="flex bg-gray-100 dark:bg-[#1a1d24] border border-gray-200 dark:border-white/[0.08] rounded-xl p-0.5">
+                                    <div className="flex bg-gray-100 dark:bg-base-200 border border-gray-200 dark:border-base-300 rounded-xl p-0.5">
                                         <button
                                             onClick={() => switchChartType('bar')}
                                             className={`px-2 py-1 text-xs font-medium rounded-lg transition-all flex items-center gap-1 ${
                                                 chartType === 'bar'
-                                                    ? 'bg-white dark:bg-white/[0.12] text-gray-900 dark:text-white shadow-sm'
-                                                    : 'text-gray-500 dark:text-white/50 hover:text-gray-900 dark:hover:text-white/80'
+                                                    ? 'bg-white dark:bg-base-100 text-gray-900 dark:text-base-content shadow-sm'
+                                                    : 'text-gray-500 dark:text-gray-400 hover:text-gray-900 dark:hover:text-base-content'
                                             }`}
                                         >
                                             <BarChart3 className="w-3.5 h-3.5" />
@@ -1276,8 +1054,8 @@ const TokenStats: React.FC = () => {
                                             onClick={() => switchChartType('area')}
                                             className={`px-2 py-1 text-xs font-medium rounded-lg transition-all flex items-center gap-1 ${
                                                 chartType === 'area'
-                                                    ? 'bg-white dark:bg-white/[0.12] text-gray-900 dark:text-white shadow-sm'
-                                                    : 'text-gray-500 dark:text-white/50 hover:text-gray-900 dark:hover:text-white/80'
+                                                    ? 'bg-white dark:bg-base-100 text-gray-900 dark:text-base-content shadow-sm'
+                                                    : 'text-gray-500 dark:text-gray-400 hover:text-gray-900 dark:hover:text-base-content'
                                             }`}
                                         >
                                             <TrendingUp className="w-3.5 h-3.5" />
@@ -1286,13 +1064,13 @@ const TokenStats: React.FC = () => {
                                     </div>
 
                                     {/* Token / 金额 维度切换 */}
-                                    <div className="flex bg-gray-100 dark:bg-[#1a1d24] border border-gray-200 dark:border-white/[0.08] rounded-xl p-0.5">
+                                    <div className="flex bg-gray-100 dark:bg-base-200 border border-gray-200 dark:border-base-300 rounded-xl p-0.5">
                                         <button
                                             onClick={() => switchMetricType('tokens')}
                                             className={`px-2 py-1 text-xs font-medium rounded-lg transition-all flex items-center gap-1 ${
                                                 metricType === 'tokens'
-                                                    ? 'bg-white dark:bg-white/[0.12] text-gray-900 dark:text-white shadow-sm'
-                                                    : 'text-gray-500 dark:text-white/50 hover:text-gray-900 dark:hover:text-white/80'
+                                                    ? 'bg-white dark:bg-base-100 text-gray-900 dark:text-base-content shadow-sm'
+                                                    : 'text-gray-500 dark:text-gray-400 hover:text-gray-900 dark:hover:text-base-content'
                                             }`}
                                         >
                                             <Zap className="w-3.5 h-3.5" />
@@ -1302,8 +1080,8 @@ const TokenStats: React.FC = () => {
                                             onClick={() => switchMetricType('cost')}
                                             className={`px-2 py-1 text-xs font-medium rounded-lg transition-all flex items-center gap-1 ${
                                                 metricType === 'cost'
-                                                    ? 'bg-white dark:bg-white/[0.12] text-emerald-600 dark:text-emerald-400 shadow-sm font-semibold'
-                                                    : 'text-gray-500 dark:text-white/50 hover:text-gray-900 dark:hover:text-white/80'
+                                                    ? 'bg-white dark:bg-base-100 text-emerald-600 dark:text-emerald-400 shadow-sm font-semibold'
+                                                    : 'text-gray-500 dark:text-gray-400 hover:text-gray-900 dark:hover:text-base-content'
                                             }`}
                                         >
                                             <DollarSign className="w-3.5 h-3.5" />
@@ -1312,13 +1090,13 @@ const TokenStats: React.FC = () => {
                                     </div>
 
                                     {/* 模型 / 账号 维度切换 */}
-                                    <div className="flex bg-gray-100 dark:bg-[#1a1d24] border border-gray-200 dark:border-white/[0.08] rounded-xl p-0.5">
+                                    <div className="flex bg-gray-100 dark:bg-base-200 border border-gray-200 dark:border-base-300 rounded-xl p-0.5">
                                         <button
                                             onClick={() => switchViewMode('model')}
                                             className={`px-2.5 py-1 text-xs font-medium rounded-lg transition-all ${
                                                 viewMode === 'model'
-                                                    ? 'bg-white dark:bg-white/[0.12] text-gray-900 dark:text-white shadow-sm'
-                                                    : 'text-gray-500 dark:text-white/50 hover:text-gray-900 dark:hover:text-white/80'
+                                                    ? 'bg-white dark:bg-base-100 text-gray-900 dark:text-base-content shadow-sm'
+                                                    : 'text-gray-500 dark:text-gray-400 hover:text-gray-900 dark:hover:text-base-content'
                                             }`}
                                         >
                                             {t('token_stats.by_model', '按模型')}
@@ -1327,8 +1105,8 @@ const TokenStats: React.FC = () => {
                                             onClick={() => switchViewMode('account')}
                                             className={`px-2.5 py-1 text-xs font-medium rounded-lg transition-all ${
                                                 viewMode === 'account'
-                                                    ? 'bg-white dark:bg-white/[0.12] text-gray-900 dark:text-white shadow-sm'
-                                                    : 'text-gray-500 dark:text-white/50 hover:text-gray-900 dark:hover:text-white/80'
+                                                    ? 'bg-white dark:bg-base-100 text-gray-900 dark:text-base-content shadow-sm'
+                                                    : 'text-gray-500 dark:text-gray-400 hover:text-gray-900 dark:hover:text-base-content'
                                             }`}
                                         >
                                             {t('token_stats.by_account_view', '按账号')}
@@ -1350,15 +1128,7 @@ const TokenStats: React.FC = () => {
                                                 <XAxis
                                                     dataKey="period"
                                                     tick={{ fontSize: 10, fill: '#888888', fontFamily: 'monospace' }}
-                                                    tickFormatter={(val) => {
-                                                        if (timeRange === 'hourly') return val.split(' ')[1] || val;
-                                                        if (timeRange === 'daily') return val.split('-').slice(1).join('/');
-                                                        if (timeRange === 'weekly') {
-                                                            const parts = val.split('-W');
-                                                            return parts.length > 1 ? `W${parts[1]}` : val;
-                                                        }
-                                                        return val;
-                                                    }}
+                                                    tickFormatter={formatPeriodAxisTick}
                                                     axisLine={false}
                                                     tickLine={false}
                                                     dy={5}
@@ -1409,15 +1179,7 @@ const TokenStats: React.FC = () => {
                                                 <XAxis
                                                     dataKey="period"
                                                     tick={{ fontSize: 10, fill: '#888888', fontFamily: 'monospace' }}
-                                                    tickFormatter={(val) => {
-                                                        if (timeRange === 'hourly') return val.split(' ')[1] || val;
-                                                        if (timeRange === 'daily') return val.split('-').slice(1).join('/');
-                                                        if (timeRange === 'weekly') {
-                                                            const parts = val.split('-W');
-                                                            return parts.length > 1 ? `W${parts[1]}` : val;
-                                                        }
-                                                        return val;
-                                                    }}
+                                                    tickFormatter={formatPeriodAxisTick}
                                                     axisLine={false}
                                                     tickLine={false}
                                                     dy={5}
@@ -1474,8 +1236,8 @@ const TokenStats: React.FC = () => {
                         {/* 经典双栏：左侧 2/3 为 Token 使用趋势堆叠柱状图，右侧 1/3 为分账号统计环形饼图 */}
                         <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
                             {/* 堆叠柱状图 (Stacked Token Usage Trend Chart) */}
-                            <div className="lg:col-span-2 bg-white dark:bg-[#121316] rounded-2xl p-4 sm:p-5 border border-gray-200/80 dark:border-white/[0.08] shadow-sm flex flex-col justify-between">
-                                <h2 className="text-[13px] font-semibold text-gray-900 dark:text-white/90 mb-3 flex items-center gap-2">
+                            <div className="lg:col-span-2 bg-white dark:bg-base-100 rounded-2xl p-4 sm:p-5 border border-gray-200/80 dark:border-base-200 shadow-sm flex flex-col justify-between">
+                                <h2 className="text-[13px] font-semibold text-gray-900 dark:text-base-content mb-3 flex items-center gap-2">
                                     <BarChart3 className="w-4 h-4 text-blue-500" />
                                     {t('token_stats.usage_trend', 'Token 使用趋势')}
                                 </h2>
@@ -1487,15 +1249,7 @@ const TokenStats: React.FC = () => {
                                                 <XAxis
                                                     dataKey="period"
                                                     tick={{ fontSize: 10, fill: '#888888', fontFamily: 'monospace' }}
-                                                    tickFormatter={(val) => {
-                                                        if (timeRange === 'hourly') return val.split(' ')[1] || val;
-                                                        if (timeRange === 'daily') return val.split('-').slice(1).join('/');
-                                                        if (timeRange === 'weekly') {
-                                                            const parts = val.split('-W');
-                                                            return parts.length > 1 ? `W${parts[1]}` : val;
-                                                        }
-                                                        return val;
-                                                    }}
+                                                    tickFormatter={formatPeriodAxisTick}
                                                     axisLine={false}
                                                     tickLine={false}
                                                     dy={5}
@@ -1537,7 +1291,7 @@ const TokenStats: React.FC = () => {
                                             </BarChart>
                                         </ResponsiveContainer>
                                     ) : (
-                                        <div className="h-full flex items-center justify-center text-gray-400 dark:text-white/30 text-xs">
+                                        <div className="h-full flex items-center justify-center text-gray-400 dark:text-gray-500 text-xs">
                                             {loading ? t('common.loading', '加载中...') : t('token_stats.no_data', '暂无数据')}
                                         </div>
                                     )}
@@ -1545,8 +1299,8 @@ const TokenStats: React.FC = () => {
                             </div>
 
                             {/* 分账号统计饼图 (Account Distribution Pie Chart) */}
-                            <div className="bg-white dark:bg-[#121316] rounded-2xl p-4 sm:p-5 border border-gray-200/80 dark:border-white/[0.08] shadow-sm flex flex-col justify-between">
-                                <h2 className="text-[13px] font-semibold text-gray-900 dark:text-white/90 mb-2 flex items-center gap-2">
+                            <div className="bg-white dark:bg-base-100 rounded-2xl p-4 sm:p-5 border border-gray-200/80 dark:border-base-200 shadow-sm flex flex-col justify-between">
+                                <h2 className="text-[13px] font-semibold text-gray-900 dark:text-base-content mb-2 flex items-center gap-2">
                                     <Users className="w-4 h-4 text-emerald-500" />
                                     {t('token_stats.by_account', '分账号统计')}
                                 </h2>
@@ -1578,12 +1332,12 @@ const TokenStats: React.FC = () => {
                                             </PieChart>
                                         </ResponsiveContainer>
                                     ) : (
-                                        <div className="h-full flex items-center justify-center text-gray-400 dark:text-white/30 text-xs">
+                                        <div className="h-full flex items-center justify-center text-gray-400 dark:text-gray-500 text-xs">
                                             {loading ? t('common.loading', '加载中...') : t('token_stats.no_data', '暂无数据')}
                                         </div>
                                     )}
                                 </div>
-                                <div className="space-y-1.5 max-h-28 overflow-y-auto pr-1 scrollbar-thin scrollbar-thumb-gray-200 dark:scrollbar-thumb-white/10 pt-2 border-t border-gray-100 dark:border-white/[0.06]">
+                                <div className="space-y-1.5 max-h-28 overflow-y-auto pr-1 scrollbar-thin scrollbar-thumb-gray-200 dark:scrollbar-thumb-base-300 pt-2 border-t border-gray-100 dark:border-base-200">
                                     {accountData.slice(0, 5).map((account, index) => (
                                         <div key={account.account_email} className="flex items-center justify-between text-xs">
                                             <div className="flex items-center gap-2">
@@ -1591,11 +1345,11 @@ const TokenStats: React.FC = () => {
                                                     className="w-2 h-2 rounded-full flex-shrink-0"
                                                     style={{ backgroundColor: PIE_COLORS[index % PIE_COLORS.length] }}
                                                 />
-                                                <span className="text-gray-600 dark:text-white/70 truncate max-w-[120px]">
+                                                <span className="text-gray-600 dark:text-gray-300 truncate max-w-[120px]">
                                                     {account.account_email.split('@')[0]}
                                                 </span>
                                             </div>
-                                            <span className="font-mono font-medium text-gray-800 dark:text-white">
+                                            <span className="font-mono font-medium text-gray-800 dark:text-base-content">
                                                 {formatNumber(account.total_tokens)}
                                             </span>
                                         </div>
@@ -1607,21 +1361,21 @@ const TokenStats: React.FC = () => {
                 )}
 
                 {/* ==================== 底部通用详细统计表格 ==================== */}
-                {viewMode === 'model' && modelData.length > 0 && (
-                    <div className="bg-white dark:bg-[#121316] rounded-2xl p-4 sm:p-5 border border-gray-200/80 dark:border-white/[0.08] shadow-sm">
+                {dashboardMode === 'classic' && viewMode === 'model' && modelData.length > 0 && (
+                    <div className="bg-white dark:bg-base-100 rounded-2xl p-4 sm:p-5 border border-gray-200/80 dark:border-base-200 shadow-sm">
                         <div className="flex items-center justify-between mb-4">
-                            <h2 className="text-[13px] font-semibold text-gray-900 dark:text-white/90 flex items-center gap-2">
+                            <h2 className="text-[13px] font-semibold text-gray-900 dark:text-base-content flex items-center gap-2">
                                 <Cpu className="w-4 h-4 text-blue-500" />
                                 {t('token_stats.model_details', '分模型详细统计')}
                             </h2>
-                            <span className="text-xs text-gray-400 dark:text-white/40 font-mono">
+                            <span className="text-xs text-gray-400 dark:text-gray-400 font-mono">
                                 {t('token_stats.pricing_snapshot_note', '按照单价快照核算')}
                             </span>
                         </div>
                         <div className="overflow-x-auto">
                             <table className="w-full text-xs">
                                 <thead>
-                                    <tr className="border-b border-gray-200 dark:border-white/[0.08] text-gray-400 dark:text-white/40 uppercase tracking-wider text-[11px]">
+                                    <tr className="border-b border-gray-200 dark:border-base-200 text-gray-400 dark:text-gray-400 uppercase tracking-wider text-[11px]">
                                         <th className="text-left py-2.5 px-3 font-medium">{t('token_stats.model', '模型')}</th>
                                         <th className="text-right py-2.5 px-3 font-medium">{t('token_stats.requests', '请求数')}</th>
                                         <th className="text-right py-2.5 px-3 font-medium">{t('token_stats.input', '输入')}</th>
@@ -1632,24 +1386,24 @@ const TokenStats: React.FC = () => {
                                         <th className="text-right py-2.5 px-3 font-medium">{t('token_stats.model_cost', '估算费用')}</th>
                                     </tr>
                                 </thead>
-                                <tbody className="divide-y divide-gray-100 dark:divide-white/[0.04]">
+                                <tbody className="divide-y divide-gray-100 dark:divide-base-200">
                                     {modelData.map((model, index) => {
                                         const percentage = summary && summary.total_tokens > 0 ? ((model.total_tokens / summary.total_tokens) * 100).toFixed(1) : '0';
                                         const cost = calculateModelCost(model);
                                         return (
-                                            <tr key={model.model} className="hover:bg-gray-50/70 dark:hover:bg-white/[0.03] transition-colors">
+                                            <tr key={model.model} className="hover:bg-gray-50/70 dark:hover:bg-base-200/50 transition-colors">
                                                 <td className="py-2.5 px-3">
                                                     <div className="flex items-center gap-2 font-mono">
                                                         <div
                                                             className="w-2 h-2 rounded-full flex-shrink-0"
                                                             style={{ backgroundColor: TOP_COLORS[index % TOP_COLORS.length] }}
                                                         />
-                                                        <span className="text-gray-900 dark:text-white/90 font-medium truncate max-w-[180px]" title={model.model}>
+                                                        <span className="text-gray-900 dark:text-base-content font-medium truncate max-w-[180px]" title={model.model}>
                                                             {model.model}
                                                         </span>
                                                     </div>
                                                 </td>
-                                                <td className="py-2.5 px-3 text-right font-mono text-gray-500 dark:text-white/60">
+                                                <td className="py-2.5 px-3 text-right font-mono text-gray-500 dark:text-gray-400">
                                                     {model.request_count.toLocaleString()}
                                                 </td>
                                                 <td className="py-2.5 px-3 text-right font-mono text-blue-600 dark:text-blue-400">
@@ -1661,10 +1415,10 @@ const TokenStats: React.FC = () => {
                                                 <td className="py-2.5 px-3 text-right font-mono text-sky-600 dark:text-sky-400">
                                                     {formatNumber(model.total_cached_tokens)}
                                                 </td>
-                                                <td className="py-2.5 px-3 text-right font-mono font-semibold text-gray-900 dark:text-white">
+                                                <td className="py-2.5 px-3 text-right font-mono font-semibold text-gray-900 dark:text-base-content">
                                                     {formatNumber(model.total_tokens)}
                                                 </td>
-                                                <td className="py-2.5 px-3 text-right font-mono text-gray-500 dark:text-white/60">
+                                                <td className="py-2.5 px-3 text-right font-mono text-gray-500 dark:text-gray-400">
                                                     {percentage}%
                                                 </td>
                                                 <td className="py-2.5 px-3 text-right font-mono font-medium text-emerald-600 dark:text-emerald-400">
@@ -1679,10 +1433,10 @@ const TokenStats: React.FC = () => {
                     </div>
                 )}
 
-                {viewMode === 'account' && accountData.length > 0 && (
-                    <div className="bg-white dark:bg-[#121316] rounded-2xl p-4 sm:p-5 border border-gray-200/80 dark:border-white/[0.08] shadow-sm">
+                {dashboardMode === 'classic' && viewMode === 'account' && accountData.length > 0 && (
+                    <div className="bg-white dark:bg-base-100 rounded-2xl p-4 sm:p-5 border border-gray-200/80 dark:border-base-200 shadow-sm">
                         <div className="flex items-center justify-between mb-4">
-                            <h2 className="text-[13px] font-semibold text-gray-900 dark:text-white/90 flex items-center gap-2">
+                            <h2 className="text-[13px] font-semibold text-gray-900 dark:text-base-content flex items-center gap-2">
                                 <Users className="w-4 h-4 text-emerald-500" />
                                 {t('token_stats.account_details', '账号详细统计')}
                             </h2>
@@ -1690,7 +1444,7 @@ const TokenStats: React.FC = () => {
                         <div className="overflow-x-auto">
                             <table className="w-full text-xs">
                                 <thead>
-                                    <tr className="border-b border-gray-200 dark:border-white/[0.08] text-gray-400 dark:text-white/40 uppercase tracking-wider text-[11px]">
+                                    <tr className="border-b border-gray-200 dark:border-base-200 text-gray-400 dark:text-gray-400 uppercase tracking-wider text-[11px]">
                                         <th className="text-left py-2.5 px-3 font-medium">{t('token_stats.account', '账号')}</th>
                                         <th className="text-right py-2.5 px-3 font-medium">{t('token_stats.requests', '请求数')}</th>
                                         <th className="text-right py-2.5 px-3 font-medium">{t('token_stats.input', '输入')}</th>
@@ -1699,13 +1453,13 @@ const TokenStats: React.FC = () => {
                                         <th className="text-right py-2.5 px-3 font-medium">{t('token_stats.total', '合计')}</th>
                                     </tr>
                                 </thead>
-                                <tbody className="divide-y divide-gray-100 dark:divide-white/[0.04]">
+                                <tbody className="divide-y divide-gray-100 dark:divide-base-200">
                                     {accountData.map((account) => (
-                                        <tr key={account.account_email} className="hover:bg-gray-50/70 dark:hover:bg-white/[0.03] transition-colors">
-                                            <td className="py-2.5 px-3 font-mono text-gray-900 dark:text-white/90 truncate max-w-[200px]" title={account.account_email}>
+                                        <tr key={account.account_email} className="hover:bg-gray-50/70 dark:hover:bg-base-200/50 transition-colors">
+                                            <td className="py-2.5 px-3 font-mono text-gray-900 dark:text-base-content truncate max-w-[200px]" title={account.account_email}>
                                                 {account.account_email}
                                             </td>
-                                            <td className="py-2.5 px-3 text-right font-mono text-gray-500 dark:text-white/60">
+                                            <td className="py-2.5 px-3 text-right font-mono text-gray-500 dark:text-gray-400">
                                                 {account.request_count.toLocaleString()}
                                             </td>
                                             <td className="py-2.5 px-3 text-right font-mono text-blue-600 dark:text-blue-400">
@@ -1717,7 +1471,7 @@ const TokenStats: React.FC = () => {
                                             <td className="py-2.5 px-3 text-right font-mono text-sky-600 dark:text-sky-400">
                                                 {formatNumber(account.total_cached_tokens)}
                                             </td>
-                                            <td className="py-2.5 px-3 text-right font-mono font-semibold text-gray-900 dark:text-white">
+                                            <td className="py-2.5 px-3 text-right font-mono font-semibold text-gray-900 dark:text-base-content">
                                                 {formatNumber(account.total_tokens)}
                                             </td>
                                         </tr>

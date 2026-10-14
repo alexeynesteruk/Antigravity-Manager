@@ -45,7 +45,7 @@ static COMPACTION_IMMUNITY_LEASES: LazyLock<DashMap<String, CompactionImmunityLe
     LazyLock::new(DashMap::new);
 
 const COMPACTION_IMMUNITY_INITIAL_TTL_SECS: u64 = 300;
-const COMPACTION_IMMUNITY_WINDOW_SECS: u64 = 60; // 调优至 60 秒，覆盖长工具调用与慢推理，杜绝 Double-400 (RFC #3576)
+const COMPACTION_IMMUNITY_WINDOW_SECS: u64 = 90; // 放宽至 90 秒，彻底覆盖大模型超长深度思考与连续多步 MCP 工具调用，杜绝 Double-400 (RFC #3576, PR #3647)
 
 /// 压缩模式类型：区分手动 ./compact 指令驱动与自动超限自愈门禁驱动
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -199,15 +199,13 @@ fn is_manual_compact_command(request: &ClaudeRequest) -> bool {
     false
 }
 
-/// 判断当前请求是否属于 Claude Desktop Cowork 专属会话
-/// 关键防护：严格排除 Claude Code 模式（CLI / Desktop Code Tab），防止日常代码工程被误触截断。
-/// 仅精准放行真正的 Cowork 模式（带 mcp__cowork_* / mcp__workspace_* 工具或 local-agent 运行环境）。
-pub fn is_cowork_session(request: &ClaudeRequest, headers: &HeaderMap) -> bool {
-    // 1. 显式排除 Claude Code 模式（一票否决权）：
-    // 关键认知：Claude Desktop 的 Cowork 模式底层同样基于 agent-sdk，也会携带 x-app: cli、x-claude-code-session-id
-    // 以及通用宿主标头 claude-desktop-3p（代表 3p 嵌入桌面宿主），因此绝不能用这些通用标头判定 Code 模式！
-    // 真正的 Code 模式专属特征为：包含 mcp__ccd_* 工具前缀，或系统提示词显式声明 "You are Claude Code"
-    let is_code_mode = request.tools.as_ref().map_or(false, |tools| {
+/// 判断当前请求是否属于 Claude Code 模式（CLI / Desktop Code Tab）
+///
+/// 判定依据（与 Cowork 排除判定完全对齐）：
+/// 1. 工具声明包含 `mcp__ccd_` 前缀（Claude Desktop Code Tab 专属工具）；
+/// 2. 或系统提示词显式声明包含 "You are Claude Code"（Claude Code CLI 官方身份）。
+pub fn is_code_mode(request: &ClaudeRequest) -> bool {
+    request.tools.as_ref().map_or(false, |tools| {
         tools.iter().any(|t| t.get_name().starts_with("mcp__ccd_"))
     }) || request.system.as_ref().map_or(false, |sys| match sys {
         crate::proxy::mappers::claude::models::SystemPrompt::String(s) => {
@@ -216,9 +214,18 @@ pub fn is_cowork_session(request: &ClaudeRequest, headers: &HeaderMap) -> bool {
         crate::proxy::mappers::claude::models::SystemPrompt::Array(arr) => {
             arr.iter().any(|b| b.text.contains("You are Claude Code"))
         }
-    });
+    })
+}
 
-    if is_code_mode {
+/// 判断当前请求是否属于 Claude Desktop Cowork 专属会话
+/// 关键防护：严格排除 Claude Code 模式（CLI / Desktop Code Tab），防止日常代码工程被误触截断。
+/// 仅精准放行真正的 Cowork 模式（带 mcp__cowork_* / mcp__workspace_* 工具或 local-agent 运行环境）。
+pub fn is_cowork_session(request: &ClaudeRequest, headers: &HeaderMap) -> bool {
+    // 1. 显式排除 Claude Code 模式（一票否决权）：
+    // 关键认知：Claude Desktop 的 Cowork 模式底层同样基于 agent-sdk，也会携带 x-app: cli、x-claude-code-session-id
+    // 以及通用宿主标头 claude-desktop-3p（代表 3p 嵌入桌面宿主），因此绝不能用这些通用标头判定 Code 模式！
+    // 真正的 Code 模式专属特征为：包含 mcp__ccd_* 工具前缀，或系统提示词显式声明 "You are Claude Code"
+    if is_code_mode(request) {
         return false;
     }
 
@@ -1101,7 +1108,13 @@ pub async fn handle_messages(
 
     // [NEW] 获取上下文控制配置
     let experimental = state.experimental.read().await;
-    let scaling_enabled = experimental.enable_usage_scaling;
+    // 关键防护（方案 A）：Claude Code (CLI / Desktop Code Tab) 具备原生的主动滑动窗口压缩机制 (/compact)，
+    // 其内部通过 input_tokens 占比达到 ~95% 上限触发自动压缩。
+    // 若对其开启用量缩放，会将百万级物理 Token 压缩映射至假性偏低的数值区间（如 500k 映射为 58k），
+    // 导致客户端永远无法感知真实上下文压力、丧失主动 /compact 触发时机，并在触及服务端硬限制时骤然崩溃 (Fixes #867, #1066, #1079)。
+    // 因此：若检测为 Claude Code 会话，强制关闭用量缩放，如实下发真实物理 Token 用量。
+    let is_code = is_code_mode(&request);
+    let scaling_enabled = experimental.enable_usage_scaling && !is_code;
 
     // [全链路会话生命周期与自愈分流体系 (Pipeline First)]
     // 提取会话唯一标识（优先提取产品专属会话头或内容锚点）
@@ -1854,6 +1867,7 @@ pub async fn handle_messages(
                 Err(e) => {
                     let headers = [
                         ("X-Mapped-Model", request_with_mapped.model.as_str()),
+                        ("X-Upstream-Model", config.final_model.as_str()),
                         ("X-Account-Email", email.as_str()),
                     ];
                     return (
@@ -2121,6 +2135,7 @@ pub async fn handle_messages(
                         .header("X-Accel-Buffering", "no")
                         .header("X-Account-Email", &email)
                         .header("X-Mapped-Model", &request_with_mapped.model)
+                        .header("X-Upstream-Model", config.final_model.as_str())
                         .header("X-Session-Id", &client_session_id)
                         .header("X-Antigravity-Session-Id", &client_session_id)
                         .header("X-Context-Purified", "false")
@@ -2270,6 +2285,7 @@ pub async fn handle_messages(
                                     .header(header::CONTENT_TYPE, "application/json")
                                     .header("X-Account-Email", &email)
                                     .header("X-Mapped-Model", &request_with_mapped.model)
+                                    .header("X-Upstream-Model", config.final_model.as_str())
                                     .header("X-Session-Id", &client_session_id)
                                     .header("X-Antigravity-Session-Id", &client_session_id)
                                     .header("X-Context-Purified", "false")
@@ -2403,6 +2419,7 @@ pub async fn handle_messages(
                     [
                         ("X-Account-Email", email.as_str()),
                         ("X-Mapped-Model", request_with_mapped.model.as_str()),
+                        ("X-Upstream-Model", config.final_model.as_str()),
                     ],
                     Json(claude_response),
                 )
@@ -2489,6 +2506,7 @@ pub async fn handle_messages(
                 [
                     ("X-Account-Email", email.as_str()),
                     ("X-Mapped-Model", request_with_mapped.model.as_str()),
+                    ("X-Upstream-Model", config.final_model.as_str()),
                 ],
                 Json(dual_err),
             )
@@ -3885,7 +3903,10 @@ mod warmup_tests {
             "Lease must be marked as consumed"
         );
 
-        // Turn 2: Concurrent request / tool call within 30s sliding window passes through
+        // Turn 2: Deep thinking / complex MCP tool calls taking 75s must remain valid under 90s sliding window
+        if let Some(mut lease) = COMPACTION_IMMUNITY_LEASES.get_mut(&session_key) {
+            lease.last_touched = std::time::Instant::now() - std::time::Duration::from_secs(75);
+        }
         passed = false;
         if !is_compaction_req {
             if let Some(mut lease) = COMPACTION_IMMUNITY_LEASES.get_mut(&session_key) {
@@ -3905,12 +3926,12 @@ mod warmup_tests {
         }
         assert!(
             passed,
-            "Concurrent turn within sliding window must pass through"
+            "Deep thinking turn taking 75s within 90s sliding window must pass through"
         );
 
-        // Expired lease after window is evicted
+        // Expired lease after 95s window is evicted
         if let Some(mut lease) = COMPACTION_IMMUNITY_LEASES.get_mut(&session_key) {
-            lease.last_touched = std::time::Instant::now() - std::time::Duration::from_secs(35);
+            lease.last_touched = std::time::Instant::now() - std::time::Duration::from_secs(95);
         }
         passed = false;
         if !is_compaction_req {
@@ -4037,8 +4058,8 @@ mod warmup_tests {
         COMPACTION_IMMUNITY_LEASES.insert(
             session_key.clone(),
             CompactionImmunityLease {
-                created_at: std::time::Instant::now() - std::time::Duration::from_secs(100),
-                last_touched: std::time::Instant::now() - std::time::Duration::from_secs(50),
+                created_at: std::time::Instant::now() - std::time::Duration::from_secs(120),
+                last_touched: std::time::Instant::now() - std::time::Duration::from_secs(100),
                 consumed: true,
             },
         );
@@ -4563,6 +4584,8 @@ mod warmup_tests {
 
     #[test]
     fn test_detect_post_compaction_continuation_with_preceding_reminders_and_extended_scan() {
+        use crate::proxy::mappers::claude::models::{Message, MessageContent};
+
         // 构造包含多轮前置 system-reminder 与环境详情的接续请求 (第 4 条为包含 <summary> 的接续轮)
         let req = ClaudeRequest {
             messages: vec![
@@ -4580,7 +4603,7 @@ mod warmup_tests {
                 },
                 Message {
                     role: "user".to_string(),
-                    content: MessageContent::String("Here is the summary of what we did:\n<summary>\n1. Initialized repo\n2. Fixed issue #3639\n</summary>".to_string()),
+                    content: MessageContent::String("Here is the summary of what we did from previous conversation:\n<summary>\n1. Initialized repo\n2. Fixed issue #3639\n</summary>".to_string()),
                 },
             ],
             ..Default::default()
@@ -4595,6 +4618,8 @@ mod warmup_tests {
 
     #[test]
     fn test_is_manual_compact_command_variants() {
+        use crate::proxy::mappers::claude::models::{Message, MessageContent};
+
         for cmd in [
             "./compact",
             ".\\compact",
@@ -4616,5 +4641,76 @@ mod warmup_tests {
                 "命令 '{cmd}' 必须被识别为手动 compact 指令"
             );
         }
+    }
+
+    #[test]
+    fn test_is_code_mode_detection_and_scaling_bypass() {
+        use crate::proxy::mappers::claude::models::{SystemBlock, SystemPrompt, Tool};
+
+        // 1. Claude Code CLI via SystemPrompt::String
+        let req_cli_string = ClaudeRequest {
+            system: Some(SystemPrompt::String(
+                "You are Claude Code, Anthropic's official CLI for Claude.".to_string(),
+            )),
+            ..Default::default()
+        };
+        assert!(is_code_mode(&req_cli_string));
+
+        // 2. Claude Code CLI via SystemPrompt::Array
+        let req_cli_array = ClaudeRequest {
+            system: Some(SystemPrompt::Array(vec![SystemBlock {
+                block_type: "text".to_string(),
+                text: "You are Claude Code, Anthropic's official CLI for Claude.".to_string(),
+            }])),
+            ..Default::default()
+        };
+        assert!(is_code_mode(&req_cli_array));
+
+        // 3. Claude Desktop Code Tab via mcp__ccd_* tool prefix
+        let req_desktop_code = ClaudeRequest {
+            tools: Some(vec![Tool {
+                type_: None,
+                name: Some("mcp__ccd_host__sync_with_base_branch".to_string()),
+                description: None,
+                input_schema: None,
+            }]),
+            ..Default::default()
+        };
+        assert!(is_code_mode(&req_desktop_code));
+
+        // 4. Regular chat request (should NOT be code mode)
+        let req_regular = ClaudeRequest {
+            system: Some(SystemPrompt::String(
+                "You are a helpful assistant.".to_string(),
+            )),
+            ..Default::default()
+        };
+        assert!(!is_code_mode(&req_regular));
+
+        // 5. Cowork session request (should NOT be code mode)
+        let req_cowork = ClaudeRequest {
+            tools: Some(vec![Tool {
+                type_: None,
+                name: Some("mcp__cowork__create_artifact".to_string()),
+                description: None,
+                input_schema: None,
+            }]),
+            ..Default::default()
+        };
+        assert!(!is_code_mode(&req_cowork));
+
+        // 6. Test scaling bypass invariant (Option A):
+        // When enable_usage_scaling is true:
+        // - Regular request -> scaling_enabled remains true
+        // - Code mode request -> scaling_enabled MUST be bypassed (forced false)
+        let enable_usage_scaling = true;
+        let scaling_for_regular = enable_usage_scaling && !is_code_mode(&req_regular);
+        assert!(scaling_for_regular);
+
+        let scaling_for_cli = enable_usage_scaling && !is_code_mode(&req_cli_string);
+        assert!(!scaling_for_cli);
+
+        let scaling_for_desktop_code = enable_usage_scaling && !is_code_mode(&req_desktop_code);
+        assert!(!scaling_for_desktop_code);
     }
 }

@@ -8,7 +8,6 @@ import ModalDialog from '../components/common/ModalDialog';
 import { showToast } from '../components/common/ToastContainer';
 import QuotaProtection from '../components/settings/QuotaProtection';
 import SmartWarmup from '../components/settings/SmartWarmup';
-import PinnedQuotaModels from '../components/settings/PinnedQuotaModels';
 import { useDebugConsole } from '../stores/useDebugConsole';
 
 import { useTranslation } from 'react-i18next';
@@ -42,7 +41,7 @@ function Settings() {
     const { config, loadConfig, saveConfig, updateLanguage, updateTheme } = useConfigStore();
     const { enable, disable, isEnabled } = useDebugConsole();
     const [activeTab, setActiveTab] = useState<'general' | 'account' | 'proxy' | 'advanced' | 'debug' | 'about'>('general');
-    const [appVersion, setAppVersion] = useState<string>('4.9.7-beta.7');
+    const [appVersion, setAppVersion] = useState<string>('4.9.7-beta.10');
     const [formData, setFormData] = useState<AppConfig>({
         language: 'zh',
         theme: 'system',
@@ -982,17 +981,6 @@ function Settings() {
                                             showToast(`${t('common.error')}: ${error}`, 'error');
                                         }
                                     }}
-                                />
-                            </div>
-
-                            {/* 配额关注列表 (Pinned Quota Models) */}
-                            <div className="group bg-white dark:bg-base-100 rounded-xl p-5 border border-gray-100 dark:border-base-200 hover:border-indigo-200 transition-all duration-300 shadow-sm">
-                                <PinnedQuotaModels
-                                    config={formData.pinned_quota_models}
-                                    onChange={(newConfig) => setFormData({
-                                        ...formData,
-                                        pinned_quota_models: newConfig
-                                    })}
                                 />
                             </div>
                         </div>

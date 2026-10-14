@@ -155,7 +155,7 @@ function BestAccounts({ accounts, currentAccountId, onSwitch }: BestAccountsProp
     const bestClaudeRender = bestClaude ? { ...bestClaude, claudeQuota: bestClaude.quotaVal } : undefined;
 
     return (
-        <div className="bg-white dark:bg-base-100 rounded-xl p-4 shadow-sm border border-gray-100 dark:border-base-200 h-full flex flex-col hover:shadow-md transition-shadow">
+        <div className="bg-white dark:bg-[#15161b] rounded-2xl p-5 shadow-sm dark:shadow-xl dark:shadow-black/40 border border-gray-100 dark:border-white/[0.10] h-full flex flex-col hover:shadow-md transition-shadow">
             <h2 className="text-base font-semibold text-gray-900 dark:text-base-content mb-3 flex items-center gap-2">
                 <TrendingUp className="w-4 h-4 text-blue-500 dark:text-blue-400" />
                 {t('dashboard.best_accounts')}
@@ -164,14 +164,14 @@ function BestAccounts({ accounts, currentAccountId, onSwitch }: BestAccountsProp
             <div className="space-y-2 flex-1">
                 {/* Best Gemini */}
                 {bestGeminiRender && (
-                    <div className="flex items-center justify-between p-2.5 bg-green-50 dark:bg-green-900/20 rounded-lg border border-green-100 dark:border-green-900/30">
+                    <div className="flex items-center justify-between p-2.5 bg-green-50 dark:bg-emerald-500/[0.08] rounded-xl border border-green-100 dark:border-emerald-500/30">
                         <div className="flex-1 min-w-0">
-                            <div className="text-[10px] text-green-600 dark:text-green-400 font-medium mb-0.5">{t('dashboard.for_gemini')}</div>
-                            <div className="font-medium text-sm text-gray-900 dark:text-base-content truncate">
+                            <div className="text-[10px] text-green-600 dark:text-emerald-400 font-semibold mb-0.5">{t('dashboard.for_gemini')}</div>
+                            <div className="font-medium text-sm text-gray-900 dark:text-zinc-100 truncate">
                                 {bestGeminiRender.email}
                             </div>
                         </div>
-                        <div className="ml-2 px-2 py-0.5 bg-green-500 text-white text-xs font-semibold rounded-full">
+                        <div className="ml-2 px-2.5 py-0.5 bg-green-500 dark:bg-emerald-500/20 dark:text-emerald-300 dark:border dark:border-emerald-500/40 text-white text-xs font-bold font-mono rounded-full shadow-xs">
                             {bestGeminiRender.geminiQuota}%
                         </div>
                     </div>
@@ -179,14 +179,14 @@ function BestAccounts({ accounts, currentAccountId, onSwitch }: BestAccountsProp
 
                 {/* Best Claude */}
                 {bestClaudeRender && (
-                    <div className="flex items-center justify-between p-2.5 bg-cyan-50 dark:bg-cyan-900/20 rounded-lg border border-cyan-100 dark:border-cyan-900/30">
+                    <div className="flex items-center justify-between p-2.5 bg-cyan-50 dark:bg-cyan-500/[0.08] rounded-xl border border-cyan-100 dark:border-cyan-500/30">
                         <div className="flex-1 min-w-0">
-                            <div className="text-[10px] text-cyan-600 dark:text-cyan-400 font-medium mb-0.5">{t('dashboard.for_claude')}</div>
-                            <div className="font-medium text-sm text-gray-900 dark:text-base-content truncate">
+                            <div className="text-[10px] text-cyan-600 dark:text-cyan-400 font-semibold mb-0.5">{t('dashboard.for_claude')}</div>
+                            <div className="font-medium text-sm text-gray-900 dark:text-zinc-100 truncate">
                                 {bestClaudeRender.email}
                             </div>
                         </div>
-                        <div className="ml-2 px-2 py-0.5 bg-cyan-500 text-white text-xs font-semibold rounded-full">
+                        <div className="ml-2 px-2.5 py-0.5 bg-cyan-500 dark:bg-cyan-500/20 dark:text-cyan-300 dark:border dark:border-cyan-500/40 text-white text-xs font-bold font-mono rounded-full shadow-xs">
                             {bestClaudeRender.claudeQuota}%
                         </div>
                     </div>
@@ -202,7 +202,7 @@ function BestAccounts({ accounts, currentAccountId, onSwitch }: BestAccountsProp
             {(bestGeminiRender || bestClaudeRender) && onSwitch && (
                 <div className="mt-auto pt-3">
                     <button
-                        className="w-full px-3 py-1.5 bg-blue-500 text-white text-xs font-medium rounded-lg hover:bg-blue-600 active:scale-[0.98] transition-all cursor-pointer"
+                        className="w-full px-3 py-2 bg-blue-600 hover:bg-blue-500 active:scale-[0.98] text-white text-xs font-semibold rounded-xl transition-all cursor-pointer shadow-md shadow-blue-900/30 dark:shadow-blue-950/50 flex items-center justify-center gap-1.5"
                         onClick={() => {
                             // Prefer switching to the account with higher quota
                             let targetId = bestGeminiRender?.id;

@@ -37,11 +37,12 @@ pub fn get_max_output_tokens(model_id: &str, token: Option<&ProxyToken>) -> u64 
     // 1. 尝试从账号动态数据中读取
     if let Some(t) = token {
         if let Some(&limit) = t.model_limits.get(&std_id) {
-            return limit;
+            // [FIX #3215] 保护输出上限：避免某些 agent 专属通道配置的 2048 小限额卡死模型长文本生成能力
+            return limit.max(8192);
         }
         // 如果原始 ID 没找到，尝试用归一化后的 ID 找
         if let Some(&limit) = t.model_limits.get(model_id) {
-            return limit;
+            return limit.max(8192);
         }
     }
 
@@ -736,18 +737,18 @@ pub fn resolve_custom_budget(
             || (!has_explicit_suffix && matches!(eff.as_deref(), Some("low") | Some("extra-low")));
 
         if is_low {
-            if tb_config.pro_low > 0 {
+            if tb_config.pro_low >= 0 {
                 Some(tb_config.pro_low as i64)
-            } else if tb_config.flash_low > 0 {
+            } else if tb_config.flash_low >= 0 {
                 Some(tb_config.flash_low as i64)
             } else {
                 None
             }
         } else {
             // High 档位（包含未指定 effort、medium 等，均由 High 档位接管保证 Pro 深度推理）
-            if tb_config.pro_high > 0 {
+            if tb_config.pro_high >= 0 {
                 Some(tb_config.pro_high as i64)
-            } else if tb_config.flash_high > 0 {
+            } else if tb_config.flash_high >= 0 {
                 Some(tb_config.flash_high as i64)
             } else {
                 None
@@ -762,14 +763,14 @@ pub fn resolve_custom_budget(
             if let Some(level) = client_level {
                 match level {
                     "LOW" => {
-                        if tb_config.flash_low > 0 {
+                        if tb_config.flash_low >= 0 {
                             Some(tb_config.flash_low as i64)
                         } else {
                             Some(1000) // 官方 low 默认值 1000
                         }
                     }
                     "HIGH" => {
-                        if tb_config.flash_high > 0 {
+                        if tb_config.flash_high >= 0 {
                             Some(tb_config.flash_high as i64)
                         } else {
                             Some(-1) // 官方 high 默认值 -1 (无上限自适应深度思考)
@@ -777,7 +778,7 @@ pub fn resolve_custom_budget(
                     }
                     _ => {
                         // MEDIUM
-                        if tb_config.flash_medium > 0 {
+                        if tb_config.flash_medium >= 0 {
                             Some(tb_config.flash_medium as i64)
                         } else {
                             Some(4000) // 官方 medium 默认值 4000
@@ -788,7 +789,7 @@ pub fn resolve_custom_budget(
                 // 客户端未传思考参数：看网关 flash_tiered 配置，未配或为 -1 则走官方默认 -1
                 if tb_config.flash_mode == ThinkingBudgetMode::Default {
                     Some(-1)
-                } else if tb_config.flash_tiered > 0 {
+                } else if tb_config.flash_tiered >= 0 {
                     Some(tb_config.flash_tiered as i64)
                 } else {
                     Some(-1)
@@ -822,26 +823,26 @@ pub fn resolve_custom_budget(
                 || (is_bare && matches!(eff_level, Some("HIGH")));
 
             if is_low {
-                if tb_config.flash_low > 0 {
+                if tb_config.flash_low >= 0 {
                     Some(tb_config.flash_low as i64)
                 } else {
                     Some(1000) // 官方 low 默认值 1000
                 }
             } else if is_medium {
-                if tb_config.flash_medium > 0 {
+                if tb_config.flash_medium >= 0 {
                     Some(tb_config.flash_medium as i64)
                 } else {
                     Some(4000) // 官方 medium 默认值 4000
                 }
             } else if is_high {
-                if tb_config.flash_high > 0 {
+                if tb_config.flash_high >= 0 {
                     Some(tb_config.flash_high as i64)
                 } else {
                     Some(-1) // 官方 high 默认值 -1
                 }
             } else {
                 // 未指定任何档位的默认平衡档位 (Medium)
-                if tb_config.flash_medium > 0 {
+                if tb_config.flash_medium >= 0 {
                     Some(tb_config.flash_medium as i64)
                 } else {
                     Some(4000) // 官方 medium 默认值 4000

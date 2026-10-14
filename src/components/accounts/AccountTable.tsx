@@ -42,22 +42,19 @@ import {
     X,
     Check,
     Clock,
-    Bot,
     Repeat2,
     Terminal,
     ArrowUpDown,
     ArrowUp,
     ArrowDown,
 } from 'lucide-react';
-import { type Account, type ModelQuota, getAccountTier } from '../../types/account';
+import { type Account, getAccountTier } from '../../types/account';
 import { useTranslation } from 'react-i18next';
 import { cn } from '../../utils/cn';
 
 import { useConfigStore } from '../../stores/useConfigStore';
-import { QuotaItem } from './QuotaItem';
-import { getModelQuotaDisplay } from '../../utils/quotaDisplay';
-import { MODEL_CONFIG, sortModels, resolveQuotaModels, ensurePinnedImageSelector } from '../../config/modelConfig';
-import { categorizeModel, getModelProtectionKey } from '../../utils/modelCategory';
+import { GroupQuotaCard } from './GroupQuotaCard';
+import { getGroupQuotaSummaries } from '../../utils/quotaDisplay';
 import { getValidationBlockedStatusLabel } from './accountValidationStatus';
 import { getLiveLimitForModel } from '../../utils/liveLimit';
 
@@ -85,7 +82,6 @@ interface AccountTableProps {
     /** 拖拽排序回调，当用户完成拖拽时触发 */
     onReorder?: (accountIds: string[]) => void;
     onViewError: (accountId: string) => void;
-    quotaWindow?: '5h' | 'weekly';
 }
 
 interface SortableRowProps {
@@ -106,7 +102,6 @@ interface SortableRowProps {
     onWarmup?: () => void;
     onUpdateLabel?: (label: string) => void;
     onViewError: () => void;
-    quotaWindow?: '5h' | 'weekly';
     isDragDisabled?: boolean;
 }
 
@@ -126,68 +121,48 @@ interface AccountRowContentProps {
     onWarmup?: () => void;
     onUpdateLabel?: (label: string) => void;
     onViewError: () => void;
-    quotaWindow?: '5h' | 'weekly';
 }
 
 // ============================================================================
 // 辅助函数
 // ============================================================================
 
-
-
-function isModelProtected(protectedModels: string[] | undefined, modelName: string): boolean {
+function isGroupProtected(protectedModels: string[] | undefined, groupKey: 'gemini' | 'claude'): boolean {
     if (!protectedModels || protectedModels.length === 0) return false;
-    const lowerName = modelName.toLowerCase();
-
-    if (lowerName === 'gemini-pro') {
-        return protectedModels.some((model) =>
-            categorizeModel(model) === 'gemini-pro' && getModelProtectionKey(model) === 'gemini-3-pro-high',
-        );
+    if (groupKey === 'gemini') {
+        return protectedModels.some(m => m.toLowerCase().startsWith('gemini'));
+    } else {
+        return protectedModels.some(m => m.toLowerCase().startsWith('claude') || m.toLowerCase().startsWith('gpt'));
     }
-    if (lowerName === 'gemini-flash') {
-        return protectedModels.some((model) =>
-            categorizeModel(model) === 'gemini-flash' && getModelProtectionKey(model) === 'gemini-3-flash',
-        );
-    }
-    if (lowerName === 'claude-sonnet') {
-        return protectedModels.some((model) =>
-            categorizeModel(model) === 'claude' && getModelProtectionKey(model) === 'claude',
-        );
-    }
-
-    const protectionKey = getModelProtectionKey(lowerName);
-    return protectionKey ? protectedModels.includes(protectionKey) : false;
 }
 
 /**
  * 提取账号的最快配额重置时间（毫秒时间戳）
  * 用于表格排序
  */
-function extractAccountResetTime(account: Account, quotaWindow?: '5h' | 'weekly'): number | null {
+function extractAccountResetTime(account: Account): number | null {
     let earliestTime: number | null = null;
 
-    if (quotaWindow === 'weekly') {
-        const groups = account.quota?.quota_groups || [];
-        for (const group of groups) {
-            for (const bucket of group.buckets || []) {
-                const isWeekly = bucket.window.toLowerCase().includes('week') || bucket.bucket_id.toLowerCase().includes('week');
-                if (isWeekly && bucket.reset_time) {
-                    const t = new Date(bucket.reset_time).getTime();
-                    if (!isNaN(t) && (earliestTime === null || t < earliestTime)) {
-                        earliestTime = t;
-                    }
-                }
-            }
-        }
-    } else {
-        // 5h 或常规视图下，从 models 中获取最近的 reset_time
-        const models = account.quota?.models || [];
-        for (const model of models) {
-            if (model.reset_time) {
-                const t = new Date(model.reset_time).getTime();
+    // 优先从 quota_groups 的各个 bucket 获取最早重置时间
+    const groups = account.quota?.quota_groups || [];
+    for (const group of groups) {
+        for (const bucket of group.buckets || []) {
+            if (bucket.reset_time) {
+                const t = new Date(bucket.reset_time).getTime();
                 if (!isNaN(t) && (earliestTime === null || t < earliestTime)) {
                     earliestTime = t;
                 }
+            }
+        }
+    }
+
+    // 也遍历 models 获取最早重置时间作为补充
+    const models = account.quota?.models || [];
+    for (const model of models) {
+        if (model.reset_time) {
+            const t = new Date(model.reset_time).getTime();
+            if (!isNaN(t) && (earliestTime === null || t < earliestTime)) {
+                earliestTime = t;
             }
         }
     }
@@ -221,7 +196,6 @@ function SortableAccountRow({
     onWarmup,
     onUpdateLabel,
     onViewError,
-    quotaWindow,
     isDragDisabled = false,
 }: SortableRowProps) {
     const { t } = useTranslation();
@@ -294,7 +268,6 @@ function SortableAccountRow({
                 onWarmup={onWarmup}
                 onUpdateLabel={onUpdateLabel}
                 onViewError={onViewError}
-                quotaWindow={quotaWindow}
             />
         </tr>
     );
@@ -320,10 +293,9 @@ function AccountRowContent({
     onWarmup,
     onUpdateLabel,
     onViewError,
-    quotaWindow,
 }: AccountRowContentProps) {
     const { t } = useTranslation();
-    const { config, showAllQuotas } = useConfigStore();
+    const { config } = useConfigStore();
     const validationBlockedLabel = getValidationBlockedStatusLabel(account.validation_blocked_reason, t);
 
     // 自定义标签编辑状态
@@ -350,88 +322,10 @@ function AccountRowContent({
         }
     };
 
-    // 解析周配额项 (当处于 weekly 视图时)
-    const weeklyItems = useMemo(() => {
-        if (quotaWindow !== 'weekly') return [];
-        return (account.quota?.quota_groups || []).flatMap(group => {
-            return (group.buckets || [])
-                .filter(b => b.window.toLowerCase().includes('week') || b.bucket_id.toLowerCase().includes('week'))
-                .map(b => {
-                    const shortGroupName = (group.display_name || '')
-                        .replace(/ models?$/i, '')
-                        .replace(/Claude and GPT/i, 'Claude/GPT');
-                    return {
-                        id: `${group.display_name}-${b.bucket_id}`,
-                        label: b.display_name ? `${shortGroupName} (${b.display_name})` : `${shortGroupName} (周)`,
-                        percentage: Math.round((b.remaining_fraction || 0) * 100),
-                        resetTime: b.reset_time,
-                        cycleTokens: b.cycle_tokens,
-                        Icon: shortGroupName.toLowerCase().includes('claude') ? Sparkles : Bot,
-                    };
-                });
-        });
-    }, [quotaWindow, account.quota?.quota_groups]);
-
-    // 获取要显示的模型列表
-    const pinnedModels = ensurePinnedImageSelector(
-        config?.pinned_quota_models?.models || Object.keys(MODEL_CONFIG),
-    );
-
-    // 根据 show_all 状态决定显示哪些模型
-    const uniqueLabels = new Set<string>();
-    const displayModels = sortModels(
-        (showAllQuotas
-            ? (account.quota?.models || []).map(m => {
-                const config = MODEL_CONFIG[m.name.toLowerCase()];
-                const label = m.display_name || (config?.i18nKey ? t(config.i18nKey) : (config?.shortLabel || config?.label || m.name));
-                return {
-                    id: m.name.toLowerCase(),
-                    label: label,
-                    protectedKey: config?.protectedKey || m.name.toLowerCase(),
-                    data: m
-                };
-            })
-            : resolveQuotaModels(account.quota?.models, pinnedModels).map(sel => {
-                const selectorConfig = MODEL_CONFIG[sel.selectorId.toLowerCase()];
-                const resolvedConfig = sel.model ? MODEL_CONFIG[sel.model.name.toLowerCase()] : undefined;
-                if (!selectorConfig && !sel.model) return null;
-                const label = sel.model?.display_name
-                    || (resolvedConfig?.shortLabel || resolvedConfig?.label)
-                    || (selectorConfig?.shortLabel || selectorConfig?.label)
-                    || (resolvedConfig?.i18nKey ? t(resolvedConfig.i18nKey) : undefined)
-                    || (selectorConfig?.i18nKey ? t(selectorConfig.i18nKey) : undefined)
-                    || sel.selectorId;
-                return {
-                    id: sel.model?.name.toLowerCase() ?? sel.selectorId.toLowerCase(),
-                    label,
-                    protectedKey: getModelProtectionKey(sel.model?.name ?? sel.selectorId) ?? resolvedConfig?.protectedKey ?? selectorConfig?.protectedKey ?? sel.selectorId,
-                    data: sel.model,
-                };
-            }).filter((item): item is { id: string; label: string; protectedKey: string; data: ModelQuota | undefined } => item !== null)
-    ).filter(m => {
-            // 过滤特定的 Claude/Gemini 思考变体 (在列表页隐藏)
-            const isHiddenThinking = m.id.includes('thinking');
-
-            if (isHiddenThinking) return false;
-
-            // 基于标签去重 (例如 G3.1 Pro 只显示一次)
-            // 优先显示有配额数据的 ID
-            const labelKey = `${m.label}-${m.protectedKey}`;
-            if (uniqueLabels.has(labelKey)) {
-                return false;
-            }
-            if (m.data) {
-                uniqueLabels.add(labelKey);
-                return true;
-            }
-            return true;
-        })
-    ).filter((m, index, self) => {
-        // 第二次过滤：确保即使没有数据的重复 Label 也只保留一个
-        const labelKey = `${m.label}-${m.protectedKey}`;
-        return self.findIndex(t => `${t.label}-${t.protectedKey}` === labelKey) === index;
-    });
-
+    const tier = useMemo(() => getAccountTier(account), [account]);
+    const groupSummaries = useMemo(() => {
+        return getGroupQuotaSummaries(account.quota?.quota_groups, account.quota?.models, tier);
+    }, [account.quota?.quota_groups, account.quota?.models, tier]);
 
     return (
         <>
@@ -460,7 +354,7 @@ function AccountRowContent({
                             </span>
                         )}
 
-                        {account.proxy_disabled && (
+                        {account.proxy_disabled && !isDisabled && (
                             <span
                                 className="px-2 py-0.5 rounded-md bg-orange-100 dark:bg-orange-900/50 text-orange-700 dark:text-orange-300 text-[10px] font-bold flex items-center gap-1 shadow-sm border border-orange-200/50"
                             >
@@ -583,40 +477,16 @@ function AccountRowContent({
                         </button>
                     </div>
                 ) : (
-                    <div className={cn(
-                        "grid gap-x-2 gap-y-1 py-0",
-                        (quotaWindow === 'weekly' && weeklyItems.length > 0)
-                            ? (weeklyItems.length === 1 ? "grid-cols-1" : "grid-cols-2")
-                            : (displayModels.length === 1 ? "grid-cols-1" : "grid-cols-2")
-                    )}>
-                        {quotaWindow === 'weekly' && weeklyItems.length > 0 ? (
-                            weeklyItems.map((item) => (
-                                <QuotaItem
-                                    key={item.id}
-                                    label={item.label}
-                                    percentage={item.percentage}
-                                    resetTime={item.resetTime}
-                                    weeklyTokens={item.cycleTokens ?? null}
-                                    Icon={item.Icon}
-                                />
-                            ))
-                        ) : (
-                            displayModels.map((model) => {
-                                const modelData = model.data;
-                                const display = getModelQuotaDisplay(model.id, modelData, account.quota?.quota_groups);
-
-                                return (
-                                    <QuotaItem
-                                        key={model.id}
-                                        label={model.label}
-                                        {...display}
-                                        isProtected={Boolean(config?.quota_protection?.enabled && isModelProtected(account.protected_models, model.protectedKey))}
-                                        liveLimit={getLiveLimitForModel(account, model.id, model.protectedKey)}
-                                        Icon={MODEL_CONFIG[model.id]?.Icon || Bot}
-                                    />
-                                );
-                            })
-                        )}
+                    <div className="grid grid-cols-1 sm:grid-cols-2 gap-1.5 py-0">
+                        {groupSummaries.map((summary) => (
+                            <GroupQuotaCard
+                                key={summary.key}
+                                summary={summary}
+                                isProtected={Boolean(config?.quota_protection?.enabled && isGroupProtected(account.protected_models, summary.key))}
+                                liveLimit={summary.key === 'gemini' ? getLiveLimitForModel(account, 'gemini-pro') : getLiveLimitForModel(account, 'claude')}
+                                compact
+                            />
+                        ))}
                     </div>
                 )}
             </td>
@@ -777,7 +647,6 @@ function AccountTable({
     onWarmup,
     onUpdateLabel,
     onViewError,
-    quotaWindow,
 }: AccountTableProps) {
     const { t } = useTranslation();
 
@@ -811,8 +680,8 @@ function AccountTable({
 
         return [...accounts].sort((a, b) => {
             if (sortConfig.key === 'reset_time') {
-                const timeA = extractAccountResetTime(a, quotaWindow);
-                const timeB = extractAccountResetTime(b, quotaWindow);
+                const timeA = extractAccountResetTime(a);
+                const timeB = extractAccountResetTime(b);
 
                 // 没有 reset_time 的排到后面
                 if (timeA === null && timeB === null) return 0;
@@ -831,7 +700,7 @@ function AccountTable({
 
             return 0;
         });
-    }, [accounts, sortConfig, quotaWindow, isSortingActive]);
+    }, [accounts, sortConfig, isSortingActive]);
 
     // 配置拖拽传感器
     const sensors = useSensors(
@@ -909,7 +778,7 @@ function AccountTable({
                                     )}
                                     title={t('accounts.table.sort_by_reset_time', '点击按配额重置时间排序')}
                                 >
-                                    <span>{quotaWindow === 'weekly' ? t('accounts.table.weekly_quota', '周配额') : t('accounts.table.quota')}</span>
+                                    <span>{t('accounts.table.quota', '模型配额')}</span>
                                     {sortConfig.key === 'reset_time' ? (
                                         sortConfig.direction === 'asc' ? <ArrowUp className="w-3.5 h-3.5 text-blue-600 dark:text-blue-400" /> : <ArrowDown className="w-3.5 h-3.5 text-blue-600 dark:text-blue-400" />
                                     ) : (
@@ -960,7 +829,6 @@ function AccountTable({
                                     onWarmup={onWarmup ? () => onWarmup(account.id) : undefined}
                                     onUpdateLabel={onUpdateLabel ? (label: string) => onUpdateLabel(account.id, label) : undefined}
                                     onViewError={() => onViewError(account.id)}
-                                    quotaWindow={quotaWindow}
                                     isDragDisabled={isSortingActive}
                                 />
                             ))}
@@ -1003,7 +871,6 @@ function AccountTable({
                                         onToggleProxy={() => { }}
                                         isDisabled={Boolean(activeAccount.disabled)}
                                         onViewError={() => { }}
-                                        quotaWindow={quotaWindow}
                                     />
                                 </tr>
                             </tbody>
