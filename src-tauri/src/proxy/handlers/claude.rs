@@ -484,7 +484,7 @@ fn extract_thinking_hint(body: &Value) -> ThinkingHint {
         hint.budget_tokens = Some(budget as u32);
     }
 
-    // Try to extract level from thinkingLevel / reasoning_effort / output_config.effort / thinking.effort
+    // Try to extract level from thinkingLevel / reasoning_effort / output_config.effort / thinking.effort / effort
     if let Some(level) = body
         .get("thinkingLevel")
         .or_else(|| body.get("thinking_level"))
@@ -492,6 +492,7 @@ fn extract_thinking_hint(body: &Value) -> ThinkingHint {
         .or_else(|| body.get("reasoningEffort"))
         .or_else(|| body.get("output_config").and_then(|o| o.get("effort")))
         .or_else(|| body.get("thinking").and_then(|t| t.get("effort")))
+        .or_else(|| body.get("effort"))
         .and_then(|l| l.as_str())
     {
         hint.level = Some(level.to_lowercase());
@@ -542,6 +543,7 @@ fn apply_thinking_hints(
             type_: "enabled".to_string(),
             budget_tokens: Some(budget),
             effort: existing_effort,
+            display: None,
         });
         tracing::debug!(
             "[{}] Applied thinking hint: budget_tokens={}",
@@ -569,6 +571,7 @@ fn apply_thinking_hints(
                 type_: "enabled".to_string(),
                 budget_tokens: Some(budget),
                 effort: None,
+                display: None,
             });
             tracing::debug!(
                 "[{}] Applied thinking hint: level={} -> budget_tokens={}",
@@ -817,6 +820,7 @@ fn apply_variant(
             type_: "enabled".to_string(),
             budget_tokens: Some(spec.effective_thinking_budget(client_budget)),
             effort: None,
+            display: None,
         });
     }
     request.output_config = None;
@@ -981,6 +985,7 @@ pub async fn handle_messages(
                 type_: "disabled".to_string(),
                 budget_tokens: Some(0),
                 effort: None,
+                display: None,
             });
         }
     } else if is_v3_or_above || is_explicit_tier_model {
@@ -990,6 +995,7 @@ pub async fn handle_messages(
             type_: "enabled".to_string(),
             budget_tokens: None,
             effort: effort_in_thinking,
+            display: None,
         });
     } else {
         // 由于此时还没拿到账号，先用模型默认限额兜底
@@ -1029,12 +1035,14 @@ pub async fn handle_messages(
                 type_: "disabled".to_string(),
                 budget_tokens: Some(0),
                 effort: None,
+                display: None,
             });
         } else if is_client_control && raw_client_budget.is_some() {
             request.thinking = Some(crate::proxy::mappers::claude::models::ThinkingConfig {
                 type_: "enabled".to_string(),
                 budget_tokens: raw_client_budget,
                 effort: effort_hint.clone(),
+                display: None,
             });
         } else if is_client_control {
             // [CRITICAL FIX] 客户端控制模式下，客户端未传数字预算（全缺省或仅传等级）
@@ -1699,6 +1707,7 @@ pub async fn handle_messages(
     let mut norm_ms: f64 = 0.0;
     let mut think_fill_ms: f64 = 0.0;
     let mut ttft_ms: f64 = 0.0;
+    let mut fallback_overhead_ms: f64 = 0.0;
 
     let request_start = tokio::time::Instant::now();
     let global_deadline = request_start
@@ -1831,6 +1840,8 @@ pub async fn handle_messages(
             }
         };
 
+        let in_flight_guard = Arc::new(token_manager.acquire_in_flight(&account_id));
+
         last_email = Some(email.clone());
         info!("✓ Using account: {} (type: {})", email, config.request_type);
 
@@ -1946,14 +1957,27 @@ pub async fn handle_messages(
         // [FIX #765/1522] Prepare Robust Beta Headers for Claude models
         let mut extra_headers = std::collections::HashMap::new();
         extra_headers.insert("x-session-id".to_string(), client_session_id.clone());
+
+        // 统一合并客户端传入的 anthropic-beta 与官方必需的 beta 声明，确保 1M 上下文、thinking、effort 等新特性透传至上游
+        let mut beta_set: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        if let Some(client_beta) = headers.get("anthropic-beta").and_then(|v| v.to_str().ok()) {
+            for item in client_beta.split(',') {
+                let trimmed = item.trim();
+                if !trimmed.is_empty() {
+                    beta_set.insert(trimmed.to_string());
+                }
+            }
+        }
         if mapped_model.to_lowercase().contains("claude") {
-            extra_headers.insert(
-                "anthropic-beta".to_string(),
-                "claude-code-20250219".to_string(),
-            );
+            beta_set.insert("claude-code-20250219".to_string());
+        }
+        if !beta_set.is_empty() {
+            let combined_beta = beta_set.into_iter().collect::<Vec<_>>().join(",");
+            extra_headers.insert("anthropic-beta".to_string(), combined_beta);
             tracing::debug!(
-                "[{}] Added Comprehensive Beta Headers for Claude model",
-                trace_id
+                "[{}] Added Comprehensive Beta Headers for Claude model: {:?}",
+                trace_id,
+                extra_headers.get("anthropic-beta")
             );
         }
 
@@ -1998,8 +2022,12 @@ pub async fn handle_messages(
             }
         };
 
+        let effective_attempt_start = call_result.effective_attempt_start;
+        let mut fallback_attempts = call_result.fallback_attempts.clone();
+        fallback_overhead_ms = call_result.fallback_overhead_s() * 1000.0;
+
         // [NEW] 记录端点降级日志到 debug 文件
-        if !call_result.fallback_attempts.is_empty() && debug_logger::is_enabled(&debug_cfg) {
+        if call_result.has_fallback() && debug_logger::is_enabled(&debug_cfg) {
             let fallback_entries: Vec<Value> = call_result
                 .fallback_attempts
                 .iter()
@@ -2116,9 +2144,21 @@ pub async fn handle_messages(
                 // 并由 stream_lifecycle 驱动器每 3 秒实时下发官方 SSE ping 心跳 (`event: ping\ndata: {"type": "ping"}\n\n`)。
                 // 这确保下游客户端（Claude Code 等）看门狗持续被心跳保活，绝不会因 Prefill 或推理思考等待触发 5 分钟无响应断连 (CLI error 'Request timed out')。
                 if client_wants_stream {
-                    ttft_ms = upstream_req_start.elapsed().as_micros() as f64 / 1000.0;
+                    ttft_ms = effective_attempt_start.elapsed().as_micros() as f64 / 1000.0;
+                    if let Some(effective_item) =
+                        fallback_attempts.iter_mut().find(|a| a.is_effective)
+                    {
+                        effective_item.duration_s = ttft_ms / 1000.0;
+                    }
+                    let attempts_b64 =
+                        crate::proxy::handlers::common::encode_attempts_header(&fallback_attempts);
+                    let _ = crate::proxy::monitor::CURRENT_UPSTREAM_CAPTURE.try_with(|holder| {
+                        holder.set_attempts(fallback_attempts.clone());
+                    });
+                    let in_flight_guard_for_stream = Arc::clone(&in_flight_guard);
                     let stream_mapped =
-                        claude_stream.map(|result| -> Result<Bytes, std::io::Error> {
+                        claude_stream.map(move |result| -> Result<Bytes, std::io::Error> {
+                            let _in_flight = &in_flight_guard_for_stream;
                             match result {
                                 Ok(b) => Ok(b),
                                 Err(e) => {
@@ -2132,6 +2172,7 @@ pub async fn handle_messages(
                         .header(header::CONTENT_TYPE, "text/event-stream")
                         .header(header::CACHE_CONTROL, "no-cache")
                         .header(header::CONNECTION, "keep-alive")
+                        .header("request-id", format!("req_{}", trace_id))
                         .header("X-Accel-Buffering", "no")
                         .header("X-Account-Email", &email)
                         .header("X-Mapped-Model", &request_with_mapped.model)
@@ -2143,6 +2184,14 @@ pub async fn handle_messages(
                         .header("X-Timing-Norm-Ms", format!("{:.3}", norm_ms))
                         .header("X-Timing-Thinking-Ms", format!("{:.3}", think_fill_ms))
                         .header("X-Timing-Ttft-Ms", format!("{:.3}", ttft_ms))
+                        .header(
+                            "X-Timing-Ttft-Overhead-Ms",
+                            format!("{:.3}", fallback_overhead_ms),
+                        )
+                        .header(
+                            "X-Timing-Ttft-Attempts",
+                            attempts_b64.as_deref().unwrap_or(""),
+                        )
                         .body(Body::from_stream(stream_mapped))
                         .unwrap();
                 }
@@ -2151,11 +2200,13 @@ pub async fn handle_messages(
                 let mut retry_this_account = false;
 
                 // Loop to skip heartbeats during peek (for non-streaming requests)
-                // [FIX #3634] 动态自适应计算 Peek 超时时间，并受全局剩余请求预算严格约束，
-                // 彻底杜绝大 Prompt 预热（TTFT > 30s）被误杀，同时杜绝累积超时触发客户端 5 分钟看门狗
-                let base_peek_secs = super::common::calculate_adaptive_peek_timeout(
+                // [FIX #3634, #3693] 动态自适应计算 Peek 超时时间（支持 thinking 宽限），并受全局剩余请求预算严格约束，
+                // 彻底杜绝大 Prompt / 深度思考预热（TTFT > 30s）被误杀，同时杜绝累积超时触发客户端 5 分钟看门狗
+                let is_thinking = request.thinking.is_some() || mapped_model.contains("thinking");
+                let base_peek_secs = super::common::calculate_adaptive_peek_timeout_full(
                     is_compaction_request,
                     false,
+                    is_thinking,
                     Some(raw_estimated),
                 );
                 let current_remaining_secs = global_deadline
@@ -2217,7 +2268,17 @@ pub async fn handle_messages(
                             }
 
                             // We found real data!
-                            ttft_ms = upstream_req_start.elapsed().as_micros() as f64 / 1000.0;
+                            ttft_ms = effective_attempt_start.elapsed().as_micros() as f64 / 1000.0;
+                            if let Some(effective_item) =
+                                fallback_attempts.iter_mut().find(|a| a.is_effective)
+                            {
+                                effective_item.duration_s = ttft_ms / 1000.0;
+                            }
+                            let _ = crate::proxy::monitor::CURRENT_UPSTREAM_CAPTURE.try_with(
+                                |holder| {
+                                    holder.set_attempts(fallback_attempts.clone());
+                                },
+                            );
                             first_data_chunk = Some(bytes);
                             break;
                         }
@@ -2280,9 +2341,14 @@ pub async fn handle_messages(
                         match collect_stream_to_json(Box::pin(combined_stream)).await {
                             Ok(full_response) => {
                                 info!("[{}] ✓ Stream collected and converted to JSON", trace_id);
+                                let attempts_b64 =
+                                    crate::proxy::handlers::common::encode_attempts_header(
+                                        &fallback_attempts,
+                                    );
                                 return Response::builder()
                                     .status(StatusCode::OK)
                                     .header(header::CONTENT_TYPE, "application/json")
+                                    .header("request-id", format!("req_{}", trace_id))
                                     .header("X-Account-Email", &email)
                                     .header("X-Mapped-Model", &request_with_mapped.model)
                                     .header("X-Upstream-Model", config.final_model.as_str())
@@ -2293,6 +2359,14 @@ pub async fn handle_messages(
                                     .header("X-Timing-Norm-Ms", format!("{:.3}", norm_ms))
                                     .header("X-Timing-Thinking-Ms", format!("{:.3}", think_fill_ms))
                                     .header("X-Timing-Ttft-Ms", format!("{:.3}", ttft_ms))
+                                    .header(
+                                        "X-Timing-Ttft-Overhead-Ms",
+                                        format!("{:.3}", fallback_overhead_ms),
+                                    )
+                                    .header(
+                                        "X-Timing-Ttft-Attempts",
+                                        attempts_b64.as_deref().unwrap_or(""),
+                                    )
                                     .body(Body::from(
                                         serde_json::to_string(&full_response).unwrap(),
                                     ))
@@ -2414,16 +2488,42 @@ pub async fn handle_messages(
                     cache_info
                 );
 
-                return (
-                    StatusCode::OK,
-                    [
-                        ("X-Account-Email", email.as_str()),
-                        ("X-Mapped-Model", request_with_mapped.model.as_str()),
-                        ("X-Upstream-Model", config.final_model.as_str()),
-                    ],
-                    Json(claude_response),
-                )
-                    .into_response();
+                ttft_ms = effective_attempt_start.elapsed().as_micros() as f64 / 1000.0;
+                if let Some(effective_item) = fallback_attempts.iter_mut().find(|a| a.is_effective)
+                {
+                    effective_item.duration_s = ttft_ms / 1000.0;
+                }
+                let attempts_b64 =
+                    crate::proxy::handlers::common::encode_attempts_header(&fallback_attempts);
+                let _ = crate::proxy::monitor::CURRENT_UPSTREAM_CAPTURE.try_with(|holder| {
+                    holder.set_attempts(fallback_attempts.clone());
+                });
+
+                return Response::builder()
+                    .status(StatusCode::OK)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header("request-id", format!("req_{}", trace_id))
+                    .header("X-Account-Email", &email)
+                    .header("X-Mapped-Model", &request_with_mapped.model)
+                    .header("X-Upstream-Model", config.final_model.as_str())
+                    .header("X-Session-Id", &client_session_id)
+                    .header("X-Antigravity-Session-Id", &client_session_id)
+                    .header("X-Timing-Clean-Ms", format!("{:.3}", clean_ms))
+                    .header("X-Timing-Norm-Ms", format!("{:.3}", norm_ms))
+                    .header("X-Timing-Thinking-Ms", format!("{:.3}", think_fill_ms))
+                    .header("X-Timing-Ttft-Ms", format!("{:.3}", ttft_ms))
+                    .header(
+                        "X-Timing-Ttft-Overhead-Ms",
+                        format!("{:.3}", fallback_overhead_ms),
+                    )
+                    .header(
+                        "X-Timing-Ttft-Attempts",
+                        attempts_b64.as_deref().unwrap_or(""),
+                    )
+                    .body(Body::from(
+                        serde_json::to_string(&claude_response).unwrap_or_default(),
+                    ))
+                    .unwrap();
             }
         }
 
@@ -2658,13 +2758,13 @@ pub async fn handle_messages(
                 {
                     tracing::error!("Failed to set validation block: {}", e);
                 }
-            }
-
-            // 设置 is_forbidden 状态
-            if let Err(e) = token_manager.set_forbidden(&account_id, &error_text).await {
-                tracing::error!("Failed to set forbidden status for {}: {}", email, e);
             } else {
-                tracing::warn!("[Claude] Account {} marked as forbidden due to 403", email);
+                // 设置 is_forbidden 状态（仅当真正非人机验证类 403 时才进入永久禁用）
+                if let Err(e) = token_manager.set_forbidden(&account_id, &error_text).await {
+                    tracing::error!("Failed to set forbidden status for {}: {}", email, e);
+                } else {
+                    tracing::warn!("[Claude] Account {} marked as forbidden due to 403", email);
+                }
             }
         }
 
@@ -2764,21 +2864,42 @@ pub async fn handle_messages(
 
 /// 列出可用模型
 pub async fn handle_list_models(State(state): State<AppState>) -> impl IntoResponse {
-    use crate::proxy::common::model_mapping::get_all_dynamic_models;
+    use crate::proxy::common::model_mapping::{
+        get_all_dynamic_models, get_all_dynamic_models_metadata,
+    };
 
     let only_raw = *state.only_raw_quota_models.read().await;
     let model_ids =
         get_all_dynamic_models(&state.custom_mapping, Some(&state.token_manager), only_raw).await;
+    let metadata_map = get_all_dynamic_models_metadata(
+        &state.custom_mapping,
+        Some(&state.token_manager),
+        only_raw,
+    )
+    .await;
 
     let data: Vec<_> = model_ids
         .into_iter()
         .map(|id| {
-            json!({
+            let mut obj = json!({
                 "id": id,
                 "object": "model",
                 "created": 1706745600,
                 "owned_by": "antigravity"
-            })
+            });
+            let meta = metadata_map
+                .get(&id)
+                .or_else(|| metadata_map.get(&id.to_lowercase()));
+            if let Some(m) = meta {
+                if let Ok(serde_json::Value::Object(map)) = serde_json::to_value(m) {
+                    if let Some(target) = obj.as_object_mut() {
+                        for (k, v) in map {
+                            target.insert(k, v);
+                        }
+                    }
+                }
+            }
+            obj
         })
         .collect();
 
@@ -2794,7 +2915,9 @@ pub async fn handle_retrieve_model(
     State(state): State<AppState>,
     axum::extract::Path(model): axum::extract::Path<String>,
 ) -> impl IntoResponse {
-    use crate::proxy::common::model_mapping::find_dynamic_model;
+    use crate::proxy::common::model_mapping::{
+        find_dynamic_model, get_all_dynamic_models_metadata,
+    };
 
     let only_raw = *state.only_raw_quota_models.read().await;
     if let Some(matched_id) = find_dynamic_model(
@@ -2805,16 +2928,40 @@ pub async fn handle_retrieve_model(
     )
     .await
     {
-        (
-            StatusCode::OK,
-            Json(json!({
-                "type": "model",
-                "id": matched_id.clone(),
-                "display_name": matched_id,
-                "created_at": "2024-10-22T00:00:00Z"
-            })),
+        let metadata_map = get_all_dynamic_models_metadata(
+            &state.custom_mapping,
+            Some(&state.token_manager),
+            only_raw,
         )
-            .into_response()
+        .await;
+
+        let meta = metadata_map
+            .get(&matched_id)
+            .or_else(|| metadata_map.get(&matched_id.to_lowercase()));
+        let display_name = meta
+            .and_then(|m| m.display_name.clone())
+            .unwrap_or_else(|| matched_id.clone());
+
+        let mut obj = json!({
+            "type": "model",
+            "id": matched_id.clone(),
+            "display_name": display_name,
+            "created_at": "2024-10-22T00:00:00Z"
+        });
+
+        if let Some(m) = meta {
+            if let Ok(serde_json::Value::Object(map)) = serde_json::to_value(m) {
+                if let Some(target) = obj.as_object_mut() {
+                    for (k, v) in map {
+                        if k != "display_name" {
+                            target.insert(k, v);
+                        }
+                    }
+                }
+            }
+        }
+
+        (StatusCode::OK, Json(obj)).into_response()
     } else {
         (
             StatusCode::NOT_FOUND,
@@ -2856,6 +3003,7 @@ mod opus_variant_tests {
             type_: "enabled".to_string(),
             budget_tokens: Some(spec.effective_thinking_budget(client_budget)),
             effort: None,
+            display: None,
         };
 
         assert_eq!(request_thinking.budget_tokens, client_budget);
@@ -2870,6 +3018,7 @@ mod opus_variant_tests {
             type_: "enabled".to_string(),
             budget_tokens: Some(spec.effective_thinking_budget(client_budget)),
             effort: None,
+            display: None,
         };
 
         assert_eq!(request_thinking.budget_tokens, Some(1_024));

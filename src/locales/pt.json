@@ -204,7 +204,11 @@
     "health_available_rate": "Disponibilidade Saudável",
     "circuit_break": "Interrompido",
     "health_all_green": "Tudo Saudável",
-    "abnormal_badge": "{{count}} Anormais"
+    "abnormal_badge": "{{count}} Anormais",
+    "no_client_account": "Nenhuma conta ativa ou vinculada para este aplicativo",
+    "go_switch_account": "Ir para alternar conta",
+    "switch_best_to_target": "Alternar melhor conta para {{target}}",
+    "switch_this_to_target": "Alternar esta conta para {{target}}"
   },
   "accounts": {
     "account": "Conta",
@@ -491,6 +495,17 @@
       "auto_sync": "Sincronização Automática da Conta Atual",
       "auto_sync_desc": "Sincronizar automaticamente as informações da conta ativa atual periodicamente",
       "sync_interval": "Intervalo de Sincronização (segundos)",
+      "auto_switch_classic": "Troca Rápida Automática no Classic",
+      "auto_switch_classic_badge": "Apenas Classic",
+      "auto_switch_classic_desc": "Quando a inspeção periódica detectar que a cota da conta atual no Antigravity Classic cair abaixo do limite, troca automaticamente para a melhor conta disponível do pool (Exclusivo para Classic Standalone; IDE e CLI não são suportados devido a limitações de arquitetura do cliente).",
+      "auto_switch_threshold_label": "Limite de Troca",
+      "auto_switch_threshold_hint": "Acionar troca quando qualquer cota monitorada for ≤ {{pct}}%",
+      "auto_switch_models_label": "Pools de Cotas Monitorados",
+      "auto_switch_models_hint": "Selecione pelo menos um pool. A troca é acionada se qualquer pool selecionado cair abaixo do limite.",
+      "auto_switch_gemini": "Pool Gemini",
+      "auto_switch_gemini_desc": "Inclui Pro / Flash / Geração de imagens",
+      "auto_switch_third_party": "Modelos de Terceiros",
+      "auto_switch_third_party_desc": "Inclui Claude 3.7 / 3.5 / GPT",
       "email": "E-mail",
       "no_accounts": "Nenhuma conta encontrada"
     },
@@ -1154,6 +1169,19 @@
       "log_retention_rows": "Maximum log rows",
       "agent_settings": {
         "title": "Configurações específicas de Agent (Specific Agent Settings)"
+      },
+      "hub": {
+        "title": "Impressão Digital do Hub Oficial",
+        "tooltip": "Alinha o tráfego de saída com as assinaturas oficiais do Google Antigravity Hub para evitar limites 429.",
+        "source_custom": "Personalizado",
+        "source_remote": "Remoto",
+        "source_local": "App Local",
+        "source_baseline": "Base Estável",
+        "detect_button": "Detectar",
+        "detect_success": "Hub oficial detectado e sincronizado: v{{version}} (CL: {{cl}})",
+        "detect_failed": "Falha na detecção: {{error}}",
+        "version_label": "Versão do Hub",
+        "cl_label": "Número de build Piper (CL)"
       }
     },
     "stream_timeouts": {
@@ -1388,7 +1416,19 @@
       "model_name": "Nome do Modelo",
       "model_id": "ID do Modelo",
       "description": "Descrição",
-      "action": "Ação"
+      "status": "Status / Conectividade",
+      "action": "Ação",
+      "test_connectivity": "Testar",
+      "batch_test": "Testar todos",
+      "stop_test": "Parar",
+      "auto_dispatch": "🤖 Alocação automática (Pool)",
+      "select_account": "Selecionar conta",
+      "view_detail": "Ver detalhes da requisição e latência",
+      "retired": "Descontinuado",
+      "untested": "Não testado",
+      "testing": "Testando...",
+      "success": "Normal",
+      "rate_limited": "Limite atingido"
     },
     "cli_sync": {
       "title": "Configuração Rápida de Ferramentas de Agent",
@@ -1416,10 +1456,14 @@
       "toast": {
         "sync_success": "Sucesso! {{name}} está pronto.",
         "sync_error": "Falha na sincronização: {{error}}",
-        "config_missing": "Gere uma Chave de API e inicie o serviço primeiro"
+        "config_missing": "Gere uma Chave de API e inicie o serviço primeiro",
+        "sync_success_with_model": "{{name}} sincronizado com sucesso com o modelo: {{model}}!"
       },
       "sync_confirm_title": "Confirmação de Sincronização",
-      "sync_confirm_message": "Pronto para sincronizar a configuração do {{name}}. ⚠️ Aviso: Isso substituirá seus arquivos de configuração local existentes (como tokens de login, chaves de API). Tem certeza de que deseja continuar?"
+      "sync_confirm_message": "Pronto para sincronizar a configuração do {{name}}. ⚠️ Aviso: Isso substituirá seus arquivos de configuração local existentes (como tokens de login, chaves de API). Tem certeza de que deseja continuar?",
+      "apps": {
+        "gemini": "Antigravity CLI (agy)"
+      }
     },
     "opencode_sync": {
       "toast": {
@@ -1715,14 +1759,11 @@
     "error_invalid_key": "Chave de acesso inválida ou expirada",
     "error_network": "Erro ao conectar ao serviço de autenticação",
     "note": "Nota: Se uma senha de administração separada estiver definida, insira-a; caso contrário, insira a API_KEY.",
-    "lookup_hint": "View gui_config.json or check environment variables to find them.",
+    "lookup_hint": "Se esqueceu, execute docker logs antigravity-manager para encontrar a Chave de API atual ou a senha da Web UI.",
     "config_hint": "Ou execute grep -E '\"api_key\"|\"admin_password\"' ~/.antigravity_tools/gui_config.json para visualizar."
   },
   "token_stats": {
     "title": "Estatísticas de Consumo de Tokens",
-    "minute": "Minuto",
-    "minute_1h": "1h (1m)",
-    "minute_24h": "24h (5m)",
     "hourly": "Hora",
     "daily": "Dia",
     "weekly": "Semana",
@@ -1875,7 +1916,16 @@
     "mode_cockpit": "Visão Geral",
     "reasoning_short": "Rac",
     "cockpit_thinking_share": "Parcela de Raciocínio",
-    "cockpit_avg_thinking_per_req": "Raciocínio Médio / req"
+    "cockpit_avg_thinking_per_req": "Raciocínio Médio / req",
+    "cockpit_user_rank": "Ranking de Usuários",
+    "cockpit_no_user_activity": "Nenhuma atividade de consumo de Key de usuário",
+    "cockpit_view_detail": "Detalhes",
+    "cockpit_tab_accounts": "Contas",
+    "cockpit_tab_models": "Modelos",
+    "cockpit_tab_users": "Usuários",
+    "minute": "Minuto",
+    "minute_1h": "1h (1m)",
+    "minute_24h": "24h (5m)"
   },
   "errors": {
     "stream": {
@@ -2019,8 +2069,25 @@
     "hint_curfew": "Deixe em branco para desativar. Baseado na hora do servidor.",
     "custom_expires_required": "Please select custom expiration time",
     "expires_custom": "Custom Time",
-    "custom_expires_at": "Custom Expiration At",
-    "hint_custom_expires": "Set precise expiration timestamp for this token"
+    "custom_expires_at": "Data de expiração personalizada",
+    "hint_custom_expires": "Definir carimbo de data/hora de expiração preciso para este token",
+    "view_stats": "Estatísticas de uso",
+    "bound_ips": "IPs de clientes",
+    "recent_ips": "IPs ativos de clientes e atividade recente",
+    "no_ips": "Nenhum registro de associação de IP encontrado",
+    "enabled": "Ativo",
+    "disabled": "Desativado",
+    "range_24h": "24 horas",
+    "range_7d": "Últimos 7 dias",
+    "range_30d": "Últimos 30 dias",
+    "range_all": "Tudo",
+    "success_rate": "Taxa de sucesso",
+    "avg_per_request": "Média de tokens/requisição",
+    "est_throughput": "Consumo estimado por requisição",
+    "calls_unit": "chamadas",
+    "records_unit": "registros",
+    "no_trend_data": "Sem dados de tendência neste período",
+    "no_model_data": "Sem dados de modelos disponíveis"
   },
   "apiKeyFun": {
     "title": "APIKEY.FUN Hub",

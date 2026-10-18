@@ -203,7 +203,11 @@
     "health_available_rate": "健康可用率",
     "circuit_break": "熔斷",
     "health_all_green": "全綠無風險",
-    "abnormal_badge": "{{count}} 異常"
+    "abnormal_badge": "{{count}} 異常",
+    "no_client_account": "該應用當前暫無登錄或綁定的帳號",
+    "go_switch_account": "前往切換帳號",
+    "switch_best_to_target": "一鍵切換最佳帳號到 {{target}}",
+    "switch_this_to_target": "一鍵將此帳號切換到 {{target}}"
   },
   "accounts": {
     "account": "帳號",
@@ -224,6 +228,12 @@
     "delete_selected": "刪除 ({{count}})",
     "current": "當前",
     "current_badge": "當前",
+    "client_classic": "經典款",
+    "client_classic_tooltip": "目前 Antigravity 經典款用戶端登入帳號",
+    "client_ide": "IDE",
+    "client_ide_tooltip": "目前 Antigravity IDE 用戶端登入帳號",
+    "client_cli": "CLI",
+    "client_cli_tooltip": "目前 Antigravity CLI (agy) 登入帳號",
     "disabled": "已停用",
     "disabled_tooltip": "帳號已被停用（例如 refresh_token 被撤銷/過期）。重新授權或更新 Token 後可恢復。",
     "proxy_disabled": "反向代理已停用",
@@ -355,14 +365,14 @@
         "batch_fail": "匯入失敗"
       },
       "import": {
-        "scheme_a": "方案 A: 從當前 IDE 資料庫",
-        "scheme_a_desc": "自動從本地 Antigravity 資料庫讀取當前登入的帳號資訊。",
-        "btn_db": "匯入當前登入帳號",
+        "scheme_a": "自動掃描本地已登入帳號",
+        "scheme_a_desc": "自動對本地系統 Keyring/Keychain、Antigravity IDE、經典款及 CLI 進行全量掃描並批次匯入已登入帳號。",
+        "btn_db": "一鍵掃描並匯入所有本地帳號",
+        "btn_custom_db": "從自定義 DB 匯入",
         "or": "或者",
         "scheme_b": "方案 B: 從 V1 版本備份",
         "scheme_b_desc": "掃描 ~/.antigravity-agent 目錄，批次匯入舊版本的帳號資料。",
-        "btn_v1": "從 V1 備份批次匯入",
-        "btn_custom_db": "從自定義 DB 匯入"
+        "btn_v1": "從 V1 備份批次匯入"
       },
       "btn_cancel": "取消",
       "btn_confirm": "確認新增",
@@ -486,7 +496,18 @@
       "refresh_interval": "重新整理間隔（分鐘）",
       "auto_sync": "自動獲取當前帳號",
       "auto_sync_desc": "定期自動重新整理當前活動帳號的資訊",
-      "sync_interval": "同步間隔（分鐘）"
+      "sync_interval": "同步間隔（分鐘）",
+      "auto_switch_classic": "經典款自動熱切換",
+      "auto_switch_classic_badge": "僅限經典款",
+      "auto_switch_classic_desc": "後台定時巡檢發現經典款原生客戶端當前帳號配額低於閾值時，自動從帳號池挑選高額度可用帳號無感熱切換（僅支援經典款原生客戶端，IDE 款與 CLI 受官方客戶端機制限制暫不支援無感熱切）。",
+      "auto_switch_threshold_label": "觸發換號閾值",
+      "auto_switch_threshold_hint": "任一監控算力池剩餘配額 ≤ {{pct}}% 時觸發自動換號",
+      "auto_switch_models_label": "監控額度池",
+      "auto_switch_models_hint": "至少選擇一個，任一所選池額度低於閾值即自動換號",
+      "auto_switch_gemini": "Gemini 算力池",
+      "auto_switch_gemini_desc": "包含 Pro / Flash / 繪圖",
+      "auto_switch_third_party": "第三方模型池",
+      "auto_switch_third_party_desc": "包含 Claude 3.7 / 3.5 / GPT"
     },
     "warmup": {
       "title": "智慧預熱",
@@ -1185,6 +1206,19 @@
       },
       "agent_settings": {
         "title": "特定 Agent 設定 (Specific Agent Settings)"
+      },
+      "hub": {
+        "title": "官方 Hub 客戶端指紋",
+        "tooltip": "出站流量對齊 Google 官方 Antigravity Hub 原生客戶端特徵，自動維護版本號與構建 CL 編號以規避 429 配額限制。",
+        "source_custom": "自訂",
+        "source_remote": "遠端探測",
+        "source_local": "本地應用",
+        "source_baseline": "穩態基準",
+        "detect_button": "動態探測",
+        "detect_success": "已成功探測並同步官方最新 Hub: v{{version}} (CL: {{cl}})",
+        "detect_failed": "探測失敗: {{error}}",
+        "version_label": "Hub 版本號 (Version)",
+        "cl_label": "Piper 構建編號 (CL)"
       }
     },
     "stream_timeouts": {
@@ -1398,9 +1432,13 @@
       "toast": {
         "config_missing": "請先生成 API Key 並啟動服務",
         "sync_success": "同步成功！{{name}} 已準備就緒。",
-        "sync_error": "同步 {{name}} 失敗: {{error}}"
+        "sync_error": "同步 {{name}} 失敗: {{error}}",
+        "sync_success_with_model": "同步成功！{{name}} 已同步模型: {{model}}"
       },
-      "model_select": "Select Model"
+      "model_select": "Select Model",
+      "apps": {
+        "gemini": "Antigravity CLI (agy)"
+      }
     },
     "hermes_sync": {
       "modal_title": "在 Hermes 中配置 Antigravity Manager",
@@ -1475,7 +1513,19 @@
       "model_name": "模型名稱",
       "model_id": "模型 ID",
       "description": "描述",
-      "action": "操作"
+      "status": "狀態 / 連通性",
+      "action": "操作",
+      "test_connectivity": "測活",
+      "batch_test": "批量測活",
+      "stop_test": "停止",
+      "auto_dispatch": "🤖 自動調度 (反代號池)",
+      "select_account": "指定測試帳號",
+      "view_detail": "查看請求明細與耗時",
+      "retired": "已退役",
+      "untested": "未測試",
+      "testing": "測試中...",
+      "success": "正常",
+      "rate_limited": "限流"
     },
     "cloudflared": {
       "title": "Public Access (Cloudflared)",
@@ -1721,16 +1771,29 @@
     },
     "timing": {
       "title": "耗時分類診斷",
-      "clean": "初始會話清洗",
+      "clean": "會話清洗",
       "clean_desc": "清理快取控制 / 合併同角色 / 破損思考過濾 / 提純去噪",
       "norm": "中轉歸一",
       "norm_desc": "模型路由 / 帳號調度 / 協議轉Gemini格式",
-      "thinking": "Thinking塊、簽名填充",
-      "thinking_desc": "ThinkingStore回填 / 補全思維塊與哨兵簽名",
-      "ttft": "等待首包（思考首ssetoken或者工具ssetoken或正文ssetoken）",
+      "thinking": "思維塊、簽名",
+      "thinking_desc": "思維鏈持久化與哨兵簽名回填",
+      "ttft": "等待首包",
       "ttft_desc": "網關發出請求至接收到上游首個有效資料塊",
-      "stream": "首包到這個包響應完的時間",
+      "ttft_pure": "等待首包",
+      "ttft_pure_desc": "最終命中端點發出請求至首個有效資料塊到達",
+      "fallback_overhead": "降級損耗",
+      "fallback_overhead_desc": "端點故障超時轉移與切換延遲開銷",
+      "fallback_badge": "已降級",
+      "direct_badge": "直連",
+      "switch_delay": "切換延遲",
+      "attempt": "嘗試",
+      "effective_hit": "首包命中",
+      "stream": "持續響應總時長",
       "stream_desc": "首個資料塊到達至整條響應流結束",
+      "fault_degraded": "故障降級",
+      "success": "成功",
+      "raw_error_payload": "報文",
+      "timeout_or_failover": "端點連接超時或故障轉移",
       "total": "總耗時",
       "copy_timing": "複製耗時分類",
       "copied_timing": "已複製耗時",
@@ -1781,14 +1844,11 @@
     "error_invalid_key": "密碼或 API Key 錯誤，請重試",
     "error_network": "網路連線失敗，請檢查服務是否正常運行",
     "note": "注意：如果設置了獨立的管理密碼，請輸入管理密碼；否則請輸入 API_KEY。",
-    "lookup_hint": "請查看 gui_config.json 或檢查環境變數以取得它們。",
+    "lookup_hint": "如果您忘記了，請運行 docker logs antigravity-manager 尋找 Current API Key 或 Web UI Password",
     "config_hint": "或執行 grep -E '\"api_key\"|\"admin_password\"' ~/.antigravity_tools/gui_config.json 查看。"
   },
   "token_stats": {
     "title": "Token 消費統計",
-    "minute": "每分鐘",
-    "minute_1h": "1小時 (1分)",
-    "minute_24h": "24小時 (5分)",
     "hourly": "每小時",
     "daily": "每日",
     "weekly": "每週",
@@ -1941,7 +2001,16 @@
     "mode_cockpit": "總覽看板",
     "reasoning_short": "思",
     "cockpit_thinking_share": "思考佔比",
-    "cockpit_avg_thinking_per_req": "均次思考"
+    "cockpit_avg_thinking_per_req": "均次思考",
+    "cockpit_user_rank": "用戶排行",
+    "cockpit_no_user_activity": "暫無用戶 Key 消耗活動",
+    "cockpit_view_detail": "詳情",
+    "cockpit_tab_accounts": "帳號",
+    "cockpit_tab_models": "模型",
+    "cockpit_tab_users": "用戶",
+    "minute": "每分鐘",
+    "minute_1h": "1小時 (1分)",
+    "minute_24h": "24小時 (5分)"
   },
   "security": {
     "title": "安全監控",
@@ -2077,7 +2146,24 @@
     "custom_expires_required": "請選擇自訂過期時間",
     "expires_custom": "自訂時間",
     "custom_expires_at": "自訂到期時間",
-    "hint_custom_expires": "設定 Token 的精確到期時間點"
+    "hint_custom_expires": "設定 Token 的精確到期時間點",
+    "view_stats": "用量統計",
+    "bound_ips": "客戶端 IP 數",
+    "recent_ips": "活躍客戶端 IP 與最近活動",
+    "no_ips": "暫無 IP 綁定記錄",
+    "enabled": "啟用",
+    "disabled": "禁用",
+    "range_24h": "24小時",
+    "range_7d": "近7天",
+    "range_30d": "近30天",
+    "range_all": "全部",
+    "success_rate": "成功率",
+    "avg_per_request": "平均單次 Token",
+    "est_throughput": "每請求吞吐估算",
+    "calls_unit": "次調用",
+    "records_unit": "個記錄",
+    "no_trend_data": "該時段內暫無走勢數據",
+    "no_model_data": "暫無模型數據"
   },
   "apiKeyFun": {
     "title": "APIKEY.FUN 中轉站",

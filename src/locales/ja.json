@@ -204,7 +204,11 @@
     "health_available_rate": "健全利用可能率",
     "circuit_break": "遮断",
     "health_all_green": "すべて正常",
-    "abnormal_badge": "{{count}}件 異常"
+    "abnormal_badge": "{{count}}件 異常",
+    "no_client_account": "このアプリに有効なアカウントがありません",
+    "go_switch_account": "アカウント切り替えへ",
+    "switch_best_to_target": "{{target}} の最適アカウントに切り替え",
+    "switch_this_to_target": "このアカウントを {{target}} に切り替え"
   },
   "accounts": {
     "account": "アカウント",
@@ -486,7 +490,18 @@
       "refresh_interval": "更新間隔 (分)",
       "auto_sync": "現在のアカウントの自動同期",
       "auto_sync_desc": "現在アクティブなアカウントの情報を定期的に自動同期する",
-      "sync_interval": "同期間隔 (秒)"
+      "sync_interval": "同期間隔 (秒)",
+      "auto_switch_classic": "クラシック版 自動ホットスワップ",
+      "auto_switch_classic_badge": "クラシック版限定",
+      "auto_switch_classic_desc": "バックグラウンド巡回時に Antigravity クラシック版の現在アカウントのクォータが閾値を下回った場合、プールから利用可能な最適アカウントへ自動で無感切り替えします（クラシック単体版限定。IDE版およびCLIはクライアント構造の制約によりサポート外です）。",
+      "auto_switch_threshold_label": "切り替えトリガー閾値",
+      "auto_switch_threshold_hint": "監視対象プールの残余クォータが ≤ {{pct}}% の場合に自動切り替え",
+      "auto_switch_models_label": "監視クォータプール",
+      "auto_switch_models_hint": "1つ以上選択してください。選択されたプールのいずれかが閾値を下回ると自動切り替えがトリガーされます。",
+      "auto_switch_gemini": "Gemini プール",
+      "auto_switch_gemini_desc": "Pro / Flash / 画像生成を含む",
+      "auto_switch_third_party": "サードパーティモデル",
+      "auto_switch_third_party_desc": "Claude 3.7 / 3.5 / GPT を含む"
     },
     "warmup": {
       "title": "スマートウォームアップ",
@@ -1141,6 +1156,19 @@
       "log_retention_rows": "最大ログ行数",
       "agent_settings": {
         "title": "特定 Agent 設定 (Specific Agent Settings)"
+      },
+      "hub": {
+        "title": "公式 Hub クライアントフィンガープリント",
+        "tooltip": "Google公式 Antigravity Hub のネイティブ署名に出力トラフィックを合わせ、バージョンとCL番号を自動維持して 429 クォータ制限を回避します。",
+        "source_custom": "カスタム",
+        "source_remote": "リモート検出",
+        "source_local": "ローカルアプリ",
+        "source_baseline": "ベースライン",
+        "detect_button": "検出",
+        "detect_success": "公式最新 Hub の検出・同期に成功: v{{version}} (CL: {{cl}})",
+        "detect_failed": "検出に失敗しました: {{error}}",
+        "version_label": "Hub バージョン (Version)",
+        "cl_label": "Piper ビルド番号 (CL)"
       }
     },
     "stream_timeouts": {
@@ -1375,7 +1403,19 @@
       "model_name": "モデル名",
       "model_id": "モデルID",
       "description": "説明",
-      "action": "操作"
+      "status": "ステータス / 接続性",
+      "action": "操作",
+      "test_connectivity": "疎通テスト",
+      "batch_test": "一括テスト",
+      "stop_test": "停止",
+      "auto_dispatch": "🤖 自動ルーティング (プロキシプール)",
+      "select_account": "テストアカウント指定",
+      "view_detail": "リクエスト詳細と所要時間を表示",
+      "retired": "廃止済み",
+      "untested": "未テスト",
+      "testing": "テスト中...",
+      "success": "正常",
+      "rate_limited": "レート制限"
     },
     "cli_sync": {
       "title": "Agentツール一括設定",
@@ -1402,10 +1442,14 @@
       },
       "toast": {
         "sync_success": "同期に成功しました！{{name}} の準備が整いました。",
-        "sync_error": "同期に失敗しました：{{error}}"
+        "sync_error": "同期に失敗しました：{{error}}",
+        "sync_success_with_model": "{{name}} の同期に成功しました。モデル: {{model}}"
       },
       "sync_confirm_title": "同期の確認",
-      "sync_confirm_message": "{{name}} の設定を同期する準備ができました。⚠️ 注意：これにより、既存のローカル設定ファイル（ログイントークン、APIキーなど）が上書きされます。続行してもよろしいですか？"
+      "sync_confirm_message": "{{name}} の設定を同期する準備ができました。⚠️ 注意：これにより、既存のローカル設定ファイル（ログイントークン、APIキーなど）が上書きされます。続行してもよろしいですか？",
+      "apps": {
+        "gemini": "Antigravity CLI (agy)"
+      }
     },
     "agent_settings": {
       "banner_title": "特定 Agent 専用機能と最適化ガバナンス",
@@ -1679,14 +1723,11 @@
     "error_invalid_key": "パスワードまたは API キーが無効です。再試行してください",
     "error_network": "ネットワーク接続に失敗しました。サービスが実行中か確認してください",
     "note": "注意：独立した管理パスワードが設定されている場合は管理パスワードを入力してください。そうでない場合は API_KEY を入力してください。",
-    "lookup_hint": "View gui_config.json or check environment variables to find them.",
+    "lookup_hint": "お忘れの場合は、docker logs antigravity-manager を実行して Current API Key または Web UI Password を探してください",
     "config_hint": "または grep -E '\"api_key\"|\"admin_password\"' ~/.antigravity_tools/gui_config.json を実行して確認してください。"
   },
   "token_stats": {
     "title": "トークン統計",
-    "minute": "分単位",
-    "minute_1h": "1時間 (1分)",
-    "minute_24h": "24時間 (5分)",
     "hourly": "時間単位",
     "daily": "日単位",
     "weekly": "週単位",
@@ -1839,7 +1880,16 @@
     "mode_cockpit": "概要ボード",
     "reasoning_short": "思",
     "cockpit_thinking_share": "思考割合",
-    "cockpit_avg_thinking_per_req": "平均思考 / 回"
+    "cockpit_avg_thinking_per_req": "平均思考 / 回",
+    "cockpit_user_rank": "ユーザー順位",
+    "cockpit_no_user_activity": "ユーザーKeyの消費アクティビティはありません",
+    "cockpit_view_detail": "詳細",
+    "cockpit_tab_accounts": "アカウント",
+    "cockpit_tab_models": "モデル",
+    "cockpit_tab_users": "ユーザー",
+    "minute": "分単位",
+    "minute_1h": "1時間 (1分)",
+    "minute_24h": "24時間 (5分)"
   },
   "errors": {
     "stream": {
@@ -1984,7 +2034,24 @@
     "custom_expires_required": "カスタム有効期限を選択してください",
     "expires_custom": "カスタム時間",
     "custom_expires_at": "カスタム有効期限",
-    "hint_custom_expires": "Tokenの正確な有効期限日時を設定"
+    "hint_custom_expires": "Tokenの正確な有効期限日時を設定",
+    "view_stats": "使用量統計",
+    "bound_ips": "クライアント IP 数",
+    "recent_ips": "アクティブなクライアント IP と最近のアクティビティ",
+    "no_ips": "IP バインドの記録はありません",
+    "enabled": "有効",
+    "disabled": "無効",
+    "range_24h": "24時間",
+    "range_7d": "直近7日",
+    "range_30d": "直近30日",
+    "range_all": "すべて",
+    "success_rate": "成功率",
+    "avg_per_request": "リクエスト平均 Token",
+    "est_throughput": "リクエストごとの推定消費",
+    "calls_unit": "回呼び出し",
+    "records_unit": "件の記録",
+    "no_trend_data": "この期間の推移データはありません",
+    "no_model_data": "モデルデータがありません"
   },
   "apiKeyFun": {
     "title": "APIKEY.FUN ハブ",

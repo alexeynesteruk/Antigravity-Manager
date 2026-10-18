@@ -9,23 +9,63 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 use tokio::time::Duration;
 
-/// 端点降级尝试的记录信息
-#[derive(Debug, Clone)]
+/// 解析端点易读简称 (Daily, Sandbox, Prod, Custom)
+pub fn parse_endpoint_name(base_url: &str) -> &'static str {
+    if base_url.contains("sandbox") {
+        "Sandbox"
+    } else if base_url.contains("daily") {
+        "Daily"
+    } else if base_url.contains("cloudcode-pa.googleapis.com") {
+        "Prod"
+    } else {
+        "Custom"
+    }
+}
+
+/// 端点降级与请求尝试的链路记录信息
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct FallbackAttemptLog {
+    /// 尝试的端点简称 (如 "Daily", "Sandbox", "Prod")
+    pub endpoint_name: String,
     /// 尝试的端点 URL
     pub endpoint_url: String,
     /// HTTP 状态码 (网络错误时为 None)
     pub status: Option<u16>,
+    /// 耗时 (秒)
+    pub duration_s: f64,
+    /// 距离上一尝试失败到当前尝试发起之间的 fallback 切换延迟 (秒)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub switch_delay_s: Option<f64>,
     /// 错误描述
     pub error: String,
+    /// 是否为最终命中的有效端点
+    pub is_effective: bool,
 }
 
 /// 上游调用结果，包含响应和降级尝试记录
 pub struct UpstreamCallResult {
     /// 最终的 HTTP 响应
     pub response: Response,
-    /// 降级过程中失败的端点尝试记录 (成功时为空)
+    /// 所有端点尝试记录 (包含前置失败项与最终有效项)
     pub fallback_attempts: Vec<FallbackAttemptLog>,
+    /// 最终有效端点发起请求的时间戳 (用于计算纯粹的点到点首包 TTFT)
+    pub effective_attempt_start: std::time::Instant,
+}
+
+impl UpstreamCallResult {
+    /// 是否发生了端点降级 (存在非有效端点尝试)
+    pub fn has_fallback(&self) -> bool {
+        self.fallback_attempts.iter().any(|a| !a.is_effective)
+    }
+
+    /// 获取前置失败端点累计的总开销 (秒，包含失败耗时与切换延迟)
+    pub fn fallback_overhead_s(&self) -> f64 {
+        self.fallback_attempts
+            .iter()
+            .filter(|a| !a.is_effective)
+            .map(|a| a.duration_s + a.switch_delay_s.unwrap_or(0.0))
+            .sum()
+    }
 }
 
 /// 邮箱脱敏：只显示前3位 + *** + @域名前2位 + ***
@@ -68,8 +108,7 @@ pub fn sanitize_error_for_log(error_text: &str) -> String {
 // Cloud Code v1internal endpoints (fallback order: Daily → Sandbox → Prod)
 //
 // Daily 优先 —— 它是官方 IDE 原生唯一主力端点（`language_server` 的启动参数即指向它），
-// 稳定支持思维链与工具调用；Sandbox 为沙箱备用、Prod 为生产兜底，
-// 后两者均易触发 Prod 环境的 429（Ref: Issue #1176, Issue #3523）。
+// 稳定支持思维链与工具调用；Sandbox 为沙箱备用容灾；Prod 端点因全流量必报 429 已被彻底剔除。
 //
 // [FIX Issue #3525 / PR #3526] 顺序同时是**正确性**要求，不只是可用性偏好：
 // 同一账号 / 模型 / 代理下，Sandbox 对部分地区返回**终止性 400**
@@ -77,15 +116,15 @@ pub fn sanitize_error_for_log(error_text: &str) -> String {
 // 只对 408 / 404 / 5xx 回退 → 400 不触发回退，故 Sandbox 排首位会让已验证可用的
 // Daily 永远不被尝试。Sandbox 保留为回退项、回退判定规则不变 ——
 // **不对所有 400 无条件重试**。
+#[allow(dead_code)]
 const V1_INTERNAL_BASE_URL_PROD: &str = "https://cloudcode-pa.googleapis.com/v1internal";
 const V1_INTERNAL_BASE_URL_DAILY: &str = "https://daily-cloudcode-pa.googleapis.com/v1internal";
 const V1_INTERNAL_BASE_URL_SANDBOX: &str =
     "https://daily-cloudcode-pa.sandbox.googleapis.com/v1internal";
 
-pub const V1_INTERNAL_BASE_URL_FALLBACKS: [&str; 3] = [
-    V1_INTERNAL_BASE_URL_DAILY, // 优先级 1: Daily (官方 IDE 原生唯一主力端点，稳定支持思维链与工具调用)
-    V1_INTERNAL_BASE_URL_SANDBOX, // 优先级 2: Sandbox (沙箱备用；部分地区对合规账号返回终止性 400)
-    V1_INTERNAL_BASE_URL_PROD,  // 优先级 3: Prod (生产兜底，易触发 429)
+pub const V1_INTERNAL_BASE_URL_FALLBACKS: [&str; 2] = [
+    V1_INTERNAL_BASE_URL_DAILY, // 优先级 1: Daily (官方 IDE 原生主力端点，毫秒级响应，稳定支持长流式与思维链)
+    V1_INTERNAL_BASE_URL_SANDBOX, // 优先级 2: Sandbox (沙箱备用，极速响应，实测完美承载 100k+ 上下文，无缝容灾)
 ];
 
 /// 提取端点的主机名或规范标识，使不同 API 路径（如 :loadCodeAssist、:fetchAvailableModels、v1internal）
@@ -105,6 +144,13 @@ pub fn extract_endpoint_host(url_or_host: &str) -> &str {
 /// 判断 HTTP 状态码是否属于应当尝试下一个候选端点的临时/可重试故障。
 pub fn should_try_next_endpoint(status: StatusCode) -> bool {
     UpstreamClient::should_try_next_endpoint(status)
+}
+
+/// 判断特定端点在特定状态码下是否可重试或回退。
+/// 特别针对 Sandbox 沙箱端点：非美 IP 会返回 400 Bad Request (FAILED_PRECONDITION: User location is not supported)，
+/// 此时必须标记该端点失败并快速回退到 Prod 生产端点。
+pub fn should_try_next_endpoint_for_url(status: StatusCode, endpoint_url: &str) -> bool {
+    UpstreamClient::should_try_next_endpoint_for_url(status, endpoint_url)
 }
 
 /// 端点健康追踪器：记录故障端点与冷却期，动态优化上游端点 Fallback 顺序，避免无状态重复踩坑。
@@ -213,7 +259,7 @@ impl EndpointHealthTracker {
 
 impl Default for EndpointHealthTracker {
     fn default() -> Self {
-        Self::new(std::time::Duration::from_secs(60))
+        Self::new(std::time::Duration::from_secs(30))
     }
 }
 
@@ -306,17 +352,17 @@ impl UpstreamClient {
         let builder = Client::builder()
             .emulation(rquest_util::Emulation::Chrome123)
             // Connection settings (优化连接复用，减少建立开销)
-            // [OPTIMIZATION] 建连仅涉及 TCP/TLS 握手，从 20s 缩短至 5s，快速识别死端点，防止多级重试累积 40s 超时
-            .connect_timeout(Duration::from_secs(5))
-            .pool_max_idle_per_host(20) // 每主机最多 20 个空闲连接 (对齐官方指纹)
-            // [FIX] 空闲连接从 90s 缩短至 45s，避免 GFE 在 45~60s 静默掐断空闲 TCP 后客户端复用死连接引发 error reading a body
-            .pool_idle_timeout(Duration::from_secs(45))
+            // [OPTIMIZATION] 建连仅涉及 TCP/TLS 握手，设置为 10s，兼顾跨国网络抖动与快速识别死端点
+            .connect_timeout(Duration::from_secs(10))
+            .pool_max_idle_per_host(10) // 每主机最多 10 个空闲连接 (防止过多闲置连接被上游服务端静默掐断)
+            // [FIX] 空闲连接收紧至 15s，避免 GFE 在 20~30s 静默掐断空闲 TCP 后客户端复用死连接引发 error reading a body from connection
+            .pool_idle_timeout(Duration::from_secs(15))
             // [FIX #3593 / #3571] 彻底恢复 Chrome 123 原生协议行为：
             // 1. 实测证实 Google GFE 对客户端 HTTP/2 PING 帧静默丢弃、不回复 PING ACK，
             //    导致 hyper2 在 keep_alive_timeout 到期时本地自杀式掐死连接并抛出 error reading a body from connection；
             // 2. 移除破坏性的底层 HTTP/2 PING 配置，回归 4.8.8 稳态基线；
-            // 3. 依赖标准 L4 TCP Keep-Alive (60s) 保活，下游已有 PR #3578 的 3s SSE 注释心跳防客户端超时。
-            .tcp_keepalive(Duration::from_secs(60)) // TCP 稳态保活探测 (60秒)
+            // 3. 依赖标准 L4 TCP Keep-Alive (30s) 保活，防 NAT / GFE 空闲超时掐断长连接，下游已有 PR #3578 的 3s SSE 注释心跳防客户端超时。
+            .tcp_keepalive(Duration::from_secs(30)) // TCP 稳态保活探测 (从 60s 收紧至 30s)
             // 强制开启 HTTP/2 协议，并支持在 SOCKS/HTTPS 代理下通过 ALPN 强制降级/协商
             .timeout(Duration::from_secs(600));
 
@@ -442,6 +488,14 @@ impl UpstreamClient {
             || status.is_server_error()
     }
 
+    /// Determine if we should try next endpoint considering endpoint-specific characteristics.
+    /// Specifically: Sandbox cluster rejects non-US IPs with 400 Bad Request (FAILED_PRECONDITION).
+    /// When this occurs on a sandbox endpoint, we must rotate to Prod instead of returning 400 to the client.
+    pub fn should_try_next_endpoint_for_url(status: StatusCode, endpoint_url: &str) -> bool {
+        Self::should_try_next_endpoint(status)
+            || (status == StatusCode::BAD_REQUEST && endpoint_url.contains("sandbox"))
+    }
+
     /// Call v1internal API (Basic Method)
     ///
     /// Initiates a basic network request, supporting multi-endpoint auto-fallback.
@@ -490,7 +544,11 @@ impl UpstreamClient {
             );
             crate::proxy::mappers::common_utils::ensure_gemini_payload_ends_with_user(&mut body);
         }
-        crate::proxy::pipeline::InboundThinkingPipeline::align_official_envelope(&mut body);
+        if method == "countTokens" {
+            crate::proxy::pipeline::InboundThinkingPipeline::align_count_tokens_envelope(&mut body);
+        } else {
+            crate::proxy::pipeline::InboundThinkingPipeline::align_official_envelope(&mut body);
+        }
 
         // [NEW] Get client based on account (cached in proxy pool manager)
         let client = self.get_client(account_id).await;
@@ -501,11 +559,10 @@ impl UpstreamClient {
             header::CONTENT_TYPE,
             header::HeaderValue::from_static("application/json"),
         );
-        headers.insert(
-            header::AUTHORIZATION,
-            header::HeaderValue::from_str(&format!("Bearer {}", access_token))
-                .map_err(|e| e.to_string())?,
-        );
+        let mut auth_val = header::HeaderValue::from_str(&format!("Bearer {}", access_token))
+            .map_err(|e| e.to_string())?;
+        auth_val.set_sensitive(true);
+        headers.insert(header::AUTHORIZATION, auth_val);
 
         headers.insert(
             header::USER_AGENT,
@@ -585,12 +642,13 @@ impl UpstreamClient {
         });
 
         let mut has_triggered_downgrade = false;
+        let mut fallback_attempts: Vec<FallbackAttemptLog> = Vec::new();
+        let mut last_attempt_failed_at: Option<std::time::Instant> = None;
 
         // [TEMPORARY FIX #3074] 针对 403 SERVICE_DISABLED 的自动降级重试逻辑
         // 我们包装一层循环，以便在检测到特定错误时移除 Header 并重试
         loop {
             let mut last_err: Option<String> = None;
-            let mut fallback_attempts: Vec<FallbackAttemptLog> = Vec::new();
             let mut should_retry_without_header = false;
 
             // 动态健康度排序：优先尝试健康端点，跳过处于冷却期的故障端点，避免无状态重复累积 40s 超时
@@ -619,14 +677,60 @@ impl UpstreamClient {
                     req_builder = req_builder.body(body_bytes.clone());
                 }
 
-                let response = req_builder.send().await;
+                let switch_delay_s = last_attempt_failed_at.map(|t| t.elapsed().as_secs_f64());
+                let attempt_start = std::time::Instant::now();
+
+                // [WATCHDOG] 端点级自适应防假死超时：流式接口保底 120s 满足大模型思维链与长上下文冷推理 (TTFT ~35s)，
+                // 普通轻量请求保底 15s 快速探活，兼顾防上游静默挂起与避免长思考被误判假死导致 429 假阳性 (Fixes #3506, Ref #3525)
+                let watchdog_secs = if method == "streamGenerateContent" {
+                    std::cmp::max(120, (body_bytes.len() as u64) / (64 * 1024) + 120)
+                } else {
+                    std::cmp::max(15, (body_bytes.len() as u64) / (256 * 1024) + 15)
+                };
+                let send_future = req_builder.send();
+                let response = match tokio::time::timeout(
+                    std::time::Duration::from_secs(watchdog_secs),
+                    send_future,
+                )
+                .await
+                {
+                    Ok(res) => res,
+                    Err(_) => {
+                        self.endpoint_health.mark_failure(base_url);
+                        last_attempt_failed_at = Some(std::time::Instant::now());
+                        let err_msg = format!(
+                            "HTTP request timed out after {}s waiting for response headers at {} (method={}, body_len={})",
+                            watchdog_secs, base_url, method, body_bytes.len()
+                        );
+                        if has_next {
+                            tracing::warn!(%err_msg, "Upstream candidate endpoint timed out, fast falling back to next endpoint");
+                        } else {
+                            tracing::warn!(%err_msg, "Terminal upstream endpoint timed out");
+                        }
+                        fallback_attempts.push(FallbackAttemptLog {
+                            endpoint_name: parse_endpoint_name(base_url).to_string(),
+                            endpoint_url: url.clone(),
+                            status: None,
+                            duration_s: attempt_start.elapsed().as_secs_f64(),
+                            switch_delay_s,
+                            error: err_msg.clone(),
+                            is_effective: false,
+                        });
+                        last_err = Some(err_msg);
+                        if !has_next {
+                            break;
+                        }
+                        continue;
+                    }
+                };
+                let duration_s = attempt_start.elapsed().as_secs_f64();
 
                 match response {
                     Ok(resp) => {
                         let status = resp.status();
                         if status.is_success() {
                             self.endpoint_health.mark_success(base_url);
-                            if idx > 0 {
+                            if idx > 0 || has_triggered_downgrade {
                                 tracing::info!(
                                     "✓ Upstream fallback succeeded | Endpoint: {} | Status: {} | Next endpoints available: {}",
                                     base_url,
@@ -640,9 +744,19 @@ impl UpstreamClient {
                                     status
                                 );
                             }
+                            fallback_attempts.push(FallbackAttemptLog {
+                                endpoint_name: parse_endpoint_name(base_url).to_string(),
+                                endpoint_url: url.clone(),
+                                status: Some(status.as_u16()),
+                                duration_s,
+                                switch_delay_s,
+                                error: String::new(),
+                                is_effective: true,
+                            });
                             return Ok(UpstreamCallResult {
                                 response: resp,
                                 fallback_attempts,
+                                effective_attempt_start: attempt_start,
                             });
                         }
 
@@ -652,6 +766,24 @@ impl UpstreamClient {
                             && !has_triggered_downgrade
                             && headers.contains_key("x-goog-user-project")
                         {
+                            last_attempt_failed_at = Some(std::time::Instant::now());
+                            let raw_body = resp.text().await.unwrap_or_default();
+                            let sanitized = sanitize_error_for_log(&raw_body);
+                            let err_detail = if sanitized.trim().is_empty() {
+                                "403 Forbidden with project header (downgrading without header)"
+                                    .to_string()
+                            } else {
+                                sanitized.trim().to_string()
+                            };
+                            fallback_attempts.push(FallbackAttemptLog {
+                                endpoint_name: parse_endpoint_name(base_url).to_string(),
+                                endpoint_url: url.clone(),
+                                status: Some(status.as_u16()),
+                                duration_s,
+                                switch_delay_s,
+                                error: err_detail,
+                                is_effective: false,
+                            });
                             tracing::warn!(
                                 "Detected 403 Forbidden with project header, retrying WITHOUT x-goog-user-project header (Account: {:?})",
                                 account_id
@@ -661,40 +793,67 @@ impl UpstreamClient {
                         }
 
                         // 如果有下一个端点且当前错误可重试，则切换
-                        if has_next && Self::should_try_next_endpoint(status) {
+                        if has_next && Self::should_try_next_endpoint_for_url(status, base_url) {
                             self.endpoint_health.mark_failure(base_url);
-                            let err_msg = format!("Upstream {} returned {}", base_url, status);
+                            last_attempt_failed_at = Some(std::time::Instant::now());
+                            let raw_body = resp.text().await.unwrap_or_default();
+                            let sanitized = sanitize_error_for_log(&raw_body);
+                            let err_msg = if sanitized.trim().is_empty() {
+                                format!("HTTP {}", status)
+                            } else {
+                                sanitized.trim().to_string()
+                            };
                             tracing::warn!(
-                                "Upstream endpoint returned {} at {} (method={}), trying next endpoint",
+                                "Upstream endpoint returned {} at {} (method={}): {}",
                                 status,
                                 base_url,
-                                method
+                                method,
+                                err_msg
                             );
                             // [NEW] 记录降级尝试
                             fallback_attempts.push(FallbackAttemptLog {
+                                endpoint_name: parse_endpoint_name(base_url).to_string(),
                                 endpoint_url: url.clone(),
                                 status: Some(status.as_u16()),
+                                duration_s,
+                                switch_delay_s,
                                 error: err_msg.clone(),
+                                is_effective: false,
                             });
                             last_err = Some(err_msg);
                             continue;
                         }
 
                         // 不可重试的错误或已是最后一个端点，直接返回
+                        fallback_attempts.push(FallbackAttemptLog {
+                            endpoint_name: parse_endpoint_name(base_url).to_string(),
+                            endpoint_url: url.clone(),
+                            status: Some(status.as_u16()),
+                            duration_s,
+                            switch_delay_s,
+                            error: format!("HTTP {}", status),
+                            is_effective: false,
+                        });
                         return Ok(UpstreamCallResult {
                             response: resp,
                             fallback_attempts,
+                            effective_attempt_start: attempt_start,
                         });
                     }
                     Err(e) => {
                         self.endpoint_health.mark_failure(base_url);
+                        last_attempt_failed_at = Some(std::time::Instant::now());
                         let msg = format!("HTTP request failed at {}: {}", base_url, e);
                         tracing::debug!("{}", msg);
                         // [NEW] 记录网络错误的降级尝试
                         fallback_attempts.push(FallbackAttemptLog {
+                            endpoint_name: parse_endpoint_name(base_url).to_string(),
                             endpoint_url: url.clone(),
                             status: None,
+                            duration_s,
+                            switch_delay_s,
                             error: msg.clone(),
+                            is_effective: false,
                         });
                         last_err = Some(msg);
 
@@ -780,7 +939,11 @@ impl UpstreamClient {
         account_id: Option<&str>,
         timeout_secs: u64,
     ) -> Result<Value, String> {
-        crate::proxy::pipeline::InboundThinkingPipeline::align_official_envelope(&mut body);
+        if method == "countTokens" {
+            crate::proxy::pipeline::InboundThinkingPipeline::align_count_tokens_envelope(&mut body);
+        } else {
+            crate::proxy::pipeline::InboundThinkingPipeline::align_official_envelope(&mut body);
+        }
         let client = self.get_client(account_id).await;
         let mut last_error = String::new();
 
@@ -818,9 +981,9 @@ impl UpstreamClient {
                 let text = response.text().await.unwrap_or_default();
                 last_error = format!("{} returned {}: {}", url, status, text);
 
-                // 与主请求路径同一判定：仅 408 / 404 / 5xx 换端点；
-                // 其余状态（如 400）说明请求本身有问题，直接终止，不做三倍重试。
-                if !Self::should_try_next_endpoint(status) {
+                // 与主请求路径同一判定：408 / 404 / 5xx 以及 sandbox 400 换端点；
+                // 其余状态说明请求本身有问题，直接终止，不做无效重试。
+                if !Self::should_try_next_endpoint_for_url(status, base_url) {
                     tracing::error!(
                         error = %last_error,
                         "Auxiliary v1internal request failed with non-retryable status (non-server fault)"
@@ -1043,5 +1206,46 @@ mod tests {
         // 模拟 prod 成功
         tracker.mark_success("https://cloudcode-pa.googleapis.com/v1internal:loadCodeAssist");
         assert!(tracker.is_healthy("https://cloudcode-pa.googleapis.com/v1internal"));
+    }
+
+    #[test]
+    fn test_v1_internal_fallbacks_order_prioritizes_daily_over_sandbox() {
+        assert_eq!(
+            V1_INTERNAL_BASE_URL_FALLBACKS,
+            [V1_INTERNAL_BASE_URL_DAILY, V1_INTERNAL_BASE_URL_SANDBOX,]
+        );
+    }
+
+    #[test]
+    fn test_should_try_next_endpoint_for_url() {
+        use rquest::StatusCode;
+
+        // 标准可重试状态码（所有端点均适用）
+        assert!(should_try_next_endpoint_for_url(
+            StatusCode::REQUEST_TIMEOUT,
+            "https://cloudcode-pa.googleapis.com/v1internal"
+        ));
+        assert!(should_try_next_endpoint_for_url(
+            StatusCode::NOT_FOUND,
+            "https://daily-cloudcode-pa.googleapis.com/v1internal"
+        ));
+        assert!(should_try_next_endpoint_for_url(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "https://daily-cloudcode-pa.sandbox.googleapis.com/v1internal"
+        ));
+
+        // 400 Bad Request：仅在 Sandbox 端点标记为可重试以回退 Prod，非 Sandbox 端点直接终止
+        assert!(should_try_next_endpoint_for_url(
+            StatusCode::BAD_REQUEST,
+            "https://daily-cloudcode-pa.sandbox.googleapis.com/v1internal"
+        ));
+        assert!(!should_try_next_endpoint_for_url(
+            StatusCode::BAD_REQUEST,
+            "https://daily-cloudcode-pa.googleapis.com/v1internal"
+        ));
+        assert!(!should_try_next_endpoint_for_url(
+            StatusCode::BAD_REQUEST,
+            "https://cloudcode-pa.googleapis.com/v1internal"
+        ));
     }
 }

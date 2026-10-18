@@ -202,7 +202,11 @@
         "health_available_rate": "معدل الجاهزية السليمة",
         "circuit_break": "قاطع الدائرة",
         "health_all_green": "سليم تمامًا",
-        "abnormal_badge": "{{count}} غير طبيعي"
+        "abnormal_badge": "{{count}} غير طبيعي",
+        "no_client_account": "لا يوجد حساب نشط أو مرتبط بهذا التطبيق",
+        "go_switch_account": "الانتقال إلى تبديل الحساب",
+        "switch_best_to_target": "تبديل أفضل حساب إلى {{target}}",
+        "switch_this_to_target": "تبديل هذا الحساب إلى {{target}}"
     },
     "accounts": {
         "account": "الحساب",
@@ -484,7 +488,18 @@
             "refresh_interval": "فاصل التحديث (دقائق)",
             "auto_sync": "مزامنة تلقائية للحساب الحالي",
             "auto_sync_desc": "مزامنة معلومات الحساب النشط الحالي بشكل دوري",
-            "sync_interval": "فاصل المزامنة (ثواني)"
+            "sync_interval": "فاصل المزامنة (ثواني)",
+            "auto_switch_classic": "التبديل التلقائي السريع للنسخة الكلاسيكية",
+            "auto_switch_classic_badge": "للنسخة الكلاسيكية فقط",
+            "auto_switch_classic_desc": "عندما يكشف الفحص الدوري أن حصة الحساب الحالي في Antigravity Classic انخفضت عن الحد الأدنى، يتم التبديل تلقائيًا وبسلاسة إلى أفضل حساب متاح في المجموعة (خاص بالنسخة الكلاسيكية فقط؛ النسخ IDE و CLI غير مدعومة بسبب قيود معمارية العميل).",
+            "auto_switch_threshold_label": "حد بدء التبديل",
+            "auto_switch_threshold_hint": "بدء التبديل عندما تكون أي حصة مراقبة ≤ {{pct}}%",
+            "auto_switch_models_label": "مجموعات الحصص المراقبة",
+            "auto_switch_models_hint": "اختر واحدة على الأقل. سيتم التبديل إذا انخفضت أي مجموعة عن الحد.",
+            "auto_switch_gemini": "مجموعة Gemini",
+            "auto_switch_gemini_desc": "يشمل Pro / Flash / توليد الصور",
+            "auto_switch_third_party": "نماذج الطرف الثالث",
+            "auto_switch_third_party_desc": "يشمل Claude 3.7 / 3.5 / GPT"
         },
         "warmup": {
             "title": "تنشيط ذكي",
@@ -1141,6 +1156,19 @@
             },
             "agent_settings": {
                 "title": "إعدادات Agent المخصصة (Specific Agent Settings)"
+            },
+            "hub": {
+                "title": "بصمة عميل Hub الرسمية",
+                "tooltip": "محاذاة حركة البيانات الصادرة مع تواقيع Google Antigravity Hub الرسمية لتجنب حدود الحصة 429.",
+                "source_custom": "مخصص",
+                "source_remote": "تم الاكتشاف عن بُعد",
+                "source_local": "تطبيق محلي",
+                "source_baseline": "الأساس الثابت",
+                "detect_button": "اكتشاف",
+                "detect_success": "تم اكتشاف ومزامنة Hub بنجاح: v{{version}} (CL: {{cl}})",
+                "detect_failed": "فشل الاكتشاف: {{error}}",
+                "version_label": "إصدار Hub",
+                "cl_label": "رقم بناء Piper (CL)"
             }
         },
         "stream_timeouts": {
@@ -1366,7 +1394,19 @@
             "model_name": "اسم النموذج",
             "model_id": "معرف النموذج",
             "description": "الوصف",
-            "action": "إجراء"
+            "status": "الحالة / الاتصال",
+            "action": "إجراء",
+            "test_connectivity": "فحص",
+            "batch_test": "فحص الكل",
+            "stop_test": "إيقاف",
+            "auto_dispatch": "🤖 توجيه تلقائي (مجمع البروكسي)",
+            "select_account": "تحديد الحساب",
+            "view_detail": "عرض تفاصيل الطلب والتأخير",
+            "retired": "تم إيقافه",
+            "untested": "لم يتم الفحص",
+            "testing": "جارٍ الفحص...",
+            "success": "طبيعي",
+            "rate_limited": "تم تجاوز المعدل"
         },
         "cli_sync": {
             "title": "الإعداد السريع لأدوات Agent",
@@ -1392,11 +1432,15 @@
             },
             "toast": {
                 "sync_success": "تمت المزامنة بنجاح! {{name}} جاهز.",
-                "sync_error": "فشلت المزامنة: {{error}}"
+                "sync_error": "فشلت المزامنة: {{error}}",
+                "sync_success_with_model": "تمت مزامنة {{name}} بنجاح مع النموذج: {{model}}"
             },
             "sync_confirm_title": "تأكيد المزامنة",
             "sync_confirm_message": "جاهز لمزامنة تكوين {{name}}. ⚠️ تحذير: سيؤدي هذا إلى الكتابة فوق ملفات التكوين المحلية الحالية (مثل توكنات تسجيل الدخول، مفاتيح API). هل أنت متأكد من رغبتك في الاستمرار؟",
-            "model_select": "Select Model"
+            "model_select": "Select Model",
+            "apps": {
+                "gemini": "Antigravity CLI (agy)"
+            }
         },
         "models": {
             "flash": "Ultra-fast",
@@ -1814,7 +1858,13 @@
         "mode_cockpit": "لوحة النظرة العامة",
         "reasoning_short": "تفك",
         "cockpit_thinking_share": "نسبة التفكير",
-        "cockpit_avg_thinking_per_req": "متوسط التفكير / طلب"
+        "cockpit_avg_thinking_per_req": "متوسط التفكير / طلب",
+        "cockpit_user_rank": "ترتيب المستخدمين",
+        "cockpit_no_user_activity": "لا يوجد نشاط لاستهلاك مفاتيح المستخدم",
+        "cockpit_view_detail": "التفاصيل",
+        "cockpit_tab_accounts": "الحسابات",
+        "cockpit_tab_models": "النماذج",
+        "cockpit_tab_users": "المستخدمون"
     },
     "errors": {
         "stream": {
@@ -1958,8 +2008,25 @@
         "hint_curfew": "اتركه فارغًا لتعطيله. بناءً على وقت الخادم.",
         "custom_expires_required": "Please select custom expiration time",
         "expires_custom": "Custom Time",
-        "custom_expires_at": "Custom Expiration At",
-        "hint_custom_expires": "Set precise expiration timestamp for this token"
+        "custom_expires_at": "وقت انتهاء مخصص",
+        "hint_custom_expires": "تعيين طابع زمني دقيق لانتهاء صلاحية هذا الرمز",
+        "view_stats": "إحصائيات الاستخدام",
+        "bound_ips": "عناوين IP للعملاء",
+        "recent_ips": "عناوين IP النشطة والنشاط الأخير",
+        "no_ips": "لم يتم العثور على سجلات ربط IP",
+        "enabled": "مفعل",
+        "disabled": "معطل",
+        "range_24h": "24 ساعة",
+        "range_7d": "آخر 7 أيام",
+        "range_30d": "آخر 30 يومًا",
+        "range_all": "الكل",
+        "success_rate": "معدل النجاح",
+        "avg_per_request": "متوسط الرموز/طلب",
+        "est_throughput": "تقدير الاستهلاك لكل طلب",
+        "calls_unit": "استدعاءات",
+        "records_unit": "سجلات",
+        "no_trend_data": "لا توجد بيانات اتجاه في هذه الفترة",
+        "no_model_data": "لا توجد بيانات للنماذج"
     },
     "apiKeyFun": {
         "title": "APIKEY.FUN Hub",

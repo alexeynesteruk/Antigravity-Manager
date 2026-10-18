@@ -941,6 +941,14 @@ pub struct ProxyConfig {
     #[serde(default)]
     pub user_agent_override: Option<String>,
 
+    /// 官方 Hub 版本自定义覆盖 (如 "2.23.1")
+    #[serde(default)]
+    pub hub_version: Option<String>,
+
+    /// 官方构建提交编号 (CL) 自定义覆盖 (如 "998881661")
+    #[serde(default)]
+    pub hub_cl: Option<String>,
+
     /// 账号调度配置 (粘性会话/限流重试)
     #[serde(default)]
     pub scheduling: crate::proxy::sticky_config::StickySessionConfig,
@@ -1127,6 +1135,8 @@ impl Default for ProxyConfig {
             security_monitor: SecurityMonitorConfig::default(),
             preferred_account_id: None, // 默认使用轮询模式
             user_agent_override: None,
+            hub_version: None,
+            hub_cl: None,
             saved_user_agent: None,
             thinking_budget: ThinkingBudgetConfig::default(),
             global_system_prompt: GlobalSystemPromptConfig::default(),

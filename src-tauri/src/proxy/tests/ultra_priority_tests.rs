@@ -32,8 +32,8 @@ fn create_test_token(
     supported_models: Vec<&str>,
 ) -> ProxyToken {
     let mut model_quotas = HashMap::new();
-    // Simulate quota: give all supported models the same remaining quota
-    for m in supported_models {
+    // Borrow the vec so the later supported_models.iter() can still run.
+    for m in &supported_models {
         model_quotas.insert(m.to_string(), remaining_quota.unwrap_or(100));
     }
 
@@ -58,6 +58,8 @@ fn create_test_token(
         validation_url: None,
         model_quotas,
         model_limits: std::collections::HashMap::new(),
+        available_models: supported_models.iter().map(|s| s.to_lowercase()).collect(),
+        model_metadata: std::collections::HashMap::new(),
     }
 }
 

@@ -41,8 +41,10 @@ function Accounts() {
   const {
     accounts,
     currentAccount,
+    activeClients,
     fetchAccounts,
     fetchCurrentAccount,
+    fetchActiveClients,
     addAccount,
     deleteAccount,
     deleteAccounts,
@@ -231,6 +233,26 @@ function Accounts() {
     fetchAccounts();
     fetchCurrentAccount();
   }, [fetchAccounts, fetchCurrentAccount]);
+
+  // 保持多客户端（经典款、IDE、CLI）当前活动账号实时感知：挂载轮询与窗口焦点刷新
+  useEffect(() => {
+    fetchActiveClients();
+
+    const handleFocus = () => {
+      fetchActiveClients();
+    };
+    window.addEventListener('focus', handleFocus);
+
+    // 每 5 秒轻量检测一次各端本地已登录账号，外部环境切换无需手动重载页面
+    const timer = setInterval(() => {
+      fetchActiveClients();
+    }, 5000);
+
+    return () => {
+      window.removeEventListener('focus', handleFocus);
+      clearInterval(timer);
+    };
+  }, [fetchActiveClients]);
 
   // Reset pagination when view mode changes to avoid empty pages or confusion
   useEffect(() => {
@@ -1035,6 +1057,7 @@ function Accounts() {
                 onToggleSelect={handleToggleSelect}
                 onToggleAll={handleToggleAll}
                 currentAccountId={currentAccount?.id || null}
+                activeClients={activeClients}
                 switchingAccountId={switchingAccountId}
                 onSwitch={handleSwitch}
                 onRefresh={handleRefresh}
@@ -1063,6 +1086,7 @@ function Accounts() {
               refreshingIds={refreshingIds}
               onToggleSelect={handleToggleSelect}
               currentAccountId={currentAccount?.id || null}
+              activeClients={activeClients}
               switchingAccountId={switchingAccountId}
               onSwitch={handleSwitch}
               onRefresh={handleRefresh}

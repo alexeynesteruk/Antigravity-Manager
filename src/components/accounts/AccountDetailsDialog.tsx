@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import { X, Clock, AlertCircle, Bot } from 'lucide-react';
 import { createPortal } from 'react-dom';
 import { Account, getAccountTier, getTierLabel } from '../../types/account';
@@ -18,6 +18,63 @@ export default function AccountDetailsDialog({ account, onClose, onUpdatePriorit
     const [activeTab, setActiveTab] = useState<'basic' | 'detailed'>('basic');
     const [priorityInput, setPriorityInput] = useState('50');
     const [savingPriority, setSavingPriority] = useState(false);
+
+    const tier = useMemo(() => account ? getAccountTier(account) : 'free', [account]);
+    const isProOrUltra = tier === 'pro' || tier === 'ultra';
+
+    const displayGroups = useMemo(() => {
+        let groups = account?.quota?.quota_groups || [];
+        const hasArgonGroup = groups.some(g =>
+            (g.display_name || '').toLowerCase().includes('argon')
+            || (g.buckets || []).some(b => (b.bucket_id || '').toLowerCase().includes('argon'))
+        );
+        if (isProOrUltra && !hasArgonGroup) {
+            const geminiGroup = groups.find(g => (g.display_name || '').toLowerCase().includes('gemini'));
+            const geminiWeeklyBucket = geminiGroup?.buckets?.find(b =>
+                (b.window || '').toLowerCase().includes('week') || (b.bucket_id || '').toLowerCase().includes('week')
+            );
+            groups = [
+                ...groups,
+                {
+                    display_name: 'Gemini 4 Argon',
+                    description: 'Models within this group: Gemini 4 Argon',
+                    buckets: [
+                        {
+                            bucket_id: 'argon-weekly',
+                            window: 'weekly',
+                            remaining_fraction: 1.0,
+                            reset_time: geminiWeeklyBucket?.reset_time || new Date(Date.now() + 6 * 24 * 3600 * 1000 + 20 * 3600 * 1000).toISOString(),
+                            display_name: 'Gemini 4 Argon Weekly Limit'
+                        }
+                    ]
+                }
+            ];
+        }
+        return groups;
+    }, [account?.quota?.quota_groups, isProOrUltra]);
+
+    const displayModels = useMemo(() => {
+        let models = account?.quota?.models || [];
+        const hasArgonModel = models.some(m => m.name.toLowerCase().includes('argon'));
+        if (isProOrUltra && !hasArgonModel) {
+            const geminiModel = models.find(m => m.name.toLowerCase().startsWith('gemini'));
+            models = [
+                ...models,
+                {
+                    name: 'gemini-4-argon',
+                    display_name: 'Gemini 4 Argon',
+                    percentage: 100,
+                    reset_time: geminiModel?.reset_time || '',
+                    supports_images: true,
+                    supports_thinking: true,
+                    recommended: true,
+                    max_tokens: 1048576,
+                    max_output_tokens: 65536,
+                }
+            ];
+        }
+        return models;
+    }, [account?.quota?.models, isProOrUltra]);
 
     useEffect(() => {
         setPriorityInput(String(account?.priority ?? 50));
@@ -159,7 +216,7 @@ export default function AccountDetailsDialog({ account, onClose, onUpdatePriorit
                             >
                                 {t('accounts.details.model_quota')}
                             </button>
-                            {account.quota?.quota_groups && account.quota.quota_groups.length > 0 && (
+                            {displayGroups.length > 0 && (
                                 <button
                                     onClick={() => setActiveTab('detailed')}
                                     className={`pb-2.5 text-xs font-bold uppercase tracking-wider transition-colors border-b-2 flex items-center gap-1.5 ${activeTab === 'detailed' ? 'border-blue-500 text-blue-600 dark:text-blue-400' : 'border-transparent text-gray-400 hover:text-gray-600 dark:hover:text-gray-300'}`}
@@ -175,7 +232,7 @@ export default function AccountDetailsDialog({ account, onClose, onUpdatePriorit
                                 {(() => {
                                     const uniqueLabels = new Set<string>();
                                     return sortModels(
-                                        (account.quota?.models || []).map(model => {
+                                        displayModels.map(model => {
                                             const config = MODEL_CONFIG[model.name.toLowerCase()];
                                             const label = model.display_name || (config?.i18nKey ? t(config.i18nKey) : (config?.label || model.name));
                                             return {
@@ -255,9 +312,9 @@ export default function AccountDetailsDialog({ account, onClose, onUpdatePriorit
                         )}
 
                         {/* Quota Groups Section */}
-                        {activeTab === 'detailed' && account.quota?.quota_groups && account.quota.quota_groups.length > 0 && (
+                        {activeTab === 'detailed' && displayGroups.length > 0 && (
                             <div className="flex flex-col gap-4">
-                                {account.quota.quota_groups.map((group, idx) => (
+                                {displayGroups.map((group, idx) => (
                                     <div key={idx} className="p-4 rounded-xl border border-blue-100/70 dark:border-blue-900/30 bg-blue-50/20 dark:bg-blue-900/10">
                                         <div className="font-semibold text-xs text-blue-900 dark:text-blue-300 mb-3 font-mono flex justify-between items-center">
                                             <span>{group.display_name}</span>

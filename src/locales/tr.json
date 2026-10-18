@@ -203,7 +203,11 @@
         "health_available_rate": "Sağlıklı Kullanılabilirlik",
         "circuit_break": "Kesildi",
         "health_all_green": "Tamamen Sağlıklı",
-        "abnormal_badge": "{{count}} Anormal"
+        "abnormal_badge": "{{count}} Anormal",
+        "no_client_account": "Bu uygulama için etkin veya bağlı hesap bulunamadı",
+        "go_switch_account": "Hesap değiştirmeye git",
+        "switch_best_to_target": "En iyi hesabı {{target}} olarak değiştir",
+        "switch_this_to_target": "Bu hesabı {{target}} olarak değiştir"
     },
     "accounts": {
         "account": "Hesap",
@@ -486,7 +490,18 @@
             "auto_sync": "Mevcut Hesabı Otomatik Senkronize Et",
             "auto_sync_desc": "Mevcut aktif hesap bilgilerini periyodik olarak otomatik senkronize et",
             "sync_interval": "Senkronizasyon Aralığı (saniye)",
-            "always_on": "Always On"
+            "always_on": "Always On",
+            "auto_switch_classic": "Classic Otomatik Hızlı Geçiş",
+            "auto_switch_classic_badge": "Yalnızca Classic",
+            "auto_switch_classic_desc": "Periyodik kontrolde Antigravity Classic mevcut hesabının kotası eşiğin altına düştüğünde, havuzdaki en uygun hesaba kesintisiz otomatik geçiş yapar (Yalnızca Classic Standalone için geçerlidir; IDE ve CLI istemci mimarisi kısıtlamaları nedeniyle desteklenmez).",
+            "auto_switch_threshold_label": "Geçiş Tetikleme Eşiği",
+            "auto_switch_threshold_hint": "İzlenen herhangi bir kota havuzu ≤ {{pct}}% olduğunda geçişi tetikle",
+            "auto_switch_models_label": "İzlenen Kota Havuzları",
+            "auto_switch_models_hint": "En az birini seçin. Seçilen havuzlardan herhangi biri eşiğin altına düşerse geçiş tetiklenir.",
+            "auto_switch_gemini": "Gemini Havuzu",
+            "auto_switch_gemini_desc": "Pro / Flash / Görsel dahil",
+            "auto_switch_third_party": "Üçüncü Taraf Modeller",
+            "auto_switch_third_party_desc": "Claude 3.7 / 3.5 / GPT dahil"
         },
         "pinned_quota_models": {
             "title": "Sabitlenmiş Kota Modelleri",
@@ -1190,6 +1205,19 @@
             },
             "agent_settings": {
                 "title": "Özel Agent Ayarları (Specific Agent Settings)"
+            },
+            "hub": {
+                "title": "Resmi Hub İstemci Parmak İzi",
+                "tooltip": "429 kota aşımını önlemek için giden trafiği resmi Google Antigravity Hub imzalarıyla eşleştirir.",
+                "source_custom": "Özel",
+                "source_remote": "Uzak Algılandı",
+                "source_local": "Yerel Uygulama",
+                "source_baseline": "Temel",
+                "detect_button": "Algıla",
+                "detect_success": "Resmi Hub başarıyla algılandı ve senkronize edildi: v{{version}} (CL: {{cl}})",
+                "detect_failed": "Algılama başarısız: {{error}}",
+                "version_label": "Hub Sürümü",
+                "cl_label": "Piper Derleme Numarası (CL)"
             }
         },
         "stream_timeouts": {
@@ -1393,16 +1421,32 @@
             "toast": {
                 "config_missing": "Lütfen önce bir API anahtarı oluşturun ve hizmeti başlatın",
                 "sync_success": "Başarılı! {{name}} kullanıma hazır.",
-                "sync_error": "{{name}} senkronizasyon hatası: {{error}}"
+                "sync_error": "{{name}} senkronizasyon hatası: {{error}}",
+                "sync_success_with_model": "{{name}} başarıyla senkronize edildi. Model: {{model}}"
             },
-            "model_select": "Select Model"
+            "model_select": "Select Model",
+            "apps": {
+                "gemini": "Antigravity CLI (agy)"
+            }
         },
         "supported_models": {
             "title": "Desteklenen Modeller ve Entegrasyon",
             "model_name": "Model Adı",
             "model_id": "Model Kimliği",
             "description": "Açıklama",
-            "action": "İşlem"
+            "status": "Durum / Bağlantı",
+            "action": "İşlem",
+            "test_connectivity": "Test Et",
+            "batch_test": "Tümünü Test Et",
+            "stop_test": "Durdur",
+            "auto_dispatch": "🤖 Otomatik Yönlendirme (Havuz)",
+            "select_account": "Hesap Seç",
+            "view_detail": "İstek ayrıntılarını ve gecikmeyi görüntüle",
+            "retired": "Kullanımdan Kaldırıldı",
+            "untested": "Test Edilmedi",
+            "testing": "Test ediliyor...",
+            "success": "Normal",
+            "rate_limited": "Hız Sınırı"
         },
         "cloudflared": {
             "title": "Public Access (Cloudflared)",
@@ -1866,7 +1910,13 @@
         "mode_cockpit": "Genel Bakış",
         "reasoning_short": "Düş",
         "cockpit_thinking_share": "Düşünme Payı",
-        "cockpit_avg_thinking_per_req": "Ort. Düşünme / istek"
+        "cockpit_avg_thinking_per_req": "Ort. Düşünme / istek",
+        "cockpit_user_rank": "Kullanıcı Sıralaması",
+        "cockpit_no_user_activity": "Kullanıcı Key tüketim etkinliği yok",
+        "cockpit_view_detail": "Ayrıntılar",
+        "cockpit_tab_accounts": "Hesaplar",
+        "cockpit_tab_models": "Modeller",
+        "cockpit_tab_users": "Kullanıcılar"
     },
     "security": {
         "title": "Güvenlik İzleme",
@@ -2001,8 +2051,25 @@
         "hint_curfew": "Devre dışı bırakmak için boş bırakın. Sunucu saatine göredir.",
         "custom_expires_required": "Please select custom expiration time",
         "expires_custom": "Custom Time",
-        "custom_expires_at": "Custom Expiration At",
-        "hint_custom_expires": "Set precise expiration timestamp for this token"
+        "custom_expires_at": "Özel Son Kullanma Tarihi",
+        "hint_custom_expires": "Bu token için kesin son kullanma zaman damgasını ayarlayın",
+        "view_stats": "Kullanım İstatistikleri",
+        "bound_ips": "İstemci IP Sayısı",
+        "recent_ips": "Aktif İstemci IP'leri ve Son Etkinlik",
+        "no_ips": "IP bağlama kaydı bulunamadı",
+        "enabled": "Etkin",
+        "disabled": "Devre Dışı",
+        "range_24h": "24 saat",
+        "range_7d": "Son 7 gün",
+        "range_30d": "Son 30 gün",
+        "range_all": "Tümü",
+        "success_rate": "Başarı Oranı",
+        "avg_per_request": "İstek Başına Ort. Token",
+        "est_throughput": "İstek başına tahmini tüketim",
+        "calls_unit": "çağrı",
+        "records_unit": "kayıt",
+        "no_trend_data": "Bu dönemde eğilim verisi yok",
+        "no_model_data": "Model verisi bulunamadı"
     },
     "apiKeyFun": {
         "title": "APIKEY.FUN Hub",

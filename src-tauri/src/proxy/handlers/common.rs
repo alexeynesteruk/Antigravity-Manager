@@ -159,9 +159,10 @@ pub fn calculate_max_retry_attempts(pool_size: usize) -> usize {
 /// 结构化规范化错误（504 Gateway Timeout 或 429/503），避免客户端弹出未响应警告框。
 pub const MAX_GATEWAY_REQUEST_BUDGET_SECS: u64 = 240;
 
-/// [Issue #3634] 统一自适应计算流预读（Peek）阶段的超时时间。
+/// [Issue #3634, #3693] 统一自适应计算流预读（Peek）阶段的超时时间。
 /// - Compaction 摘要请求：大 Prompt 处理，默认 180s；
 /// - 图像生成请求：图像生成耗时较长，默认 60s；
+/// - 思考/深度推理模型请求：思考阶段 TTFT 较长，底线 60s（大上下文 90s/120s）；
 /// - 正常会话请求：根据估算 Token 数量动态自适应，避免大上下文 Prompt 预热（TTFT）超过 30s 被过早误杀导致全池轮换雪崩；
 ///   * > 100k tokens: 120s
 ///   * > 50k tokens: 90s
@@ -172,10 +173,26 @@ pub fn calculate_adaptive_peek_timeout(
     is_image_gen: bool,
     estimated_tokens: Option<u32>,
 ) -> u64 {
+    calculate_adaptive_peek_timeout_full(is_compaction, is_image_gen, false, estimated_tokens)
+}
+
+pub fn calculate_adaptive_peek_timeout_full(
+    is_compaction: bool,
+    is_image_gen: bool,
+    is_thinking: bool,
+    estimated_tokens: Option<u32>,
+) -> u64 {
     if is_compaction {
         180
     } else if is_image_gen {
         60
+    } else if is_thinking {
+        // [Issue #3693] 深度思考模型预热耗时长，设置 60s 宽限底线，防止过早误杀
+        match estimated_tokens {
+            Some(tokens) if tokens >= 100_000 => 120,
+            Some(tokens) if tokens >= 50_000 => 90,
+            _ => 60,
+        }
     } else {
         match estimated_tokens {
             Some(tokens) if tokens >= 100_000 => 120,
@@ -229,7 +246,18 @@ pub fn determine_retry_strategy_adaptive(
 
     let lower = error_text.to_lowercase();
     match status_code {
-        // 400 错误：仅在特定 Thinking 签名失败时重试一次
+        // 400 错误：
+        // 1. 若为 Sandbox 地域限制 (User location is not supported)，允许在多账号/端点间快速重试逃逸至可用节点 (Prod)
+        400 if lower.contains("user location is not supported") && attempt < pool_size => {
+            tracing::warn!(
+                "[Retry] 400 User location is not supported on attempt {}/{}; fast rotating to fallback endpoint/account",
+                attempt + 1,
+                pool_size
+            );
+            RetryStrategy::FixedDelay(Duration::from_millis(50))
+        }
+
+        // 2. 仅在特定 Thinking 签名失败时重试一次
         400 if !retried_without_thinking
             && (lower.contains("invalid thought signature")
                 || lower.contains("invalid `signature`")
@@ -294,20 +322,21 @@ pub fn determine_retry_strategy_adaptive(
                     || lower.contains("weekly quota")
                     || lower.contains("daily quota")
                     || lower.contains("per day")
+                    || lower.contains("individual quota")
                     || (lower.contains("quota_exhausted")
                         && !lower.contains("resource has been exhausted")));
 
-            // 请求级 429 防穿透保护 (无明确重置时间且非账号硬配额耗尽)：
-            // [FIX #3506] 若遭遇无明确重置时间的请求级 429，最多允许尝试 2 个账号快切逃逸（min(pool_size, 2)）。
-            // 连续 2 个账号失败说明该请求为恶性 Payload、超大 Token 或 IP/提供商级流控，
-            // 必须立即终止进一步轮换，严禁打穿全池导致全池健康账号被锁入 RateLimitExceeded。
+            // 请求级 429 防早退与极速失败保护 (无明确重置时间且非账号硬配额耗尽)：
+            // 在多账号池中，第一轮 (attempt < pool_size) 允许全池每一个可用健康账号均获得 1 次 150ms 执行机会，
+            // 并支持第二轮 (pool_size <= attempt < pool_size * 2) 线性退避 (1.5s~3.5s) 恢复重试，
+            // 解决大 Prompt 突发并发导致瞬态 429 时全池健康账号被 150ms 闪电过早误杀退出（Fixes #3506）。
+            // 仅当第二轮全池遍历耗尽（attempt >= pool_size * 2）仍 429 时，立即快速失败退出 (NoRetry)。
             let is_request_level_429 = parsed_delay.is_none() && !is_hard_quota_exhausted;
-            let request_level_429_max_attempts = pool_size.min(2);
+            let request_level_429_max_attempts = (pool_size * 2).max(2);
             if is_request_level_429 && attempt >= request_level_429_max_attempts {
                 tracing::warn!(
-                    "[Retry] Request-level 429 persisted across {} attempts without explicit delay; aborting further rotation to protect remaining {} accounts.",
-                    attempt,
-                    pool_size.saturating_sub(attempt)
+                    "[Retry] Request-level 429 persisted across 2 rounds ({} attempts); aborting to prevent excessive client stalls.",
+                    attempt
                 );
                 return RetryStrategy::NoRetry;
             }
@@ -332,12 +361,12 @@ pub fn determine_retry_strategy_adaptive(
 
             let is_first_round = attempt < pool_size;
             if is_first_round {
-                // Round 1 (第一轮)：全池闪电快切，毫秒级逃逸至其他健康账号
+                // Round 1 (第一轮)：全池匀速轮换 (150ms)，留出微冷却时间，毫秒级逃逸至其他健康账号
                 tracing::info!(
-                    "[Retry] Multi-account Round 1 (attempt {}/{}): fast rotating to next account in pool (50ms)",
+                    "[Retry] Multi-account Round 1 (attempt {}/{}): rotating to next account in pool (150ms)",
                     attempt + 1, pool_size
                 );
-                return RetryStrategy::FixedDelay(Duration::from_millis(50));
+                return RetryStrategy::FixedDelay(Duration::from_millis(150));
             }
 
             // Round 2 (第二轮)：全池在第一轮已全部遭遇 429，进入智能退避与小间隙等待阶段
@@ -370,8 +399,9 @@ pub fn determine_retry_strategy_adaptive(
                 return RetryStrategy::FixedDelay(Duration::from_millis(capped_ms));
             }
 
-            // 第二轮未解析出具体 delay：线性温和退避 2s~4s，让瞬时并发高峰平息
-            let backoff_ms = (2000 * ((attempt.saturating_sub(pool_size)) + 1) as u64).min(5000);
+            // 第二轮未解析出具体 delay：线性温和退避 1.5s~3.5s，让瞬时并发与 TPM 高峰平息冷却
+            let step = (attempt.saturating_sub(pool_size)) as u64;
+            let backoff_ms = (1500 + step * 1000).min(3500);
             RetryStrategy::FixedDelay(Duration::from_millis(backoff_ms))
         }
 
@@ -545,6 +575,10 @@ pub fn should_rotate_account(status_code: u16, strategy: Option<&RetryStrategy>)
         // 这些错误是账号级别或特定节点配额的，需要轮换
         // [FIX #3485] 503/529 边缘节点熔断或特定账号负载过高，多账号时支持轮换逃逸，杜绝死锁死等
         429 | 401 | 403 | 404 | 500 | 503 | 529 => true,
+        // 若为 400 且返回了 50ms 快速退避策略（例如 user location is not supported），需要轮换账号/节点
+        400 if matches!(strategy, Some(RetryStrategy::FixedDelay(d)) if *d == Duration::from_millis(50)) => {
+            true
+        }
         _ => false,
     }
 }
@@ -600,13 +634,15 @@ pub async fn handle_detect_model(
 
 /// [Issue #3414] 从形如 "All accounts limited. Wait 29s." 或其他明确冷却提示中解析等待秒数
 pub fn extract_retry_after_seconds(error_text: &str) -> Option<u64> {
-    if let Some(pos) = error_text.find("Wait ") {
-        let rest = &error_text[pos + 5..];
-        if let Some(s_pos) = rest.find('s') {
-            if let Ok(sec) = rest[..s_pos].trim().parse::<u64>() {
-                if sec > 0 {
-                    return Some(sec);
-                }
+    // 查找 "Wait " (大写) 或 "wait " (小写)
+    let pos = error_text
+        .find("Wait ")
+        .or_else(|| error_text.find("wait "))?;
+    let rest = &error_text[pos + 5..];
+    if let Some(s_pos) = rest.find('s') {
+        if let Ok(sec) = rest[..s_pos].trim().parse::<u64>() {
+            if sec > 0 {
+                return Some(sec);
             }
         }
     }
@@ -958,6 +994,19 @@ pub fn build_dual_track_error(
     }
 }
 
+/// 将端点尝试记录列表安全序列化并编码为 Base64，便于注入 HTTP 响应头
+pub fn encode_attempts_header(
+    attempts: &[crate::proxy::upstream::client::FallbackAttemptLog],
+) -> Option<String> {
+    if attempts.is_empty() {
+        return None;
+    }
+    use base64::Engine;
+    serde_json::to_string(attempts)
+        .ok()
+        .map(|json_str| base64::engine::general_purpose::STANDARD.encode(json_str.as_bytes()))
+}
+
 #[cfg(test)]
 mod retry_after_tests {
     use super::*;
@@ -971,6 +1020,10 @@ mod retry_after_tests {
         assert_eq!(
             extract_retry_after_seconds("Token error: All accounts limited. Wait 5s."),
             Some(5)
+        );
+        assert_eq!(
+            extract_retry_after_seconds("All accounts rate-limited. Cooldown wait 27s."),
+            Some(27)
         );
         assert_eq!(extract_retry_after_seconds("Token pool is empty"), None);
         assert_eq!(
@@ -1031,6 +1084,24 @@ mod retry_after_tests {
             30
         );
         assert_eq!(calculate_adaptive_peek_timeout(false, false, None), 30);
+
+        // 4. 思考/推理模型赋予至少 60s 底线，防止 30s 误杀
+        assert_eq!(
+            calculate_adaptive_peek_timeout_full(false, false, true, None),
+            60
+        );
+        assert_eq!(
+            calculate_adaptive_peek_timeout_full(false, false, true, Some(10_000)),
+            60
+        );
+        assert_eq!(
+            calculate_adaptive_peek_timeout_full(false, false, true, Some(60_000)),
+            90
+        );
+        assert_eq!(
+            calculate_adaptive_peek_timeout_full(false, false, true, Some(120_000)),
+            120
+        );
     }
 
     #[test]

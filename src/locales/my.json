@@ -202,7 +202,11 @@
         "health_available_rate": "ကျန်းမာစွာ အသုံးပြုနိုင်မှုနှုန်း",
         "circuit_break": "ဖြတ်တောက်မှု",
         "health_all_green": "အားလုံး ကောင်းမွန်သည်",
-        "abnormal_badge": "{{count}} ပုံမှန်မဟုတ်ပါ"
+        "abnormal_badge": "{{count}} ပုံမှန်မဟုတ်ပါ",
+        "no_client_account": "ဤအက်ပ်အတွက် အသုံးပြုနေသော အကောင့်မရှိပါ",
+        "go_switch_account": "အကောင့်ပြောင်းရန် သွားပါ",
+        "switch_best_to_target": "အကောင်းဆုံးအကောင့်ကို {{target}} သို့ ပြောင်းပါ",
+        "switch_this_to_target": "ဤအကောင့်ကို {{target}} သို့ ပြောင်းပါ"
     },
     "accounts": {
         "account": "အကောင့်",
@@ -484,7 +488,18 @@
             "refresh_interval": "Selang Muat Semula (minit)",
             "auto_sync": "Segerak Automatik Akaun Semasa",
             "auto_sync_desc": "Segerakkan maklumat akaun aktif semasa secara berkala secara automatik",
-            "sync_interval": "Selang Segerak (saat)"
+            "sync_interval": "Selang Segerak (saat)",
+            "auto_switch_classic": "Pertukaran Pantas Automatik Classic",
+            "auto_switch_classic_badge": "Untuk Classic Sahaja",
+            "auto_switch_classic_desc": "Apabila semakan berkala mendapati kuota akaun semasa Antigravity Classic jatuh di bawah ambang, tukar secara automatik dan lancar ke akaun terbaik yang tersedia dalam kumpulan (Eksklusif untuk Classic Standalone; IDE dan CLI tidak disokong kerana kekangan seni bina klien).",
+            "auto_switch_threshold_label": "Ambang Pencetus Pertukaran",
+            "auto_switch_threshold_hint": "Cetuskan pertukaran apabila mana-mana kuota yang dipantau ≤ {{pct}}%",
+            "auto_switch_models_label": "Kumpulan Kuota Dipantau",
+            "auto_switch_models_hint": "Pilih sekurang-kurangnya satu. Pertukaran akan dicetuskan jika mana-mana kumpulan jatuh di bawah ambang.",
+            "auto_switch_gemini": "Kumpulan Gemini",
+            "auto_switch_gemini_desc": "Termasuk Pro / Flash / Penjanaan imej",
+            "auto_switch_third_party": "Model Pihak Ketiga",
+            "auto_switch_third_party_desc": "Termasuk Claude 3.7 / 3.5 / GPT"
         },
         "warmup": {
             "title": "Pemanasan Pintar",
@@ -1132,6 +1147,19 @@
             },
             "agent_settings": {
                 "title": "Konfigurasi Agent Khusus (Specific Agent Settings)"
+            },
+            "hub": {
+                "title": "တရားဝင် Hub Client Fingerprint",
+                "tooltip": "429 ကန့်သတ်ချက်များကို ရှောင်ရှားရန် Google Antigravity Hub နှင့် ကိုက်ညီအောင် ပြုလုပ်ထားပါသည်။",
+                "source_custom": "စိတ်ကြိုက်",
+                "source_remote": "အဝေးမှ စစ်ဆေးတွေ့ရှိ",
+                "source_local": "စက်တွင်း အက်ပ်",
+                "source_baseline": "မူလစံနှုန်း",
+                "detect_button": "စစ်ဆေးရန်",
+                "detect_success": "တရားဝင် Hub ဗားရှင်းကို အောင်မြင်စွာ ရယူပြီး: v{{version}} (CL: {{cl}})",
+                "detect_failed": "စစ်ဆေးမှု မအောင်မြင်ပါ: {{error}}",
+                "version_label": "Hub ဗားရှင်း",
+                "cl_label": "Piper Build နံပါတ် (CL)"
             }
         },
         "stream_timeouts": {
@@ -1357,7 +1385,19 @@
             "model_name": "Nama Model",
             "model_id": "ID Model",
             "description": "Penerangan",
-            "action": "Tindakan"
+            "status": "Status / Ketersambungan",
+            "action": "Tindakan",
+            "test_connectivity": "Uji",
+            "batch_test": "Uji Semua",
+            "stop_test": "Henti",
+            "auto_dispatch": "🤖 Agihan Automatik (Kolam Proksi)",
+            "select_account": "Pilih Akaun",
+            "view_detail": "Lihat butiran permintaan & kependaman",
+            "retired": "Ditamatkan",
+            "untested": "Belum diuji",
+            "testing": "Menguji...",
+            "success": "Biasa",
+            "rate_limited": "Had Kadar"
         },
         "cli_sync": {
             "title": "Konfigurasi Alat Agent Satu-Klik",
@@ -1383,11 +1423,15 @@
             },
             "toast": {
                 "sync_success": "Segerak berjaya! {{name}} sudah sedia.",
-                "sync_error": "Segerak gagal: {{error}}"
+                "sync_error": "Segerak gagal: {{error}}",
+                "sync_success_with_model": "Berjaya menyegerakkan {{name}} dengan model: {{model}}"
             },
             "sync_confirm_title": "Pengesahan Segerak",
             "sync_confirm_message": "Bersedia untuk menyegerakkan konfigurasi {{name}}. ⚠️ Amaran: Ini akan menimpa fail konfigurasi tempatan sedia ada anda (cth. token log masuk, Kunci API). Adakah anda pasti mahu meneruskan?",
-            "model_select": "Select Model"
+            "model_select": "Select Model",
+            "apps": {
+                "gemini": "Antigravity CLI (agy)"
+            }
         },
         "models": {
             "flash": "Ultra-fast",
@@ -1805,7 +1849,13 @@
         "mode_cockpit": "ခြုံငုံသုံးသပ်ချက် ဘုတ်",
         "reasoning_short": "စဥ်",
         "cockpit_thinking_share": "စဥ်းစားမှု အချိုး",
-        "cockpit_avg_thinking_per_req": "တောင်းဆိုမှုတစ်ခုလျှင် ပျမ်းမျှစဉ်းစားမှု"
+        "cockpit_avg_thinking_per_req": "တောင်းဆိုမှုတစ်ခုလျှင် ပျမ်းမျှစဉ်းစားမှု",
+        "cockpit_user_rank": "အသုံးပြုသူ အဆင့်သတ်မှတ်ချက်",
+        "cockpit_no_user_activity": "အသုံးပြုသူ Key အသုံးပြုမှု လုပ်ဆောင်ချက် မရှိပါ",
+        "cockpit_view_detail": "အသေးစိတ်",
+        "cockpit_tab_accounts": "အကောင့်များ",
+        "cockpit_tab_models": "မော်ဒယ်များ",
+        "cockpit_tab_users": "အသုံးပြုသူများ"
     },
     "errors": {
         "stream": {
@@ -1851,8 +1901,25 @@
         "hint_curfew": "Biarkan kosong untuk nyahaktifkan. Berdasarkan masa pelayan.",
         "custom_expires_required": "Please select custom expiration time",
         "expires_custom": "Custom Time",
-        "custom_expires_at": "Custom Expiration At",
-        "hint_custom_expires": "Set precise expiration timestamp for this token"
+        "custom_expires_at": "Tamat Tempoh Tersuai",
+        "hint_custom_expires": "Tetapkan cap masa tamat tempoh tepat untuk token ini",
+        "view_stats": "Statistik Penggunaan",
+        "bound_ips": "IP Klien",
+        "recent_ips": "IP Klien Aktif & Aktiviti Terkini",
+        "no_ips": "Tiada rekod ikatan IP ditemui",
+        "enabled": "Aktif",
+        "disabled": "Dinyahaktifkan",
+        "range_24h": "24 jam",
+        "range_7d": "7 Hari lepas",
+        "range_30d": "30 Hari lepas",
+        "range_all": "Semua",
+        "success_rate": "Kadar Kejayaan",
+        "avg_per_request": "Purata Token/Permintaan",
+        "est_throughput": "Anggaran penggunaan setiap permintaan",
+        "calls_unit": "panggilan",
+        "records_unit": "rekod",
+        "no_trend_data": "Tiada data trend dalam tempoh ini",
+        "no_model_data": "Tiada data model tersedia"
     },
     "apiKeyFun": {
         "title": "APIKEY.FUN Hub",

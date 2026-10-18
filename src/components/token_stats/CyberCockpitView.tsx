@@ -1,18 +1,19 @@
-import React, { useMemo, useState } from 'react';
+import React, { useMemo, useState, useEffect } from 'react';
 import { useTranslation } from 'react-i18next';
 import {
-    Users,
     AlertTriangle,
     ArrowUpRight,
     Flame,
-    Cpu,
     Clock,
     Zap,
     Scale,
+    RefreshCw,
 } from 'lucide-react';
 import { HourlyUsagePoint } from './HourlyTrendBarCard';
 import { ModelShareItem } from './TopModelsShareCard';
 import { AccountTokenStats } from '../../pages/TokenStats';
+import { request as invoke } from '../../utils/request';
+import { UserTokenStatsModal, UserTokenSummaryItem } from '../user_tokens/UserTokenStatsModal';
 
 interface TokenStatsSummary {
     total_input_tokens: number;
@@ -38,6 +39,22 @@ interface CyberCockpitViewProps {
     setShowPricingModal: (s: boolean) => void;
 }
 
+export interface UserTokenRankItem {
+    id: string;
+    token: string;
+    username: string;
+    description?: string | null;
+    enabled: boolean;
+    expires_type: string;
+    expires_at?: number | null;
+    max_ips: number;
+    total_tokens: number;
+    input_tokens: number;
+    output_tokens: number;
+    requests: number;
+    percentage: number;
+}
+
 const MODEL_NEON_COLORS = ['#10b981', '#3b82f6', '#a855f7', '#f59e0b', '#ec4899', '#06b6d4'];
 
 export const CyberCockpitView: React.FC<CyberCockpitViewProps> = ({
@@ -53,9 +70,40 @@ export const CyberCockpitView: React.FC<CyberCockpitViewProps> = ({
     setShowPricingModal,
 }) => {
     const { t } = useTranslation();
-    const [rightTab, setRightTab] = useState<'accounts' | 'models'>('accounts');
+    const [rightTab, setRightTab] = useState<'accounts' | 'models' | 'users'>('accounts');
     const [selectedModelIdx, setSelectedModelIdx] = useState<number | null>(null);
     const [hoveredHourIdx, setHoveredHourIdx] = useState<number | null>(null);
+    const [userTokensRank, setUserTokensRank] = useState<UserTokenRankItem[]>([]);
+    const [userTokensLoading, setUserTokensLoading] = useState<boolean>(false);
+    const [selectedUserToken, setSelectedUserToken] = useState<UserTokenSummaryItem | null>(null);
+    const [showUserTokenModal, setShowUserTokenModal] = useState<boolean>(false);
+
+    // 获取用户 Token 消耗排行榜数据
+    useEffect(() => {
+        let isMounted = true;
+        const fetchUserRankings = async () => {
+            try {
+                setUserTokensLoading(true);
+                const res = await invoke<UserTokenRankItem[]>('get_user_tokens_ranking', {
+                    timeRange,
+                    time_range: timeRange,
+                });
+                if (isMounted && Array.isArray(res)) {
+                    setUserTokensRank(res);
+                }
+            } catch (e) {
+                console.error('Failed to fetch user tokens ranking:', e);
+            } finally {
+                if (isMounted) {
+                    setUserTokensLoading(false);
+                }
+            }
+        };
+        fetchUserRankings();
+        return () => {
+            isMounted = false;
+        };
+    }, [timeRange, summary]);
 
     // 1. 输入输出比例与生成比
     const inOutRatio = useMemo(() => {
@@ -274,6 +322,29 @@ export const CyberCockpitView: React.FC<CyberCockpitViewProps> = ({
             };
         });
     }, [modelShareItems, summary]);
+
+    // 7. 用户 Token 消耗排行榜
+    const userTokensRankList = useMemo(() => {
+        const sorted = [...userTokensRank].sort((a, b) => b.total_tokens - a.total_tokens);
+        const maxTokens = sorted[0]?.total_tokens || 1;
+        const totalTokens = summary?.total_tokens || 1;
+
+        return sorted.map((u, idx) => {
+            const sharePct = totalTokens > 0
+                ? Math.round((u.total_tokens / totalTokens) * 100)
+                : 0;
+            const relativePct = maxTokens > 0
+                ? Math.min(100, Math.round((u.total_tokens / maxTokens) * 100))
+                : 0;
+
+            return {
+                ...u,
+                rank: idx + 1,
+                sharePct,
+                relativePct,
+            };
+        });
+    }, [userTokensRank, summary]);
 
     return (
         <div className="h-full w-full flex flex-col gap-3 font-sans select-none overflow-hidden text-gray-800 dark:text-gray-100">
@@ -639,37 +710,48 @@ export const CyberCockpitView: React.FC<CyberCockpitViewProps> = ({
                     </div>
                 </div>
 
-                {/* ---------------- 右侧 30%：双视图自由切换（账号排查 / 模型排行） ---------------- */}
+                {/* ---------------- 右侧 30%：多视图自由切换（账号排查 / 模型排行 / 用户排行） ---------------- */}
                 <div className="col-span-3 flex flex-col gap-2.5 min-h-0 bg-white/95 dark:bg-[#0c121e] border border-gray-200/90 dark:border-[#1e2a3f] rounded-2xl p-4 shadow-sm dark:shadow-lg transition-colors">
-                    {/* Top: 双视图 Tab 切换器 */}
+                    {/* Top: 多视图 Tab 切换器 (强制三等分单行、不折行) */}
                     <div className="shrink-0 flex items-center justify-between pb-1.5 border-b border-gray-100 dark:border-white/[0.06]">
-                        <div className="flex bg-gray-100 dark:bg-[#121929] border border-gray-200 dark:border-[#1f2b42] rounded-lg p-0.5 w-full">
+                        <div className="grid grid-cols-3 gap-1 bg-gray-100 dark:bg-[#121929] border border-gray-200 dark:border-[#1f2b42] rounded-lg p-0.5 w-full">
                             <button
                                 onClick={() => setRightTab('accounts')}
-                                className={`flex-1 py-1 text-center rounded text-xs font-mono transition-all flex items-center justify-center gap-1.5 ${
+                                className={`py-1.5 px-2 text-center rounded-md text-xs font-mono font-medium transition-all min-w-0 truncate ${
                                     rightTab === 'accounts'
                                         ? 'bg-white dark:bg-[#1e2a40] text-blue-600 dark:text-emerald-400 font-bold shadow-sm'
                                         : 'text-gray-500 dark:text-gray-400 hover:text-gray-900 dark:hover:text-white'
                                 }`}
+                                title={`${t('token_stats.cockpit_account_audit', '账号排查')} (${accountData.length})`}
                             >
-                                <Users className="w-3.5 h-3.5" />
-                                {t('token_stats.cockpit_account_audit', '账号排查')} ({accountData.length})
+                                {t('token_stats.cockpit_tab_accounts', '账号')}
                             </button>
                             <button
                                 onClick={() => setRightTab('models')}
-                                className={`flex-1 py-1 text-center rounded text-xs font-mono transition-all flex items-center justify-center gap-1.5 ${
+                                className={`py-1.5 px-2 text-center rounded-md text-xs font-mono font-medium transition-all min-w-0 truncate ${
                                     rightTab === 'models'
                                         ? 'bg-white dark:bg-[#1e2a40] text-blue-600 dark:text-blue-400 font-bold shadow-sm'
                                         : 'text-gray-500 dark:text-gray-400 hover:text-gray-900 dark:hover:text-white'
                                 }`}
+                                title={`${t('token_stats.cockpit_model_rank', '模型排行')} (${modelShareItems.length})`}
                             >
-                                <Cpu className="w-3.5 h-3.5" />
-                                {t('token_stats.cockpit_model_rank', '模型排行')} ({modelShareItems.length})
+                                {t('token_stats.cockpit_tab_models', '模型')}
+                            </button>
+                            <button
+                                onClick={() => setRightTab('users')}
+                                className={`py-1.5 px-2 text-center rounded-md text-xs font-mono font-medium transition-all min-w-0 truncate ${
+                                    rightTab === 'users'
+                                        ? 'bg-white dark:bg-[#1e2a40] text-purple-600 dark:text-purple-400 font-bold shadow-sm'
+                                        : 'text-gray-500 dark:text-gray-400 hover:text-gray-900 dark:hover:text-white'
+                                }`}
+                                title={`${t('token_stats.cockpit_user_rank', '用户排行')} (${userTokensRank.length})`}
+                            >
+                                {t('token_stats.cockpit_tab_users', '用户')}
                             </button>
                         </div>
                     </div>
 
-                    {/* Middle: 完整的消耗列表 (双视图完全国际化 + 完整模型名 title tooltip) */}
+                    {/* Middle: 完整的消耗列表 (三视图完全国际化 + 完整名 title tooltip) */}
                     <div className="flex-1 min-h-0 overflow-y-auto space-y-2 pr-1 scrollbar-thin scrollbar-thumb-gray-200 dark:scrollbar-thumb-[#1e293b]">
                         {rightTab === 'accounts' ? (
                             accountRiskPool.length === 0 ? (
@@ -739,7 +821,7 @@ export const CyberCockpitView: React.FC<CyberCockpitViewProps> = ({
                                     </div>
                                 ))
                             )
-                        ) : (
+                        ) : rightTab === 'models' ? (
                             allModelsRankList.length === 0 ? (
                                 <div className="text-center text-xs text-gray-400 py-12 font-mono">
                                     {t('token_stats.no_model_activity', '暂无模型活动')}
@@ -788,6 +870,87 @@ export const CyberCockpitView: React.FC<CyberCockpitViewProps> = ({
                                     </div>
                                 ))
                             )
+                        ) : (
+                            userTokensLoading ? (
+                                <div className="flex items-center justify-center py-12 text-xs text-gray-400 font-mono">
+                                    <RefreshCw className="w-4 h-4 animate-spin mr-1.5" />
+                                    {t('common.loading', '加载中...')}
+                                </div>
+                            ) : userTokensRankList.length === 0 ? (
+                                <div className="text-center text-xs text-gray-400 py-12 font-mono">
+                                    {t('token_stats.cockpit_no_user_activity', '暂无用户 Key 消耗活动')}
+                                </div>
+                            ) : (
+                                userTokensRankList.map((u) => (
+                                    <div
+                                        key={u.id}
+                                        onClick={() => {
+                                            setSelectedUserToken({
+                                                id: u.id,
+                                                token: u.token,
+                                                username: u.username,
+                                                description: u.description || undefined,
+                                                enabled: u.enabled,
+                                                expires_type: u.expires_type,
+                                                expires_at: u.expires_at || undefined,
+                                                max_ips: u.max_ips,
+                                                total_requests: u.requests,
+                                                total_tokens_used: u.total_tokens,
+                                            });
+                                            setShowUserTokenModal(true);
+                                        }}
+                                        className="group p-2.5 rounded-xl border bg-gray-50/80 dark:bg-[#111929] border-gray-200/70 dark:border-[#1b263b] hover:border-purple-400 dark:hover:border-purple-500/50 hover:bg-white dark:hover:bg-[#152033] cursor-pointer transition-all shadow-none hover:shadow-sm"
+                                    >
+                                        <div className="flex items-center justify-between text-xs font-mono mb-1 gap-2">
+                                            <div className="flex items-center gap-1.5 min-w-0 flex-1">
+                                                <span
+                                                    className={`w-4 h-4 rounded text-[10px] flex items-center justify-center font-bold shrink-0 ${
+                                                        u.rank === 1
+                                                            ? 'bg-amber-400 text-black'
+                                                            : u.rank === 2
+                                                            ? 'bg-gray-300 text-black dark:bg-gray-400'
+                                                            : u.rank === 3
+                                                            ? 'bg-amber-700 text-white'
+                                                            : 'bg-gray-200 dark:bg-[#1f293d] text-gray-600 dark:text-gray-400'
+                                                    }`}
+                                                >
+                                                    {u.rank}
+                                                </span>
+                                                <span className="text-gray-800 dark:text-gray-200 font-semibold truncate" title={u.username}>
+                                                    {u.username}
+                                                </span>
+                                                <span className="text-[10px] font-mono text-gray-400 dark:text-gray-500 shrink-0 hidden sm:inline" title={u.token}>
+                                                    {u.token ? `${u.token.slice(0, 4)}...${u.token.slice(-4)}` : ''}
+                                                </span>
+                                                {!u.enabled && (
+                                                    <span className="text-[9px] px-1 py-0.2 rounded bg-red-100 dark:bg-red-400/20 text-red-600 dark:text-red-400 font-mono shrink-0">
+                                                        {t('user_token.disabled', '已禁用')}
+                                                    </span>
+                                                )}
+                                            </div>
+                                            <span className="text-purple-600 dark:text-purple-400 font-bold font-mono shrink-0">
+                                                {formatNumber(u.total_tokens)}
+                                            </span>
+                                        </div>
+
+                                        <div className="w-full h-1.5 bg-gray-200 dark:bg-[#172236] rounded-full overflow-hidden mb-1.5">
+                                            <div
+                                                className="h-full bg-gradient-to-r from-purple-500 to-indigo-500"
+                                                style={{ width: `${u.relativePct}%` }}
+                                            />
+                                        </div>
+
+                                        <div className="flex items-center justify-between text-[10px] font-mono text-gray-500 dark:text-gray-400">
+                                            <span>
+                                                {t('token_stats.percentage', '占比')}: {u.sharePct}% ({u.requests} {t('token_stats.times', '次')})
+                                            </span>
+                                            <span className="text-purple-600 dark:text-purple-400 group-hover:underline flex items-center gap-0.5">
+                                                {t('token_stats.cockpit_view_detail', '详情')} <ArrowUpRight className="w-3 h-3" />
+                                            </span>
+                                        </div>
+                                    </div>
+                                ))
+                            )
                         )}
                     </div>
 
@@ -798,6 +961,13 @@ export const CyberCockpitView: React.FC<CyberCockpitViewProps> = ({
                     </div>
                 </div>
             </div>
+
+            {/* 用户 Token 专属用量弹窗 */}
+            <UserTokenStatsModal
+                isOpen={showUserTokenModal}
+                onClose={() => setShowUserTokenModal(false)}
+                token={selectedUserToken}
+            />
         </div>
     );
 };

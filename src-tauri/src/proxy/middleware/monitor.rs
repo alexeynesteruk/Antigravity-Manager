@@ -455,6 +455,7 @@ fn consolidate_non_streaming_response(
     raw_json: &Value,
     log: &ProxyRequestLog,
     headers_map: &serde_json::Map<String, Value>,
+    upstream_attempts: Option<Vec<crate::proxy::upstream::client::FallbackAttemptLog>>,
 ) -> Option<Value> {
     // 若本就已是统一的 consolidated 格式 (例如带有顶层 thinking/tool_calls 且无 choices/candidates)，直接返回 None
     if (raw_json.get("thinking").is_some()
@@ -643,6 +644,7 @@ fn consolidate_non_streaming_response(
         "norm_ms",
         "thinking_ms",
         "ttft_ms",
+        "ttft_overhead_ms",
         "stream_ms",
         "total_ms",
     ] {
@@ -652,6 +654,26 @@ fn consolidate_non_streaming_response(
                 let out_key = key.replace("_ms", "_s");
                 timing_obj.insert(out_key, serde_json::json!(n / 1000.0));
             }
+        }
+    }
+    if let (Some(ttft), Some(overhead)) = (
+        timing_obj.get("ttft_s").and_then(|v| v.as_f64()),
+        timing_obj.get("ttft_overhead_s").and_then(|v| v.as_f64()),
+    ) {
+        if overhead > 0.0 {
+            timing_obj.insert(
+                "ttft_total_wait_s".to_string(),
+                serde_json::json!(ttft + overhead),
+            );
+        }
+    }
+
+    if let Some(attempts) = upstream_attempts {
+        if !attempts.is_empty() {
+            timing_obj.insert(
+                "ttft_attempts".to_string(),
+                serde_json::to_value(&attempts).unwrap_or(serde_json::Value::Null),
+            );
         }
     }
     if !timing_obj.contains_key("total_s") {
@@ -856,6 +878,7 @@ pub async fn monitor_middleware(
         .await;
     let upstream_request_body = upstream_holder.take();
     let upstream_request_headers = upstream_holder.take_headers();
+    let upstream_attempts = upstream_holder.take_attempts();
     let response_headers_json =
         crate::proxy::payload_audit::headers_to_redacted_json(response.headers());
 
@@ -964,6 +987,7 @@ pub async fn monitor_middleware(
         let mut stream = body.into_data_stream();
         let (tx, rx) = tokio::sync::mpsc::channel(64);
         let start_instant = start;
+        let attempts_for_stream = upstream_attempts.clone();
 
         tokio::spawn(async move {
             let stream_start = std::time::Instant::now();
@@ -1395,9 +1419,40 @@ pub async fn monitor_middleware(
                         timing_obj.insert("thinking_s".to_string(), serde_json::json!(n / 1000.0));
                     }
                 }
+                let mut ttft_val = 0.0;
                 if let Some(ttft) = headers_map.get("x-timing-ttft-ms").and_then(|v| v.as_str()) {
                     if let Ok(n) = ttft.parse::<f64>() {
-                        timing_obj.insert("ttft_s".to_string(), serde_json::json!(n / 1000.0));
+                        ttft_val = n / 1000.0;
+                        timing_obj.insert("ttft_s".to_string(), serde_json::json!(ttft_val));
+                    }
+                }
+                if let Some(oh) = headers_map
+                    .get("x-timing-ttft-overhead-ms")
+                    .and_then(|v| v.as_str())
+                {
+                    if let Ok(n) = oh.parse::<f64>() {
+                        let overhead_s = n / 1000.0;
+                        if overhead_s > 0.0 {
+                            timing_obj.insert(
+                                "ttft_overhead_s".to_string(),
+                                serde_json::json!(overhead_s),
+                            );
+                            if ttft_val > 0.0 {
+                                timing_obj.insert(
+                                    "ttft_total_wait_s".to_string(),
+                                    serde_json::json!(ttft_val + overhead_s),
+                                );
+                            }
+                        }
+                    }
+                }
+
+                if let Some(attempts) = attempts_for_stream {
+                    if !attempts.is_empty() {
+                        timing_obj.insert(
+                            "ttft_attempts".to_string(),
+                            serde_json::to_value(&attempts).unwrap_or(serde_json::Value::Null),
+                        );
                     }
                 }
                 timing_obj.insert(
@@ -1645,9 +1700,12 @@ pub async fn monitor_middleware(
                             .or_else(|| Some(s.to_string()));
                     } else if let Ok(json) = serde_json::from_str::<Value>(&s) {
                         // 🌟 非流式响应入库统一转换为满血简要版 (包含网关权威签名回填与防雪崩确定性 Tool ID)
-                        if let Some(canonical) =
-                            consolidate_non_streaming_response(&json, &log, &headers_map)
-                        {
+                        if let Some(canonical) = consolidate_non_streaming_response(
+                            &json,
+                            &log,
+                            &headers_map,
+                            upstream_attempts.clone(),
+                        ) {
                             log.response_body = serde_json::to_string_pretty(&canonical)
                                 .ok()
                                 .or_else(|| Some(s.to_string()));

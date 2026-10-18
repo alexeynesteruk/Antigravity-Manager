@@ -1,16 +1,18 @@
 import { create } from 'zustand';
-import { Account } from '../types/account';
+import { Account, ActiveClientsStatus } from '../types/account';
 import * as accountService from '../services/accountService';
 
 interface AccountState {
     accounts: Account[];
     currentAccount: Account | null;
+    activeClients: ActiveClientsStatus;
     loading: boolean;
     error: string | null;
 
     // Actions
     fetchAccounts: () => Promise<void>;
     fetchCurrentAccount: () => Promise<void>;
+    fetchActiveClients: () => Promise<void>;
     addAccount: (email: string, refreshToken: string) => Promise<void>;
     deleteAccount: (accountId: string) => Promise<void>;
     deleteAccounts: (accountIds: string[]) => Promise<void>;
@@ -37,6 +39,7 @@ interface AccountState {
 export const useAccountStore = create<AccountState>((set, get) => ({
     accounts: [],
     currentAccount: null,
+    activeClients: {},
     loading: false,
     error: null,
 
@@ -44,8 +47,11 @@ export const useAccountStore = create<AccountState>((set, get) => ({
         set({ loading: true, error: null });
         try {
             console.log('[Store] Fetching accounts...');
-            const accounts = await accountService.listAccounts();
-            set({ accounts, loading: false });
+            const [accounts, activeClients] = await Promise.all([
+                accountService.listAccounts(),
+                accountService.getActiveClientsStatus().catch(() => ({} as ActiveClientsStatus))
+            ]);
+            set({ accounts, activeClients, loading: false });
         } catch (error) {
             console.error('[Store] Fetch accounts failed:', error);
             set({ error: String(error), loading: false });
@@ -55,10 +61,22 @@ export const useAccountStore = create<AccountState>((set, get) => ({
     fetchCurrentAccount: async () => {
         set({ loading: true, error: null });
         try {
-            const account = await accountService.getCurrentAccount();
-            set({ currentAccount: account, loading: false });
+            const [account, activeClients] = await Promise.all([
+                accountService.getCurrentAccount(),
+                accountService.getActiveClientsStatus().catch(() => ({} as ActiveClientsStatus))
+            ]);
+            set({ currentAccount: account, activeClients, loading: false });
         } catch (error) {
             set({ error: String(error), loading: false });
+        }
+    },
+
+    fetchActiveClients: async () => {
+        try {
+            const activeClients = await accountService.getActiveClientsStatus();
+            set({ activeClients });
+        } catch (error) {
+            console.error('[Store] Fetch active clients failed:', error);
         }
     },
 
@@ -110,19 +128,24 @@ export const useAccountStore = create<AccountState>((set, get) => ({
             await accountService.switchAccount(accountId, targetIde);
             await Promise.all([
                 get().fetchCurrentAccount(),
-                get().fetchAccounts()
+                get().fetchAccounts(),
+                get().fetchActiveClients(),
             ]);
-            
+
+            set({ loading: false });
+
             // Asynchronously refresh quota to update the dashboard, do not block the UI
             // NOTE: We call the service directly instead of get().refreshQuota() to avoid
             // re-setting loading=true after we just set loading=false.
             accountService.fetchAccountQuota(accountId)
-                .then(() => Promise.all([get().fetchAccounts(), get().fetchCurrentAccount()]))
+                .then(() => Promise.all([
+                    get().fetchAccounts(),
+                    get().fetchCurrentAccount(),
+                    get().fetchActiveClients(),
+                ]))
                 .catch(e => {
                     console.error('[Store] Background quota refresh failed after switch:', e);
                 });
-            
-            set({ loading: false });
         } catch (error) {
             set({ error: String(error), loading: false });
             throw error;

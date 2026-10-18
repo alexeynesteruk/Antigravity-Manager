@@ -929,6 +929,42 @@ fn read_from_file_credentials() -> Result<crate::modules::migration::ImportedOAu
     })
 }
 
+/// 读取 Antigravity CLI (agy) 原生与备份文件凭据，严格限制仅扫描 Antigravity
+pub fn read_antigravity_cli_credentials() -> Vec<crate::modules::migration::ImportedOAuthState> {
+    let mut states = Vec::new();
+    let Some(home) = dirs::home_dir() else {
+        return states;
+    };
+
+    let cli_dir = home.join(".gemini").join("antigravity-cli");
+    let candidate_files = [
+        cli_dir.join("antigravity-oauth-token"),
+        cli_dir.join("antigravity-oauth-token.antigravity.bak"),
+        cli_dir.join("antigravity-oauth-token.bak"),
+    ];
+
+    let mut seen_tokens = std::collections::HashSet::new();
+    for path in &candidate_files {
+        if path.exists() {
+            if let Ok(content) = fs::read_to_string(path) {
+                if let Ok(state) = parse_keyring_payload(&content) {
+                    if !state.refresh_token.is_empty()
+                        && seen_tokens.insert(state.refresh_token.clone())
+                    {
+                        crate::modules::logger::log_info(&format!(
+                            "[CLI-Scan] Discovered Antigravity CLI OAuth state in {:?}",
+                            path
+                        ));
+                        states.push(state);
+                    }
+                }
+            }
+        }
+    }
+
+    states
+}
+
 /// 辅助方法：从宿主操作系统的 Keychain/Credentials Manager 读取 Token
 pub fn read_from_system_keyring() -> Result<crate::modules::migration::ImportedOAuthState, String> {
     read_system_credentials(true)

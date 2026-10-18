@@ -2,9 +2,7 @@ use serde_json::Value;
 
 // loadCodeAssist 端点（fallback order: Daily → Sandbox → Prod）
 //
-// [FIX Issue #3525] Daily 优先，与官方 Antigravity language_server 的出站端点一致。
-// Sandbox 在部分地区会对合规账号返回终止性 400 `User location is not supported for the API use.`；
-// 官方从不访问 sandbox 端点，保留它仅作为可用性兜底。
+// 优先使用官方 IDE 主力集群 Daily，沙箱备用，生产集群兜底。
 const LOAD_PROJECT_ENDPOINTS: [&str; 3] = [
     "https://daily-cloudcode-pa.googleapis.com/v1internal:loadCodeAssist",
     "https://daily-cloudcode-pa.sandbox.googleapis.com/v1internal:loadCodeAssist",
@@ -61,7 +59,8 @@ pub async fn fetch_project_id(access_token: &str) -> Result<String, String> {
                         return Err("账号无资格获取官方 cloudaicompanionProject".to_string());
                     }
                 } else {
-                    if crate::proxy::upstream::client::should_try_next_endpoint(status) {
+                    if crate::proxy::upstream::client::should_try_next_endpoint_for_url(status, url)
+                    {
                         health_tracker.mark_failure(url);
                     }
                     let body = resp.text().await.unwrap_or_default();
@@ -104,10 +103,8 @@ mod tests {
             ]
         );
 
-        // 模拟 Daily 挂掉（无论是主聊天超时还是 loadCodeAssist 发现）
-        tracker.mark_failure(
-            "https://daily-cloudcode-pa.googleapis.com/v1internal:streamGenerateContent",
-        );
+        // 模拟 Daily 故障
+        tracker.mark_failure("https://daily-cloudcode-pa.googleapis.com/v1internal:loadCodeAssist");
         let ordered = tracker.get_ordered_endpoints(&LOAD_PROJECT_ENDPOINTS);
         assert_eq!(
             ordered[0],

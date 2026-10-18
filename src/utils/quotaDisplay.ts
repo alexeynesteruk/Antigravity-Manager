@@ -28,9 +28,15 @@ export interface ConstrainedQuotaResult {
 // An exhausted weekly window takes precedence; protection still uses the backend quota.
 export function getModelQuotaDisplay(modelId: string, model: ModelQuota | undefined, groups: QuotaGroup[] = []) {
     const name = modelId.toLowerCase();
-    const thirdParty = name.startsWith('claude') || name.startsWith('gpt');
+    const isArgon = name.includes('argon');
+    const thirdParty = !isArgon && (name.startsWith('claude') || name.startsWith('gpt'));
     const buckets = (groups || []).filter(group => {
         const groupName = (group?.display_name || '').toLowerCase();
+        const hasArgonBucket = (group?.buckets || []).some(bucket => bucket?.bucket_id?.toLowerCase().includes('argon'));
+        const groupIsArgon = groupName.includes('argon') || hasArgonBucket;
+        if (isArgon) return groupIsArgon;
+        if (groupIsArgon) return false;
+
         const isThirdParty = /claude|gpt|3p/.test(groupName)
             || (group?.buckets || []).some(bucket => bucket?.bucket_id?.toLowerCase().includes('3p'));
         return thirdParty ? isThirdParty : name.startsWith('gemini') && !isThirdParty;
@@ -60,10 +66,16 @@ export function getModelConstrainedQuota(
     view: DashboardQuotaView = 'weighted'
 ): ConstrainedQuotaResult {
     const name = modelId.toLowerCase();
-    const thirdParty = name.startsWith('claude') || name.startsWith('gpt');
+    const isArgon = name.includes('argon');
+    const thirdParty = !isArgon && (name.startsWith('claude') || name.startsWith('gpt'));
 
     const buckets = (groups || []).filter(group => {
         const groupName = (group?.display_name || '').toLowerCase();
+        const hasArgonBucket = (group?.buckets || []).some(bucket => bucket?.bucket_id?.toLowerCase().includes('argon'));
+        const groupIsArgon = groupName.includes('argon') || hasArgonBucket;
+        if (isArgon) return groupIsArgon;
+        if (groupIsArgon) return false;
+
         const isThirdParty = /claude|gpt|3p/.test(groupName)
             || (group?.buckets || []).some(bucket => bucket?.bucket_id?.toLowerCase().includes('3p'));
         return thirdParty ? isThirdParty : name.startsWith('gemini') && !isThirdParty;
@@ -150,7 +162,7 @@ export interface GroupQuotaItem {
 }
 
 export interface GroupQuotaSummary {
-    key: 'gemini' | 'claude';
+    key: 'gemini' | 'claude' | 'argon';
     labelKey: string;
     defaultLabel: string;
     fiveHour?: GroupQuotaItem;
@@ -160,7 +172,7 @@ export interface GroupQuotaSummary {
 }
 
 /**
- * 提取 Gemini Models 与 Claude & GPT models 的聚合双窗口配额
+ * 提取 Gemini Models、Claude & GPT models 以及 Gemini 4 Argon 的聚合配额
  * @param groups 配额组数据 (quota_groups)
  * @param fallbackModels 兜底模型列表 (models)
  * @param tier 账号订阅类型 ('ultra' | 'pro' | 'free')
@@ -172,17 +184,22 @@ export function getGroupQuotaSummaries(
 ): GroupQuotaSummary[] {
     const isFreeTier = tier === 'free';
 
-    const findGroupBuckets = (isThirdPartyTarget: boolean) => {
+    const findGroupBuckets = (target: 'gemini' | 'claude' | 'argon') => {
         return (groups || []).filter(group => {
             const groupName = (group?.display_name || '').toLowerCase();
+            const hasArgonBucket = (group?.buckets || []).some(b => /argon/i.test(`${b?.bucket_id || ''} ${b?.display_name || ''}`));
+            const isArgon = /argon/i.test(groupName) || hasArgonBucket;
+            if (target === 'argon') return isArgon;
+            if (isArgon) return false;
+
             const isThirdParty = /claude|gpt|3p/.test(groupName)
                 || (group?.buckets || []).some(bucket => bucket?.bucket_id?.toLowerCase().includes('3p'));
-            return isThirdPartyTarget ? isThirdParty : !isThirdParty;
+            return target === 'claude' ? isThirdParty : !isThirdParty;
         }).flatMap(group => group?.buckets || []);
     };
 
-    const buildGroup = (key: 'gemini' | 'claude', isThirdParty: boolean): GroupQuotaSummary => {
-        const buckets = findGroupBuckets(isThirdParty);
+    const buildGroup = (key: 'gemini' | 'claude' | 'argon'): GroupQuotaSummary => {
+        const buckets = findGroupBuckets(key);
 
         const fiveHourBucket = buckets.filter(bucket => /5h|hour/i.test(`${bucket?.window || ''} ${bucket?.bucket_id || ''}`))
             .reduce<(typeof buckets)[number] | undefined>((chosen, bucket) =>
@@ -199,7 +216,10 @@ export function getGroupQuotaSummaries(
         if (fallbackModels.length > 0) {
             const matched = fallbackModels.filter(m => {
                 const n = m.name.toLowerCase();
-                return isThirdParty ? (n.startsWith('claude') || n.startsWith('gpt')) : n.startsWith('gemini');
+                const isArgon = n.includes('argon');
+                if (key === 'argon') return isArgon;
+                if (isArgon) return false;
+                return key === 'claude' ? (n.startsWith('claude') || n.startsWith('gpt')) : n.startsWith('gemini');
             });
 
             if (matched.length > 0) {
@@ -233,7 +253,7 @@ export function getGroupQuotaSummaries(
                 } else if (matched.length > 0 && !fiveHourModels.length) {
                     // 若均无明确时间戳，则作为常规配额
                     const minModel = matched.reduce((prev, curr) => curr.percentage < prev.percentage ? curr : prev, matched[0]);
-                    if (isFreeTier) {
+                    if (isFreeTier || key === 'argon') {
                         fallbackWeekly = {
                             percentage: minModel.percentage,
                             resetTime: minModel.reset_time,
@@ -260,20 +280,30 @@ export function getGroupQuotaSummaries(
         const weeklyResetTime = weeklyBucket?.reset_time || fallbackWeekly?.resetTime || (isFreeTier ? fallback5h?.resetTime : undefined);
         const fiveHourResetTime = isFreeTier ? undefined : (fiveHourBucket?.reset_time || fallback5h?.resetTime);
 
-        const isWeeklyExhausted = rawWeekly !== undefined && rawWeekly <= 0;
-        const isWeeklyConstrained = isWeeklyExhausted || (rawWeekly !== undefined && raw5h !== undefined && rawWeekly < raw5h);
+        const effectiveWeekly = rawWeekly;
+        const effectiveWeeklyResetTime = weeklyResetTime;
+
+        const isWeeklyExhausted = effectiveWeekly !== undefined && effectiveWeekly <= 0;
+        const isWeeklyConstrained = isWeeklyExhausted || (effectiveWeekly !== undefined && raw5h !== undefined && effectiveWeekly < raw5h);
+
+        const labelKey = key === 'argon'
+            ? 'accounts.quota_group_argon'
+            : (key === 'claude' ? 'accounts.quota_group_claude' : 'accounts.quota_group_gemini');
+        const defaultLabel = key === 'argon'
+            ? 'Gemini 4 Argon'
+            : (key === 'claude' ? 'Claude & GPT Models' : 'Gemini Models');
 
         return {
             key,
-            labelKey: isThirdParty ? 'accounts.quota_group_claude' : 'accounts.quota_group_gemini',
-            defaultLabel: isThirdParty ? 'Claude & GPT Models' : 'Gemini Models',
+            labelKey,
+            defaultLabel,
             fiveHour: raw5h !== undefined ? {
                 percentage: isWeeklyExhausted ? 0 : raw5h,
-                resetTime: isWeeklyExhausted ? weeklyResetTime : fiveHourResetTime,
+                resetTime: isWeeklyExhausted ? effectiveWeeklyResetTime : fiveHourResetTime,
             } : undefined,
-            weekly: rawWeekly !== undefined ? {
-                percentage: rawWeekly,
-                resetTime: weeklyResetTime,
+            weekly: effectiveWeekly !== undefined ? {
+                percentage: effectiveWeekly,
+                resetTime: effectiveWeeklyResetTime,
                 cycleTokens: weeklyBucket?.cycle_tokens,
             } : undefined,
             isWeeklyConstrained,
@@ -281,9 +311,21 @@ export function getGroupQuotaSummaries(
         };
     };
 
-    return [
-        buildGroup('gemini', false),
-        buildGroup('claude', true),
+    const hasArgon = (groups || []).some(group => {
+        const groupName = (group?.display_name || '').toLowerCase();
+        return /argon/i.test(groupName)
+            || (group?.buckets || []).some(b => /argon/i.test(`${b?.bucket_id || ''} ${b?.display_name || ''}`));
+    }) || fallbackModels.some(m => /argon/i.test(m?.name || ''));
+
+    const summaries: GroupQuotaSummary[] = [
+        buildGroup('gemini'),
+        buildGroup('claude'),
     ];
+
+    if (hasArgon) {
+        summaries.push(buildGroup('argon'));
+    }
+
+    return summaries;
 }
 

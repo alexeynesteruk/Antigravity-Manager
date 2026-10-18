@@ -204,7 +204,11 @@
     "health_available_rate": "Доступность",
     "circuit_break": "Сбой",
     "health_all_green": "Все в норме",
-    "abnormal_badge": "{{count}} сбоев"
+    "abnormal_badge": "{{count}} сбоев",
+    "no_client_account": "Нет активного или привязанного аккаунта для этого приложения",
+    "go_switch_account": "Перейти к смене аккаунта",
+    "switch_best_to_target": "Переключить лучший аккаунт на {{target}}",
+    "switch_this_to_target": "Переключить этот аккаунт на {{target}}"
   },
   "accounts": {
     "account": "Аккаунт",
@@ -486,7 +490,18 @@
       "refresh_interval": "Интервал обновления (минуты)",
       "auto_sync": "Автосинхронизация текущего аккаунта",
       "auto_sync_desc": "Автоматически синхронизировать информацию о текущем активном аккаунте периодически",
-      "sync_interval": "Интервал синхронизации (секунды)"
+      "sync_interval": "Интервал синхронизации (секунды)",
+      "auto_switch_classic": "Авто-хотсвап для Classic",
+      "auto_switch_classic_badge": "Только для Classic",
+      "auto_switch_classic_desc": "При фоновой проверке квот Antigravity Classic, если квота текущего аккаунта падает ниже порога, автоматически и незаметно переключает на лучший доступный аккаунт из пула (Только для Classic Standalone; IDE и CLI не поддерживаются из-за архитектурных ограничений клиентов).",
+      "auto_switch_threshold_label": "Порог переключения",
+      "auto_switch_threshold_hint": "Переключать, если квота любого отслеживаемого пула ≤ {{pct}}%",
+      "auto_switch_models_label": "Отслеживаемые пулы квот",
+      "auto_switch_models_hint": "Выберите хотя бы один пул. Переключение сработает, если квота любого выбранного пула упадет ниже порога.",
+      "auto_switch_gemini": "Пул Gemini",
+      "auto_switch_gemini_desc": "Включает Pro / Flash / генерацию изображений",
+      "auto_switch_third_party": "Сторонние модели",
+      "auto_switch_third_party_desc": "Включает Claude 3.7 / 3.5 / GPT"
     },
     "warmup": {
       "title": "Умный разогрев",
@@ -1141,6 +1156,19 @@
       "log_retention_rows": "Maximum log rows",
       "agent_settings": {
         "title": "Специальные настройки Agent (Specific Agent Settings)"
+      },
+      "hub": {
+        "title": "Официальный отпечаток Hub",
+        "tooltip": "Согласует исходящий трафик с официальными сигнатурами Google Antigravity Hub, предотвращая лимиты 429.",
+        "source_custom": "Свой",
+        "source_remote": "Удаленно",
+        "source_local": "Локально",
+        "source_baseline": "Базовый",
+        "detect_button": "Определить",
+        "detect_success": "Определена последняя версия Hub: v{{version}} (CL: {{cl}})",
+        "detect_failed": "Ошибка определения: {{error}}",
+        "version_label": "Версия Hub",
+        "cl_label": "Номер сборки Piper (CL)"
       }
     },
     "stream_timeouts": {
@@ -1375,7 +1403,19 @@
       "model_name": "Название модели",
       "model_id": "ID модели",
       "description": "Описание",
-      "action": "Действие"
+      "status": "Статус / Связь",
+      "action": "Действие",
+      "test_connectivity": "Проверка",
+      "batch_test": "Проверить все",
+      "stop_test": "Стоп",
+      "auto_dispatch": "🤖 Авто-маршрутизация (Пул)",
+      "select_account": "Выбрать аккаунт",
+      "view_detail": "Подробности запроса и время отклика",
+      "retired": "Устарела",
+      "untested": "Не проверялось",
+      "testing": "Проверка...",
+      "success": "В норме",
+      "rate_limited": "Лимит (429)"
     },
     "cli_sync": {
       "title": "Быстрая настройка инструментов Agent",
@@ -1402,10 +1442,14 @@
       },
       "toast": {
         "sync_success": "Успешно! {{name}} готов к работе.",
-        "sync_error": "Ошибка синхронизации: {{error}}"
+        "sync_error": "Ошибка синхронизации: {{error}}",
+        "sync_success_with_model": "Успешно синхронизировано {{name}} с моделью: {{model}}!"
       },
       "sync_confirm_title": "Подтверждение синхронизации",
-      "sync_confirm_message": "Готово к синхронизации конфигурации {{name}}. ⚠️ Внимание: это перезапишет ваши существующие локальные файлы конфигурации (например, токены входа, API ключи). Вы уверены, что хотите продолжить?"
+      "sync_confirm_message": "Готово к синхронизации конфигурации {{name}}. ⚠️ Внимание: это перезапишет ваши существующие локальные файлы конфигурации (например, токены входа, API ключи). Вы уверены, что хотите продолжить?",
+      "apps": {
+        "gemini": "Antigravity CLI (agy)"
+      }
     },
     "hermes_sync": {
       "modal_title": "Настройка Antigravity Manager в Hermes",
@@ -1747,14 +1791,11 @@
     "error_invalid_key": "Неверный пароль или API-ключ, попробуйте снова",
     "error_network": "Сбой сетевого подключения. Проверьте, запущена ли служба",
     "note": "Примечание: если установлен отдельный пароль управления, введите его; в противном случае введите API_KEY.",
-    "lookup_hint": "View gui_config.json or check environment variables to find them.",
+    "lookup_hint": "Если вы забыли, запустите docker logs antigravity-manager, чтобы найти текущий ключ API или пароль Web UI.",
     "config_hint": "Или выполните grep -E '\"api_key\"|\"admin_password\"' ~/.antigravity_tools/gui_config.json для просмотра."
   },
   "token_stats": {
     "title": "Статистика токенов",
-    "minute": "Поминутная",
-    "minute_1h": "1ч (1м)",
-    "minute_24h": "24ч (5м)",
     "hourly": "Почасовая",
     "daily": "Ежедневная",
     "weekly": "Еженедельная",
@@ -1907,7 +1948,16 @@
     "mode_cockpit": "Общий обзор",
     "reasoning_short": "Расс",
     "cockpit_thinking_share": "Доля рассуждений",
-    "cockpit_avg_thinking_per_req": "Ср. рассуждений / запр."
+    "cockpit_avg_thinking_per_req": "Ср. рассуждений / запр.",
+    "cockpit_user_rank": "Рейтинг пользователей",
+    "cockpit_no_user_activity": "Нет активности использования пользовательских ключей",
+    "cockpit_view_detail": "Подробнее",
+    "cockpit_tab_accounts": "Аккаунты",
+    "cockpit_tab_models": "Модели",
+    "cockpit_tab_users": "Пользователи",
+    "minute": "Поминутная",
+    "minute_1h": "1ч (1м)",
+    "minute_24h": "24ч (5м)"
   },
   "errors": {
     "stream": {
@@ -2051,8 +2101,25 @@
     "hint_curfew": "Оставьте пустым, чтобы отключить. По времени сервера.",
     "custom_expires_required": "Please select custom expiration time",
     "expires_custom": "Custom Time",
-    "custom_expires_at": "Custom Expiration At",
-    "hint_custom_expires": "Set precise expiration timestamp for this token"
+    "custom_expires_at": "Пользовательское время истечения",
+    "hint_custom_expires": "Установите точное время истечения срока действия для этого токена",
+    "view_stats": "Статистика использования",
+    "bound_ips": "IP-адреса клиентов",
+    "recent_ips": "Активные IP клиентов и недавняя активность",
+    "no_ips": "Нет записей о привязке IP",
+    "enabled": "Активен",
+    "disabled": "Отключен",
+    "range_24h": "24 часа",
+    "range_7d": "7 дней",
+    "range_30d": "30 дней",
+    "range_all": "Все",
+    "success_rate": "Успешность",
+    "avg_per_request": "Среднее число токенов/запрос",
+    "est_throughput": "Оценка расхода на запрос",
+    "calls_unit": "вызовов",
+    "records_unit": "записей",
+    "no_trend_data": "Нет данных о динамике за этот период",
+    "no_model_data": "Нет данных по моделям"
   },
   "apiKeyFun": {
     "title": "Хаб APIKEY.FUN",

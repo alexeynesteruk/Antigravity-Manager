@@ -207,7 +207,7 @@ impl ProxyRequestLog {
             response_body: None,
             request_headers: None,
             upstream_request_headers: None,
-            response_headers: None,
+            response_headers: self.response_headers.clone(),
             input_tokens: self.input_tokens,
             output_tokens: self.output_tokens,
             cached_tokens: self.cached_tokens,
@@ -223,6 +223,7 @@ impl ProxyRequestLog {
 pub(crate) struct UpstreamCapture {
     body: Option<String>,
     headers: Option<String>,
+    attempts: Option<Vec<crate::proxy::upstream::client::FallbackAttemptLog>>,
 }
 
 #[derive(Clone, Default)]
@@ -264,6 +265,16 @@ impl UpstreamRequestBodyHolder {
 
     pub fn take_headers(&self) -> Option<String> {
         self.0.lock().ok().and_then(|mut g| g.headers.take())
+    }
+
+    pub fn set_attempts(&self, attempts: Vec<crate::proxy::upstream::client::FallbackAttemptLog>) {
+        if let Ok(mut lock) = self.0.lock() {
+            lock.attempts = Some(attempts);
+        }
+    }
+
+    pub fn take_attempts(&self) -> Option<Vec<crate::proxy::upstream::client::FallbackAttemptLog>> {
+        self.0.lock().ok().and_then(|mut g| g.attempts.take())
     }
 }
 

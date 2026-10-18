@@ -1,4 +1,4 @@
-import { AlertTriangle, Clock, Lock, Sparkles } from 'lucide-react';
+import { Clock, Lock, Sparkles } from 'lucide-react';
 import { Gemini } from '@lobehub/icons';
 import { useTranslation } from 'react-i18next';
 import { cn } from '../../utils/cn';
@@ -12,16 +12,21 @@ interface GroupQuotaCardProps {
     liveLimit?: LiveLimitStatus;
     isProtected?: boolean;
     compact?: boolean;
+    fullWidth?: boolean;
 }
 
-export function GroupQuotaCard({ summary, liveLimit, isProtected }: GroupQuotaCardProps) {
+export function GroupQuotaCard({ summary, liveLimit, isProtected, fullWidth }: GroupQuotaCardProps) {
     const { t } = useTranslation();
     const liveState = getLiveLimitState(liveLimit);
     const showLiveIssue = liveState.shouldShow || summary.isWeeklyConstrained;
     const isUnavailable = liveState.isActive || summary.isWeeklyExhausted;
 
-    const label = summary.key === 'gemini' ? 'Gemini' : 'Claude / GPT';
-    const Icon = summary.key === 'gemini' ? Gemini.Color : Sparkles;
+    const label = summary.key === 'gemini'
+        ? 'Gemini'
+        : summary.key === 'argon'
+            ? (fullWidth ? 'Gemini 4 Argon' : 'G4 Argon')
+            : 'Claude / GPT';
+    const Icon = summary.key === 'gemini' || summary.key === 'argon' ? Gemini.Color : Sparkles;
 
     const fiveHour = summary.fiveHour;
     const weekly = summary.weekly;
@@ -88,15 +93,6 @@ export function GroupQuotaCard({ summary, liveLimit, isProtected }: GroupQuotaCa
                             showLiveIssue && "text-amber-700 dark:text-amber-300",
                             isUnavailable && "text-rose-700 dark:text-rose-300"
                         )}>
-                            {showLiveIssue && (
-                                <AlertTriangle
-                                    size={12}
-                                    className={cn(
-                                        "shrink-0",
-                                        isUnavailable ? "text-rose-500" : "text-amber-500"
-                                    )}
-                                />
-                            )}
                             <Icon size={12} className="shrink-0" />
                             <span className="truncate">{label}</span>
                             <span className="text-[9px] font-normal text-gray-400 dark:text-gray-500 scale-95 shrink-0">5H</span>
@@ -133,12 +129,13 @@ export function GroupQuotaCard({ summary, liveLimit, isProtected }: GroupQuotaCa
                 <div
                     className={cn(
                         "relative h-[22px] flex items-center px-1.5 rounded-md overflow-hidden border border-gray-100/50 dark:border-white/5 bg-gray-50/30 dark:bg-white/5 group/quota transition-all",
+                        summary.key === 'argon' && !showLiveIssue && !isUnavailable && "border-indigo-300/50 dark:border-indigo-700/40 bg-indigo-50/25 dark:bg-indigo-950/25",
                         summary.isWeeklyExhausted && "border-rose-400/70 dark:border-rose-500/70 bg-rose-50/80 dark:bg-rose-950/30 ring-rose-400/30",
                         // 当只有周额度时，如果受保护或有 live limit 也高亮该条目
                         fiveHour === undefined && showLiveIssue && "border-amber-400/70 dark:border-amber-500/70 bg-amber-50/80 dark:bg-amber-950/30 ring-1 ring-amber-400/30",
                         fiveHour === undefined && isUnavailable && "border-rose-400/70 dark:border-rose-500/70 bg-rose-50/80 dark:bg-rose-950/30 ring-rose-400/30"
                     )}
-                    title={t('accounts.quota_window_weekly')}
+                    title={summary.key === 'argon' ? 'Gemini 4 Argon (Weekly Limit)' : t('accounts.quota_window_weekly')}
                 >
                     {/* Background Progress Bar */}
                     <div
@@ -158,15 +155,6 @@ export function GroupQuotaCard({ summary, liveLimit, isProtected }: GroupQuotaCa
                             fiveHour === undefined && isUnavailable && "text-rose-700 dark:text-rose-300"
                         )}>
                             {/* 统一展示图标、分组名称与周配额标识 */}
-                            {showLiveIssue && (
-                                <AlertTriangle
-                                    size={12}
-                                    className={cn(
-                                        "shrink-0",
-                                        isUnavailable ? "text-rose-500" : "text-amber-500"
-                                    )}
-                                />
-                            )}
                             <Icon size={12} className="shrink-0" />
                             <span className="truncate">{label}</span>
                             <span className="text-[9px] font-normal text-gray-400 dark:text-gray-500 scale-95 shrink-0">

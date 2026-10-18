@@ -204,7 +204,11 @@
     "health_available_rate": "정상 가용률",
     "circuit_break": "차단",
     "health_all_green": "모두 정상",
-    "abnormal_badge": "{{count}}개 이상"
+    "abnormal_badge": "{{count}}개 이상",
+    "no_client_account": "이 애플리케이션에 활성화되거나 바인딩된 계정이 없습니다",
+    "go_switch_account": "계정 전환으로 이동",
+    "switch_best_to_target": "{{target}} 최적 계정으로 원클릭 전환",
+    "switch_this_to_target": "이 계정을 {{target}}(으)로 전환"
   },
   "accounts": {
     "account": "계정",
@@ -486,7 +490,18 @@
       "refresh_interval": "새로고침 간격 (분)",
       "auto_sync": "현재 계정 자동 동기화",
       "auto_sync_desc": "현재 활성 계정 정보를 주기적으로 자동 동기화",
-      "sync_interval": "동기화 간격 (분)"
+      "sync_interval": "동기화 간격 (분)",
+      "auto_switch_classic": "클래식 버전 자동 핫스왑",
+      "auto_switch_classic_badge": "클래식 전용",
+      "auto_switch_classic_desc": "백그라운드 점검 시 Antigravity 클래식 버전의 현재 계정 할당량이 임계값 이하로 떨어지면, 계정 풀에서 사용 가능한 최적의 계정으로 무중단 자동 전환합니다(클래식 독립형 버전 전용이며, IDE 및 CLI는 클라이언트 구조적 제한으로 지원되지 않습니다).",
+      "auto_switch_threshold_label": "전환 트리거 임계값",
+      "auto_switch_threshold_hint": "모니터링 중인 풀의 잔여 할당량이 ≤ {{pct}}% 일 때 자동 전환",
+      "auto_switch_models_label": "모니터링 할당량 풀",
+      "auto_switch_models_hint": "최소 하나 이상 선택하세요. 선택한 풀 중 하나라도 임계값 이하로 떨어지면 자동 전환됩니다.",
+      "auto_switch_gemini": "Gemini 연산 풀",
+      "auto_switch_gemini_desc": "Pro / Flash / 이미지 생성 포함",
+      "auto_switch_third_party": "타사 모델 풀",
+      "auto_switch_third_party_desc": "Claude 3.7 / 3.5 / GPT 포함"
     },
     "warmup": {
       "title": "스마트 웜업",
@@ -1141,6 +1156,19 @@
       "log_retention_rows": "최대 로그 행 수",
       "agent_settings": {
         "title": "특정 Agent 설정 (Specific Agent Settings)"
+      },
+      "hub": {
+        "title": "공식 Hub 클라이언트 지문",
+        "tooltip": "Google 공식 Antigravity Hub 네이티브 클라이언트 특성에 아웃바운드 트래픽을 맞춰 429 할당량 초과를 방지합니다.",
+        "source_custom": "사용자 지정",
+        "source_remote": "원격 감지",
+        "source_local": "로컬 앱",
+        "source_baseline": "기본값",
+        "detect_button": "감지",
+        "detect_success": "공식 최신 Hub 감지 및 동기화 성공: v{{version}} (CL: {{cl}})",
+        "detect_failed": "감지 실패: {{error}}",
+        "version_label": "Hub 버전 (Version)",
+        "cl_label": "Piper 빌드 번호 (CL)"
       }
     },
     "stream_timeouts": {
@@ -1375,7 +1403,19 @@
       "model_name": "모델 이름",
       "model_id": "모델 ID",
       "description": "설명",
-      "action": "작업"
+      "status": "상태 / 연결성",
+      "action": "작업",
+      "test_connectivity": "연결 테스트",
+      "batch_test": "전체 테스트",
+      "stop_test": "중지",
+      "auto_dispatch": "🤖 자동 디스패치 (프록시 풀)",
+      "select_account": "테스트 계정 선택",
+      "view_detail": "요청 세부 정보 및 지연 시간 보기",
+      "retired": "지원 종료",
+      "untested": "미테스트",
+      "testing": "테스트 중...",
+      "success": "정상",
+      "rate_limited": "제한됨"
     },
     "cli_sync": {
       "title": "Agent 도구 원클릭 설정",
@@ -1402,10 +1442,14 @@
       },
       "toast": {
         "sync_success": "동기화 성공! {{name}}이(가) 준비되었습니다.",
-        "sync_error": "동기화 실패: {{error}}"
+        "sync_error": "동기화 실패: {{error}}",
+        "sync_success_with_model": "{{name}} 동기화 성공! 모델: {{model}}"
       },
       "sync_confirm_title": "동기화 확인",
-      "sync_confirm_message": "{{name}} 구성을 동기화할 준비가 되었습니다. ⚠️ 경고: 이 작업은 기존 로컬 구성 파일(예: 로그인 토큰, API 키)을 덮어씁니다. 계속하시겠습니까?"
+      "sync_confirm_message": "{{name}} 구성을 동기화할 준비가 되었습니다. ⚠️ 경고: 이 작업은 기존 로컬 구성 파일(예: 로그인 토큰, API 키)을 덮어씁니다. 계속하시겠습니까?",
+      "apps": {
+        "gemini": "Antigravity CLI (agy)"
+      }
     },
     "agent_settings": {
       "banner_title": "특정 Agent 전용 기능 및 최적화 거버넌스",
@@ -1679,14 +1723,11 @@
     "error_invalid_key": "비밀번호 또는 API 키가 잘못되었습니다. 다시 시도하십시오",
     "error_network": "네트워크 연결에 실패했습니다. 서비스가 실행 중인지 확인하십시오",
     "note": "참고: 별도의 관리 비밀번호가 설정된 경우 관리 비밀번호를 입력하십시오. 그렇지 않으면 API_KEY를 입력하십시오.",
-    "lookup_hint": "View gui_config.json or check environment variables to find them.",
+    "lookup_hint": "잊으신 경우 docker logs antigravity-manager를 실행하여 Current API Key 또는 Web UI Password를 찾으십시오.",
     "config_hint": "또는 grep -E '\"api_key\"|\"admin_password\"' ~/.antigravity_tools/gui_config.json을 실행하여 확인하십시오."
   },
   "token_stats": {
     "title": "토큰 사용 통계",
-    "minute": "분",
-    "minute_1h": "1시간 (1분)",
-    "minute_24h": "24시간 (5분)",
     "hourly": "시간",
     "daily": "일",
     "weekly": "주",
@@ -1839,7 +1880,16 @@
     "mode_cockpit": "개요 대시보드",
     "reasoning_short": "추",
     "cockpit_thinking_share": "추론 비율",
-    "cockpit_avg_thinking_per_req": "평균 추론 / 회"
+    "cockpit_avg_thinking_per_req": "평균 추론 / 회",
+    "cockpit_user_rank": "사용자 순위",
+    "cockpit_no_user_activity": "사용자 Key 소비 활동 없음",
+    "cockpit_view_detail": "세부정보",
+    "cockpit_tab_accounts": "계정",
+    "cockpit_tab_models": "모델",
+    "cockpit_tab_users": "사용자",
+    "minute": "분",
+    "minute_1h": "1시간 (1분)",
+    "minute_24h": "24시간 (5분)"
   },
   "errors": {
     "stream": {
@@ -1984,7 +2034,24 @@
     "custom_expires_required": "사용자 지정 만료 시간을 선택하세요",
     "expires_custom": "사용자 지정 시간",
     "custom_expires_at": "사용자 지정 만료일시",
-    "hint_custom_expires": "토큰의 정확한 만료 일시 설정"
+    "hint_custom_expires": "토큰의 정확한 만료 일시 설정",
+    "view_stats": "사용량 통계",
+    "bound_ips": "클라이언트 IP 수",
+    "recent_ips": "활성 클라이언트 IP 및 최근 활동",
+    "no_ips": "IP 바인딩 기록이 없습니다",
+    "enabled": "활성",
+    "disabled": "비활성",
+    "range_24h": "24시간",
+    "range_7d": "최근 7일",
+    "range_30d": "최근 30일",
+    "range_all": "전체",
+    "success_rate": "성공률",
+    "avg_per_request": "요청당 평균 Token",
+    "est_throughput": "요청당 예상 처리량",
+    "calls_unit": "회 호출",
+    "records_unit": "개 기록",
+    "no_trend_data": "해당 기간의 추세 데이터가 없습니다",
+    "no_model_data": "모델 데이터가 없습니다"
   },
   "apiKeyFun": {
     "title": "APIKEY.FUN 허브",

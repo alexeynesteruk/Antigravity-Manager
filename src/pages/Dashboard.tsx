@@ -28,8 +28,10 @@ function Dashboard() {
     const {
         accounts,
         currentAccount,
+        activeClients,
         fetchAccounts,
         fetchCurrentAccount,
+        fetchActiveClients,
         switchAccount,
         addAccount,
         refreshQuota,
@@ -39,6 +41,23 @@ function Dashboard() {
     useEffect(() => {
         fetchAccounts();
         fetchCurrentAccount();
+        fetchActiveClients();
+
+        // 保持 5 秒轮询三大客户端（经典款 / IDE / CLI）当前生效账号状态
+        const intervalId = setInterval(() => {
+            fetchActiveClients();
+        }, 5000);
+
+        // 窗口聚焦时即刻拉取最新客户端状态
+        const handleFocus = () => {
+            fetchActiveClients();
+        };
+        window.addEventListener('focus', handleFocus);
+
+        return () => {
+            clearInterval(intervalId);
+            window.removeEventListener('focus', handleFocus);
+        };
     }, []);
 
     const [onlyProxyPool, setOnlyProxyPool] = useState<boolean>(() => {
@@ -99,6 +118,7 @@ function Dashboard() {
             if (a.quota?.quota_groups) {
                 for (const group of a.quota.quota_groups) {
                     const gname = group.display_name.toLowerCase();
+                    if (gname.includes('argon')) continue;
                     const matches = isClaude
                         ? (gname.includes('claude') || gname.includes('gpt') || gname.includes('3p'))
                         : (gname.includes('gemini') || (!gname.includes('claude') && !gname.includes('gpt') && !gname.includes('3p')));
@@ -126,6 +146,7 @@ function Dashboard() {
             if (a.quota?.quota_groups) {
                 for (const group of a.quota.quota_groups) {
                     const gname = group.display_name.toLowerCase();
+                    if (gname.includes('argon')) continue;
                     const matches = isClaude
                         ? (gname.includes('claude') || gname.includes('gpt') || gname.includes('3p'))
                         : (gname.includes('gemini') || (!gname.includes('claude') && !gname.includes('gpt') && !gname.includes('3p')));
@@ -272,13 +293,13 @@ function Dashboard() {
 
     const isSwitchingRef = useRef(false);
 
-    const handleSwitch = async (accountId: string) => {
+    const handleSwitch = async (accountId: string, targetIde?: string) => {
         if (loading || isSwitchingRef.current) return;
 
         isSwitchingRef.current = true;
-        console.log('[Dashboard] handleSwitch called for', accountId);
+        console.log('[Dashboard] handleSwitch called for', accountId, 'targetIde:', targetIde);
         try {
-            await switchAccount(accountId);
+            await switchAccount(accountId, targetIde);
             showToast(t('dashboard.toast.switch_success'), 'success');
         } catch (error) {
             console.error('切换账号失败:', error);
@@ -459,36 +480,36 @@ function Dashboard() {
                 <div className="space-y-4">
                         {/* 核心 Bento 4 卡矩阵 (纯黑极简风格) */}
                         <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-3.5 items-stretch">
-                            {/* 卡片 1 (对偶反转 Hero 卡片): 浅色下为黑卡，深色下为明亮白金卡 */}
+                            {/* 卡片 1: 账号底座资产 */}
                             <motion.div
                                 whileHover={{ y: -2 }}
                                 transition={{ duration: 0.15 }}
-                                className="bg-[#121316] dark:bg-gradient-to-br dark:from-white dark:to-zinc-100 text-white dark:text-gray-900 rounded-2xl p-5 shadow-sm dark:shadow-2xl dark:shadow-white/[0.08] border border-gray-800 dark:border-white/90 flex flex-col justify-between relative overflow-hidden"
+                                className="bg-white dark:bg-[#15161b] rounded-2xl p-5 shadow-sm dark:shadow-xl dark:shadow-black/40 border border-gray-100 dark:border-white/[0.10] flex flex-col justify-between relative overflow-hidden"
                             >
                                 <div className="space-y-4">
                                     <div className="flex items-center justify-between">
                                         <div className="flex items-center gap-2">
-                                            <div className="p-1.5 rounded-lg bg-white/10 dark:bg-emerald-50 text-emerald-400 dark:text-emerald-600">
+                                            <div className="p-1.5 rounded-lg bg-emerald-50 dark:bg-emerald-500/15 text-emerald-600 dark:text-emerald-400 border border-transparent dark:border-emerald-500/20">
                                                 <Zap className="w-4 h-4" />
                                             </div>
-                                            <span className="text-xs font-bold text-gray-300 dark:text-gray-800">
+                                            <span className="text-xs font-bold text-gray-800 dark:text-zinc-200">
                                                 {t('dashboard.accounts_health', '账号底座资产')}
                                             </span>
                                         </div>
-                                        <span className="px-2 py-0.5 rounded-full text-[10px] font-mono font-bold bg-white/10 dark:bg-emerald-50 text-emerald-300 dark:text-emerald-700 border border-white/10 dark:border-emerald-200/80">
+                                        <span className="px-2 py-0.5 rounded-full text-[10px] font-mono font-bold bg-emerald-50 dark:bg-emerald-500/15 text-emerald-700 dark:text-emerald-300 border border-emerald-200/60 dark:border-emerald-500/30">
                                             {stats.available}/{stats.total}
                                         </span>
                                     </div>
 
                                     {/* 核心大数字 */}
                                     <div>
-                                        <div className="text-3xl sm:text-4xl font-black font-mono tracking-tight text-white dark:text-gray-950">
+                                        <div className="text-3xl sm:text-4xl font-black font-mono tracking-tight text-gray-900 dark:text-white">
                                             {stats.available}
-                                            <span className="text-sm font-sans font-normal text-gray-400 dark:text-gray-500 ml-1.5">
+                                            <span className="text-sm font-sans font-normal text-gray-400 dark:text-zinc-400 ml-1.5">
                                                 / {stats.total} {t('dashboard.available_accounts_unit', '可用')}
                                             </span>
                                         </div>
-                                        <div className="text-[11px] text-gray-400 dark:text-gray-500 mt-1 font-medium">
+                                        <div className="text-[11px] text-gray-400 dark:text-zinc-400 mt-1 font-medium">
                                             {stats.proxyOnline > 0
                                                 ? t('dashboard.proxy_joined_pool', { count: stats.proxyOnline, defaultValue: `✓ ${stats.proxyOnline} 个账号已加入反代服务池` })
                                                 : t('dashboard.disabled_accounts_desc', '手动停用/待开启')
@@ -497,23 +518,23 @@ function Dashboard() {
                                     </div>
 
                                     {/* 彩色进度条 */}
-                                    <div className="w-full bg-white/10 dark:bg-gray-100 h-2 rounded-full overflow-hidden">
+                                    <div className="w-full bg-gray-100 dark:bg-white/10 h-2 rounded-full overflow-hidden">
                                         <div
-                                            className="bg-gradient-to-r from-emerald-400 via-teal-300 to-cyan-300 dark:from-emerald-500 dark:to-teal-500 h-full rounded-full transition-all duration-300 shadow-[0_0_8px_rgba(52,211,153,0.4)]"
+                                            className="bg-gradient-to-r from-emerald-500 to-teal-400 h-full rounded-full transition-all duration-300 shadow-[0_0_8px_rgba(52,211,153,0.4)]"
                                             style={{ width: `${Math.round((stats.available / (stats.total || 1)) * 100)}%` }}
                                         />
                                     </div>
                                 </div>
 
                                 {/* 底部操作栏胶囊 */}
-                                <div className="pt-3 mt-3 border-t border-white/10 dark:border-gray-200/60 flex items-center justify-between text-xs">
-                                    <span className="text-[11px] text-gray-400 dark:text-gray-500 font-mono font-medium">
+                                <div className="pt-3 mt-3 border-t border-gray-100 dark:border-white/[0.08] flex items-center justify-between text-xs">
+                                    <span className="text-[11px] text-gray-400 dark:text-zinc-400 font-mono font-medium">
                                         {Math.round((stats.available / (stats.total || 1)) * 100)}% {t('dashboard.asset_rate', '资产率')}
                                     </span>
                                     <button
                                         type="button"
                                         onClick={() => navigate('/accounts')}
-                                        className="px-3 py-1 bg-white/10 hover:bg-white/20 dark:bg-gray-900 dark:hover:bg-gray-800 text-white dark:text-white text-[11px] font-semibold rounded-lg transition-colors flex items-center gap-1 cursor-pointer shadow-xs"
+                                        className="px-3 py-1 bg-gray-900 hover:bg-gray-800 dark:bg-white/10 dark:hover:bg-white/15 text-white text-[11px] font-semibold rounded-lg transition-colors flex items-center gap-1 cursor-pointer shadow-xs"
                                     >
                                         <span>{t('dashboard.view_all_accounts', '查看账号')}</span>
                                         <ArrowRight className="w-3 h-3" />
@@ -860,11 +881,14 @@ function Dashboard() {
                 <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
                     <CurrentAccount
                         account={currentAccount}
-                        onSwitch={() => navigate('/accounts')}
+                        accounts={accounts}
+                        activeClients={activeClients}
+                        onSwitch={(targetIde) => navigate('/accounts', { state: { targetIde } })}
                     />
                     <BestAccounts
                         accounts={accounts}
                         currentAccountId={currentAccount?.id}
+                        activeClients={activeClients}
                         onSwitch={handleSwitch}
                     />
                 </div>

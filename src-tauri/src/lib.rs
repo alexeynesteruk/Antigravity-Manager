@@ -440,6 +440,12 @@ pub fn run() {
                         }
                     }
 
+                    // Initialize Hub fingerprint from config or detection
+                    crate::modules::hub_version::update_hub_fingerprint(
+                        config.proxy.hub_version.as_deref(),
+                        config.proxy.hub_cl.as_deref(),
+                    );
+
                     // Start proxy service
                     if let Err(e) = commands::proxy::internal_start_proxy_service(
                         config.proxy,
@@ -541,6 +547,10 @@ pub fn run() {
             tauri::async_runtime::spawn(async move {
                 // Load config
                 if let Ok(config) = modules::config::load_app_config() {
+                    crate::modules::hub_version::update_hub_fingerprint(
+                        config.proxy.hub_version.as_deref(),
+                        config.proxy.hub_cl.as_deref(),
+                    );
                     let state = handle.state::<commands::proxy::ProxyServiceState>();
                     let cf_state = handle.state::<commands::cloudflared::CloudflaredState>();
                     let integration =
@@ -652,6 +662,7 @@ pub fn run() {
             commands::delete_device_version,
             commands::open_device_folder,
             commands::get_current_account,
+            commands::get_active_clients_status,
             // Quota commands
             commands::fetch_account_quota,
             commands::refresh_all_quotas,
@@ -717,6 +728,7 @@ pub fn run() {
             commands::proxy::clear_thinking_store,
             commands::proxy::get_thinking_store_count,
             commands::proxy::get_proxy_db_disk_size,
+            commands::proxy::test_model_connectivity,
             commands::proxy::generate_api_key,
             commands::proxy::reload_proxy_accounts,
             commands::proxy::update_model_mapping,
@@ -727,6 +739,8 @@ pub fn run() {
             commands::proxy::clear_proxy_session_bindings,
             commands::proxy::set_preferred_account,
             commands::proxy::get_preferred_account,
+            commands::proxy::get_hub_fingerprint,
+            commands::proxy::detect_remote_hub_fingerprint,
             commands::proxy::clear_proxy_rate_limit,
             commands::proxy::clear_all_proxy_rate_limits,
             // Proxy Pool Binding commands
@@ -823,6 +837,8 @@ pub fn run() {
             commands::user_token::renew_user_token,
             commands::user_token::get_token_ip_bindings,
             commands::user_token::get_user_token_summary,
+            commands::user_token::get_user_token_stats,
+            commands::user_token::get_user_tokens_ranking,
             commands::query_transit_info,
             // Patch commands
             commands::patch_agy_binary,

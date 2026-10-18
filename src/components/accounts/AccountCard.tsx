@@ -1,7 +1,7 @@
 import { useMemo, useState } from 'react';
 import { motion } from 'framer-motion';
 import { ArrowRightLeft, RefreshCw, Trash2, Download, Info, Lock, Ban, Diamond, Gem, Circle, ToggleLeft, ToggleRight, Fingerprint, Sparkles, Tag, X, Check, Clock, Repeat2, Terminal } from 'lucide-react';
-import { Account, getAccountTier } from '../../types/account';
+import { Account, ActiveClientsStatus, getAccountTier } from '../../types/account';
 import { cn } from '../../utils/cn';
 import { useTranslation } from 'react-i18next';
 import { useConfigStore } from '../../stores/useConfigStore';
@@ -15,6 +15,7 @@ interface AccountCardProps {
     selected: boolean;
     onSelect: () => void;
     isCurrent: boolean;
+    activeClients?: ActiveClientsStatus;
     isRefreshing: boolean;
     isSwitching?: boolean;
     onSwitch: (targetIde?: string) => void;
@@ -29,7 +30,7 @@ interface AccountCardProps {
     onViewError: () => void;
 }
 
-function AccountCard({ account, selected, onSelect, isCurrent: propIsCurrent, isRefreshing, isSwitching = false, onSwitch, onRefresh, onViewDetails, onExport, onDelete, onToggleProxy, onViewDevice, onWarmup, onUpdateLabel, onViewError }: AccountCardProps) {
+function AccountCard({ account, selected, onSelect, isCurrent: propIsCurrent, activeClients, isRefreshing, isSwitching = false, onSwitch, onRefresh, onViewDetails, onExport, onDelete, onToggleProxy, onViewDevice, onWarmup, onUpdateLabel, onViewError }: AccountCardProps) {
     const { t } = useTranslation();
     const { config } = useConfigStore();
     const isDisabled = Boolean(account.disabled);
@@ -39,8 +40,10 @@ function AccountCard({ account, selected, onSelect, isCurrent: propIsCurrent, is
     const [isEditingLabel, setIsEditingLabel] = useState(false);
     const [labelInput, setLabelInput] = useState(account.custom_label || '');
 
-    // Use the prop directly from parent component
-    const isCurrent = propIsCurrent;
+    const isClassic = activeClients?.classic_account_id === account.id;
+    const isIde = activeClients?.ide_account_id === account.id;
+    const isAgy = activeClients?.agy_account_id === account.id;
+    const isCurrent = propIsCurrent || isClassic || isIde || isAgy;
 
     const handleSaveLabel = () => {
         if (onUpdateLabel) {
@@ -67,13 +70,16 @@ function AccountCard({ account, selected, onSelect, isCurrent: propIsCurrent, is
         return getGroupQuotaSummaries(account.quota?.quota_groups, account.quota?.models, tier);
     }, [account.quota?.quota_groups, account.quota?.models, tier]);
 
-    const isGroupProtected = (key: 'gemini' | 'claude') => {
+    const isGroupProtected = (key: 'gemini' | 'claude' | 'argon') => {
         if (!config?.quota_protection?.enabled) return false;
         if (!account.protected_models || account.protected_models.length === 0) return false;
+        if (key === 'argon') {
+            return account.protected_models.some(m => m.toLowerCase().includes('argon'));
+        }
         if (key === 'gemini') {
-            return account.protected_models.some(m => m.startsWith('gemini'));
+            return account.protected_models.some(m => m.toLowerCase().startsWith('gemini') && !m.toLowerCase().includes('argon'));
         } else {
-            return account.protected_models.some(m => m.startsWith('claude') || m.startsWith('gpt'));
+            return account.protected_models.some(m => m.toLowerCase().startsWith('claude') || m.toLowerCase().startsWith('gpt'));
         }
     };
 
@@ -108,7 +114,31 @@ function AccountCard({ account, selected, onSelect, isCurrent: propIsCurrent, is
                     </h3>
                     <div className="flex items-center justify-between w-full gap-2">
                         <div className="flex items-center gap-1.5 flex-wrap">
-                            {isCurrent && (
+                            {isClassic && (
+                                <span
+                                    className="px-1.5 py-0.5 rounded-md bg-blue-100 dark:bg-blue-900/40 text-blue-700 dark:text-blue-300 text-[9px] font-bold shadow-sm border border-blue-200/50"
+                                    title={t('accounts.client_classic_tooltip', '当前 Antigravity 经典款客户端登录账号')}
+                                >
+                                    {t('accounts.client_classic', '经典款')}
+                                </span>
+                            )}
+                            {isIde && (
+                                <span
+                                    className="px-1.5 py-0.5 rounded-md bg-sky-100 dark:bg-sky-900/40 text-sky-700 dark:text-sky-300 text-[9px] font-bold shadow-sm border border-sky-200/50"
+                                    title={t('accounts.client_ide_tooltip', '当前 Antigravity IDE 客户端登录账号')}
+                                >
+                                    {t('accounts.client_ide', 'IDE')}
+                                </span>
+                            )}
+                            {isAgy && (
+                                <span
+                                    className="px-1.5 py-0.5 rounded-md bg-emerald-100 dark:bg-emerald-900/40 text-emerald-700 dark:text-emerald-300 text-[9px] font-bold shadow-sm border border-emerald-200/50"
+                                    title={t('accounts.client_cli_tooltip', '当前 Antigravity CLI (agy) 登录账号')}
+                                >
+                                    {t('accounts.client_cli', 'CLI')}
+                                </span>
+                            )}
+                            {!isClassic && !isIde && !isAgy && propIsCurrent && (
                                 <span className="px-1.5 py-0.5 rounded-md bg-blue-100 dark:bg-blue-900/40 text-blue-700 dark:text-blue-300 text-[9px] font-bold shadow-sm border border-blue-200/50">
                                     {t('accounts.current').toUpperCase()}
                                 </span>
@@ -188,15 +218,15 @@ function AccountCard({ account, selected, onSelect, isCurrent: propIsCurrent, is
 
             {/* 配额展示 (统一分组展示) */}
             <div className="flex-1 px-1 mb-2 overflow-y-auto scrollbar-none">
-                {isDisabled || account.quota?.is_forbidden || account.proxy_disabled || account.validation_blocked ? (
+                {isDisabled || account.quota?.is_forbidden || account.validation_blocked ? (
                     <div className="flex flex-wrap items-center justify-center gap-x-3 gap-y-1 h-full py-4 text-center">
                         <div className={cn(
                             "flex items-center gap-1.5",
                             account.validation_blocked ? "text-amber-600 dark:text-amber-400" : "text-red-600 dark:text-red-400"
                         )}>
-                            {account.validation_blocked ? <Clock className="w-4 h-4" /> : (isDisabled || account.proxy_disabled ? <Ban className="w-4 h-4" /> : <Lock className="w-4 h-4" />)}
+                            {account.validation_blocked ? <Clock className="w-4 h-4" /> : (isDisabled ? <Ban className="w-4 h-4" /> : <Lock className="w-4 h-4" />)}
                             <span className="text-[11px] font-bold">
-                                {account.validation_blocked ? validationBlockedLabel : (isDisabled ? t('accounts.status.disabled') : account.proxy_disabled ? t('accounts.status.proxy_disabled') : t('accounts.forbidden_msg'))}
+                                {account.validation_blocked ? validationBlockedLabel : (isDisabled ? t('accounts.status.disabled') : t('accounts.forbidden_msg'))}
                             </span>
                         </div>
                         <div className={cn(
@@ -211,15 +241,31 @@ function AccountCard({ account, selected, onSelect, isCurrent: propIsCurrent, is
                         </button>
                     </div>
                 ) : (
-                    <div className="grid grid-cols-1 sm:grid-cols-2 gap-2 content-start">
-                        {groupSummaries.map((summary) => (
-                            <GroupQuotaCard
-                                key={summary.key}
-                                summary={summary}
-                                isProtected={isGroupProtected(summary.key)}
-                                liveLimit={summary.key === 'gemini' ? getLiveLimitForModel(account, 'gemini-pro') : getLiveLimitForModel(account, 'claude')}
-                            />
-                        ))}
+                    <div className="flex flex-col gap-1.5 content-start">
+                        <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+                            {groupSummaries.filter(s => s.key !== 'argon').map((summary) => (
+                                <GroupQuotaCard
+                                    key={summary.key}
+                                    summary={summary}
+                                    isProtected={isGroupProtected(summary.key)}
+                                    liveLimit={summary.key === 'gemini' ? getLiveLimitForModel(account, 'gemini-pro') : getLiveLimitForModel(account, 'claude')}
+                                />
+                            ))}
+                        </div>
+                        {(() => {
+                            const argon = groupSummaries.find(s => s.key === 'argon');
+                            if (!argon) return null;
+                            return (
+                                <div className="w-full">
+                                    <GroupQuotaCard
+                                        summary={argon}
+                                        isProtected={isGroupProtected('argon')}
+                                        liveLimit={getLiveLimitForModel(account, 'gemini-4-argon')}
+                                        fullWidth
+                                    />
+                                </div>
+                            );
+                        })()}
                     </div>
                 )}
             </div>

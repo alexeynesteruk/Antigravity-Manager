@@ -1032,7 +1032,9 @@ impl AxumServer {
                 get(admin_list_user_tokens).post(admin_create_user_token),
             )
             .route("/user-tokens/summary", get(admin_get_user_token_summary))
+            .route("/user-tokens/ranking", get(admin_get_user_tokens_ranking))
             .route("/user-tokens/:id/renew", post(admin_renew_user_token))
+            .route("/user-tokens/:id/stats", get(admin_get_user_token_stats))
             .route(
                 "/user-tokens/:id",
                 delete(admin_delete_user_token).patch(admin_update_user_token),
@@ -2497,6 +2499,40 @@ async fn admin_update_user_token(
             )
         })?;
     Ok(StatusCode::OK)
+}
+
+#[derive(Deserialize)]
+struct TokenStatsQuery {
+    time_range: Option<String>,
+}
+
+async fn admin_get_user_token_stats(
+    Path(id): Path<String>,
+    Query(query): Query<TokenStatsQuery>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    let stats = crate::commands::user_token::get_user_token_stats(id, query.time_range)
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse { error: e }),
+            )
+        })?;
+    Ok(Json(stats))
+}
+
+async fn admin_get_user_tokens_ranking(
+    Query(query): Query<TokenStatsQuery>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    let list = crate::commands::user_token::get_user_tokens_ranking(query.time_range)
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse { error: e }),
+            )
+        })?;
+    Ok(Json(list))
 }
 
 async fn admin_should_check_updates() -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)>

@@ -204,7 +204,11 @@
     "health_available_rate": "Disponibilidad Saludable",
     "circuit_break": "Interrumpido",
     "health_all_green": "Todo Saludable",
-    "abnormal_badge": "{{count}} Anormales"
+    "abnormal_badge": "{{count}} Anormales",
+    "no_client_account": "No hay ninguna cuenta activa o vinculada para esta aplicación",
+    "go_switch_account": "Ir a cambiar de cuenta",
+    "switch_best_to_target": "Cambiar la mejor cuenta a {{target}}",
+    "switch_this_to_target": "Cambiar esta cuenta a {{target}}"
   },
   "accounts": {
     "account": "Cuenta",
@@ -486,7 +490,18 @@
       "refresh_interval": "Intervalo de Actualización (minutos)",
       "auto_sync": "Sincronización Automática de Cuenta Actual",
       "auto_sync_desc": "Sincronizar automáticamente la información de la cuenta activa periódicamente",
-      "sync_interval": "Intervalo de Sincronización (segundos)"
+      "sync_interval": "Intervalo de Sincronización (segundos)",
+      "auto_switch_classic": "Cambio Rápido Automático en Clásico",
+      "auto_switch_classic_badge": "Solo Clásico",
+      "auto_switch_classic_desc": "Cuando la inspección periódica detecta que la cuota de la cuenta actual en Antigravity Clásico cae por debajo del umbral, cambia automáticamente a la mejor cuenta disponible del grupo (Exclusivo para Classic Standalone; IDE y CLI no son compatibles debido a limitaciones de arquitectura del cliente).",
+      "auto_switch_threshold_label": "Umbral de Activación",
+      "auto_switch_threshold_hint": "Activar cambio cuando cualquier cuota monitoreada sea ≤ {{pct}}%",
+      "auto_switch_models_label": "Grupos de Cuotas Monitoreados",
+      "auto_switch_models_hint": "Seleccione al menos uno. El cambio se activará si cualquier grupo cae por debajo del umbral.",
+      "auto_switch_gemini": "Grupo Gemini",
+      "auto_switch_gemini_desc": "Incluye Pro / Flash / Generación de imágenes",
+      "auto_switch_third_party": "Modelos de Terceros",
+      "auto_switch_third_party_desc": "Incluye Claude 3.7 / 3.5 / GPT"
     },
     "warmup": {
       "title": "Calentamiento Inteligente",
@@ -1141,6 +1156,19 @@
       "log_retention_rows": "Maximum log rows",
       "agent_settings": {
         "title": "Configuración específica de Agent (Specific Agent Settings)"
+      },
+      "hub": {
+        "title": "Huella de Cliente Hub Oficial",
+        "tooltip": "Alinea el tráfico de salida con las firmas oficiales de Google Antigravity Hub para evitar límites 429.",
+        "source_custom": "Personalizado",
+        "source_remote": "Detectado Remoto",
+        "source_local": "App Local",
+        "source_baseline": "Base Estable",
+        "detect_button": "Detectar",
+        "detect_success": "Hub oficial detectado y sincronizado con éxito: v{{version}} (CL: {{cl}})",
+        "detect_failed": "Error al detectar: {{error}}",
+        "version_label": "Versión de Hub",
+        "cl_label": "Número de compilación Piper (CL)"
       }
     },
     "stream_timeouts": {
@@ -1375,7 +1403,19 @@
       "model_name": "Nombre del Modelo",
       "model_id": "ID del Modelo",
       "description": "Descripción",
-      "action": "Acción"
+      "status": "Estado / Conectividad",
+      "action": "Acción",
+      "test_connectivity": "Probar",
+      "batch_test": "Probar todo",
+      "stop_test": "Detener",
+      "auto_dispatch": "🤖 Asignación automática (Pool)",
+      "select_account": "Seleccionar cuenta",
+      "view_detail": "Ver detalles de solicitud y tiempos",
+      "retired": "Retirado",
+      "untested": "Sin probar",
+      "testing": "Probando...",
+      "success": "Correcto",
+      "rate_limited": "Límite excedido"
     },
     "cli_sync": {
       "title": "Configuración Rápida de Herramientas de Agent",
@@ -1402,10 +1442,14 @@
       },
       "toast": {
         "sync_success": "¡Sincronización exitosa! {{name}} está listo.",
-        "sync_error": "Error de sincronización: {{error}}"
+        "sync_error": "Error de sincronización: {{error}}",
+        "sync_success_with_model": "¡{{name}} sincronizado con éxito con el modelo: {{model}}!"
       },
       "sync_confirm_title": "Confirmación de Sincronización",
-      "sync_confirm_message": "Listo para sincronizar configuración de {{name}}. ⚠️ Advertencia: Esto sobrescribirá sus archivos de configuración locales existentes (ej. tokens de inicio de sesión, Claves API). ¿Está seguro de que desea continuar?"
+      "sync_confirm_message": "Listo para sincronizar configuración de {{name}}. ⚠️ Advertencia: Esto sobrescribirá sus archivos de configuración locales existentes (ej. tokens de inicio de sesión, Claves API). ¿Está seguro de que desea continuar?",
+      "apps": {
+        "gemini": "Antigravity CLI (agy)"
+      }
     },
     "agent_settings": {
       "banner_title": "Funciones exclusivas y gobernanza de optimización de Agent",
@@ -1679,14 +1723,11 @@
     "error_invalid_key": "Contraseña o clave API no válida, intente de nuevo",
     "error_network": "Error de conexión de red, verifique si el servicio se está ejecutando",
     "note": "Nota: Si se estableció una contraseña de administración separada, ingrésela; de lo contrario, ingrese la API_KEY.",
-    "lookup_hint": "View gui_config.json or check environment variables to find them.",
+    "lookup_hint": "Si olvidó, ejecute docker logs antigravity-manager para encontrar la Current API Key o Web UI Password",
     "config_hint": "O ejecute grep -E '\"api_key\"|\"admin_password\"' ~/.antigravity_tools/gui_config.json para ver."
   },
   "token_stats": {
     "title": "Estadísticas de Consumo de Tokens",
-    "minute": "Minuto",
-    "minute_1h": "1h (1m)",
-    "minute_24h": "24h (5m)",
     "hourly": "Hora",
     "daily": "Día",
     "weekly": "Semana",
@@ -1839,7 +1880,16 @@
     "mode_cockpit": "Panel General",
     "reasoning_short": "Raz",
     "cockpit_thinking_share": "Cuota de Razonamiento",
-    "cockpit_avg_thinking_per_req": "Razonamiento Medio / req"
+    "cockpit_avg_thinking_per_req": "Razonamiento Medio / req",
+    "cockpit_user_rank": "Ranking de Usuarios",
+    "cockpit_no_user_activity": "Sin actividad de consumo de Key de usuario",
+    "cockpit_view_detail": "Detalles",
+    "cockpit_tab_accounts": "Cuentas",
+    "cockpit_tab_models": "Modelos",
+    "cockpit_tab_users": "Usuarios",
+    "minute": "Minuto",
+    "minute_1h": "1h (1m)",
+    "minute_24h": "24h (5m)"
   },
   "errors": {
     "stream": {
@@ -1983,8 +2033,25 @@
     "hint_curfew": "Dejar vacío para desactivar. Basado en la hora del servidor.",
     "custom_expires_required": "Please select custom expiration time",
     "expires_custom": "Custom Time",
-    "custom_expires_at": "Custom Expiration At",
-    "hint_custom_expires": "Set precise expiration timestamp for this token"
+    "custom_expires_at": "Fecha de caducidad personalizada",
+    "hint_custom_expires": "Establecer marca de tiempo de caducidad precisa para este token",
+    "view_stats": "Estadísticas de uso",
+    "bound_ips": "IPs de clientes",
+    "recent_ips": "IPs activas de clientes y actividad reciente",
+    "no_ips": "No se encontraron registros de enlace de IP",
+    "enabled": "Activo",
+    "disabled": "Desactivado",
+    "range_24h": "24 horas",
+    "range_7d": "Últimos 7 días",
+    "range_30d": "Últimos 30 días",
+    "range_all": "Todo",
+    "success_rate": "Tasa de éxito",
+    "avg_per_request": "Tokens medios/solicitud",
+    "est_throughput": "Rendimiento estimado por solicitud",
+    "calls_unit": "llamadas",
+    "records_unit": "registros",
+    "no_trend_data": "Sin datos de tendencia en este período",
+    "no_model_data": "Sin datos de modelos disponibles"
   },
   "apiKeyFun": {
     "title": "APIKEY.FUN Hub",
