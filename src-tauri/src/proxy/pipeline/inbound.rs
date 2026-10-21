@@ -1552,6 +1552,117 @@ impl InboundThinkingPipeline {
             .and_then(Value::as_i64)
     }
 
+    /// [FIX #3713] 503/过载自愈：尝试降级请求载荷中的思维链预算（协议无关流水线能力）
+    ///
+    /// 适用场景：
+    /// 当 Gemini 上游返回 503 / 529 (The model is overloaded) 时，
+    /// 通常是因为思考预算处于无上限自适应 (-1) 或超高算力档位 (> 4000)，被上游调度至高算力集群产生并发排队与熔断。
+    ///
+    /// 执行策略：
+    /// 1. 若当前 thinkingBudget 为 -1 (无上限) 或 > 4000，降级为稳妥的 4000 (Medium 档位)；
+    /// 2. 若当前 thinkingLevel 为 "HIGH"，降级为 "MEDIUM"；
+    /// 3. 若仅开启 includeThoughts: true 而无具体预算，注入 4000 避免无上限超载；
+    /// 4. 若模型名显式带有 -high 后缀，替换为 -medium。
+    ///
+    /// 返回值：
+    /// - `true`: 成功执行降级操作（可以在当前账号原地重试以保留 Prefix Cache）；
+    /// - `false`: 请求本身无需降级或已处于低档位/无思考，无需原地重试。
+    pub fn try_degrade_thinking_budget(body: &mut Value) -> bool {
+        let mut degraded = false;
+
+        let degrade_tc = |tc: &mut Value| -> bool {
+            let mut changed = false;
+            if let Some(obj) = tc.as_object_mut() {
+                // 1. thinkingBudget 降级：-1 (无上限自适应) 或 > 4000 降级为稳妥的 4000
+                if let Some(budget_val) = obj.get("thinkingBudget") {
+                    if let Some(budget) = budget_val.as_i64() {
+                        if budget == -1 || budget > 4000 {
+                            obj.insert("thinkingBudget".to_string(), json!(4000));
+                            changed = true;
+                        }
+                    }
+                } else if obj.get("thinkingLevel").is_none()
+                    && obj.get("includeThoughts").and_then(|v| v.as_bool()) == Some(true)
+                {
+                    // 仅有 includeThoughts: true，无具体预算约束：注入 4000 避免无上限超载
+                    obj.insert("thinkingBudget".to_string(), json!(4000));
+                    changed = true;
+                }
+
+                // 2. thinkingLevel 降级：HIGH 降级为 MEDIUM
+                if let Some(level_val) = obj.get("thinkingLevel") {
+                    if let Some(level) = level_val.as_str() {
+                        if level.eq_ignore_ascii_case("HIGH") {
+                            obj.insert("thinkingLevel".to_string(), json!("MEDIUM"));
+                            changed = true;
+                        }
+                    }
+                }
+            }
+            changed
+        };
+
+        let check_gc = |gc: &mut Value| -> bool {
+            let mut gc_degraded = false;
+            if let Some(tc) = gc.get_mut("thinkingConfig") {
+                if degrade_tc(tc) {
+                    gc_degraded = true;
+                }
+            }
+            if let Some(tc) = gc.get_mut("thinking_config") {
+                if degrade_tc(tc) {
+                    gc_degraded = true;
+                }
+            }
+            gc_degraded
+        };
+
+        if let Some(gc) = body.get_mut("generationConfig") {
+            if check_gc(gc) {
+                degraded = true;
+            }
+        }
+        if let Some(gc) = body.get_mut("generation_config") {
+            if check_gc(gc) {
+                degraded = true;
+            }
+        }
+
+        if let Some(req) = body.get_mut("request") {
+            if let Some(gc) = req.get_mut("generationConfig") {
+                if check_gc(gc) {
+                    degraded = true;
+                }
+            }
+            if let Some(gc) = req.get_mut("generation_config") {
+                if check_gc(gc) {
+                    degraded = true;
+                }
+            }
+        }
+
+        // 检查模型名是否带 -high 后缀，替换为 -medium
+        let mut degrade_model_str = |m_val: &mut Value| {
+            if let Some(m_str) = m_val.as_str() {
+                if m_str.ends_with("-high") || m_str.contains("-high") {
+                    *m_val = json!(m_str.replace("-high", "-medium"));
+                    degraded = true;
+                }
+            }
+        };
+
+        if let Some(m) = body.get_mut("model") {
+            degrade_model_str(m);
+        }
+        if let Some(req) = body.get_mut("request") {
+            if let Some(m) = req.get_mut("model") {
+                degrade_model_str(m);
+            }
+        }
+
+        degraded
+    }
+
     /// 统一规范化与对齐四大协议转译后的 Google Request 内部拓扑（Pipeline First 核心归一节点）
     /// 确保 OpenAI Chat, OpenAI Responses, Claude 与 Gemini 在上游呈现 100% 严格对齐官方 Antigravity 的结构：
     /// 1. contents: 上下文历史置于首位
@@ -1864,6 +1975,28 @@ impl InboundThinkingPipeline {
             }
         }
 
+        // [Pipeline First] Claude 协议与强制工具调用 (tool_choice / toolConfig) 冲突保护 (Fixes #3721):
+        // Anthropic 官方规范约束："Thinking may not be enabled when tool_choice forces tool use."
+        // 当客户端显式指定了强制工具调用（mode == "ANY" 或指定特定函数）且目标为 Claude 系列模型时，
+        // 客户端核心意图为本轮必须执行工具（如结构化输出/调用指定函数）。
+        // 自动从 generationConfig 中剔除 thinkingConfig，杜绝上游 Anthropic 抛出不可重试的 400 INVALID_ARGUMENT 导致客户端会话崩溃。
+        let is_forced_tool_choice = canonical_tool_config.as_ref().map_or(false, |tc| {
+            tc.get("functionCallingConfig")
+                .and_then(|fcc| fcc.get("mode"))
+                .and_then(Value::as_str)
+                .map_or(false, |m| m.eq_ignore_ascii_case("any"))
+        });
+
+        let target_is_claude = is_claude || target_model.to_lowercase().contains("claude");
+        if target_is_claude && is_forced_tool_choice {
+            if gc_obj.remove("thinkingConfig").is_some() {
+                tracing::warn!(
+                    "[Pipeline-Defense] Target is Claude model [{}] with forced tool_choice (mode: ANY). Stripped thinkingConfig to prevent upstream 400 conflict.",
+                    target_model
+                );
+            }
+        }
+
         // 官方标准：从官方模型结构体中动态读取 maxOutputTokens
         // 用户规则明确指出："思考预算你不用动" (保持既有 thinkingConfig 预算)
         if let Some(official_max_output) = official_model.max_output_tokens {
@@ -2166,6 +2299,111 @@ impl InboundThinkingPipeline {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_try_degrade_thinking_budget() {
+        // Case 1: thinkingBudget == -1 in request envelope -> 降级为 4000
+        let mut body1 = json!({
+            "model": "gemini-3.8-flash",
+            "request": {
+                "generationConfig": {
+                    "thinkingConfig": {
+                        "includeThoughts": true,
+                        "thinkingBudget": -1
+                    }
+                }
+            }
+        });
+        assert!(InboundThinkingPipeline::try_degrade_thinking_budget(
+            &mut body1
+        ));
+        assert_eq!(
+            body1["request"]["generationConfig"]["thinkingConfig"]["thinkingBudget"],
+            4000
+        );
+
+        // Case 2: thinkingBudget > 4000 (例如 10000) -> 降级为 4000
+        let mut body2 = json!({
+            "generationConfig": {
+                "thinkingConfig": {
+                    "includeThoughts": true,
+                    "thinkingBudget": 10000
+                }
+            }
+        });
+        assert!(InboundThinkingPipeline::try_degrade_thinking_budget(
+            &mut body2
+        ));
+        assert_eq!(
+            body2["generationConfig"]["thinkingConfig"]["thinkingBudget"],
+            4000
+        );
+
+        // Case 3: thinkingBudget <= 4000 (例如 2048) -> 不变，返回 false
+        let mut body3 = json!({
+            "generationConfig": {
+                "thinkingConfig": {
+                    "includeThoughts": true,
+                    "thinkingBudget": 2048
+                }
+            }
+        });
+        assert!(!InboundThinkingPipeline::try_degrade_thinking_budget(
+            &mut body3
+        ));
+        assert_eq!(
+            body3["generationConfig"]["thinkingConfig"]["thinkingBudget"],
+            2048
+        );
+
+        // Case 4: 仅 includeThoughts: true，无具体预算约束 -> 注入 4000
+        let mut body4 = json!({
+            "generationConfig": {
+                "thinkingConfig": {
+                    "includeThoughts": true
+                }
+            }
+        });
+        assert!(InboundThinkingPipeline::try_degrade_thinking_budget(
+            &mut body4
+        ));
+        assert_eq!(
+            body4["generationConfig"]["thinkingConfig"]["thinkingBudget"],
+            4000
+        );
+
+        // Case 5: thinkingLevel == "HIGH" -> 降级为 "MEDIUM"
+        let mut body5 = json!({
+            "generationConfig": {
+                "thinkingConfig": {
+                    "includeThoughts": true,
+                    "thinkingLevel": "HIGH"
+                }
+            }
+        });
+        assert!(InboundThinkingPipeline::try_degrade_thinking_budget(
+            &mut body5
+        ));
+        assert_eq!(
+            body5["generationConfig"]["thinkingConfig"]["thinkingLevel"],
+            "MEDIUM"
+        );
+
+        // Case 6: 模型名含 -high -> 降级为 -medium
+        let mut body6 = json!({
+            "model": "gemini-3.8-flash-high",
+            "generationConfig": {
+                "thinkingConfig": {
+                    "includeThoughts": true,
+                    "thinkingBudget": 4000
+                }
+            }
+        });
+        assert!(InboundThinkingPipeline::try_degrade_thinking_budget(
+            &mut body6
+        ));
+        assert_eq!(body6["model"], "gemini-3.8-flash-medium");
+    }
 
     #[test]
     fn test_preserves_process_commentary_alongside_tool_call() {
@@ -4124,5 +4362,143 @@ mod tests {
         let inner = body.get("request").unwrap();
         assert!(inner.get("safetySettings").is_none());
         assert!(inner.get("contents").is_some());
+    }
+
+    #[test]
+    fn test_claude_forced_tool_choice_strips_thinking_config_issue_3721() {
+        // [FIX #3721] 当目标模型为 Claude 家族且客户端指定 forced tool_choice (mode: ANY) 时，
+        // 门禁必须自动剔除 thinkingConfig，防止触发 Anthropic 400 报错：
+        // "Thinking may not be enabled when tool_choice forces tool use."
+        let mut inner_req = json!({
+            "contents": [
+                {
+                    "role": "user",
+                    "parts": [{"text": "call required function"}]
+                }
+            ],
+            "tools": [
+                {
+                    "functionDeclarations": [
+                        { "name": "lookup_user", "description": "Lookup user details" }
+                    ]
+                }
+            ],
+            "toolConfig": {
+                "functionCallingConfig": {
+                    "mode": "ANY",
+                    "allowedFunctionNames": ["lookup_user"]
+                }
+            },
+            "generationConfig": {
+                "thinkingConfig": {
+                    "includeThoughts": true,
+                    "thinkingBudget": 4096
+                }
+            }
+        });
+
+        InboundThinkingPipeline::align_google_request_prefix_topology_with_model(
+            &mut inner_req,
+            "claude-sonnet-4-6",
+            None,
+        );
+
+        assert!(
+            inner_req.get("toolConfig").is_some(),
+            "toolConfig 必须保留 mode: ANY 供上游强制调用"
+        );
+        let gc = inner_req.get("generationConfig").expect("generationConfig");
+        assert!(
+            gc.get("thinkingConfig").is_none(),
+            "Claude 目标模型与强制工具调用并存时，thinkingConfig 必须被剔除以避免 400 冲突 (Fixes #3721)"
+        );
+    }
+
+    #[test]
+    fn test_gemini_forced_tool_choice_preserves_thinking_config_issue_3721() {
+        // 针对 Gemini 原生模型，Google 支持在 mode: ANY 下使用思考模型，必须完整保留 thinkingConfig
+        let mut inner_req = json!({
+            "contents": [
+                {
+                    "role": "user",
+                    "parts": [{"text": "call required function"}]
+                }
+            ],
+            "tools": [
+                {
+                    "functionDeclarations": [
+                        { "name": "lookup_user", "description": "Lookup user details" }
+                    ]
+                }
+            ],
+            "toolConfig": {
+                "functionCallingConfig": {
+                    "mode": "ANY"
+                }
+            },
+            "generationConfig": {
+                "thinkingConfig": {
+                    "includeThoughts": true,
+                    "thinkingBudget": 4000
+                }
+            }
+        });
+
+        InboundThinkingPipeline::align_google_request_prefix_topology_with_model(
+            &mut inner_req,
+            "gemini-3.8-flash-high",
+            None,
+        );
+
+        assert!(inner_req.get("toolConfig").is_some());
+        let gc = inner_req.get("generationConfig").expect("generationConfig");
+        assert!(
+            gc.get("thinkingConfig").is_some(),
+            "Gemini 原生模型支持 mode: ANY 与思考共存，thinkingConfig 必须保留"
+        );
+    }
+
+    #[test]
+    fn test_claude_auto_tool_choice_preserves_thinking_config_issue_3721() {
+        // 针对 Claude 模型，如果 toolConfig 为 AUTO（非强制工具调用），thinkingConfig 必须正常保留
+        let mut inner_req = json!({
+            "contents": [
+                {
+                    "role": "user",
+                    "parts": [{"text": "solve problem with optional tools"}]
+                }
+            ],
+            "tools": [
+                {
+                    "functionDeclarations": [
+                        { "name": "search", "description": "Search web" }
+                    ]
+                }
+            ],
+            "toolConfig": {
+                "functionCallingConfig": {
+                    "mode": "AUTO"
+                }
+            },
+            "generationConfig": {
+                "thinkingConfig": {
+                    "includeThoughts": true,
+                    "thinkingBudget": 4096
+                }
+            }
+        });
+
+        InboundThinkingPipeline::align_google_request_prefix_topology_with_model(
+            &mut inner_req,
+            "claude-sonnet-4-6",
+            None,
+        );
+
+        assert!(inner_req.get("toolConfig").is_some());
+        let gc = inner_req.get("generationConfig").expect("generationConfig");
+        assert!(
+            gc.get("thinkingConfig").is_some(),
+            "Claude 目标模型当 toolConfig 为 AUTO 时，thinkingConfig 必须正常保留"
+        );
     }
 }

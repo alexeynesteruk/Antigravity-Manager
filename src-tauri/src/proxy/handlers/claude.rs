@@ -1696,6 +1696,8 @@ pub async fn handle_messages(
 
     let mut last_error = String::new();
     let mut retried_without_thinking = false;
+    let mut retried_with_budget_degraded = false;
+    let mut degraded_gemini_body: Option<serde_json::Value> = None;
     let mut last_email: Option<String> = None;
     let mut last_mapped_model: Option<String> = None;
     let mut last_status = StatusCode::SERVICE_UNAVAILABLE; // Default to 503 if no response reached
@@ -1857,44 +1859,57 @@ pub async fn handle_messages(
         // let _trace_id = format!("req_{}", chrono::Utc::now().timestamp_subsec_millis());
 
         let token_obj = token_manager.get_token_by_id(&account_id);
-        let (mut gemini_body, transform_timing) =
-            match crate::proxy::mappers::claude::transform_claude_request_in_timed(
-                &request_with_mapped,
-                &project_id,
-                retried_without_thinking,
-                Some(account_id.as_str()),
-                &store_key,
-                &affinity_key,
-                token_obj.as_ref(),
-            ) {
-                Ok((b, timing)) => {
-                    debug!(
-                        "[{}] Transformed Gemini Body: {}",
-                        trace_id,
-                        serde_json::to_string_pretty(&b).unwrap_or_default()
-                    );
-                    (b, timing)
-                }
-                Err(e) => {
-                    let headers = [
-                        ("X-Mapped-Model", request_with_mapped.model.as_str()),
-                        ("X-Upstream-Model", config.final_model.as_str()),
-                        ("X-Account-Email", email.as_str()),
-                    ];
-                    return (
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        headers,
-                        Json(json!({
-                            "type": "error",
-                            "error": {
-                                "type": "api_error",
-                                "message": format!("Transform error: {}", e)
-                            }
-                        })),
-                    )
-                        .into_response();
-                }
-            };
+        let (mut gemini_body, transform_timing) = if let Some(body) = degraded_gemini_body.take() {
+            (
+                body,
+                crate::proxy::mappers::claude::request::TransformTiming::default(),
+            )
+        } else {
+            let (mut b, timing) =
+                match crate::proxy::mappers::claude::transform_claude_request_in_timed(
+                    &request_with_mapped,
+                    &project_id,
+                    retried_without_thinking,
+                    Some(account_id.as_str()),
+                    &store_key,
+                    &affinity_key,
+                    token_obj.as_ref(),
+                ) {
+                    Ok((b, timing)) => {
+                        debug!(
+                            "[{}] Transformed Gemini Body: {}",
+                            trace_id,
+                            serde_json::to_string_pretty(&b).unwrap_or_default()
+                        );
+                        (b, timing)
+                    }
+                    Err(e) => {
+                        let headers = [
+                            ("X-Mapped-Model", request_with_mapped.model.as_str()),
+                            ("X-Upstream-Model", config.final_model.as_str()),
+                            ("X-Account-Email", email.as_str()),
+                        ];
+                        return (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            headers,
+                            Json(json!({
+                                "type": "error",
+                                "error": {
+                                    "type": "api_error",
+                                    "message": format!("Transform error: {}", e)
+                                }
+                            })),
+                        )
+                            .into_response();
+                    }
+                };
+            if retried_with_budget_degraded {
+                crate::proxy::pipeline::InboundThinkingPipeline::try_degrade_thinking_budget(
+                    &mut b,
+                );
+            }
+            (b, timing)
+        };
 
         let _ =
             crate::proxy::mappers::context_manager::ContextManager::apply_post_transit_context_mgmt(
@@ -2630,6 +2645,61 @@ pub async fn handle_messages(
                 "[{}] Unbound session {} from account {} due to status {}",
                 trace_id, affinity_key, email, status_code
             );
+        }
+
+        // [FIX #3713] 503 / 529 服务端过载：思考预算原地降级自愈 (Pipeline First)
+        // 当模型遭遇过载 (503/529 / overloaded)，若当前请求带有 -1 或超大思考预算，优先在当前账号上降级预算原地重试一次，
+        // 杜绝盲目全池轮换导致跨账号缓存丢失 (Prefix Cache Protection)。
+        if crate::proxy::pipeline::UpstreamClassification::is_server_overloaded(
+            status_code,
+            &error_text,
+        ) && !retried_with_budget_degraded
+            && crate::proxy::pipeline::InboundThinkingPipeline::try_degrade_thinking_budget(
+                &mut gemini_body,
+            )
+        {
+            retried_with_budget_degraded = true;
+            degraded_gemini_body = Some(gemini_body);
+            force_rotate = false;
+            tracing::warn!(
+                "[{}] Upstream {}/overloaded detected. In-place self-healing: degraded thinking budget to 4000 on account {} (preserving prefix cache)",
+                trace_id, status_code, email
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+            continue;
+        }
+
+        // [FIX #3721] 400 强制工具调用与思考冲突：自愈剔除 thinkingConfig 原地重试 (Pipeline First)
+        if crate::proxy::pipeline::UpstreamClassification::is_thinking_tool_choice_conflict(
+            status_code,
+            &error_text,
+        ) && !retried_without_thinking
+        {
+            retried_without_thinking = true;
+            if let Some(req) = gemini_body
+                .get_mut("request")
+                .and_then(Value::as_object_mut)
+            {
+                if let Some(gc) = req
+                    .get_mut("generationConfig")
+                    .and_then(Value::as_object_mut)
+                {
+                    gc.remove("thinkingConfig");
+                }
+            } else if let Some(gc) = gemini_body
+                .get_mut("generationConfig")
+                .and_then(Value::as_object_mut)
+            {
+                gc.remove("thinkingConfig");
+            }
+            degraded_gemini_body = Some(gemini_body);
+            force_rotate = false;
+            tracing::warn!(
+                "[{}] Upstream 400 tool_choice/thinking conflict detected. In-place self-healing: stripped thinkingConfig on account {}, retrying.",
+                trace_id, email
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            continue;
         }
 
         // 4. 处理 400 错误 (Thinking 签名失效 或 块顺序错误)

@@ -321,6 +321,27 @@ export ANTHROPIC_BASE_URL="http://127.0.0.1:8045"
 claude
 ```
 
+### 终端原生切号工具 (`at` / `antigravity-tools`) 使用说明
+Antigravity 内置原生轻量级 CLI 切号套件，专为终端开发者打造，支持秒级轮换系统 Keychain 账号，并可在切换后自动接续 `agy` 交互式会话：
+
+```bash
+# 1. 查看所有账号列表、当前激活指示符 (👉) 与状态
+at list
+
+# 2. 查看当前在 agy CLI (Keychain)、IDE 分别生效的账号邮箱
+at current
+
+# 3. 切换账号 (支持序号、邮箱完整或前缀、账号别名)
+at switch 2                      # 切到序号 #2 的账号
+at switch work@gmail.com         # 按邮箱切号
+at switch work                   # 按邮箱前缀模糊切号
+at switch "工作号"               # 按账号别名切号
+at switch                        # 无参自动环形轮换 (Round-Robin) 至下一可用账号
+
+# 4. 切号并自动接续 agy 会话 (恢复上一次问答上下文)
+at switch 2 -c                   # -c 等价于 --continue
+```
+
 ### 如何接入 OpenCode?
 1.  进入 **API 反代**页面 → **外部 Providers** → 点击 **OpenCode Sync** 卡片。
 2.  点击 **Sync** 按钮，将自动生成 `~/.config/opencode/opencode.json` 配置文件：

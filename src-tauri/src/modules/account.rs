@@ -119,6 +119,78 @@ mod tests {
     }
 
     #[test]
+    fn test_resolve_account_summary_by_index_email_name_and_round_robin() {
+        let accounts = vec![
+            crate::models::AccountSummary {
+                id: "id-alpha-111".to_string(),
+                email: "alpha@test.com".to_string(),
+                name: Some("工作号".to_string()),
+                disabled: false,
+                proxy_disabled: false,
+                protected_models: HashSet::new(),
+                created_at: 1,
+                last_used: 1,
+            },
+            crate::models::AccountSummary {
+                id: "id-beta-222".to_string(),
+                email: "beta@test.com".to_string(),
+                name: Some("个人号".to_string()),
+                disabled: false,
+                proxy_disabled: false,
+                protected_models: HashSet::new(),
+                created_at: 2,
+                last_used: 2,
+            },
+            crate::models::AccountSummary {
+                id: "id-gamma-333".to_string(),
+                email: "gamma@test.com".to_string(),
+                name: None,
+                disabled: true, // 已禁用
+                proxy_disabled: false,
+                protected_models: HashSet::new(),
+                created_at: 3,
+                last_used: 3,
+            },
+        ];
+
+        let index = crate::models::AccountIndex {
+            version: "1.0".to_string(),
+            accounts,
+            current_account_id: Some("id-alpha-111".to_string()),
+            current_target_ide: Some("agy".to_string()),
+            current_classic_account_id: None,
+            current_ide_account_id: None,
+            current_agy_account_id: Some("id-alpha-111".to_string()),
+        };
+
+        // 1. 纯数字序号 1-based
+        let acc1 = resolve_account_summary_in_index(&index, Some("2"), None).unwrap();
+        assert_eq!(acc1.id, "id-beta-222");
+
+        // 2. 精确匹配 Email
+        let acc2 = resolve_account_summary_in_index(&index, Some("alpha@test.com"), None).unwrap();
+        assert_eq!(acc2.id, "id-alpha-111");
+
+        // 3. 别名 Name 匹配
+        let acc3 = resolve_account_summary_in_index(&index, Some("工作号"), None).unwrap();
+        assert_eq!(acc3.id, "id-alpha-111");
+
+        // 4. 模糊包含匹配
+        let acc4 = resolve_account_summary_in_index(&index, Some("beta"), None).unwrap();
+        assert_eq!(acc4.id, "id-beta-222");
+
+        // 5. 无参顺延轮替：当前是 alpha，顺延挑出 beta（跳过禁用的 gamma）
+        let acc5 = resolve_account_summary_in_index(&index, None, Some("agy")).unwrap();
+        assert_eq!(acc5.id, "id-beta-222");
+
+        // 6. 当前若是 beta，顺延跨过 gamma 回到 alpha
+        let mut index_at_beta = index.clone();
+        index_at_beta.current_agy_account_id = Some("id-beta-222".to_string());
+        let acc6 = resolve_account_summary_in_index(&index_at_beta, None, Some("agy")).unwrap();
+        assert_eq!(acc6.id, "id-alpha-111");
+    }
+
+    #[test]
     fn test_migrate_data_dir_rename_and_copy() {
         let _guard = SHARED_TEST_ENV_LOCK
             .lock()
@@ -2394,6 +2466,121 @@ pub fn detect_active_clients_status() -> Result<crate::models::ActiveClientsStat
     }
 
     Ok(status)
+}
+
+/// 智能解析目标账号：支持 UUID、邮箱（完整或前缀）、账号名称、1-based 序号，或 None 时顺延下一个未禁用账号
+pub fn resolve_account_summary(
+    query: Option<&str>,
+    target_ide: Option<&str>,
+) -> Result<crate::models::AccountSummary, String> {
+    let index = load_account_index()?;
+    resolve_account_summary_in_index(&index, query, target_ide)
+}
+
+/// 基于传入的 AccountIndex 内部解析目标账号（纯函数，便于单元测试）
+pub fn resolve_account_summary_in_index(
+    index: &crate::models::AccountIndex,
+    query: Option<&str>,
+    target_ide: Option<&str>,
+) -> Result<crate::models::AccountSummary, String> {
+    if index.accounts.is_empty() {
+        return Err("当前无可用账号".to_string());
+    }
+
+    let trimmed = query.map(str::trim).filter(|s| !s.is_empty());
+
+    if let Some(q) = trimmed {
+        // 1. 如果是纯数字，按 1-based 序号查找
+        if let Ok(idx) = q.parse::<usize>() {
+            if idx >= 1 && idx <= index.accounts.len() {
+                return Ok(index.accounts[idx - 1].clone());
+            }
+        }
+
+        // 2. 精确匹配 ID
+        if let Some(acc) = index.accounts.iter().find(|a| a.id == q) {
+            return Ok(acc.clone());
+        }
+
+        // 3. 精确匹配 Email（忽略大小写）
+        if let Some(acc) = index
+            .accounts
+            .iter()
+            .find(|a| a.email.eq_ignore_ascii_case(q))
+        {
+            return Ok(acc.clone());
+        }
+
+        // 4. 精确匹配 Name（别名）
+        if let Some(acc) = index.accounts.iter().find(|a| a.name.as_deref() == Some(q)) {
+            return Ok(acc.clone());
+        }
+
+        // 5. 模糊包含匹配 Email
+        let q_lower = q.to_lowercase();
+        if let Some(acc) = index
+            .accounts
+            .iter()
+            .find(|a| a.email.to_lowercase().contains(&q_lower))
+        {
+            return Ok(acc.clone());
+        }
+
+        // 6. 模糊包含匹配 Name
+        if let Some(acc) = index.accounts.iter().find(|a| {
+            a.name
+                .as_deref()
+                .map(|n| n.to_lowercase().contains(&q_lower))
+                .unwrap_or(false)
+        }) {
+            return Ok(acc.clone());
+        }
+
+        return Err(format!("未找到匹配的账号: '{}'", q));
+    }
+
+    // 无参时：环形顺延轮换（Round-Robin）
+    let current_id = match target_ide {
+        Some("agy") => index
+            .current_agy_account_id
+            .as_deref()
+            .or(index.current_account_id.as_deref()),
+        Some("ide") => index
+            .current_ide_account_id
+            .as_deref()
+            .or(index.current_account_id.as_deref()),
+        Some("classic") => index
+            .current_classic_account_id
+            .as_deref()
+            .or(index.current_account_id.as_deref()),
+        _ => index.current_account_id.as_deref(),
+    };
+
+    let total = index.accounts.len();
+    let current_idx = current_id
+        .and_then(|id| index.accounts.iter().position(|a| a.id == id))
+        .unwrap_or(0);
+
+    // 优先从下一个开始寻找未被禁用的账号
+    for offset in 1..=total {
+        let idx = (current_idx + offset) % total;
+        let candidate = &index.accounts[idx];
+        if !candidate.disabled && !candidate.proxy_disabled {
+            return Ok(candidate.clone());
+        }
+    }
+
+    // 保底：寻找任意未禁用的账号
+    for offset in 1..=total {
+        let idx = (current_idx + offset) % total;
+        let candidate = &index.accounts[idx];
+        if !candidate.disabled {
+            return Ok(candidate.clone());
+        }
+    }
+
+    // 若都不可用，返回第一个
+    Ok(index.accounts[0].clone())
 }
 
 /// Update account quota

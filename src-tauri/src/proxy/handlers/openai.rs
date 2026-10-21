@@ -2132,6 +2132,8 @@ pub async fn handle_chat_completions(
     let mut failure_statuses = FailureStatusTracker::default();
     let mut used_attempts = 0;
     let mut retried_without_thinking = false;
+    let mut retried_with_budget_degraded = false;
+    let mut degraded_gemini_body: Option<Value> = None;
 
     // 2. 模型路由解析 (移到循环外以支持在所有路径返回 X-Mapped-Model)
     let mapped_model = crate::proxy::common::model_mapping::resolve_model_route_with_effort(
@@ -2267,15 +2269,25 @@ pub async fn handle_chat_completions(
         // 4. 转换请求 (返回内容包含 session_id, message_count, prefix_hash)
         let tf_start = std::time::Instant::now();
         let (mut gemini_body, _routed_session, message_count, _prefix_hash) =
-            transform_openai_request_with_session(
-                &openai_req,
-                &project_id,
-                &mapped_model,
-                proxy_token.as_ref(),
-                &affinity_key,
-                None,
-                false,
-            );
+            if let Some(body) = degraded_gemini_body.take() {
+                (body, String::new(), 0, String::new())
+            } else {
+                let (mut b, s, c, p) = transform_openai_request_with_session(
+                    &openai_req,
+                    &project_id,
+                    &mapped_model,
+                    proxy_token.as_ref(),
+                    &affinity_key,
+                    None,
+                    false,
+                );
+                if retried_with_budget_degraded {
+                    crate::proxy::pipeline::InboundThinkingPipeline::try_degrade_thinking_budget(
+                        &mut b,
+                    );
+                }
+                (b, s, c, p)
+            };
         let session_id = store_key.clone();
         let tf_micros = tf_start.elapsed().as_micros() as u64;
         let norm_total_micros = norm_start.elapsed().as_micros() as u64;
@@ -2959,6 +2971,61 @@ pub async fn handle_chat_completions(
             &error_text,
             retry_after.as_deref(),
         );
+
+        // [FIX #3713] 503 / 529 服务端过载：思考预算原地降级自愈 (Pipeline First)
+        // 当模型遭遇过载 (503/529 / overloaded)，若当前请求带有 -1 或超大思考预算，优先在当前账号上降级预算原地重试一次，
+        // 杜绝盲目全池轮换导致跨账号缓存丢失 (Prefix Cache Protection)。
+        if crate::proxy::pipeline::UpstreamClassification::is_server_overloaded(
+            status_code,
+            &error_text,
+        ) && !retried_with_budget_degraded
+            && crate::proxy::pipeline::InboundThinkingPipeline::try_degrade_thinking_budget(
+                &mut gemini_body,
+            )
+        {
+            retried_with_budget_degraded = true;
+            degraded_gemini_body = Some(gemini_body);
+            force_rotate = false;
+            tracing::warn!(
+                "[{}] Upstream {}/overloaded detected. In-place self-healing: degraded thinking budget to 4000 on account {} (preserving prefix cache)",
+                trace_id, status_code, email
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+            continue;
+        }
+
+        // [FIX #3721] 400 强制工具调用与思考冲突：自愈剔除 thinkingConfig 原地重试 (Pipeline First)
+        if crate::proxy::pipeline::UpstreamClassification::is_thinking_tool_choice_conflict(
+            status_code,
+            &error_text,
+        ) && !retried_without_thinking
+        {
+            retried_without_thinking = true;
+            if let Some(req) = gemini_body
+                .get_mut("request")
+                .and_then(Value::as_object_mut)
+            {
+                if let Some(gc) = req
+                    .get_mut("generationConfig")
+                    .and_then(Value::as_object_mut)
+                {
+                    gc.remove("thinkingConfig");
+                }
+            } else if let Some(gc) = gemini_body
+                .get_mut("generationConfig")
+                .and_then(Value::as_object_mut)
+            {
+                gc.remove("thinkingConfig");
+            }
+            degraded_gemini_body = Some(gemini_body);
+            force_rotate = false;
+            tracing::warn!(
+                "[{}] Upstream 400 tool_choice/thinking conflict detected. In-place self-healing: stripped thinkingConfig on account {}, retrying.",
+                trace_id, email
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            continue;
+        }
 
         if classification.is_model_not_found() {
             // [NEW] 针对特定账号记录单模型临时熔断（例如该 PRO 账号未开通 Claude 5.5），绝不连坐其他模型
@@ -4031,6 +4098,8 @@ pub async fn handle_completions(
     }
 
     let mut force_rotate = false;
+    let mut retried_with_budget_degraded = false;
+    let mut degraded_gemini_body: Option<Value> = None;
 
     while let Some(attempt) = next_rotation_attempt(
         &mut used_attempts,
@@ -4113,27 +4182,38 @@ pub async fn handle_completions(
 
         let proxy_token = token_manager.get_token_by_id(&account_id);
         let tf_start = std::time::Instant::now();
-        let (mut gemini_body, _routed_session, message_count, _prefix_hash) = if is_responses_api {
-            transform_openai_request_with_session(
-                &openai_req,
-                &project_id,
-                &mapped_model,
-                proxy_token.as_ref(),
-                &affinity_key,
-                signature_read_key.as_deref(),
-                true, // is_responses_api
-            )
-        } else {
-            transform_openai_request_with_session(
-                &openai_req,
-                &project_id,
-                &mapped_model,
-                proxy_token.as_ref(),
-                &affinity_key,
-                None,
-                false,
-            )
-        };
+        let (mut gemini_body, _routed_session, message_count, _prefix_hash) =
+            if let Some(body) = degraded_gemini_body.take() {
+                (body, String::new(), 0, String::new())
+            } else {
+                let (mut b, r, m, p) = if is_responses_api {
+                    transform_openai_request_with_session(
+                        &openai_req,
+                        &project_id,
+                        &mapped_model,
+                        proxy_token.as_ref(),
+                        &affinity_key,
+                        signature_read_key.as_deref(),
+                        true, // is_responses_api
+                    )
+                } else {
+                    transform_openai_request_with_session(
+                        &openai_req,
+                        &project_id,
+                        &mapped_model,
+                        proxy_token.as_ref(),
+                        &affinity_key,
+                        None,
+                        false,
+                    )
+                };
+                if retried_with_budget_degraded {
+                    crate::proxy::pipeline::InboundThinkingPipeline::try_degrade_thinking_budget(
+                        &mut b,
+                    );
+                }
+                (b, r, m, p)
+            };
         let session_id = session_id_str.clone();
         let tf_micros = tf_start.elapsed().as_micros() as u64;
         let norm_total_micros = norm_start.elapsed().as_micros() as u64;
@@ -4990,6 +5070,61 @@ pub async fn handle_completions(
             retry_after.as_deref(),
         );
 
+        // [FIX #3713] 503 / 529 服务端过载：思考预算原地降级自愈 (Pipeline First)
+        // 当模型遭遇过载 (503/529 / overloaded)，若当前请求带有 -1 或超大思考预算，优先在当前账号上降级预算原地重试一次，
+        // 杜绝盲目全池轮换导致跨账号缓存丢失 (Prefix Cache Protection)。
+        if crate::proxy::pipeline::UpstreamClassification::is_server_overloaded(
+            status_code,
+            &error_text,
+        ) && !retried_with_budget_degraded
+            && crate::proxy::pipeline::InboundThinkingPipeline::try_degrade_thinking_budget(
+                &mut gemini_body,
+            )
+        {
+            retried_with_budget_degraded = true;
+            degraded_gemini_body = Some(gemini_body);
+            force_rotate = false;
+            tracing::warn!(
+                "[{}] Upstream {}/overloaded detected. In-place self-healing: degraded thinking budget to 4000 on account {} (preserving prefix cache)",
+                trace_id, status_code, email
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+            continue;
+        }
+
+        // [FIX #3721] 400 强制工具调用与思考冲突：自愈剔除 thinkingConfig 原地重试 (Pipeline First)
+        if crate::proxy::pipeline::UpstreamClassification::is_thinking_tool_choice_conflict(
+            status_code,
+            &error_text,
+        ) && !retried_with_budget_degraded
+        {
+            retried_with_budget_degraded = true;
+            if let Some(req) = gemini_body
+                .get_mut("request")
+                .and_then(Value::as_object_mut)
+            {
+                if let Some(gc) = req
+                    .get_mut("generationConfig")
+                    .and_then(Value::as_object_mut)
+                {
+                    gc.remove("thinkingConfig");
+                }
+            } else if let Some(gc) = gemini_body
+                .get_mut("generationConfig")
+                .and_then(Value::as_object_mut)
+            {
+                gc.remove("thinkingConfig");
+            }
+            degraded_gemini_body = Some(gemini_body);
+            force_rotate = false;
+            tracing::warn!(
+                "[{}] Upstream 400 tool_choice/thinking conflict detected. In-place self-healing: stripped thinkingConfig on account {}, retrying.",
+                trace_id, email
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            continue;
+        }
+
         if classification.is_model_not_found() {
             tracing::warn!(
                 "[{}] Pipeline: Target model [{}] not found on upstream (HTTP {}). Terminating completions retry loop without account lockout.",
@@ -5124,6 +5259,112 @@ pub async fn handle_completions(
     (final_status, headers, axum::Json(dual_err)).into_response()
 }
 
+/// Helper to resolve token limits (context length and max output tokens) for any model ID.
+pub fn resolve_model_token_limits(model_id: &str) -> (i64, i64) {
+    if !model_id.is_empty() {
+        if let Some(info) = crate::models::official_model::OfficialModelCatalog::get(model_id) {
+            let max_tokens = info.max_tokens.unwrap_or(1_048_576);
+            let max_output = info.max_output_tokens.unwrap_or(65_536);
+            return (max_tokens, max_output);
+        }
+        let lower = model_id.to_lowercase();
+        if lower.contains("claude") {
+            return (200_000, 8_192);
+        }
+        if lower.contains("gpt") || lower.contains("o1") || lower.contains("o3") {
+            return (128_000, 16_384);
+        }
+    }
+    (1_048_576, 65_536)
+}
+
+#[derive(Debug, serde::Deserialize, Default)]
+pub struct PropsQuery {
+    pub model: Option<String>,
+}
+
+/// llama.cpp compatible /props and /v1/props endpoint.
+/// Hermes Agent and local LLM clients probe this to determine runtime n_ctx.
+pub async fn handle_props(
+    query: Result<axum::extract::Query<PropsQuery>, axum::extract::rejection::QueryRejection>,
+) -> impl IntoResponse {
+    let model_id = query.ok().and_then(|q| q.0.model).unwrap_or_default();
+    let (n_ctx, n_predict) = resolve_model_token_limits(&model_id);
+    let alias = if model_id.is_empty() {
+        "default"
+    } else {
+        model_id.as_str()
+    };
+
+    let resp = json!({
+        "default_generation_settings": {
+            "n_ctx": n_ctx,
+            "n_predict": n_predict,
+        },
+        "total_slots": 1,
+        "model_alias": alias
+    });
+
+    (StatusCode::OK, Json(resp))
+}
+
+/// vLLM compatible /version and /v1/version endpoint.
+/// Hermes Agent and vLLM clients probe this to detect server type.
+pub async fn handle_version() -> impl IntoResponse {
+    let resp = json!({
+        "version": env!("CARGO_PKG_VERSION"),
+        "app": "antigravity-tools",
+        "name": "antigravity-tools"
+    });
+
+    (StatusCode::OK, Json(resp))
+}
+
+#[cfg(test)]
+mod model_probe_compatibility_tests {
+    use super::*;
+
+    #[test]
+    fn test_resolve_model_token_limits() {
+        let (ctx, out) = resolve_model_token_limits("gemini-3.8-flash-high");
+        assert_eq!(ctx, 1_048_576);
+        assert_eq!(out, 65_536);
+
+        // Aliased model inherits mapped official model limits
+        let (ctx_aliased, out_aliased) = resolve_model_token_limits("gpt-4o");
+        assert_eq!(ctx_aliased, 1_048_576);
+        assert_eq!(out_aliased, 65_536);
+
+        // Uncataloged fallbacks
+        let (ctx_claude, out_claude) = resolve_model_token_limits("custom-claude-unknown");
+        assert_eq!(ctx_claude, 200_000);
+        assert_eq!(out_claude, 8_192);
+
+        let (ctx_gpt, out_gpt) = resolve_model_token_limits("unknown-gpt-custom");
+        assert_eq!(ctx_gpt, 128_000);
+        assert_eq!(out_gpt, 16_384);
+
+        let (ctx_def, out_def) = resolve_model_token_limits("");
+        assert_eq!(ctx_def, 1_048_576);
+        assert_eq!(out_def, 65_536);
+    }
+
+    #[tokio::test]
+    async fn test_handle_version() {
+        let resp = handle_version().await.into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn test_handle_props() {
+        let query = Ok(axum::extract::Query(PropsQuery {
+            model: Some("gemini-3.8-flash-high".to_string()),
+        }));
+        let resp = handle_props(query).await.into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+}
+
 pub async fn handle_list_models(State(state): State<AppState>) -> impl IntoResponse {
     use crate::proxy::common::model_mapping::{
         get_all_dynamic_models, get_all_dynamic_models_metadata,
@@ -5142,11 +5383,19 @@ pub async fn handle_list_models(State(state): State<AppState>) -> impl IntoRespo
     let data: Vec<_> = model_ids
         .into_iter()
         .map(|id| {
+            let (ctx_len, out_len) = resolve_model_token_limits(&id);
             let mut obj = json!({
                 "id": id,
                 "object": "model",
                 "created": 1706745600,
-                "owned_by": "antigravity"
+                "owned_by": "antigravity",
+                "context_length": ctx_len,
+                "max_context_length": ctx_len,
+                "max_input_tokens": ctx_len,
+                "max_model_len": ctx_len,
+                "max_tokens": ctx_len,
+                "max_completion_tokens": out_len,
+                "max_output_tokens": out_len,
             });
             let meta = metadata_map
                 .get(&id)
@@ -5181,7 +5430,7 @@ pub async fn handle_retrieve_model(
     };
 
     let only_raw = *state.only_raw_quota_models.read().await;
-    if let Some(matched_id) = find_dynamic_model(
+    let resolved_id = if let Some(matched_id) = find_dynamic_model(
         &state.custom_mapping,
         Some(&state.token_manager),
         only_raw,
@@ -5189,6 +5438,15 @@ pub async fn handle_retrieve_model(
     )
     .await
     {
+        Some(matched_id)
+    } else if crate::models::official_model::OfficialModelCatalog::get(&model).is_some() {
+        Some(model.clone())
+    } else {
+        None
+    };
+
+    if let Some(matched_id) = resolved_id {
+        let (ctx_len, out_len) = resolve_model_token_limits(&matched_id);
         let metadata_map = get_all_dynamic_models_metadata(
             &state.custom_mapping,
             Some(&state.token_manager),
@@ -5200,7 +5458,14 @@ pub async fn handle_retrieve_model(
             "id": matched_id,
             "object": "model",
             "created": 1706745600,
-            "owned_by": "antigravity"
+            "owned_by": "antigravity",
+            "context_length": ctx_len,
+            "max_context_length": ctx_len,
+            "max_input_tokens": ctx_len,
+            "max_model_len": ctx_len,
+            "max_tokens": ctx_len,
+            "max_completion_tokens": out_len,
+            "max_output_tokens": out_len,
         });
         let meta = metadata_map
             .get(&matched_id)

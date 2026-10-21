@@ -1,3 +1,4 @@
+use crate::models::quota::ModelQuota;
 use crate::modules;
 use tauri::{
     image::Image,
@@ -5,6 +6,91 @@ use tauri::{
     tray::{MouseButton, TrayIconBuilder, TrayIconEvent},
     Emitter, Listener, Manager,
 };
+
+#[derive(Default)]
+struct KeyModelQuotas {
+    claude: Option<i32>,
+    gemini_pro: Option<i32>,
+    gemini_flash: Option<i32>,
+    gemini_image: Option<i32>,
+}
+
+/// 智能提取核心模型的剩余配额百分比（首选精准旗舰型号，未匹配时回退通配分类）
+fn extract_key_model_quotas(models: &[ModelQuota]) -> KeyModelQuotas {
+    let mut claude: Option<i32> = None;
+    let mut gemini_pro: Option<i32> = None;
+    let mut gemini_flash: Option<i32> = None;
+    let mut gemini_image: Option<i32> = None;
+
+    // 1. 首选匹配当前主力核心型号
+    for m in models {
+        let name = m.name.trim().to_lowercase();
+        if claude.is_none()
+            && (name == "claude-sonnet-4-6"
+                || name == "claude-opus-4-6-thinking"
+                || name == "claude-sonnet-4-5")
+        {
+            claude = Some(m.percentage);
+        }
+        if gemini_pro.is_none()
+            && (name == "gemini-pro-agent"
+                || name == "gemini-3.1-pro-high"
+                || name == "gemini-3-pro-high"
+                || name == "gemini-3.1-pro")
+        {
+            gemini_pro = Some(m.percentage);
+        }
+        if gemini_flash.is_none()
+            && (name == "gemini-3.8-flash-high"
+                || name == "gemini-3.8-flash"
+                || name == "gemini-3-flash-agent"
+                || name == "gemini-3-flash"
+                || name == "gemini-3.5-flash")
+        {
+            gemini_flash = Some(m.percentage);
+        }
+        if gemini_image.is_none()
+            && (name == "gemini-3.1-flash-image" || name == "gemini-3-pro-image")
+        {
+            gemini_image = Some(m.percentage);
+        }
+    }
+
+    // 2. 类别通配回退匹配（应对未来模型版本迭代）
+    for m in models {
+        let name = m.name.trim().to_lowercase();
+        let is_gemini = name.starts_with("gemini-");
+        let is_image = (is_gemini && name.contains("image"))
+            || name.starts_with("image")
+            || name.starts_with("imagen");
+
+        if gemini_image.is_none() && is_image {
+            gemini_image = Some(m.percentage);
+        } else if is_gemini && name.contains("flash") {
+            if gemini_flash.is_none() {
+                gemini_flash = Some(m.percentage);
+            }
+        } else if is_gemini && name.contains("pro") {
+            if gemini_pro.is_none() {
+                gemini_pro = Some(m.percentage);
+            }
+        } else if claude.is_none()
+            && (name.contains("claude")
+                || name.contains("sonnet")
+                || name.contains("opus")
+                || name.contains("haiku"))
+        {
+            claude = Some(m.percentage);
+        }
+    }
+
+    KeyModelQuotas {
+        claude,
+        gemini_pro,
+        gemini_flash,
+        gemini_image,
+    }
+}
 
 pub fn create_tray(app: &tauri::AppHandle) -> tauri::Result<()> {
     // 1. Load config to get language settings
@@ -48,6 +134,7 @@ pub fn create_tray(app: &tauri::AppHandle) -> tauri::Result<()> {
 
     // System functions
     let show_i = MenuItem::with_id(app, "show", &texts.show_window, true, None::<&str>)?;
+    let mini_i = MenuItem::with_id(app, "mini_view", &texts.mini_view, true, None::<&str>)?;
     let lightweight_i = CheckMenuItem::with_id(
         app,
         "toggle_lightweight",
@@ -73,6 +160,7 @@ pub fn create_tray(app: &tauri::AppHandle) -> tauri::Result<()> {
             &refresh_curr,
             &sep2,
             &show_i,
+            &mini_i,
             &lightweight_i,
             &sep3,
             &quit_i,
@@ -84,12 +172,18 @@ pub fn create_tray(app: &tauri::AppHandle) -> tauri::Result<()> {
         .menu(&menu)
         .show_menu_on_left_click(false)
         .icon(icon)
+        .tooltip("Antigravity Manager")
         .icon_as_template(cfg!(target_os = "macos"))
         .on_menu_event(move |app, event| {
             let app_handle = app.clone();
             match event.id().as_ref() {
                 "show" => {
                     let _ = modules::lightweight::exit_lightweight_mode(&app_handle);
+                    let _ = app_handle.emit("tray://show-window", ());
+                }
+                "mini_view" => {
+                    let _ = modules::lightweight::exit_lightweight_mode(&app_handle);
+                    let _ = app_handle.emit("tray://show-mini-view", ());
                 }
                 "toggle_lightweight" => {
                     tauri::async_runtime::spawn(async move {
@@ -235,6 +329,7 @@ pub fn create_tray(app: &tauri::AppHandle) -> tauri::Result<()> {
             {
                 let app = tray.app_handle();
                 let _ = modules::lightweight::exit_lightweight_mode(app);
+                let _ = app.emit("tray://show-window", ());
             }
         })
         .build(app)?;
@@ -268,48 +363,102 @@ pub fn update_tray_menus(app: &tauri::AppHandle) {
 
         let mut menu_lines = Vec::new();
         let mut user_text = format!("{}: {}", texts.current, texts.no_account);
+        let mut tooltip_text = format!(
+            "Antigravity Manager\n{}: {}",
+            texts.current, texts.no_account
+        );
+        #[allow(unused_mut)]
+        let mut macos_title: Option<String> = None;
 
         if let Some(id) = current {
             if let Ok(account) = modules::load_account(&id) {
                 user_text = format!("{}: {}", texts.current, account.email);
 
+                let email_display = if account.email.chars().count() > 28 {
+                    let truncated: String = account.email.chars().take(25).collect();
+                    format!("{}...", truncated)
+                } else {
+                    account.email.clone()
+                };
+
                 if let Some(q) = account.quota {
                     if q.is_forbidden {
-                        menu_lines.push(format!("🚫 {}", texts.forbidden));
+                        let forbidden_msg = format!("🚫 {}", texts.forbidden);
+                        menu_lines.push(forbidden_msg.clone());
+                        tooltip_text =
+                            format!("Antigravity Manager ({})\n{}", email_display, forbidden_msg);
+                        macos_title = Some("🚫".to_string());
                     } else {
-                        // Extract the 3 specified models
-                        let mut gemini_high = 0;
-                        let mut gemini_image = 0;
-                        let mut claude = 0;
+                        let key_quotas = extract_key_model_quotas(&q.models);
 
-                        // Use strict matching, consistent with frontend
-                        for m in q.models {
-                            let name = m.name.to_lowercase();
-                            if name == "gemini-3.1-pro-high" || name == "gemini-3-pro-high" {
-                                gemini_high = m.percentage;
-                            }
-                            if name == "gemini-3.1-flash-image" || name == "gemini-3-pro-image" {
-                                gemini_image = m.percentage;
-                            }
-                            if name == "claude-sonnet-4-6" || name == "claude-sonnet-4-5" {
-                                claude = m.percentage;
-                            }
+                        if let Some(c) = key_quotas.claude {
+                            menu_lines.push(format!("Claude: {}%", c));
+                        }
+                        if let Some(gp) = key_quotas.gemini_pro {
+                            menu_lines.push(format!("Gemini Pro: {}%", gp));
+                        }
+                        if let Some(gi) = key_quotas.gemini_image {
+                            menu_lines.push(format!("Gemini Image: {}%", gi));
+                        }
+                        if let Some(gf) = key_quotas.gemini_flash {
+                            menu_lines.push(format!("Gemini Flash: {}%", gf));
                         }
 
-                        menu_lines.push(format!("Gemini High: {}%", gemini_high));
-                        menu_lines.push(format!("Gemini Image: {}%", gemini_image));
-                        menu_lines.push(format!("Claude 4.5: {}%", claude));
+                        if menu_lines.is_empty() {
+                            menu_lines.push(texts.unknown_quota.clone());
+                        }
+
+                        // Formulate concise tooltip (strictly within Windows 128-char limit)
+                        let mut tooltip_parts = Vec::new();
+                        if let Some(c) = key_quotas.claude {
+                            tooltip_parts.push(format!("Claude: {}%", c));
+                        }
+                        if let Some(gp) = key_quotas.gemini_pro {
+                            tooltip_parts.push(format!("Gemini: {}%", gp));
+                        }
+                        if let Some(gi) = key_quotas.gemini_image {
+                            tooltip_parts.push(format!("Image: {}%", gi));
+                        }
+
+                        let quota_summary = if tooltip_parts.is_empty() {
+                            texts.unknown_quota.clone()
+                        } else {
+                            tooltip_parts.join(" | ")
+                        };
+
+                        tooltip_text =
+                            format!("Antigravity Manager ({})\n{}", email_display, quota_summary);
+
+                        // macOS menu bar title (concise for status bar space)
+                        macos_title = match (key_quotas.claude, key_quotas.gemini_pro) {
+                            (Some(c), Some(g)) => Some(format!("C:{}% G:{}%", c, g)),
+                            (Some(c), None) => Some(format!("C:{}%", c)),
+                            (None, Some(g)) => Some(format!("G:{}%", g)),
+                            _ => None,
+                        };
                     }
                 } else {
                     menu_lines.push(texts.unknown_quota.clone());
+                    tooltip_text = format!(
+                        "Antigravity Manager ({})\n{}",
+                        email_display, texts.unknown_quota
+                    );
                 }
             } else {
                 user_text = format!("{}: Error", texts.current);
                 menu_lines.push(format!("{}: --", texts.quota));
+                tooltip_text = format!("Antigravity Manager\n{}: Error", texts.current);
             }
         } else {
             menu_lines.push(texts.unknown_quota.clone());
         };
+
+        // Always update tray tooltip and macOS title (regardless of menu rebuild status)
+        if let Some(tray) = app_clone.tray_by_id("main") {
+            let _ = tray.set_tooltip(Some(tooltip_text));
+            #[cfg(target_os = "macos")]
+            let _ = tray.set_title(macos_title);
+        }
 
         // Rebuild menu items
         let info_user = MenuItem::with_id(&app_clone, "info_user", &user_text, false, None::<&str>);
@@ -345,6 +494,13 @@ pub fn update_tray_menus(app: &tauri::AppHandle) {
         );
 
         let show_i = MenuItem::with_id(&app_clone, "show", &texts.show_window, true, None::<&str>);
+        let mini_i = MenuItem::with_id(
+            &app_clone,
+            "mini_view",
+            &texts.mini_view,
+            true,
+            None::<&str>,
+        );
         let lightweight_i = CheckMenuItem::with_id(
             &app_clone,
             "toggle_lightweight",
@@ -355,11 +511,12 @@ pub fn update_tray_menus(app: &tauri::AppHandle) {
         );
         let quit_i = MenuItem::with_id(&app_clone, "quit", &texts.quit, true, None::<&str>);
 
-        if let (Ok(i_u), Ok(s_n), Ok(r_c), Ok(s), Ok(l), Ok(q)) = (
+        if let (Ok(i_u), Ok(s_n), Ok(r_c), Ok(s), Ok(m), Ok(l), Ok(q)) = (
             info_user,
             switch_next,
             refresh_curr,
             show_i,
+            mini_i,
             lightweight_i,
             quit_i,
         ) {
@@ -382,6 +539,7 @@ pub fn update_tray_menus(app: &tauri::AppHandle) {
                 items.push(s);
             }
             items.push(&s);
+            items.push(&m);
             items.push(&l);
             if let Some(ref s) = sep3 {
                 items.push(s);

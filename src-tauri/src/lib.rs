@@ -2,6 +2,8 @@ mod commands;
 pub mod constants;
 pub mod error;
 #[cfg(target_os = "linux")]
+pub mod linux_display_guard;
+#[cfg(target_os = "linux")]
 mod linux_graphics;
 mod models;
 mod modules;
@@ -140,6 +142,8 @@ fn nvidia_proprietary_loaded() -> bool {
 
 #[cfg(target_os = "linux")]
 fn configure_linux_graphics() {
+    linux_display_guard::init_display_guard();
+
     use linux_graphics::{
         desktop_is_gnome, desktop_is_kde, desktop_is_wlroots_family, should_disable_webkit_dmabuf,
         should_force_x11_backend,
@@ -292,6 +296,22 @@ pub fn run() {
 
     // Check for headless mode
     let args: Vec<String> = std::env::args().collect();
+
+    // Check for CLI subcommands (switch, list, current, etc.)
+    if let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    {
+        match runtime.block_on(modules::cli_handler::try_handle_cli(&args)) {
+            Ok(true) => return,
+            Ok(false) => {}
+            Err(e) => {
+                eprintln!("\x1b[31m[Antigravity CLI Error]\x1b[0m {}", e);
+                std::process::exit(1);
+            }
+        }
+    }
+
     let is_headless = args.iter().any(|arg| arg == "--headless");
 
     // Increase file descriptor limit (macOS only)
@@ -607,6 +627,35 @@ pub fn run() {
 
             apply_login_launch_policy(app);
 
+            ensure_cli_symlinks();
+
+            #[cfg(target_os = "linux")]
+            {
+                tauri::async_runtime::spawn(async {
+                    use tokio::signal::unix::{signal, SignalKind};
+                    let mut sigterm = signal(SignalKind::terminate()).ok();
+                    let mut sigint = signal(SignalKind::interrupt()).ok();
+                    tokio::select! {
+                        _ = async {
+                            if let Some(ref mut s) = sigterm {
+                                s.recv().await;
+                            } else {
+                                std::future::pending::<()>().await;
+                            }
+                        } => {},
+                        _ = async {
+                            if let Some(ref mut s) = sigint {
+                                s.recv().await;
+                            } else {
+                                std::future::pending::<()>().await;
+                            }
+                        } => {},
+                    }
+                    tracing::info!("[Linux Display Guard] Received termination signal in background mode, shutting down cleanly.");
+                    std::process::exit(0);
+                });
+            }
+
             Ok(())
         })
         .on_window_event(|window, event| {
@@ -914,3 +963,22 @@ pub fn run() {
             }
         });
 }
+
+#[cfg(unix)]
+fn ensure_cli_symlinks() {
+    if let (Some(home), Ok(current_exe)) = (dirs::home_dir(), std::env::current_exe()) {
+        let local_bin = home.join(".local/bin");
+        if !local_bin.exists() {
+            let _ = std::fs::create_dir_all(&local_bin);
+        }
+        for name in &["antigravity-tools", "at"] {
+            let link = local_bin.join(name);
+            if !link.exists() {
+                let _ = std::os::unix::fs::symlink(&current_exe, &link);
+            }
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn ensure_cli_symlinks() {}

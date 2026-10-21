@@ -1,5 +1,5 @@
 cask "antigravity-tools" do
-  version "4.9.9-beta.1"
+  version "4.9.9-beta.4"
   sha256 :no_check
 
   name "Antigravity Tools"
@@ -12,6 +12,8 @@ cask "antigravity-tools" do
     url "https://github.com/lbjlaq/Antigravity-Manager/releases/download/v#{version}/Antigravity.Tools_#{version}_#{arch}.dmg"
 
     app "Antigravity Tools.app"
+    binary "#{appdir}/Antigravity Tools.app/Contents/MacOS/antigravity-tools"
+    binary "#{appdir}/Antigravity Tools.app/Contents/MacOS/antigravity-tools", target: "at"
 
     postflight_steps do
       run "/usr/bin/xattr",

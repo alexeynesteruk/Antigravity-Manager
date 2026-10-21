@@ -440,7 +440,7 @@ impl SystemIntegration for DesktopIntegration {
 }
 
 /// 辅助方法：向宿主操作系统的 Keychain/Credentials Manager 写入 Token
-fn write_to_system_keyring(account: &crate::models::Account) -> Result<(), String> {
+pub(crate) fn write_to_system_keyring(account: &crate::models::Account) -> Result<(), String> {
     // 1. 构建 Token 的 JSON Payload，并将过期时间戳格式化为符合 RFC3339 的带微秒格式
     let expiry_secs = if account.token.expiry_timestamp > 10_000_000_000 {
         account.token.expiry_timestamp / 1000
@@ -1196,11 +1196,74 @@ impl SystemIntegration for HeadlessIntegration {
     }
 }
 
+/// CLI 模式实现：支持向宿主操作系统的 Keychain/Keyring 写入凭据（用于终端命令行切号）
+pub struct CliIntegration;
+
+impl SystemIntegration for CliIntegration {
+    async fn on_account_switch(
+        &self,
+        account: &crate::models::Account,
+        target_ide: Option<&str>,
+    ) -> Result<(), String> {
+        if target_ide == Some("agy") {
+            write_to_system_keyring(account)?;
+            let stored = read_from_system_keyring_only()?;
+            verify_agy_credentials(&account.token.refresh_token, &stored.refresh_token)?;
+
+            if let Ok(storage_path) = device::get_storage_path(target_ide) {
+                if let Some(ref profile) = account.device_profile {
+                    let _ = device::write_profile(&storage_path, profile);
+                }
+            }
+            return Ok(());
+        }
+
+        let classic_running = process::is_antigravity_running(None);
+        let ide_running = process::is_antigravity_running(Some("ide"));
+        let classic_exe = process::get_antigravity_executable_path(Some("classic"));
+        let ide_exe = process::get_antigravity_executable_path(Some("ide"));
+        let ide_exe_str = ide_exe.as_ref().map(|p| p.to_string_lossy().to_string());
+
+        let (_is_ide, effective_target) = resolve_effective_target(
+            target_ide,
+            classic_running,
+            ide_running,
+            classic_exe.is_some(),
+            ide_exe_str.as_deref(),
+        );
+
+        let _ = write_to_system_keyring(account);
+        if let Ok(db_path) = db::get_db_path(effective_target) {
+            if db_path.exists() {
+                let _ = db::inject_token(
+                    &db_path,
+                    &account.token.access_token,
+                    &account.token.refresh_token,
+                    account.token.expiry_timestamp,
+                    &account.email,
+                    account.token.is_gcp_tos,
+                    account.token.project_id.as_deref(),
+                    account.token.id_token.as_deref(),
+                    account.token.oauth_client_key.as_deref(),
+                    effective_target,
+                );
+            }
+        }
+        Ok(())
+    }
+
+    fn update_tray(&self) {}
+    fn show_notification(&self, title: &str, body: &str) {
+        crate::modules::logger::log_info(&format!("[CLI Notification] {}: {}", title, body));
+    }
+}
+
 /// 系统集成管理器：替代 Arc<dyn SystemIntegration> 以解决 async trait 的 dyn 兼容性问题
 #[derive(Clone)]
 pub enum SystemManager {
     Desktop(tauri::AppHandle),
     Headless,
+    Cli,
 }
 
 impl SystemManager {
@@ -1218,6 +1281,10 @@ impl SystemManager {
             }
             SystemManager::Headless => {
                 let integration = HeadlessIntegration;
+                integration.on_account_switch(account, target_ide).await
+            }
+            SystemManager::Cli => {
+                let integration = CliIntegration;
                 integration.on_account_switch(account, target_ide).await
             }
         }
@@ -1244,6 +1311,10 @@ impl SystemManager {
                 let integration = HeadlessIntegration;
                 integration.show_notification(title, body);
             }
+            SystemManager::Cli => {
+                let integration = CliIntegration;
+                integration.show_notification(title, body);
+            }
         }
     }
 }
@@ -1254,18 +1325,7 @@ impl SystemIntegration for SystemManager {
         account: &crate::models::Account,
         target_ide: Option<&str>,
     ) -> Result<(), String> {
-        match self {
-            SystemManager::Desktop(handle) => {
-                let integration = DesktopIntegration {
-                    app_handle: handle.clone(),
-                };
-                integration.on_account_switch(account, target_ide).await
-            }
-            SystemManager::Headless => {
-                let integration = HeadlessIntegration;
-                integration.on_account_switch(account, target_ide).await
-            }
-        }
+        self.on_account_switch(account, target_ide).await
     }
 
     fn update_tray(&self) {

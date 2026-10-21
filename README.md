@@ -320,6 +320,27 @@ export ANTHROPIC_BASE_URL="http://127.0.0.1:8045"
 claude
 ```
 
+### Native CLI Account Switcher (`at` / `antigravity-tools`)
+Antigravity includes a lightweight native CLI suite designed for terminal developers. It enables instant system Keychain credential rotation and seamless session continuation with `agy`:
+
+```bash
+# 1. List all accounts with status and active indicators (👉)
+at list
+
+# 2. Inspect currently active accounts across agy CLI (Keychain) and IDE
+at current
+
+# 3. Switch account (supports 1-based index, email, prefix, or alias)
+at switch 2                      # Switch to account #2
+at switch work@gmail.com         # Switch by email
+at switch work                   # Switch by email prefix
+at switch "WorkAccount"          # Switch by account name
+at switch                        # Auto round-robin to next normal account
+
+# 4. Switch and automatically resume agy session
+at switch 2 -c                   # -c is short for --continue
+```
+
 ### How to use with OpenCode?
 1. Go to **API Proxy** → **External Providers** → click the **OpenCode Sync** card.
 2. Click **Sync** to generate `~/.config/opencode/opencode.json`:

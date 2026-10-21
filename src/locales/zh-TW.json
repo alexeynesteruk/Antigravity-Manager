@@ -781,6 +781,7 @@
     "switch_next": "切換下一個帳號",
     "refresh_current": "重新整理當前帳號額度",
     "show_window": "顯示主視窗",
+    "mini_view": "迷你懸浮窗",
     "quit": "退出應用 (Exit)",
     "no_account": "無帳號",
     "unknown_quota": "未知 (點選重新整理)",

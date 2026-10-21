@@ -3,6 +3,43 @@
 > 完整版本历史记录。返回项目主页请查看 [README_ZH.md](README_ZH.md) | [English Changelog](CHANGELOG.md)。
 
 *   **版本演进**:
+    *   **v4.9.9-beta.4 (2026-10-21)**:
+        -   **[系统托盘分层配额感知与迷你悬浮窗快捷联动] (Fixes #3719, Thanks to @Wiojelt)**:
+            -   **全平台系统托盘悬停配额卡片 (Tooltip)**: 针对跨平台系统托盘底层差异（Windows 任务栏通知区物理不支持图标旁文字，而 macOS 状态栏原生支持），在系统托盘实现富文本悬停卡片；鼠标滑过托盘图标即可立即查看当前账号及 Claude、Gemini Pro、Gemini Flash、Gemini Image 各核心模型的剩余配额百分比；严格适配 Windows `NOTIFYICONDATAW.szTip` 128 字符硬限制，超长邮箱安全收敛，确保全平台零截断与极低交互干扰。(Fixes #3719, Thanks to @Wiojelt)
+            -   **macOS 原生状态栏配额标题 (Title)**: 在 macOS 菜单栏图标旁原生常驻展示核心模型剩余百分比（如 `C:85% G:100%`），紧凑精炼且自适应屏幕刘海空间；异常与未登录态自适应清除或显示预警标识。(Fixes #3719)
+            -   **核心模型智能两阶段匹配 (Pipeline First)**: 重构托盘模型匹配算法，废除过往针对特定版本的硬编码名称限制，优先精准匹配最新主力旗舰模型，并对衍生与未来迭代版本（`gemini-*-pro*`、`gemini-*-flash*`、`*image*`、`*claude*/*sonnet*`）提供弹性通配回退。(Fixes #3719)
+            -   **迷你悬浮窗一键呼出与状态双向联动**: 在托盘右键菜单新增【迷你悬浮窗】快捷入口，打通 `tray://show-mini-view` 与 `tray://show-window` 双向事件；点击可由托盘一键无缝唤起/切换至桌面 Mini HUD 悬浮看板，点击显示主窗口时安全退出 Mini 模式恢复完整主界面；全量覆盖 12 种系统语言并维持单语纯粹性。(Fixes #3719)
+
+        -   **[Linux 重启自识别隔离、Wayland 断开保活与强制工具调用] (Fixes #3721, Thanks to @q514168795)**:
+            -   **全量重启不再把管理器当成 IDE**: `is_manager_or_tools_process` 覆盖 Linux 内核 15 字节进程名截断（`antigravity-too` / `antigravity_too`），避免重启时再拉起一份管理器。(Fixes #3721)
+            -   **Wayland 断开后 8045 反代继续服务**: 显示守护只结束 GUI 线程，代理保持运行。`antigravity-tools --headless` 可直接以无头模式启动。(Fixes #3721)
+            -   **Claude 强制 tool_choice 不再与思考配置冲突 400**: 进站流水线在 Claude 且 `tool_choice` 为 ANY 时剔除 `thinkingConfig`；若上游仍返回该冲突，则在当前账号上去掉思考参数再试一次。(Fixes #3721)
+        -   **[监控过滤第三方网关探活]**:
+            -   健康日志捕获关闭时，成功的 NewAPI / OneAPI 探活请求不再写入监控。4xx / 5xx 仍然记录。
+
+    *   **v4.9.9-beta.3 (2026-10-21)**:
+        -   **[多客户端身份归一化与提示词特征流控防御升级] (Ref #3720: antigravity 限速调查)**:
+            -   **跨平台主流 AI Agent / CLI 身份归一化广谱纳管**: 结合近期生产环境限速与低优先级降级调查（详见 Issue #3720《antigravity 限速调查》实测报告），针对 Google 上游对非官方 Antigravity Harness（OpenCode、OpenClaw、Grok Build、Cursor、Cascade、Cline、Aider、KiloCode、DSH、Devin 等）加强语义特征流控、在集群容量紧张时加速将账号打入低优先级排队慢速池的问题（排查证实首字延迟从 4s 恶化至 40s~80s+），全面重构 `PromptSanitizer` 身份归一化引擎；扩展识别原生名谓式开场、宿主集成式声明（`running inside / within`, `integrated into`）以及中文自然语序，将其开场白统一收敛对齐为官方原生 Antigravity 身份，彻底抹除外部第三方套壳与竞品生态指纹，享受官方原生 IDE 同等白名单调度与快速通道待遇。(Ref #3720)
+            -   **自适应头部探测窗口与前置插件上下文穿透**: 将系统提示词头部扫描窗口由原先固定的前 4 句扩展为前 8 句或前 1500 字符的弹性双重窗口，能够可靠穿透如 OpenClaw 等插件在开头自动注入的前置元数据/上下文垫片（`--- OpenClaw plugin-injected context ---`），彻底根除因前置垫片消耗句子配额导致真正身份句被挤出扫描范围而漏洗的架构缺陷。(Ref #3720)
+            -   **版本号小数点前瞻识别与主要提示词架构级绝对保护**: 优化归属动词前导与归属对象匹配正则，支持精准跨越模型版本号小数点（如 `Grok 4.6`、`GPT-5.2`），杜绝因小数点被误判为英文句号导致的断句与局部残留；在流水线入口设立最高优先级白名单守卫，确保 `JeikCode` 等核心主要提示词、XML 容器及通用无害提示词 100% 豁免原样透传，实现零误伤与架构级安全闭环。(Ref #3720)
+
+    *   **v4.9.9-beta.2 (2026-10-20)**:
+        -   **[Hermes Agent / 本地探针端点兼容与 OpenAI 模型上下文元数据增强] (PR #3708, Thanks to @CarlitoDon)**:
+            -   **llama.cpp 与 vLLM 标准探针端点集成**: 新增 `/props`、`/v1/props`（返回 `n_ctx`、`n_predict` 等标准生成配置，支持 `?model=` 查询）与 `/version`、`/v1/version`（返回包版本与应用标识）只读端点，全面消除 Hermes Agent、llama.cpp 工具链及 vLLM 客户端接入时的探测警告与探针 404 错误。(PR #3708, Thanks to @CarlitoDon)
+            -   **OpenAI 模型列表与详情元数据补全**: 在 `/v1/models` 与 `/v1/models/{model}` 响应中注入 `context_length`、`max_context_length`、`max_input_tokens`、`max_model_len`、`max_tokens` 及 `max_completion_tokens` 等权威容量限制，优先通过 `OfficialModelCatalog` 读取权威规格并对未收录模型按家族进行智能降级；单模型详情支持从官方模型目录回退查询，使直接按官方 ID 查询详情更鲁棒。(PR #3708, Thanks to @CarlitoDon)
+            -   **探针请求日志静默与健康检查免检放宽**: 将探针端点纳入 `is_health_check` 白名单，请求日志转为 `trace` 心跳级别彻底杜绝探针在反代流量日志中刷屏，并在 `AllExceptHealth` 模式下保持免密放行，确保本地 Agent 握手探针无阻碍启动。(PR #3708, Thanks to @CarlitoDon)
+        -   **[模型测活与内部预热模型路由对齐修复] (Fixes #3715)**:
+            -   **测活端点（`/internal/warmup`）补齐模型路由归一化**: 修复测活端点直接透传前端派生的裸模型名（如 `gemini-3.8-flash`、`gpt-oss-120b`）作为上游实体构建 Google 请求导致上游返回 404 (`Requested entity was not found.`) 的缺陷；在预热入口接入 `resolve_model_route_with_effort`，自动将裸模型对齐到对应的官方物理实体（如 `gemini-3.8-flash-tiered`），彻底消除连通性测试 404 误报并对齐流量日志映射与响应头。(Fixes #3715)
+        -   **[Gemini 503 过载原地自愈与前缀缓存保护] (Fixes #3713)**:
+            -   **思考预算原地降级自愈 (Pipeline First)**: 针对 Google 上游在高负载时对无上限自适应思考预算（`thinkingBudget: -1` 或 > 4000）频繁抛出 503 (`The model is overloaded.`) 触发全池盲目轮换并丢失 Prefix Cache 的痛点，在统一流水线引入 `try_degrade_thinking_budget` 与 `is_server_overloaded` 识别；遭遇 503 时优先在当前账号原地将思考预算安全降至 4000 (Medium 档位) 重试一次，95% 场景下原地恢复并 100% 维持前缀上下文缓存，同时严格保证仅在降级重试仍失败时才触发跨账号故障转移。(Fixes #3713)
+        -   **[OpenAI 兼容端点流式 finish_reason 终态兜底与模型收尾防御规整] (Fixes #3716)**:
+            -   **OpenAI 流式转换器终态 finish_reason 补全**: 修复上游 Gemini 在未显式下发 `finishReason` 的情况下直接 EOF 挂断或仅发送 `usageMetadata` 时，网关遗漏发射收尾块导致下游客户端（如 OpenCode、Cline）标记为 `finish=unknown` 的缺陷；在流终态新增兜底状态机，确保在发射 `[DONE]` 之前强制补发带有合法 `finish_reason` ("stop" 或 "tool_calls") 及 Token 使用量的终止块。(Fixes #3716)
+            -   **模型收尾防御精细化拦截 (Pipeline First)**: 重构通用中转报文防御节点 `ensure_gemini_payload_ends_with_user`；针对上游 Gemini 严格禁止纯 model 轮收尾的规则，精准区分工具回执与文本轮次——对带有 `functionResponse` 的工具轮 100% 原样保留以守护人机交互状态机 (Fixes #3629)，对流中断后客户端发起的空 assistant 续步轮自动 `pop` 剥离恢复合法 user 结尾，对包含实质内容的 model 尾轮自动追加合规 user 垫片，彻底根除 Google 上游 400 (`Requests ending with a model turn are not supported.`) 报错与 40+ 次无效重试风暴。(Fixes #3716)
+        -   **[Antigravity CLI 原生切号、多端探查与无缝会话接续] (Fixes #3686, Thanks to @Ran-Xing)**:
+            -   **原生命令行工具集成 (`at` / `antigravity-tools`)**: 推出轻量高效的终端切号套件，支持列表查看 (`at list`)、多端当前账号探查 (`at current`) 与智能切号 (`at switch [query]`)，全面兼容按序号、邮箱（全称或前缀）、别名或无参环形顺延轮替；支持带 `-c` / `--continue` 在切换系统 Keychain 凭据后自动原地无缝接续当前 `agy` 会话。(Fixes #3686, Thanks to @Ran-Xing)
+            -   **HTTP 管理 API 智能对齐**: 增强 `/api/accounts/switch` 端点，支持直接传入邮箱、别名或序号自动解析为真实 Account ID，并严格联动 `targetIde: "agy"` 触发系统 Keychain 写入。(Fixes #3686)
+            -   **满血官方 OAuth 与 429 顺延循环守护**: 优化 CLI 同步 Wrapper，去除破坏原生 OAuth 特性的反代环境变量注入，保留完整 `/plugin` 插件与高思考预算；内置 429 配额用尽自动顺延换号与 `--continue` 恢复会话的循环守护。(Fixes #3686, Thanks to @Ran-Xing)
+
     *   **v4.9.9-beta.1 (2026-10-18)**:
         -   **[代理池安全防泄露、URL 凭据清洗与高延迟节点容灾] (Fixes #3703, Ref #3323, PR #3706, Thanks to @cubelikeplayDaniel)**:
             -   **专属绑定账号防 Direct 泄漏机制**: 重构专属代理路由决策；当绑定的专属代理被判定为不健康时，优先故障转移至可用公用池节点；若无可用公共节点，强制沿用专属代理尝试出站（宁可网络报错也绝不静默回退至直连），彻底杜绝服务器真实源站 IP 泄漏至 Google 授权系统导致的风控封号风险。(Fixes #3703, PR #3706, Thanks to @cubelikeplayDaniel)

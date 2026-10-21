@@ -779,6 +779,7 @@
     "switch_next": "다음 계정으로 전환",
     "refresh_current": "현재 할당량 새로고침",
     "show_window": "메인 창 보이기",
+    "mini_view": "미니 뷰",
     "quit": "애플리케이션 종료",
     "no_account": "계정 없음",
     "unknown_quota": "알 수 없음 (클릭하여 새로고침)",

@@ -189,6 +189,8 @@ pub async fn handle_generate(
     let mut failure_statuses = FailureStatusTracker::default();
     let mut used_attempts = 0;
     let mut retried_without_thinking = false;
+    let mut retried_with_budget_degraded = false;
+    let mut degraded_wrapped_body: Option<Value> = None;
 
     let client_effort = body
         .get("request")
@@ -347,17 +349,27 @@ pub async fn handle_generate(
         // [NEW] 获取完整 Token 对象以注入动态规格 (dynamic > static default > 65535)
         let token_obj = token_manager.get_token_by_id(&account_id);
         let tf_start = std::time::Instant::now();
-        let mut wrapped_body = wrap_request_v2(
-            &body,
-            &project_id,
-            &mapped_model,
-            Some(account_id.as_str()),
-            Some(&session_id),
-            token_obj.as_ref(),
-            Some(&token_manager),
-            Some(&state.upstream),
-            Some(&affinity_key),
-        );
+        let mut wrapped_body = if let Some(body) = degraded_wrapped_body.take() {
+            body
+        } else {
+            let mut wb = wrap_request_v2(
+                &body,
+                &project_id,
+                &mapped_model,
+                Some(account_id.as_str()),
+                Some(&session_id),
+                token_obj.as_ref(),
+                Some(&token_manager),
+                Some(&state.upstream),
+                Some(&affinity_key),
+            );
+            if retried_with_budget_degraded {
+                crate::proxy::pipeline::InboundThinkingPipeline::try_degrade_thinking_budget(
+                    &mut wb,
+                );
+            }
+            wb
+        };
         let tf_micros = tf_start.elapsed().as_micros() as u64;
         let norm_total_micros = norm_start.elapsed().as_micros() as u64;
         norm_ms = norm_total_micros.saturating_sub(tf_micros) as f64 / 1000.0;
@@ -1122,6 +1134,29 @@ pub async fn handle_generate(
             &error_text,
             retry_after.as_deref(),
         );
+
+        // [FIX #3713] 503 / 529 服务端过载：思考预算原地降级自愈 (Pipeline First)
+        // 当模型遭遇过载 (503/529 / overloaded)，若当前请求带有 -1 或超大思考预算，优先在当前账号上降级预算原地重试一次，
+        // 杜绝盲目全池轮换导致跨账号缓存丢失 (Prefix Cache Protection)。
+        if crate::proxy::pipeline::UpstreamClassification::is_server_overloaded(
+            status_code,
+            &error_text,
+        ) && !retried_with_budget_degraded
+            && crate::proxy::pipeline::InboundThinkingPipeline::try_degrade_thinking_budget(
+                &mut wrapped_body,
+            )
+        {
+            retried_with_budget_degraded = true;
+            degraded_wrapped_body = Some(wrapped_body);
+            force_rotate = false;
+            tracing::warn!(
+                "[Gemini] Upstream {}/overloaded detected. In-place self-healing: degraded thinking budget to 4000 on account {} (preserving prefix cache)",
+                status_code, email
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+            continue;
+        }
+
         if classification.abandons_sticky_account() {
             token_manager.abandon_session(&affinity_key, &account_id);
             tracing::debug!(

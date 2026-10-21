@@ -1101,7 +1101,7 @@ export const ProxyMonitor: React.FC<ProxyMonitorProps> = ({ className }) => {
                                 ? 'bg-emerald-600 text-white border-emerald-600 shadow-xs'
                                 : 'bg-white dark:bg-base-200 text-gray-700 dark:text-gray-200 border-gray-300 dark:border-base-300 hover:bg-gray-100 dark:hover:bg-base-300/80 hover:text-gray-900 dark:hover:text-white shadow-2xs'
                         }`}
-                        title={t('monitor.filters.capture_health_tip', { defaultValue: '默认关闭：过滤全部 GET 成功请求（含 /v1/models 模型列表轮询与 /health 探针）且不入库；失败请求始终记录；开启后才全部记录并落库' })}
+                        title={t('monitor.filters.capture_health_tip', { defaultValue: '默认关闭：过滤全部 GET 成功请求（含 /v1/models 模型列表轮询与 /health 探针）以及三方网关探活探测且不入库；失败请求始终记录；开启后才全部记录并落库' })}
                     >
                         <span className={`w-1.5 h-1.5 rounded-full ${captureHealthLogs ? 'bg-white animate-pulse' : 'bg-gray-400 dark:bg-gray-500'}`} />
                         {t('monitor.filters.capture_health', { defaultValue: '捕获健康检查' })}

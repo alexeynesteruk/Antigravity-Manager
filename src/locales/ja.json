@@ -779,6 +779,7 @@
     "switch_next": "次のアカウントに切り替え",
     "refresh_current": "現在のクォータを更新",
     "show_window": "メインウィンドウを表示",
+    "mini_view": "ミニビュー",
     "quit": "アプリを終了",
     "no_account": "アカウントなし",
     "unknown_quota": "不明 (クリックして更新)",

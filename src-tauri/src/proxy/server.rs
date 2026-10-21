@@ -607,6 +607,12 @@ impl AxumServer {
         let proxy_routes = Router::new()
             .route("/health", get(health_check_handler))
             .route("/healthz", get(health_check_handler))
+            // Version endpoints (vLLM / Hermes / Agent compatibility)
+            .route("/version", get(handlers::openai::handle_version))
+            .route("/v1/version", get(handlers::openai::handle_version))
+            // Props endpoints (llama.cpp / Hermes / Local probe compatibility)
+            .route("/props", get(handlers::openai::handle_props))
+            .route("/v1/props", get(handlers::openai::handle_props))
             // OpenAI Protocol (Chat & Universal Models)
             .route("/v1/models", get(handlers::openai::handle_list_models))
             .route(
@@ -1577,15 +1583,22 @@ async fn admin_switch_account(
         *switching = true;
     }
 
-    let account_id = payload.account_id.clone();
+    let resolved_account_id = match account::resolve_account_summary(
+        Some(&payload.account_id),
+        payload.target_ide.as_deref(),
+    ) {
+        Ok(summary) => summary.id,
+        Err(_) => payload.account_id.clone(),
+    };
+
     logger::log_info(&format!(
-        "[API] Starting account switch: {} (target_ide: {:?})",
-        account_id, payload.target_ide
+        "[API] Starting account switch: {} (resolved: {}) (target_ide: {:?})",
+        payload.account_id, resolved_account_id, payload.target_ide
     ));
 
     let result = state
         .account_service
-        .switch_account(&account_id, payload.target_ide.as_deref())
+        .switch_account(&resolved_account_id, payload.target_ide.as_deref())
         .await;
 
     {
@@ -1595,7 +1608,10 @@ async fn admin_switch_account(
 
     match result {
         Ok(()) => {
-            logger::log_info(&format!("[API] Account switch successful: {}", account_id));
+            logger::log_info(&format!(
+                "[API] Account switch successful: {}",
+                resolved_account_id
+            ));
 
             // [FIX #1166] 账号切换后立即同步内存状态
             state.token_manager.clear_all_sessions();
