@@ -6770,7 +6770,7 @@ pub fn cleanup_cached_tool_calls() {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 
 struct WebsocketSessionState {
     last_request: Option<Value>,
@@ -7648,6 +7648,7 @@ fn convert_codex_to_openai_request(mut body: Value) -> Value {
     body
 }
 
+#[derive(Default)]
 struct TranslationState {
     response_id: String,
     item_id: String,
@@ -7736,8 +7737,8 @@ async fn translate_openai_chunk_to_ws(
                         });
                         if !state.structured_output {
                             send_ws_event(socket, ws_events, &delta_ev).await;
+                            state.accumulated_text.push_str(reasoning);
                         }
-                        state.accumulated_text.push_str(reasoning);
                     }
                 }
 
@@ -8371,6 +8372,89 @@ pub async fn handle_videos_generations(
 #[cfg(test)]
 mod structured_response_tests {
     use super::*;
+
+    #[tokio::test]
+    async fn websocket_structured_output_keeps_reasoning_out_of_json() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (sender, mut receiver) = tokio::sync::mpsc::channel(1);
+        let app = axum::Router::new().route(
+            "/",
+            axum::routing::get(move |upgrade: axum::extract::WebSocketUpgrade| {
+                let sender = sender.clone();
+                async move {
+                    upgrade.on_upgrade(move |mut socket| async move {
+                        let mut state = TranslationState {
+                            response_id: "resp-test".into(),
+                            item_id: "msg-test".into(),
+                            structured_output: true,
+                            ..Default::default()
+                        };
+                        let mut events = Vec::new();
+                        for delta in [
+                            json!({"reasoning_content":"private analysis"}),
+                            json!({"content":"```json\n{\"title\":\"example\"}\n```"}),
+                        ] {
+                            translate_openai_chunk_to_ws(
+                                &json!({"choices":[{"delta":delta}]}),
+                                &mut state,
+                                &mut socket,
+                                &mut events,
+                            )
+                            .await;
+                        }
+                        finalize_ws_events(
+                            &mut state,
+                            &mut socket,
+                            &mut WebsocketSessionState::default(),
+                            &mut events,
+                        )
+                        .await;
+                        sender.send(events).await.unwrap();
+                    })
+                }
+            }),
+        );
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let events = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            let mut client = tokio::net::TcpStream::connect(address).await.unwrap();
+            client.write_all(b"GET / HTTP/1.1\r\nHost: localhost\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n").await.unwrap();
+            let mut headers = Vec::new();
+            while !headers.ends_with(b"\r\n\r\n") {
+                headers.push(client.read_u8().await.unwrap());
+                assert!(headers.len() < 8192);
+            }
+            assert!(headers.starts_with(b"HTTP/1.1 101"));
+            receiver.recv().await.unwrap()
+        })
+        .await;
+        server.abort();
+        let events = events.unwrap();
+        assert!(events.iter().any(|event| {
+            event["type"] == "response.reasoning_summary_text.delta"
+                && event["delta"] == "private analysis"
+        }));
+        let visible_text: String = events
+            .iter()
+            .filter(|event| event["type"] == "response.output_text.delta")
+            .filter_map(|event| event["delta"].as_str())
+            .collect();
+        assert_eq!(visible_text, "{\"title\":\"example\"}");
+        let done = events
+            .iter()
+            .find(|event| event["type"] == "response.output_text.done")
+            .unwrap();
+        assert_eq!(done["text"], visible_text);
+        let completed = events.last().unwrap();
+        assert_eq!(completed["type"], "response.completed");
+        assert_eq!(
+            completed["response"]["output"][0]["content"][0]["text"],
+            visible_text
+        );
+    }
+
     #[test]
     fn json_repair_is_scoped_to_explicit_structured_responses() {
         let response: OpenAIResponse=serde_json::from_value(json!({"id":"chatcmpl-json","object":"chat.completion","created":1,"model":"test","choices":[{"index":0,"message":{"role":"assistant","content":"```json\n{\"title\":\"example\"}\n```"},"finish_reason":"stop"}]})).unwrap();
