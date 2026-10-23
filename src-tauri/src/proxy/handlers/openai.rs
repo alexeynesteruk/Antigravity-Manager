@@ -1833,6 +1833,9 @@ pub async fn handle_chat_completions(
     >,
     Json(mut body): Json<Value>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
+    crate::proxy::pipeline::schema_limits::validate_request_tool_schemas(&body)
+        .map_err(|error| (StatusCode::BAD_REQUEST, error))?;
+
     let clean_start = std::time::Instant::now();
     // [NEW] Check for Image Model Redirection
     let model_name = body
@@ -3301,6 +3304,11 @@ pub async fn handle_completions(
     >,
     Json(mut body): Json<Value>,
 ) -> Response {
+    if let Err(error) = crate::proxy::pipeline::schema_limits::validate_request_tool_schemas(&body)
+    {
+        return (StatusCode::BAD_REQUEST, error).into_response();
+    }
+
     let clean_start = std::time::Instant::now();
     debug!(
         "Received /v1/completions or /v1/responses payload: {} bytes",
@@ -7062,6 +7070,8 @@ fn normalize_responses_websocket_request(
     mut payload: Value,
     state: &mut WebsocketSessionState,
 ) -> Result<Value, String> {
+    crate::proxy::pipeline::schema_limits::validate_request_tool_schemas(&payload)?;
+
     let event_type = payload
         .get("type")
         .and_then(Value::as_str)

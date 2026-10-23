@@ -530,6 +530,8 @@ impl UpstreamClient {
         extra_headers: std::collections::HashMap<String, String>,
         account_id: Option<&str>, // [NEW] Account ID
     ) -> Result<UpstreamCallResult, String> {
+        crate::proxy::pipeline::schema_limits::validate_request_tool_schemas(&body)?;
+
         // [DEFENSE] 全局终极防御拦截：净化所有发往上游报文中的损坏/空 inlineData 以及触发 Google WAF 拦截的违规计费元数据，并最终统一对齐官方信封与前缀拓扑
         if let Some(inner) = body.get_mut("request") {
             crate::proxy::mappers::common_utils::sanitize_gemini_payload_inline_data(inner);
@@ -939,6 +941,8 @@ impl UpstreamClient {
         account_id: Option<&str>,
         timeout_secs: u64,
     ) -> Result<Value, String> {
+        crate::proxy::pipeline::schema_limits::validate_request_tool_schemas(&body)?;
+
         if method == "countTokens" {
             crate::proxy::pipeline::InboundThinkingPipeline::align_count_tokens_envelope(&mut body);
         } else {

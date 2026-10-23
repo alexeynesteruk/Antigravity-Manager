@@ -13,6 +13,7 @@ pub mod inbound;
 #[cfg(test)]
 mod official_alignment_tests;
 pub mod policy;
+pub mod schema_limits;
 pub mod stream_lifecycle;
 pub mod structured_output;
 pub mod usage;

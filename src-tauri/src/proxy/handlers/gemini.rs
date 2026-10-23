@@ -81,6 +81,9 @@ pub async fn handle_generate(
     >,
     Json(mut body): Json<Value>, // 改为 mut 以支持修复提示词注入
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
+    crate::proxy::pipeline::schema_limits::validate_request_tool_schemas(&body)
+        .map_err(|error| (StatusCode::BAD_REQUEST, error))?;
+
     let clean_start = std::time::Instant::now();
 
     // 解析 model:method
@@ -1457,6 +1460,11 @@ pub async fn handle_count_tokens(
     >,
     Json(body): Json<Value>,
 ) -> Response {
+    if let Err(error) = crate::proxy::pipeline::schema_limits::validate_request_tool_schemas(&body)
+    {
+        return (StatusCode::BAD_REQUEST, error).into_response();
+    }
+
     execute_count_tokens(
         state,
         headers,
