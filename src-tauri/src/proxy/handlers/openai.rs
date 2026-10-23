@@ -1213,7 +1213,7 @@ data: {"type":"response.failed","response":{"status":"failed","error":{"code":"u
             .expect("inline image data");
 
         assert_eq!(
-            function_response["functionResponse"]["response"]["result"],
+            function_response["functionResponse"]["response"]["output"],
             "image generated"
         );
         assert!(!function_response.to_string().contains("data:image/"));
