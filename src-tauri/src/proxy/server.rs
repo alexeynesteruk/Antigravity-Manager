@@ -4761,15 +4761,13 @@ async fn admin_get_droid_config_content(
 }
 
 #[cfg(test)]
-mod config_reload_tests {
+pub(crate) mod config_reload_tests {
     use super::*;
     use tower::ServiceExt;
 
-    #[tokio::test]
-    async fn saving_web_config_updates_live_state_and_pool_bindings() {
-        let _dir = crate::proxy::monitor::prompt_log_tests::TestDataDir::new();
+    pub(crate) fn test_state() -> AppState {
         let _ = config::load_app_config().unwrap();
-        let mut config = config::load_app_config().unwrap();
+        let _ = config::load_app_config().unwrap();
         let pool = Arc::new(RwLock::new(Default::default()));
         let manager = Arc::new(crate::proxy::proxy_pool::ProxyPoolManager::new(
             pool.clone(),
@@ -4803,6 +4801,15 @@ mod config_reload_tests {
             only_raw_quota_models: Arc::new(RwLock::new(false)),
             image_scheduler: ImageScheduler::new(Vec::new(), 1),
         };
+        state
+    }
+
+    #[tokio::test]
+    async fn saving_web_config_updates_live_state_and_pool_bindings() {
+        let _dir = crate::proxy::monitor::prompt_log_tests::TestDataDir::new();
+        let _ = config::load_app_config().unwrap();
+        let mut config = config::load_app_config().unwrap();
+        let state = test_state();
         config.proxy.only_raw_quota_models = true;
         config.proxy.user_agent_override =
             Some("antigravity/hub/9.99.0 integration-reload-test".into());
@@ -5037,5 +5044,100 @@ mod image_scheduler_tests {
         let listener_v6 = super::bind_tcp_listener("::", port)
             .expect("wildcard v6 dual-stack bind should succeed");
         drop(listener_v6);
+    }
+}
+
+#[cfg(test)]
+mod gateway_integration_tests {
+    use super::*;
+    use tower::ServiceExt;
+
+    fn app() -> Router {
+        Router::new()
+            .route(
+                "/v1/responses",
+                post(crate::proxy::handlers::openai::handle_completions),
+            )
+            .route(
+                "/v1/chat/completions",
+                post(crate::proxy::handlers::openai::handle_chat_completions),
+            )
+            .route(
+                "/v1/messages",
+                post(crate::proxy::handlers::claude::handle_messages),
+            )
+            .route(
+                "/v1beta/models/:model",
+                post(crate::proxy::handlers::gemini::handle_generate),
+            )
+            .with_state(super::config_reload_tests::test_state())
+    }
+
+    async fn send(app: Router, path: &str, body: serde_json::Value) -> Response {
+        let request = axum::http::Request::builder()
+            .method("POST")
+            .uri(path)
+            .header("content-type", "application/json")
+            .body(axum::body::Body::from(body.to_string()))
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), app.oneshot(request))
+            .await
+            .unwrap()
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn missing_response_history_fails_before_upstream_work() {
+        let _dir = crate::proxy::monitor::prompt_log_tests::TestDataDir::new();
+        let response=send(app(),"/v1/responses",json!({"model":"gemini-pro-agent","input":"continue","previous_response_id":"missing-response"})).await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let bytes = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["error"]["code"], "previous_response_not_found");
+    }
+
+    #[tokio::test]
+    async fn all_four_protocols_reject_expansion_bombs_before_account_selection() {
+        let _dir = crate::proxy::monitor::prompt_log_tests::TestDataDir::new();
+        let app = app();
+        let mut defs = serde_json::Map::new();
+        defs.insert("leaf".into(), json!({"type":"string"}));
+        let mut previous = "leaf".to_string();
+        for index in 0..20 {
+            let name = format!("level{index}");
+            defs.insert(name.clone(),json!({"properties":{"left":{"$ref":format!("#/$defs/{previous}")},"right":{"$ref":format!("#/$defs/{previous}")}}}));
+            previous = name;
+        }
+        let schema = json!({"$defs":defs,"$ref":format!("#/$defs/{previous}")});
+        for (path, body) in [
+            (
+                "/v1/responses",
+                json!({"model":"gemini-pro-agent","input":"hello","tools":[{"type":"function","name":"t","parameters":schema}]}),
+            ),
+            (
+                "/v1/chat/completions",
+                json!({"model":"gemini-pro-agent","messages":[{"role":"user","content":"hello"}],"tools":[{"type":"function","function":{"name":"t","parameters":schema}}]}),
+            ),
+            (
+                "/v1/messages",
+                json!({"model":"claude-sonnet-4-6","messages":[{"role":"user","content":"hello"}],"tools":[{"name":"t","input_schema":schema}]}),
+            ),
+            (
+                "/v1beta/models/gemini-pro-agent:generateContent",
+                json!({"contents":[{"role":"user","parts":[{"text":"hello"}]}],"tools":[{"functionDeclarations":[{"name":"t","parameters":schema}]}]}),
+            ),
+        ] {
+            let response = send(app.clone(), path, body).await;
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{path}");
+            let body = axum::body::to_bytes(response.into_body(), 4096)
+                .await
+                .unwrap();
+            assert!(
+                String::from_utf8_lossy(&body).contains("node budget"),
+                "{path}"
+            );
+        }
     }
 }

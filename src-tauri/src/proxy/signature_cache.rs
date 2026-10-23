@@ -65,6 +65,42 @@ pub struct SignatureCache {
     session_reasonings: Mutex<HashMap<String, CacheEntry<Vec<String>>>>,
 }
 
+// Payload budgets follow the bounded-cache fork; entry counts also bound metadata.
+const TOOL_BYTES: usize = 2 * 1024 * 1024;
+const FAMILY_BYTES: usize = 2 * 1024 * 1024;
+const SESSION_BYTES: usize = 24 * 1024 * 1024;
+const REASONING_BYTES: usize = 4 * 1024 * 1024;
+const MAX_REASONING_TURN_INDEX: usize = 4096;
+
+fn enforce_cache_budget<T>(
+    cache: &mut HashMap<String, CacheEntry<T>>,
+    count: usize,
+    budget: usize,
+    size: impl Fn(&T) -> usize,
+) {
+    cache.retain(|_, entry| !entry.is_expired());
+    let mut total: usize = cache
+        .iter()
+        .map(|(key, entry)| key.capacity().saturating_add(size(&entry.data)))
+        .sum();
+    if cache.len() <= count && total <= budget {
+        return;
+    }
+    let mut oldest: Vec<_> = cache
+        .iter()
+        .map(|(key, entry)| (key.clone(), entry.timestamp))
+        .collect();
+    oldest.sort_unstable_by(|a, b| a.1.cmp(&b.1).then(a.0.cmp(&b.0)));
+    for (key, _) in oldest {
+        if cache.len() <= count && total <= budget {
+            break;
+        }
+        if let Some((key, entry)) = cache.remove_entry(&key) {
+            total = total.saturating_sub(key.capacity().saturating_add(size(&entry.data)));
+        }
+    }
+}
+
 impl SignatureCache {
     fn new() -> Self {
         Self {
@@ -109,6 +145,9 @@ impl SignatureCache {
             return;
         };
 
+        if signature.len().saturating_add(id_str.len()) > TOOL_BYTES {
+            return;
+        }
         // 1. 持久化到 SQLite L2 数据库 (支持代理重启后秒级恢复)
         let _ = crate::modules::proxy_db::save_tool_signature(&id_str, &signature);
 
@@ -118,18 +157,7 @@ impl SignatureCache {
             cache.insert(id_str, CacheEntry::new(signature));
 
             // Clean up expired entries when limit is reached
-            if cache.len() > TOOL_CACHE_LIMIT {
-                let before = cache.len();
-                cache.retain(|_, v| !v.is_expired());
-                let after = cache.len();
-                if before != after {
-                    tracing::debug!(
-                        "[SignatureCache] Tool cache cleanup: {} -> {} entries",
-                        before,
-                        after
-                    );
-                }
-            }
+            enforce_cache_budget(&mut cache, TOOL_CACHE_LIMIT, TOOL_BYTES, String::capacity);
         }
     }
 
@@ -168,6 +196,12 @@ impl SignatureCache {
                 let sig: String = sig;
                 if let Ok(mut cache) = self.tool_signatures.lock() {
                     cache.insert(candidate.clone(), CacheEntry::new(sig.clone()));
+                    enforce_cache_budget(
+                        &mut cache,
+                        TOOL_CACHE_LIMIT,
+                        TOOL_BYTES,
+                        String::capacity,
+                    );
                 }
                 tracing::info!(
                     "[SignatureCache] Restored tool signature from SQLite for id: {}",
@@ -186,6 +220,9 @@ impl SignatureCache {
             return;
         }
 
+        if signature.len().saturating_add(family.len()) > FAMILY_BYTES {
+            return;
+        }
         if let Ok(mut cache) = self.thinking_families.lock() {
             tracing::debug!(
                 "[SignatureCache] Caching thinking family for sig (len={}): {}",
@@ -199,18 +236,12 @@ impl SignatureCache {
                 cache.insert(norm, CacheEntry::new(family));
             }
 
-            if cache.len() > FAMILY_CACHE_LIMIT {
-                let before = cache.len();
-                cache.retain(|_, v| !v.is_expired());
-                let after = cache.len();
-                if before != after {
-                    tracing::debug!(
-                        "[SignatureCache] Family cache cleanup: {} -> {} entries",
-                        before,
-                        after
-                    );
-                }
-            }
+            enforce_cache_budget(
+                &mut cache,
+                FAMILY_CACHE_LIMIT,
+                FAMILY_BYTES,
+                String::capacity,
+            );
         }
     }
 
@@ -312,19 +343,13 @@ impl SignatureCache {
             }
 
             // Cleanup when limit is reached (Session cache has largest limit)
-            if cache.len() > SESSION_CACHE_LIMIT {
-                let before = cache.len();
-                cache.retain(|_, v| !v.is_expired());
-                let after = cache.len();
-                if before != after {
-                    tracing::info!(
-                        "[SignatureCache] Session cache cleanup: {} -> {} entries (limit: {})",
-                        before,
-                        after,
-                        SESSION_CACHE_LIMIT
-                    );
-                }
-            }
+            enforce_cache_budget(&mut cache, SESSION_CACHE_LIMIT, SESSION_BYTES, |history| {
+                history.capacity() * std::mem::size_of::<(usize, SessionSignatureEntry)>()
+                    + history
+                        .values()
+                        .map(|entry| entry.signature.capacity())
+                        .sum::<usize>()
+            });
         }
     }
 
@@ -392,6 +417,11 @@ impl SignatureCache {
 
     /// Store reasoning text for a specific assistant turn in a session
     pub fn cache_session_reasoning(&self, session_id: &str, reasoning: String, turn_index: usize) {
+        if turn_index >= MAX_REASONING_TURN_INDEX
+            || reasoning.len().saturating_add(session_id.len()) > REASONING_BYTES
+        {
+            return;
+        }
         if reasoning.trim().is_empty() {
             return;
         }
@@ -422,18 +452,15 @@ impl SignatureCache {
             }
 
             // Session cache cleanup if limit exceeded
-            if cache.len() > SESSION_CACHE_LIMIT {
-                let before = cache.len();
-                cache.retain(|_, v| !v.is_expired());
-                let after = cache.len();
-                if before != after {
-                    tracing::debug!(
-                        "[SignatureCache] Session reasoning cache cleanup: {} -> {} entries",
-                        before,
-                        after
-                    );
-                }
-            }
+            enforce_cache_budget(
+                &mut cache,
+                SESSION_CACHE_LIMIT,
+                REASONING_BYTES,
+                |history| {
+                    history.capacity() * std::mem::size_of::<String>()
+                        + history.iter().map(String::capacity).sum::<usize>()
+                },
+            );
         }
     }
 
@@ -492,6 +519,21 @@ impl SignatureCache {
             });
         }
         let _ = crate::modules::proxy_db::delete_tool_signatures_for_session(session_id);
+    }
+
+    pub fn evict_expired(&self) {
+        if let Ok(mut cache) = self.tool_signatures.lock() {
+            cache.retain(|_, entry| !entry.is_expired());
+        }
+        if let Ok(mut cache) = self.thinking_families.lock() {
+            cache.retain(|_, entry| !entry.is_expired());
+        }
+        if let Ok(mut cache) = self.session_signatures.lock() {
+            cache.retain(|_, entry| !entry.is_expired());
+        }
+        if let Ok(mut cache) = self.session_reasonings.lock() {
+            cache.retain(|_, entry| !entry.is_expired());
+        }
     }
 
     /// Clear all caches (for testing or manual reset)
@@ -709,5 +751,49 @@ mod tests {
         assert!(cache.get_session_reasoning("sess-1", 0).is_none());
         assert!(cache.get_session_reasoning("tenant:sess-1", 0).is_none());
         assert!(cache.get_session_reasoning("sess-2", 0).is_some());
+    }
+}
+
+#[cfg(test)]
+mod memory_budget_tests {
+    use super::*;
+    #[test]
+    fn signature_payloads_are_bounded_and_idle_entries_are_released() {
+        let cache = SignatureCache::new();
+        for index in 0..40 {
+            cache.cache_session_signature(&format!("budget-{index}"), "s".repeat(1024 * 1024), 1);
+        }
+        {
+            let entries = cache.session_signatures.lock().unwrap();
+            let bytes: usize = entries
+                .values()
+                .flat_map(|e| e.data.values())
+                .map(|e| e.signature.capacity())
+                .sum();
+            assert!(bytes <= SESSION_BYTES);
+            assert!(entries.contains_key("budget-39"));
+        }
+        for entry in cache.session_signatures.lock().unwrap().values_mut() {
+            entry.timestamp = SystemTime::now() - SIGNATURE_TTL - Duration::from_secs(1);
+        }
+        cache.evict_expired();
+        assert!(cache.session_signatures.lock().unwrap().is_empty());
+    }
+    #[test]
+    fn sparse_reasoning_indices_do_not_allocate_unbounded_vectors() {
+        let cache = SignatureCache::new();
+        cache.cache_session_reasoning("sparse", "reasoning".into(), usize::MAX);
+        assert!(cache.session_reasonings.lock().unwrap().is_empty());
+        for index in 0..10 {
+            cache.cache_session_reasoning(&format!("session-{index}"), "r".repeat(1024 * 1024), 0);
+        }
+        let entries = cache.session_reasonings.lock().unwrap();
+        let bytes: usize = entries
+            .values()
+            .flat_map(|e| e.data.iter())
+            .map(String::capacity)
+            .sum();
+        assert!(bytes <= REASONING_BYTES);
+        assert!(entries.contains_key("session-9"));
     }
 }

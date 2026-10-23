@@ -129,6 +129,35 @@ pub struct CacheManager {
     prefix_stats: std::sync::RwLock<(u64, u64, u64)>,
 }
 
+const PAYLOAD_BYTES: usize = 8 * 1024 * 1024;
+
+fn enforce_payload_budget<V>(
+    map: &DashMap<String, V>,
+    count: usize,
+    size: impl Fn(&V) -> usize,
+    timestamp: impl Fn(&V) -> Instant,
+) {
+    loop {
+        let total: usize = map
+            .iter()
+            .map(|entry| entry.key().capacity().saturating_add(size(entry.value())))
+            .sum();
+        if map.len() <= count && total <= PAYLOAD_BYTES {
+            break;
+        }
+        // Drop the iterator guard before removing from the same DashMap.
+        let oldest = {
+            map.iter()
+                .min_by_key(|entry| timestamp(entry.value()))
+                .map(|entry| entry.key().clone())
+        };
+        let Some(key) = oldest else {
+            break;
+        };
+        map.remove(&key);
+    }
+}
+
 impl CacheManager {
     /// Create a new CacheManager
     pub fn new() -> Self {
@@ -222,6 +251,10 @@ impl CacheManager {
 
     /// Store into Layer 1: raw -> sanitized
     pub fn cache_si(&self, raw_hash: String, sanitized_text: String) {
+        if raw_hash.len().saturating_add(sanitized_text.len()) > PAYLOAD_BYTES {
+            return;
+        }
+
         let entry = SiCacheEntry {
             sanitized_text,
             timestamp: Instant::now(),
@@ -235,20 +268,12 @@ impl CacheManager {
         );
 
         // LRU eviction: clear expired entries when over the limit
-        if self.si_cache.len() > SI_CACHE_LIMIT {
-            let before = self.si_cache.len();
-            self.si_cache
-                .retain(|_, v| !Self::is_expired(v.timestamp, LAYER_12_TTL));
-            let after = self.si_cache.len();
-            if before != after {
-                tracing::debug!(
-                    "[CacheManager:L1-SI] LRU cleanup: {} → {} (limit: {})",
-                    before,
-                    after,
-                    SI_CACHE_LIMIT
-                );
-            }
-        }
+        enforce_payload_budget(
+            &self.si_cache,
+            SI_CACHE_LIMIT,
+            |entry| entry.sanitized_text.capacity(),
+            |entry| entry.timestamp,
+        );
     }
 
     /// Compute the Layer 1 key: SHA256(raw instructions text)
@@ -319,6 +344,10 @@ impl CacheManager {
 
     /// Store into Layer 2: raw -> processed tools JSON
     pub fn cache_tools(&self, raw_hash: String, tools_json: String) {
+        if raw_hash.len().saturating_add(tools_json.len()) > PAYLOAD_BYTES {
+            return;
+        }
+
         let entry = ToolsCacheEntry {
             tools_json,
             timestamp: Instant::now(),
@@ -331,20 +360,12 @@ impl CacheManager {
             &raw_hash[..raw_hash.len().min(16)]
         );
 
-        if self.tools_cache.len() > TOOLS_CACHE_LIMIT {
-            let before = self.tools_cache.len();
-            self.tools_cache
-                .retain(|_, v| !Self::is_expired(v.timestamp, LAYER_12_TTL));
-            let after = self.tools_cache.len();
-            if before != after {
-                tracing::debug!(
-                    "[CacheManager:L2-Tools] LRU cleanup: {} → {} (limit: {})",
-                    before,
-                    after,
-                    TOOLS_CACHE_LIMIT
-                );
-            }
-        }
+        enforce_payload_budget(
+            &self.tools_cache,
+            TOOLS_CACHE_LIMIT,
+            |entry| entry.tools_json.capacity(),
+            |entry| entry.timestamp,
+        );
     }
 
     /// Compute the Layer 2 key: SHA256(raw tools JSON string)
@@ -459,20 +480,17 @@ impl CacheManager {
         );
         self.prefix_tracker.insert(hash, entry);
 
-        if self.prefix_tracker.len() > PREFIX_TRACKER_LIMIT {
-            let before = self.prefix_tracker.len();
-            let now = Instant::now();
-            self.prefix_tracker.retain(|_, v| v.expires_at > now);
-            let after = self.prefix_tracker.len();
-            if before != after {
-                tracing::debug!(
-                    "[CacheManager:L3-Prefix] LRU cleanup: {} → {} (limit: {})",
-                    before,
-                    after,
-                    PREFIX_TRACKER_LIMIT
-                );
-            }
-        }
+        enforce_payload_budget(
+            &self.prefix_tracker,
+            PREFIX_TRACKER_LIMIT,
+            |entry| {
+                entry.si_hash.capacity()
+                    + entry.tools_hash.capacity()
+                    + entry.cache_name.capacity()
+                    + entry.model.capacity()
+            },
+            |entry| entry.created_at,
+        );
     }
 
     /// Record one implicit cache hit (from a response's cachedContentTokenCount > 0)
@@ -990,5 +1008,31 @@ mod tests {
         assert_eq!(stats.si_total, 0);
         assert_eq!(stats.prefix_total, 0);
         assert_eq!(stats.active_si_entries, 0);
+    }
+}
+
+#[cfg(test)]
+mod memory_budget_tests {
+    use super::*;
+    #[test]
+    fn payloads_are_bounded_below_entry_count_limits() {
+        let cache = CacheManager::new();
+        for index in 0..12 {
+            cache.cache_si(format!("si-{index}"), "s".repeat(1024 * 1024));
+            cache.cache_tools(format!("tool-{index}"), "t".repeat(1024 * 1024));
+        }
+        let si: usize = cache
+            .si_cache
+            .iter()
+            .map(|e| e.key().capacity() + e.sanitized_text.capacity())
+            .sum();
+        let tools: usize = cache
+            .tools_cache
+            .iter()
+            .map(|e| e.key().capacity() + e.tools_json.capacity())
+            .sum();
+        assert!(si <= PAYLOAD_BYTES && tools <= PAYLOAD_BYTES);
+        assert!(cache.si_cache.contains_key("si-11"));
+        assert!(cache.tools_cache.contains_key("tool-11"));
     }
 }

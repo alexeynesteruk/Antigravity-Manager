@@ -313,6 +313,10 @@ impl TokenManager {
                         break;
                     }
                     _ = interval.tick() => {
+                        crate::proxy::handlers::openai::cleanup_cached_tool_calls();
+                        crate::proxy::signature_cache::SignatureCache::global().evict_expired();
+                        crate::proxy::cache_manager::global_cache_manager().evict_expired();
+                        crate::proxy::http_session_store::cleanup_expired_sessions().await;
                         let cleaned = tracker.cleanup_expired();
                         if cleaned > 0 {
                             tracing::info!(

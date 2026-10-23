@@ -3388,10 +3388,10 @@ pub async fn handle_completions(
                 );
                 prepared.merged
             } else {
-                if store_response {
-                    session_delta_input = existing_input.clone();
-                }
-                existing_input
+                return (StatusCode::BAD_REQUEST, Json(json!({"error": {
+                    "type": "invalid_request_error", "code": "previous_response_not_found", "param": "previous_response_id",
+                    "message": "Previous response is unavailable or expired. Resend the complete input without previous_response_id."
+                }}))).into_response();
             }
         } else {
             if store_response {
@@ -6682,27 +6682,91 @@ use tokio::sync::RwLock as TokioRwLock;
 
 use std::collections::HashMap;
 
-static WEBSOCKET_TOOL_CALL_CACHE: OnceLock<TokioRwLock<HashMap<String, Value>>> = OnceLock::new();
+const TOOL_CALL_CACHE_CAP: usize = 2000;
+const TOOL_CALL_CACHE_BYTES: usize = 8 * 1024 * 1024;
+const TOOL_CALL_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(3600);
 
-pub fn get_cached_tool_call(call_id: &str) -> Option<Value> {
-    if let Some(cache) = WEBSOCKET_TOOL_CALL_CACHE.get() {
-        if let Ok(guard) = cache.try_read() {
-            return guard.get(call_id).cloned();
+#[derive(Default)]
+struct ToolCallCache {
+    entries: HashMap<String, (Value, std::time::Instant, usize)>,
+    retained_bytes: usize,
+}
+
+impl ToolCallCache {
+    fn evict_expired(&mut self) {
+        let bytes = &mut self.retained_bytes;
+        self.entries.retain(|_, (_, timestamp, size)| {
+            if timestamp.elapsed() < TOOL_CALL_CACHE_TTL {
+                true
+            } else {
+                *bytes = bytes.saturating_sub(*size);
+                false
+            }
+        });
+    }
+    fn get(&self, call_id: &str) -> Option<Value> {
+        self.entries
+            .get(call_id)
+            .filter(|(_, timestamp, _)| timestamp.elapsed() < TOOL_CALL_CACHE_TTL)
+            .map(|(value, _, _)| value.clone())
+    }
+    fn insert(&mut self, call_id: String, item: Value) {
+        self.evict_expired();
+        let size = call_id
+            .capacity()
+            .saturating_add(crate::proxy::http_session_store::value_heap_bytes(&item))
+            .saturating_add(std::mem::size_of::<Value>());
+        if size > TOOL_CALL_CACHE_BYTES {
+            return;
+        }
+        if let Some((_, _, old_size)) = self.entries.remove(&call_id) {
+            self.retained_bytes = self.retained_bytes.saturating_sub(old_size);
+        }
+        self.entries
+            .insert(call_id, (item, std::time::Instant::now(), size));
+        self.retained_bytes = self.retained_bytes.saturating_add(size);
+        while self.entries.len() > TOOL_CALL_CACHE_CAP
+            || self.retained_bytes > TOOL_CALL_CACHE_BYTES
+        {
+            let oldest = self
+                .entries
+                .iter()
+                .min_by_key(|(_, (_, time, _))| *time)
+                .map(|(key, _)| key.clone());
+            let Some(key) = oldest else {
+                break;
+            };
+            if let Some((_, _, size)) = self.entries.remove(&key) {
+                self.retained_bytes = self.retained_bytes.saturating_sub(size);
+            }
         }
     }
+}
 
-    None
+static WEBSOCKET_TOOL_CALL_CACHE: OnceLock<TokioRwLock<ToolCallCache>> = OnceLock::new();
+
+pub fn get_cached_tool_call(call_id: &str) -> Option<Value> {
+    WEBSOCKET_TOOL_CALL_CACHE
+        .get()
+        .and_then(|cache| cache.try_read().ok().and_then(|guard| guard.get(call_id)))
 }
 
 pub fn insert_cached_tool_call(call_id: String, item: Value) {
     if call_id.is_empty() {
         return;
     }
-
-    let cache = WEBSOCKET_TOOL_CALL_CACHE.get_or_init(|| TokioRwLock::new(HashMap::new()));
-
+    let cache =
+        WEBSOCKET_TOOL_CALL_CACHE.get_or_init(|| TokioRwLock::new(ToolCallCache::default()));
     if let Ok(mut guard) = cache.try_write() {
         guard.insert(call_id, item);
+    }
+}
+
+pub fn cleanup_cached_tool_calls() {
+    if let Some(cache) = WEBSOCKET_TOOL_CALL_CACHE.get() {
+        if let Ok(mut guard) = cache.try_write() {
+            guard.evict_expired();
+        }
     }
 }
 
@@ -8320,5 +8384,37 @@ mod structured_response_tests {
             structured["output"][0]["content"][0]["text"],
             "{\"title\":\"example\"}"
         );
+    }
+}
+
+#[cfg(test)]
+mod tool_call_memory_tests {
+    use super::*;
+    #[test]
+    fn tool_call_payloads_and_idle_retention_are_bounded() {
+        let mut cache = ToolCallCache::default();
+        for index in 0..12 {
+            cache.insert(
+                format!("call-{index}"),
+                json!({"arguments":"x".repeat(1024*1024)}),
+            );
+        }
+        assert!(cache.retained_bytes <= TOOL_CALL_CACHE_BYTES);
+        assert!(cache.get("call-11").is_some());
+        for (_, time, _) in cache.entries.values_mut() {
+            *time =
+                std::time::Instant::now() - TOOL_CALL_CACHE_TTL - std::time::Duration::from_secs(1);
+        }
+        assert!(cache.get("call-11").is_none());
+        cache.evict_expired();
+        assert!(cache.entries.is_empty());
+        assert_eq!(cache.retained_bytes, 0);
+        for index in 0..TOOL_CALL_CACHE_CAP + 10 {
+            cache.insert(format!("tiny-{index}"), json!({"name":"read"}));
+        }
+        assert_eq!(cache.entries.len(), TOOL_CALL_CACHE_CAP);
+        assert!(cache
+            .get(&format!("tiny-{}", TOOL_CALL_CACHE_CAP + 9))
+            .is_some());
     }
 }
