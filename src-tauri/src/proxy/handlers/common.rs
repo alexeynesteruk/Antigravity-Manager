@@ -123,6 +123,16 @@ pub struct FailureStatusTracker {
 }
 
 impl FailureStatusTracker {
+    pub fn record_upstream_error(&mut self, error: &str) {
+        let error = error.to_ascii_lowercase();
+        let status = if error.contains("timeout") || error.contains("timed out") {
+            StatusCode::GATEWAY_TIMEOUT
+        } else {
+            StatusCode::BAD_GATEWAY
+        };
+        self.record(status);
+    }
+
     pub fn record(&mut self, status: StatusCode) {
         self.saw_failure = true;
         if status != StatusCode::TOO_MANY_REQUESTS {
@@ -1333,5 +1343,43 @@ mod retry_after_tests {
             "invalid_grant: refresh token revoked"
         ));
         assert!(!is_transient_token_error("No available account with quota"));
+    }
+}
+
+#[cfg(test)]
+mod failure_status_tests {
+    use super::*;
+    #[test]
+    fn timeout_and_network_failures_do_not_leak_prior_rate_limits() {
+        for (error, expected) in [
+            (
+                "HTTP request timed out waiting for response headers",
+                StatusCode::GATEWAY_TIMEOUT,
+            ),
+            (
+                "Timeout waiting for first data",
+                StatusCode::GATEWAY_TIMEOUT,
+            ),
+            ("connection reset by peer", StatusCode::BAD_GATEWAY),
+        ] {
+            let mut failures = FailureStatusTracker::default();
+            failures.record(StatusCode::TOO_MANY_REQUESTS);
+            failures.record_upstream_error(error);
+            failures.record(super::super::claude::normalize_claude_error_status(529));
+            assert_eq!(
+                super::super::claude::normalize_claude_error_status(
+                    failures.final_status().as_u16()
+                ),
+                expected
+            );
+        }
+    }
+    #[test]
+    fn genuinely_exhausted_pools_retain_rate_limit_status() {
+        let mut failures = FailureStatusTracker::default();
+        for code in [429, 529, 429] {
+            failures.record(super::super::claude::normalize_claude_error_status(code));
+        }
+        assert_eq!(failures.final_status(), StatusCode::TOO_MANY_REQUESTS);
     }
 }

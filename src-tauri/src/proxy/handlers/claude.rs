@@ -1705,7 +1705,7 @@ pub async fn handle_messages(
     let mut degraded_gemini_body: Option<serde_json::Value> = None;
     let mut last_email: Option<String> = None;
     let mut last_mapped_model: Option<String> = None;
-    let mut last_status = StatusCode::SERVICE_UNAVAILABLE; // Default to 503 if no response reached
+    let mut failure_statuses = super::common::FailureStatusTracker::default();
     let mut force_rotate = false;
 
     // [Stage Timing] 阶段耗时度量变量 (毫秒，保留微秒级浮点精度)
@@ -1733,9 +1733,7 @@ pub async fn handle_messages(
                 super::common::MAX_GATEWAY_REQUEST_BUDGET_SECS,
                 attempt
             );
-            if last_status == StatusCode::SERVICE_UNAVAILABLE || last_status == StatusCode::OK {
-                last_status = StatusCode::GATEWAY_TIMEOUT;
-            }
+            failure_statuses.record(StatusCode::GATEWAY_TIMEOUT);
             if last_error.is_empty() {
                 last_error = format!(
                     "Gateway global request budget exceeded ({}s)",
@@ -1752,9 +1750,7 @@ pub async fn handle_messages(
                 trace_id,
                 remaining_global_secs
             );
-            if last_status == StatusCode::SERVICE_UNAVAILABLE || last_status == StatusCode::OK {
-                last_status = StatusCode::GATEWAY_TIMEOUT;
-            }
+            failure_statuses.record(StatusCode::GATEWAY_TIMEOUT);
             break;
         }
 
@@ -2032,6 +2028,7 @@ pub async fn handle_messages(
             Ok(r) => r,
             Err(e) => {
                 last_error = e.clone();
+                failure_statuses.record_upstream_error(&e);
                 debug!(
                     "Request failed on attempt {}/{}: {}",
                     attempt + 1,
@@ -2082,7 +2079,9 @@ pub async fn handle_messages(
         // [NEW] 提取实际请求的上游端点 URL，用于日志记录和排查
         let upstream_url = response.url().to_string();
         let status = response.status();
-        last_status = status;
+        if !status.is_success() {
+            failure_statuses.record(normalize_claude_error_status(status.as_u16()));
+        }
 
         // 成功
         if status.is_success() {
@@ -2336,6 +2335,7 @@ pub async fn handle_messages(
                 }
 
                 if retry_this_account {
+                    failure_statuses.record_upstream_error(&last_error);
                     force_rotate = true;
                     continue;
                 }
@@ -2399,6 +2399,7 @@ pub async fn handle_messages(
                                         e
                                     );
                                 last_error = format!("Stream collection error: {}", e);
+                                failure_statuses.record_upstream_error(&last_error);
                                 force_rotate = true;
                                 continue;
                             }
@@ -2549,7 +2550,7 @@ pub async fn handle_messages(
 
         // 1. 立即提取状态码和 headers（防止 response 被 move）
         let status_code = status.as_u16();
-        last_status = status;
+
         let retry_after = response
             .headers()
             .get("Retry-After")
@@ -2919,7 +2920,7 @@ pub async fn handle_messages(
         }
     }
 
-    let response_status = normalize_claude_error_status(last_status.as_u16());
+    let response_status = normalize_claude_error_status(failure_statuses.final_status().as_u16());
     let headers = crate::proxy::handlers::common::build_token_error_headers_for_protocol(
         "claude",
         last_mapped_model.as_deref(),
