@@ -31,7 +31,7 @@ where
 }
 
 pub async fn collect_stream_to_json_with_anchor_and_count<S, E>(
-    mut stream: S,
+    stream: S,
     session_id: &str,
     anchor: Option<&str>,
     message_count: usize,
@@ -40,6 +40,10 @@ where
     S: futures::Stream<Item = Result<Bytes, E>> + Unpin,
     E: std::fmt::Display,
 {
+    // Process a final SSE line without a trailing newline through the same
+    // collector path, including metadata-only final frames.
+    let mut stream =
+        stream.chain(futures::stream::iter([Bytes::from_static(b"\n")]).map(Ok::<Bytes, E>));
     let mut collected_response = json!({
         "candidates": [
             {
@@ -56,6 +60,7 @@ where
     let mut content_parts: Vec<Value> = Vec::new(); // To accumulate parts
     let mut usage_metadata: Option<Value> = None;
     let mut finish_reason: Option<String> = None;
+    let mut grounding_metadata: Option<Value> = None;
     let mut stream_error: Option<Value> = None;
     let mut line_buffer = bytes::BytesMut::new();
 
@@ -112,6 +117,11 @@ where
                         actual_data.get("candidates").and_then(|c| c.as_array())
                     {
                         if let Some(candidate) = candidates.first() {
+                            // Each grounding object is a complete snapshot. Keep unknown
+                            // fields and support indices intact instead of merging arrays.
+                            if let Some(metadata) = candidate.get("groundingMetadata") {
+                                grounding_metadata = Some(metadata.clone());
+                            }
                             // Update finish reason if present
                             if let Some(fr) = candidate.get("finishReason").and_then(|v| v.as_str())
                             {
@@ -240,33 +250,6 @@ where
         }
     }
 
-    // Flush leftover buffer if any
-    if stream_error.is_none() && !line_buffer.is_empty() {
-        let line_str = String::from_utf8_lossy(&line_buffer);
-        let line = line_str.trim();
-        if line.starts_with("data: ") {
-            let json_part = line.trim_start_matches("data: ").trim();
-            if json_part != "[DONE]" {
-                if let Ok(mut json) = serde_json::from_str::<Value>(json_part) {
-                    let actual_data =
-                        if let Some(inner) = json.get_mut("response").map(|v| v.take()) {
-                            inner
-                        } else {
-                            json
-                        };
-                    if let Some(err) = actual_data.get("error") {
-                        let err_val = if actual_data.as_object().is_some_and(|m| m.len() == 1) {
-                            actual_data
-                        } else {
-                            json!({ "error": err })
-                        };
-                        stream_error = Some(err_val);
-                    }
-                }
-            }
-        }
-    }
-
     // If stream contained an error event/payload, return it directly without polluting state
     if let Some(err_val) = stream_error {
         return Ok(err_val);
@@ -301,6 +284,9 @@ where
     }
     if let Some(usage) = usage_metadata {
         collected_response["usageMetadata"] = usage;
+    }
+    if let Some(metadata) = grounding_metadata {
+        collected_response["candidates"][0]["groundingMetadata"] = metadata;
     }
 
     Ok(collected_response)
@@ -457,5 +443,140 @@ mod tests {
         assert_eq!(parts[0]["thought"], true);
         assert_eq!(parts[0]["thoughtSignature"], "sig_valid_1234567890");
         assert_eq!(parts[1]["text"], "Final answer.");
+    }
+}
+
+#[cfg(test)]
+mod grounding_tests {
+    use super::*;
+
+    async fn replay(frames: &[Value]) -> Value {
+        let chunks: Vec<Result<Bytes, String>> = frames
+            .iter()
+            .map(|frame| Ok(Bytes::from(format!("data: {}\n\n", frame))))
+            .collect();
+        collect_stream_to_json_with_anchor(
+            futures::stream::iter(chunks),
+            "synthetic-grounding-replay",
+            Some("synthetic-grounding-anchor"),
+        )
+        .await
+        .expect("synthetic SSE replay should complete")
+    }
+
+    #[tokio::test]
+    async fn grounding_in_separate_metadata_frame_preserves_original_shape() {
+        let metadata = json!({
+            "webSearchQueries": ["synthetic public query"],
+            "groundingChunks": [{"web": {"uri": "https://example.invalid/source", "title": "Source"}}],
+            "groundingSupports": [{"segment": {"startIndex": 0, "endIndex": 6, "text": "Result"}, "groundingChunkIndices": [0]}],
+            "searchEntryPoint": {"renderedContent": "synthetic entry point"},
+            "futureMetadata": {"opaque": [1, {"flag": true}]}
+        });
+        let usage = json!({"promptTokenCount": 78, "candidatesTokenCount": 653});
+        let result = replay(&[
+            json!({"response": {"candidates": [{"content": {"parts": [{"text": "Res"}]}}]}}),
+            json!({"candidates": [{"content": {"parts": [{"text": "ult"}]}}]}),
+            json!({"response": {"candidates": [{"groundingMetadata": metadata.clone()}]}}),
+            json!({"candidates": [{"finishReason": "STOP"}], "usageMetadata": usage.clone()}),
+        ])
+        .await;
+        assert_eq!(result["candidates"][0]["groundingMetadata"], metadata);
+        assert_eq!(
+            result["candidates"][0]["content"]["parts"],
+            json!([{"text": "Result"}])
+        );
+        assert_eq!(result["candidates"][0]["finishReason"], "STOP");
+        assert_eq!(result["usageMetadata"], usage);
+    }
+
+    #[tokio::test]
+    async fn grounding_snapshots_replace_atomically_without_reindexing_supports() {
+        let first = json!({
+            "webSearchQueries": ["first"],
+            "groundingChunks": [{"web": {"uri": "https://example.invalid/old"}}],
+            "groundingSupports": [{"groundingChunkIndices": [0]}],
+            "oldOnly": true
+        });
+        let latest = json!({
+            "webSearchQueries": ["final"],
+            "groundingChunks": [
+                {"web": {"uri": "https://example.invalid/new-first"}},
+                {"web": {"uri": "https://example.invalid/new-second"}}
+            ],
+            "groundingSupports": [{"groundingChunkIndices": [1]}],
+            "unknownSnapshotField": {"value": "preserved"}
+        });
+        let result = replay(&[
+            json!({"candidates": [{"groundingMetadata": first}]}),
+            json!({"candidates": [{"content": {"parts": [{"text": "Result"}]}}]}),
+            json!({"response": {"candidates": [{"groundingMetadata": latest.clone()}]}}),
+            json!({"candidates": [{"finishReason": "STOP"}]}),
+        ])
+        .await;
+        assert_eq!(result["candidates"][0]["groundingMetadata"], latest);
+        assert_eq!(
+            result["candidates"][0]["groundingMetadata"]["groundingChunks"]
+                .as_array()
+                .unwrap()
+                .len(),
+            2
+        );
+        assert_eq!(
+            result["candidates"][0]["groundingMetadata"]["groundingSupports"][0]
+                ["groundingChunkIndices"],
+            json!([1])
+        );
+        assert!(result["candidates"][0]["groundingMetadata"]
+            .get("oldOnly")
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn missing_grounding_is_not_invented_and_other_response_fields_survive() {
+        let parts = json!([
+            {"text": "synthetic thought", "thought": true},
+            {"functionCall": {"name": "synthetic_read", "args": {"id": 1}}, "thoughtSignature": "synthetic-signature"}
+        ]);
+        let result = replay(&[
+            json!({"candidates": [{"content": {"parts": parts.clone()}}]}),
+            json!({"candidates": [{"finishReason": "MALFORMED_FUNCTION_CALL"}], "usageMetadata": {"totalTokenCount": 5}}),
+        ])
+        .await;
+        assert!(result["candidates"][0].get("groundingMetadata").is_none());
+        assert_eq!(result["candidates"][0]["content"]["parts"], parts);
+        assert_eq!(
+            result["candidates"][0]["finishReason"],
+            "MALFORMED_FUNCTION_CALL"
+        );
+        assert_eq!(result["usageMetadata"], json!({"totalTokenCount": 5}));
+    }
+
+    #[tokio::test]
+    async fn explicit_empty_grounding_snapshot_replaces_earlier_metadata() {
+        let result = replay(&[
+            json!({"candidates": [{"groundingMetadata": {"groundingChunks": [{"web": {"uri": "https://example.invalid/old"}}]}}]}),
+            json!({"candidates": [{"groundingMetadata": {}, "finishReason": "STOP"}]}),
+        ])
+        .await;
+        assert_eq!(result["candidates"][0]["groundingMetadata"], json!({}));
+    }
+
+    #[tokio::test]
+    async fn final_metadata_frame_without_newline_is_preserved() {
+        let frame = json!({"response": {"candidates": [{"content": {"parts": [{"text": "Result"}]}, "finishReason": "STOP", "groundingMetadata": {"futureField": [1, 2]}}]}});
+        let chunks =
+            futures::stream::iter([Ok::<Bytes, String>(Bytes::from(format!("data: {}", frame)))]);
+        let result = collect_stream_to_json(chunks, "grounding-final-line")
+            .await
+            .unwrap();
+        assert_eq!(
+            result["candidates"][0]["groundingMetadata"]["futureField"],
+            json!([1, 2])
+        );
+        assert_eq!(
+            result["candidates"][0]["content"]["parts"][0]["text"],
+            "Result"
+        );
     }
 }
