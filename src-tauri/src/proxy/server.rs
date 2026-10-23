@@ -1887,11 +1887,22 @@ async fn admin_save_config(
         *mapping = new_config.clone().proxy.custom_mapping;
     }
 
+    {
+        let mut only_raw = state.only_raw_quota_models.write().await;
+        *only_raw = new_config.proxy.only_raw_quota_models;
+    }
+
     // 更新上游代理
     {
         let mut proxy = state.upstream_proxy.write().await;
         *proxy = new_config.clone().proxy.upstream_proxy;
     }
+    state
+        .upstream
+        .rebuild_default_client(Some(new_config.proxy.upstream_proxy.clone()))
+        .await;
+    state.upstream.clear_client_cache();
+    crate::utils::http::invalidate_shared_clients();
 
     // 更新安全策略
     {
@@ -1905,11 +1916,28 @@ async fn admin_save_config(
         *exp = new_config.clone().proxy.experimental;
     }
 
+    {
+        let mut debug_logging = state.debug_logging.write().await;
+        *debug_logging = new_config.proxy.debug_logging.clone();
+    }
+
     // 更新代理池配置（Web/Docker 保存配置时热更新）
     {
         let mut pool = state.proxy_pool_state.write().await;
         *pool = new_config.clone().proxy.proxy_pool;
     }
+    state.proxy_pool_manager.sync_bindings_from_config().await;
+    state
+        .upstream
+        .set_user_agent_override(new_config.proxy.user_agent_override.clone())
+        .await;
+    state
+        .monitor
+        .set_capture_health_logs(new_config.proxy.capture_health_logs);
+    crate::modules::hub_version::update_hub_fingerprint(
+        new_config.proxy.hub_version.as_deref(),
+        new_config.proxy.hub_cl.as_deref(),
+    );
 
     // 同步全局内存配置（热更新思考预算、系统提示词、图像思考模式与审计策略）
     crate::proxy::update_thinking_budget_config(new_config.proxy.thinking_budget.clone());
@@ -4730,6 +4758,102 @@ async fn admin_get_droid_config_content(
                 Json(ErrorResponse { error: e }),
             )
         })
+}
+
+#[cfg(test)]
+mod config_reload_tests {
+    use super::*;
+    use tower::ServiceExt;
+
+    #[tokio::test]
+    async fn saving_web_config_updates_live_state_and_pool_bindings() {
+        let _dir = crate::proxy::monitor::prompt_log_tests::TestDataDir::new();
+        let _ = config::load_app_config().unwrap();
+        let mut config = config::load_app_config().unwrap();
+        let pool = Arc::new(RwLock::new(Default::default()));
+        let manager = Arc::new(crate::proxy::proxy_pool::ProxyPoolManager::new(
+            pool.clone(),
+        ));
+        let integration = crate::modules::integration::SystemManager::Headless;
+        let state = AppState {
+            token_manager: Arc::new(TokenManager::new(account::get_data_dir().unwrap())),
+            custom_mapping: Arc::new(RwLock::new(Default::default())),
+            request_timeout: 60,
+            thought_signature_map: Arc::new(tokio::sync::Mutex::new(Default::default())),
+            upstream_proxy: Arc::new(RwLock::new(Default::default())),
+            upstream: Arc::new(crate::proxy::upstream::client::UpstreamClient::new(
+                None, None,
+            )),
+            monitor: Arc::new(crate::proxy::monitor::ProxyMonitor::new(10, None)),
+            experimental: Arc::new(RwLock::new(Default::default())),
+            debug_logging: Arc::new(RwLock::new(Default::default())),
+            switching: Arc::new(RwLock::new(false)),
+            account_service: Arc::new(crate::modules::account_service::AccountService::new(
+                integration.clone(),
+            )),
+            integration,
+            security: Arc::new(RwLock::new(
+                crate::proxy::ProxySecurityConfig::from_proxy_config(&Default::default()),
+            )),
+            cloudflared_state: Arc::new(crate::commands::cloudflared::CloudflaredState::new()),
+            is_running: Arc::new(RwLock::new(true)),
+            port: 8045,
+            proxy_pool_state: pool,
+            proxy_pool_manager: manager,
+            only_raw_quota_models: Arc::new(RwLock::new(false)),
+            image_scheduler: ImageScheduler::new(Vec::new(), 1),
+        };
+        config.proxy.only_raw_quota_models = true;
+        config.proxy.user_agent_override =
+            Some("antigravity/hub/9.99.0 integration-reload-test".into());
+        config.proxy.capture_health_logs = true;
+        config.proxy.debug_logging.enabled = true;
+        config
+            .proxy
+            .proxy_pool
+            .account_bindings
+            .insert("account".into(), "proxy".into());
+        let app = Router::new()
+            .route("/config", post(admin_save_config))
+            .with_state(state.clone());
+        let request = axum::http::Request::builder()
+            .method("POST")
+            .uri("/config")
+            .header("content-type", "application/json")
+            .body(axum::body::Body::from(
+                json!({"config": config}).to_string(),
+            ))
+            .unwrap();
+        let response = app.oneshot(request).await.unwrap();
+        let status = response.status();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+        assert!(*state.only_raw_quota_models.read().await);
+        assert!(state.debug_logging.read().await.enabled);
+        assert!(state
+            .monitor
+            .capture_health_logs
+            .load(std::sync::atomic::Ordering::Relaxed));
+        assert_eq!(
+            state.upstream.get_user_agent().await,
+            "antigravity/hub/9.99.0 integration-reload-test"
+        );
+        assert_eq!(
+            state
+                .proxy_pool_manager
+                .get_account_binding("account")
+                .as_deref(),
+            Some("proxy")
+        );
+        let saved = config::load_app_config().unwrap();
+        assert!(
+            saved.proxy.only_raw_quota_models,
+            "persisted config: {}",
+            serde_json::to_string(&saved).unwrap()
+        );
+    }
 }
 
 #[cfg(test)]
