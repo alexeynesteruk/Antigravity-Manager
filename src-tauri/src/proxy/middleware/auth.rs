@@ -6,10 +6,124 @@ use axum::{
     middleware::Next,
     response::Response,
 };
+use std::borrow::Cow;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
 use crate::proxy::{ProxyAuthMode, ProxySecurityConfig};
+
+/// 从请求中提取 API Key / Token
+/// 支持提取顺序：
+/// 1. Authorization header (Bearer token / Raw token)
+/// 2. x-api-key header
+/// 3. x-goog-api-key header (Google Gemini / Google Cloud)
+/// 4. URL query 参数 ?key=... (Google Gemini 官方 REST 协议规范)
+fn extract_api_key<B>(request: &Request<B>, allow_query: bool) -> Option<Cow<'_, str>> {
+    // 1. Authorization header
+    if let Some(auth_val) = request
+        .headers()
+        .get(header::AUTHORIZATION)
+        .and_then(|h| h.to_str().ok())
+    {
+        let trimmed = auth_val.trim();
+        let token = if let Some(stripped) = trimmed.strip_prefix("Bearer ") {
+            stripped.trim()
+        } else if let Some(stripped) = trimmed.strip_prefix("bearer ") {
+            stripped.trim()
+        } else if trimmed.eq_ignore_ascii_case("bearer") {
+            ""
+        } else {
+            trimmed
+        };
+        if !token.is_empty() {
+            return Some(Cow::Borrowed(token));
+        }
+    }
+
+    // 2. x-api-key header
+    if let Some(val) = request
+        .headers()
+        .get("x-api-key")
+        .and_then(|h| h.to_str().ok())
+    {
+        let trimmed = val.trim();
+        if !trimmed.is_empty() {
+            return Some(Cow::Borrowed(trimmed));
+        }
+    }
+
+    // 3. x-goog-api-key header
+    if let Some(val) = request
+        .headers()
+        .get("x-goog-api-key")
+        .and_then(|h| h.to_str().ok())
+    {
+        let trimmed = val.trim();
+        if !trimmed.is_empty() {
+            return Some(Cow::Borrowed(trimmed));
+        }
+    }
+
+    if !allow_query {
+        return None;
+    }
+
+    // 4. URL query 参数 (?key=...)
+    if let Some(query) = request.uri().query() {
+        for (k, v) in url::form_urlencoded::parse(query.as_bytes()) {
+            if k == "key" {
+                match v {
+                    Cow::Borrowed(s) => {
+                        let trimmed = s.trim();
+                        if !trimmed.is_empty() {
+                            return Some(Cow::Borrowed(trimmed));
+                        }
+                    }
+                    Cow::Owned(s) => {
+                        let trimmed = s.trim();
+                        if !trimmed.is_empty() {
+                            return Some(Cow::Owned(trimmed.to_string()));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    None
+}
+
+fn without_query_key(mut request: Request) -> Request {
+    let Some(query) = request.uri().query() else {
+        return request;
+    };
+    let mut encoded = url::form_urlencoded::Serializer::new(String::new());
+    let mut removed = false;
+    for (key, value) in url::form_urlencoded::parse(query.as_bytes()) {
+        if key == "key" {
+            removed = true;
+        } else {
+            encoded.append_pair(&key, &value);
+        }
+    }
+    if removed {
+        let query = encoded.finish();
+        let path = request.uri().path();
+        let path_and_query = if query.is_empty() {
+            path.to_string()
+        } else {
+            format!("{path}?{query}")
+        };
+        let mut parts = request.uri().clone().into_parts();
+        if let Ok(value) = path_and_query.parse() {
+            parts.path_and_query = Some(value);
+            if let Ok(uri) = axum::http::Uri::from_parts(parts) {
+                *request.uri_mut() = uri;
+            }
+        }
+    }
+    request
+}
 
 /// API Key 认证中间件 (代理接口使用，遵循 auth_mode)
 pub async fn auth_middleware(
@@ -74,26 +188,24 @@ async fn auth_middleware_internal(
 
     let security = security.read().await.clone();
     let effective_mode = security.effective_auth_mode();
+    let allow_query_key =
+        !force_strict && (path == "/v1beta/models" || path.starts_with("/v1beta/models/"));
+    let api_key = extract_api_key(&request, allow_query_key).map(Cow::into_owned);
+    // The monitor runs after authentication. Do not persist URL credentials in logs.
+    let request = if allow_query_key {
+        without_query_key(request)
+    } else {
+        request
+    };
 
     // 权限检查逻辑
     if !force_strict {
         // AI 代理接口 (v1/chat/completions 等)
         if matches!(effective_mode, ProxyAuthMode::Off) {
             // [FIX] 即使 auth_mode=Off，也需要尝试识别 User Token 以记录使用情况
-            // 先检查是否携带了 User Token
-            let api_key = request
-                .headers()
-                .get(header::AUTHORIZATION)
-                .and_then(|h| h.to_str().ok())
-                .and_then(|s| s.strip_prefix("Bearer ").or(Some(s)))
-                .or_else(|| {
-                    request
-                        .headers()
-                        .get("x-api-key")
-                        .and_then(|h| h.to_str().ok())
-                });
+            // 先检查是否携带了 User Token (支持 header 或 URL query ?key=)
 
-            if let Some(token) = api_key {
+            if let Some(token) = api_key.as_deref() {
                 // 尝试验证是否为 User Token（不阻止请求，只记录）
                 if let Ok(Some(user_token)) =
                     crate::modules::user_token_db::get_token_by_value(token)
@@ -124,24 +236,7 @@ async fn auth_middleware_internal(
         }
     }
 
-    // 从 header 中提取 API key
-    let api_key = request
-        .headers()
-        .get(header::AUTHORIZATION)
-        .and_then(|h| h.to_str().ok())
-        .and_then(|s| s.strip_prefix("Bearer ").or(Some(s)))
-        .or_else(|| {
-            request
-                .headers()
-                .get("x-api-key")
-                .and_then(|h| h.to_str().ok())
-        })
-        .or_else(|| {
-            request
-                .headers()
-                .get("x-goog-api-key")
-                .and_then(|h| h.to_str().ok())
-        });
+    // 从 header 或 URL query (?key=) 中提取 API key
 
     if security.api_key.is_empty()
         && (security.admin_password.is_none()
@@ -159,22 +254,28 @@ async fn auth_middleware_internal(
     let authorized = if force_strict {
         // 管理接口：优先使用独立的 admin_password，如果没有则回退使用 api_key
         match &security.admin_password {
-            Some(pwd) if !pwd.is_empty() => api_key.map(|k| k == pwd).unwrap_or(false),
+            Some(pwd) if !pwd.is_empty() => api_key.as_deref().map(|k| k == pwd).unwrap_or(false),
             _ => {
                 // 回退使用 api_key
-                api_key.map(|k| k == security.api_key).unwrap_or(false)
+                api_key
+                    .as_deref()
+                    .map(|k| k == security.api_key)
+                    .unwrap_or(false)
             }
         }
     } else {
         // AI 代理接口：仅允许使用 api_key
-        api_key.map(|k| k == security.api_key).unwrap_or(false)
+        api_key
+            .as_deref()
+            .map(|k| k == security.api_key)
+            .unwrap_or(false)
     };
 
     if authorized {
         Ok(next.run(request).await)
     } else if !force_strict && api_key.is_some() {
         // 尝试验证 UserToken
-        let token = api_key.unwrap();
+        let token = api_key.as_deref().unwrap();
 
         // 提取 IP (复用 ip_filter 规范化逻辑，支持 IPv4/IPv6 及 ConnectInfo)
         let client_ip = crate::proxy::middleware::ip_filter::extract_client_ip(&request)
@@ -252,6 +353,94 @@ pub struct UserTokenIdentity {
 mod tests {
     use super::*;
     use crate::proxy::ProxyAuthMode;
+
+    fn strict_security() -> Arc<RwLock<ProxySecurityConfig>> {
+        Arc::new(RwLock::new(ProxySecurityConfig {
+            auth_mode: ProxyAuthMode::Strict,
+            api_key: "valid+key".into(),
+            admin_password: Some("admin-password".into()),
+            allow_lan_access: false,
+            port: 8045,
+            security_monitor: Default::default(),
+        }))
+    }
+
+    #[test]
+    fn key_extraction_preserves_header_precedence_and_decodes_query() {
+        let query = Request::builder()
+            .uri("/v1beta/models?key=valid%2Bkey")
+            .body(())
+            .unwrap();
+        assert_eq!(extract_api_key(&query, true).as_deref(), Some("valid+key"));
+        assert!(extract_api_key(&query, false).is_none());
+        for (header, value, expected) in [
+            ("Authorization", "Bearer header-key", "header-key"),
+            ("Authorization", "bearer header-key", "header-key"),
+            ("x-api-key", "header-key", "header-key"),
+            ("x-goog-api-key", "header-key", "header-key"),
+        ] {
+            let request = Request::builder()
+                .uri("/v1beta/models?key=valid%2Bkey")
+                .header(header, value)
+                .body(())
+                .unwrap();
+            assert_eq!(extract_api_key(&request, true).as_deref(), Some(expected));
+        }
+    }
+
+    #[tokio::test]
+    async fn gemini_query_auth_removes_credentials_before_monitoring() {
+        use tower::ServiceExt;
+        let app = axum::Router::new()
+            .route(
+                "/v1beta/models",
+                axum::routing::get(|request: Request| async move { request.uri().to_string() }),
+            )
+            .layer(axum::middleware::from_fn_with_state(
+                strict_security(),
+                auth_middleware,
+            ));
+        let request = Request::builder()
+            .uri("/v1beta/models?key=valid%2Bkey&alt=sse&key=duplicate")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 1024)
+            .await
+            .unwrap();
+        assert_eq!(body.as_ref(), b"/v1beta/models?alt=sse");
+    }
+
+    #[tokio::test]
+    async fn query_credentials_do_not_authenticate_admin_or_chat_routes() {
+        use tower::ServiceExt;
+        for admin in [false, true] {
+            let app = axum::Router::new().route(
+                "/api/config",
+                axum::routing::get(|| async { StatusCode::OK }),
+            );
+            let app = if admin {
+                app.layer(axum::middleware::from_fn_with_state(
+                    strict_security(),
+                    admin_auth_middleware,
+                ))
+            } else {
+                app.layer(axum::middleware::from_fn_with_state(
+                    strict_security(),
+                    auth_middleware,
+                ))
+            };
+            let request = Request::builder()
+                .uri("/api/config?key=admin-password")
+                .body(axum::body::Body::empty())
+                .unwrap();
+            assert_eq!(
+                app.oneshot(request).await.unwrap().status(),
+                StatusCode::UNAUTHORIZED
+            );
+        }
+    }
 
     #[tokio::test]
     async fn test_admin_auth_with_password() {
