@@ -5,16 +5,26 @@ use super::account::get_data_dir;
 use crate::models::AppConfig;
 
 const CONFIG_FILE: &str = "gui_config.json";
+// A migration read may write back a normalized snapshot. Serialize that entire
+// transaction with explicit saves so background readers cannot restore stale data.
+static CONFIG_IO_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// Load application configuration
 pub fn load_app_config() -> Result<AppConfig, String> {
+    let _guard = CONFIG_IO_LOCK
+        .lock()
+        .map_err(|e| format!("configuration lock: {e}"))?;
+    load_app_config_locked()
+}
+
+fn load_app_config_locked() -> Result<AppConfig, String> {
     let data_dir = get_data_dir()?;
     let config_path = data_dir.join(CONFIG_FILE);
 
     if !config_path.exists() {
         let config = AppConfig::new();
         // [FIX #1460] Persist initial config to prevent new API Key on every refresh
-        if let Err(e) = save_app_config(&config) {
+        if let Err(e) = save_app_config_locked(&config) {
             tracing::warn!(
                 "Failed to persist initial config to {}: {}. An in-memory config will be used; the next start may generate a new API key if the file is still missing.",
                 config_path.display(),
@@ -31,7 +41,7 @@ pub fn load_app_config() -> Result<AppConfig, String> {
 
     // If migration occurred or empty config was generated, auto-save once to clean up the file
     if modified {
-        if let Err(e) = save_app_config(&config) {
+        if let Err(e) = save_app_config_locked(&config) {
             tracing::warn!(
                 "Failed to persist healed or migrated config to {}: {}. An in-memory config will be used; the next start may generate a new API key if the file is still empty.",
                 config_path.display(),
@@ -236,6 +246,13 @@ pub fn parse_and_migrate_config(content: &str) -> Result<(AppConfig, bool), Stri
 
 /// Save application configuration (atomic write)
 pub fn save_app_config(config: &AppConfig) -> Result<(), String> {
+    let _guard = CONFIG_IO_LOCK
+        .lock()
+        .map_err(|e| format!("configuration lock: {e}"))?;
+    save_app_config_locked(config)
+}
+
+fn save_app_config_locked(config: &AppConfig) -> Result<(), String> {
     let data_dir = get_data_dir()?;
     let config_path = data_dir.join(CONFIG_FILE);
 
@@ -249,6 +266,27 @@ pub fn save_app_config(config: &AppConfig) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn migration_reads_do_not_overwrite_concurrent_saves() {
+        let _dir = crate::proxy::monitor::prompt_log_tests::TestDataDir::new();
+        let mut config = AppConfig::default();
+        save_app_config(&config).unwrap();
+        let reader = std::thread::spawn(|| {
+            for _ in 0..64 {
+                load_app_config().unwrap();
+            }
+        });
+        for index in 0..64 {
+            config.theme = format!("saved-{index}");
+            config.proxy.only_raw_quota_models = true;
+            save_app_config(&config).unwrap();
+        }
+        reader.join().unwrap();
+        let saved = load_app_config().unwrap();
+        assert_eq!(saved.theme, "saved-63");
+        assert!(saved.proxy.only_raw_quota_models);
+    }
 
     #[test]
     fn test_parse_and_migrate_empty_or_whitespace_config() {
