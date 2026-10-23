@@ -14,6 +14,7 @@ pub mod inbound;
 mod official_alignment_tests;
 pub mod policy;
 pub mod stream_lifecycle;
+pub mod structured_output;
 pub mod usage;
 
 pub use auto_heal::{wrap_stream_with_empty_thinking_auto_heal, ThinkingAutoHealContext};

@@ -799,6 +799,7 @@ pub fn create_codex_sse_stream<S, E>(
         tokio::sync::oneshot::Sender<(Vec<Value>, tokio::sync::oneshot::Sender<()>)>,
     >,
     cache_tool_calls: bool,
+    structured_output: bool,
 ) -> Pin<Box<dyn Stream<Item = Result<Bytes, String>> + Send>>
 where
     S: Stream<Item = Result<Bytes, E>> + Send + ?Sized + 'static,
@@ -1008,8 +1009,8 @@ where
                                                                         "content_index": 0,
                                                                         "delta": clean_text
                                                                     });
-                                                                    let delta_ev = inject_seq(delta_ev, &mut sequence_number);
-                                                                    yield Ok::<Bytes, String>(codex_sse_frame(&delta_ev));
+                                                                    if !structured_output { let delta_ev = inject_seq(delta_ev, &mut sequence_number);
+                                                                    yield Ok::<Bytes, String>(codex_sse_frame(&delta_ev)); }
                                                                 }
                                                             }
                                                         }
@@ -1177,8 +1178,8 @@ where
                                                             "content_index": 0,
                                                             "delta": grounding_text
                                                         });
-                                                        let delta_ev = inject_seq(delta_ev, &mut sequence_number);
-                                                        yield Ok::<Bytes, String>(codex_sse_frame(&delta_ev));
+                                                        if !structured_output { let delta_ev = inject_seq(delta_ev, &mut sequence_number);
+                                                        yield Ok::<Bytes, String>(codex_sse_frame(&delta_ev)); }
                                                     }
                                                 }
                                             }
@@ -1325,6 +1326,13 @@ where
             let content_part_added = json!({"type": "response.content_part.added", "item_id": &message_item_id, "output_index": message_output_index, "content_index": 0, "part": {"type": "output_text", "text": "", "annotations": []}});
             let content_part_added = inject_seq(content_part_added, &mut sequence_number);
             yield Ok::<Bytes, String>(codex_sse_frame(&content_part_added));
+        }
+
+        if structured_output && message_item_emitted {
+            accumulated_text = crate::proxy::pipeline::structured_output::normalize_json_text(&accumulated_text).into_owned();
+            let delta_ev = json!({"type": "response.output_text.delta", "item_id": &message_item_id, "output_index": message_output_index, "content_index": 0, "delta": &accumulated_text});
+            let delta_ev = inject_seq(delta_ev, &mut sequence_number);
+            yield Ok::<Bytes, String>(codex_sse_frame(&delta_ev));
         }
 
         if message_item_emitted {
@@ -1527,6 +1535,7 @@ mod tests {
             "resp-test-codex-session".to_string(),
             None,
             cache_tool_calls,
+            false,
         );
 
         let mut raw = String::new();
@@ -1561,6 +1570,7 @@ mod tests {
             "resp-test-codex-session".to_string(),
             None,
             true,
+            false,
         );
 
         let mut raw = String::new();
@@ -1660,6 +1670,7 @@ mod tests {
             response_id.clone(),
             Some(completion_tx),
             true,
+            false,
         );
 
         let mut raw = String::new();
@@ -2440,5 +2451,68 @@ mod tests {
             vec!["stop".to_string()],
             "Must emit finish_reason 'stop' before stream end to avoid finish=unknown"
         );
+    }
+}
+
+#[cfg(test)]
+mod structured_output_tests {
+    use super::*;
+    #[tokio::test]
+    async fn structured_sse_deltas_match_completed_text_without_changing_plain_output() {
+        let text = "```json\n{\"title\":\"example\"}\n```";
+        for structured in [false, true] {
+            let frames = vec![
+                json!({"candidates":[{"content":{"parts":[{"text":text}]}}]}),
+                json!({"candidates":[{"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":2,"candidatesTokenCount":4}}),
+            ];
+            let chunks: Vec<Result<Bytes, String>> = frames
+                .into_iter()
+                .map(|v| Ok(Bytes::from(format!("data: {v}\n\n"))))
+                .collect();
+            let mut stream = create_codex_sse_stream(
+                Box::pin(futures::stream::iter(chunks)),
+                "gemini-3.7-flash-high".into(),
+                "structured-session".into(),
+                1,
+                0,
+                "resp-structured".into(),
+                None,
+                false,
+                structured,
+            );
+            let mut raw = String::new();
+            while let Some(chunk) = stream.next().await {
+                raw.push_str(std::str::from_utf8(&chunk.unwrap()).unwrap());
+            }
+            let events: Vec<Value> = raw
+                .lines()
+                .filter_map(|l| l.strip_prefix("data: "))
+                .filter_map(|l| serde_json::from_str(l).ok())
+                .collect();
+            let deltas: String = events
+                .iter()
+                .filter(|e| e["type"] == "response.output_text.delta")
+                .filter_map(|e| e["delta"].as_str())
+                .collect();
+            let done = events
+                .iter()
+                .find(|e| e["type"] == "response.output_text.done")
+                .unwrap();
+            let expected = if structured {
+                "{\"title\":\"example\"}"
+            } else {
+                text
+            };
+            assert_eq!(deltas, expected);
+            assert_eq!(done["text"], expected);
+            let completed = events
+                .iter()
+                .find(|e| e["type"] == "response.completed")
+                .unwrap();
+            assert_eq!(
+                completed["response"]["output"][0]["content"][0]["text"],
+                expected
+            );
+        }
     }
 }

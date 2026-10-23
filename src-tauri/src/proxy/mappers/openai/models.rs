@@ -35,6 +35,8 @@ pub struct OpenAIRequest {
     pub stop: Option<Value>,
     pub response_format: Option<ResponseFormat>,
     #[serde(default)]
+    pub text: Option<ResponsesTextConfig>,
+    #[serde(default)]
     pub tools: Option<Vec<Value>>,
     #[serde(rename = "tool_choice")]
     pub tool_choice: Option<Value>,
@@ -129,6 +131,71 @@ pub struct ResponseFormat {
     pub r#type: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub json_schema: Option<ResponseFormatJSONSchema>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ResponsesTextConfig {
+    pub format: Option<ResponsesTextFormat>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ResponsesTextFormat {
+    pub r#type: String,
+    pub name: Option<String>,
+    pub description: Option<String>,
+    pub schema: Option<Value>,
+    pub strict: Option<bool>,
+}
+
+impl OpenAIRequest {
+    pub fn effective_response_format(&self) -> Option<ResponseFormat> {
+        self.response_format.clone().or_else(|| {
+            let format = self.text.as_ref()?.format.as_ref()?;
+            match format.r#type.as_str() {
+                "json_object" => Some(ResponseFormat {
+                    r#type: "json_object".into(),
+                    json_schema: None,
+                }),
+                "json_schema" => Some(ResponseFormat {
+                    r#type: "json_schema".into(),
+                    json_schema: Some(ResponseFormatJSONSchema {
+                        name: format.name.clone(),
+                        description: format.description.clone(),
+                        schema: format.schema.clone(),
+                        strict: format.strict,
+                    }),
+                }),
+                _ => None,
+            }
+        })
+    }
+
+    pub fn expects_json_output(&self) -> bool {
+        self.effective_response_format()
+            .is_some_and(|f| matches!(f.r#type.as_str(), "json_object" | "json_schema"))
+    }
+
+    pub fn validate_response_format(&self) -> Result<(), String> {
+        let Some(format) = self.effective_response_format() else {
+            return Ok(());
+        };
+        if format.r#type != "json_schema" {
+            return Ok(());
+        }
+        if format
+            .json_schema
+            .as_ref()
+            .and_then(|s| s.schema.as_ref())
+            .is_none_or(Value::is_null)
+        {
+            return Err("json_schema output requires a schema".into());
+        }
+        let tools_disabled = self.tool_choice.as_ref().and_then(Value::as_str) == Some("none");
+        if !tools_disabled && self.tools.as_ref().is_some_and(|tools| !tools.is_empty()) {
+            return Err("This upstream does not support json_schema output together with active tools; use tool_choice: none or request these in separate turns".into());
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

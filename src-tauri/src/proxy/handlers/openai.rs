@@ -831,7 +831,10 @@ fn responses_usage_value(chat_response: &OpenAIResponse) -> Value {
         })
 }
 
-fn convert_chat_response_to_responses(chat_response: &OpenAIResponse) -> Value {
+fn convert_chat_response_to_responses(
+    chat_response: &OpenAIResponse,
+    structured_output: bool,
+) -> Value {
     let mut output = Vec::new();
 
     for choice in &chat_response.choices {
@@ -855,6 +858,11 @@ fn convert_chat_response_to_responses(chat_response: &OpenAIResponse) -> Value {
             .as_ref()
             .map(openai_content_text)
             .unwrap_or_default();
+        let text = if structured_output {
+            crate::proxy::pipeline::structured_output::normalize_json_text(&text).into_owned()
+        } else {
+            text
+        };
         let refusal = choice
             .message
             .refusal
@@ -1448,7 +1456,7 @@ data: {"type":"response.failed","response":{"status":"failed","error":{"code":"u
         }))
         .expect("valid OpenAI response fixture");
 
-        let response = convert_chat_response_to_responses(&chat_response);
+        let response = convert_chat_response_to_responses(&chat_response, false);
         assert_eq!(response["object"], "response");
         assert_eq!(response["output"][0]["type"], "reasoning");
         assert_eq!(
@@ -1888,6 +1896,10 @@ pub async fn handle_chat_completions(
     });
     let mut openai_req: OpenAIRequest = serde_json::from_value(body)
         .map_err(|e| (StatusCode::BAD_REQUEST, format!("Invalid request: {}", e)))?;
+
+    openai_req
+        .validate_response_format()
+        .map_err(|e| (StatusCode::BAD_REQUEST, e))?;
 
     // Safety: Ensure messages is not empty
     if openai_req.messages.is_empty() {
@@ -3966,6 +3978,10 @@ pub async fn handle_completions(
         }
     };
 
+    if let Err(error) = openai_req.validate_response_format() {
+        return (StatusCode::BAD_REQUEST, error).into_response();
+    }
+
     // Safety: Inject empty message if needed
     if openai_req.messages.is_empty() {
         openai_req
@@ -4421,6 +4437,7 @@ pub async fn handle_completions(
                             response_id_for_save.clone(),
                             completion_tx,
                             store_response,
+                            openai_req.expects_json_output(),
                         )
                     } else {
                         use crate::proxy::mappers::openai::streaming::create_legacy_sse_stream;
@@ -4749,7 +4766,10 @@ pub async fn handle_completions(
                             let is_responses_api = is_responses_api_path(uri.path());
 
                             if is_responses_api {
-                                let mut resp = convert_chat_response_to_responses(&chat_resp);
+                                let mut resp = convert_chat_response_to_responses(
+                                    &chat_resp,
+                                    openai_req.expects_json_output(),
+                                );
                                 resp["id"] = json!(response_id_for_save.clone());
                                 let outputs = resp
                                     .get("output")
@@ -4945,7 +4965,10 @@ pub async fn handle_completions(
             let is_responses_api = is_responses_api_path(uri.path());
 
             if is_responses_api {
-                let resp = convert_chat_response_to_responses(&chat_resp);
+                let resp = convert_chat_response_to_responses(
+                    &chat_resp,
+                    openai_req.expects_json_output(),
+                );
                 if debug_logger::is_enabled(&debug_cfg) {
                     let payload = json!({
                         "kind": "exchange_summary",
@@ -6796,6 +6819,12 @@ async fn handle_websocket_session(mut socket: WebSocket, headers: HeaderMap, sta
         };
 
         let openai_body = convert_codex_to_openai_request(normalized);
+        let structured_output = openai_body
+            .get("response_format")
+            .or_else(|| openai_body.get("text").and_then(|t| t.get("format")))
+            .and_then(|f| f.get("type"))
+            .and_then(Value::as_str)
+            .is_some_and(|t| matches!(t, "json_object" | "json_schema"));
         let response_result = handle_chat_completions(
             State(state.clone()),
             headers.clone(),
@@ -6845,6 +6874,7 @@ async fn handle_websocket_session(mut socket: WebSocket, headers: HeaderMap, sta
             message_item_added: false,
             content_part_added: false,
             accumulated_text: String::new(),
+            structured_output,
             tool_calls: std::collections::HashMap::new(),
             tool_calls_added: std::collections::HashSet::new(),
         };
@@ -7553,6 +7583,7 @@ struct TranslationState {
     message_item_added: bool,
     content_part_added: bool,
     accumulated_text: String,
+    structured_output: bool,
     tool_calls: std::collections::HashMap<u32, (String, String, String, String)>,
     tool_calls_added: std::collections::HashSet<u32>,
 }
@@ -7629,7 +7660,9 @@ async fn translate_openai_chunk_to_ws(
                             "content_index": 0,
                             "delta": reasoning
                         });
-                        send_ws_event(socket, ws_events, &delta_ev).await;
+                        if !state.structured_output {
+                            send_ws_event(socket, ws_events, &delta_ev).await;
+                        }
                         state.accumulated_text.push_str(reasoning);
                     }
                 }
@@ -7682,7 +7715,9 @@ async fn translate_openai_chunk_to_ws(
                             "content_index": 0,
                             "delta": content
                         });
-                        send_ws_event(socket, ws_events, &delta_ev).await;
+                        if !state.structured_output {
+                            send_ws_event(socket, ws_events, &delta_ev).await;
+                        }
                         state.accumulated_text.push_str(content);
                     }
                 }
@@ -7839,6 +7874,16 @@ async fn finalize_ws_events(
 
     if state.message_item_added {
         let message_output_index = state.message_output_index.unwrap_or(0);
+        if state.structured_output {
+            state.accumulated_text =
+                crate::proxy::pipeline::structured_output::normalize_json_text(
+                    &state.accumulated_text,
+                )
+                .into_owned();
+            let delta = json!({"type": "response.output_text.delta", "item_id": &state.item_id, "output_index": message_output_index, "content_index": 0, "delta": &state.accumulated_text});
+            send_ws_event(socket, ws_events, &delta).await;
+        }
+
         let text_done = json!({
             "type": "response.output_text.done",
             "item_id": &state.item_id,
@@ -8247,4 +8292,23 @@ pub async fn handle_videos_generations(
 
     let video_response = crate::proxy::video::parse_veo_response(&resp_json, target_model);
     Ok(Json(video_response))
+}
+
+#[cfg(test)]
+mod structured_response_tests {
+    use super::*;
+    #[test]
+    fn json_repair_is_scoped_to_explicit_structured_responses() {
+        let response: OpenAIResponse=serde_json::from_value(json!({"id":"chatcmpl-json","object":"chat.completion","created":1,"model":"test","choices":[{"index":0,"message":{"role":"assistant","content":"```json\n{\"title\":\"example\"}\n```"},"finish_reason":"stop"}]})).unwrap();
+        let plain = convert_chat_response_to_responses(&response, false);
+        let structured = convert_chat_response_to_responses(&response, true);
+        assert_eq!(
+            plain["output"][0]["content"][0]["text"],
+            "```json\n{\"title\":\"example\"}\n```"
+        );
+        assert_eq!(
+            structured["output"][0]["content"][0]["text"],
+            "{\"title\":\"example\"}"
+        );
+    }
 }

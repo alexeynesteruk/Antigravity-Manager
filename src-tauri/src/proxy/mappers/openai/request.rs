@@ -1067,7 +1067,7 @@ pub fn transform_openai_request_with_session(
         }
     }
 
-    if let Some(fmt) = &request.response_format {
+    if let Some(fmt) = &request.effective_response_format() {
         if fmt.r#type == "json_object" {
             gen_config["responseMimeType"] = json!("application/json");
         } else if fmt.r#type == "json_schema" {
@@ -1243,7 +1243,10 @@ pub fn transform_openai_request_with_session(
 
     // Removed auto-inject since we handle it above now if Codex passes it.
 
-    if !function_declarations.is_empty() {
+    if !function_declarations.is_empty()
+        && !(request.expects_json_output()
+            && request.tool_choice.as_ref().and_then(Value::as_str) == Some("none"))
+    {
         inner_request["tools"] = json!([{ "functionDeclarations": function_declarations }]);
     }
 
@@ -3456,5 +3459,66 @@ mod tests {
             fc_part["thoughtSignature"], valid_gemini_sig,
             "OpenAI adapter and pipeline must recover real tool signature from SignatureCache"
         );
+    }
+}
+
+#[cfg(test)]
+mod structured_output_tests {
+    use super::*;
+
+    fn request(extra: Value) -> OpenAIRequest {
+        let mut body = json!({"model":"gemini-3.7-flash-high","messages":[{"role":"user","content":"Name this session"}],"text":{"format":{"type":"json_schema","name":"title","strict":true,"schema":{"type":"object","properties":{"title":{"type":"string"}},"required":["title"],"additionalProperties":false}}}});
+        for (key, value) in extra.as_object().unwrap() {
+            body[key] = value.clone();
+        }
+        serde_json::from_value(body).unwrap()
+    }
+
+    #[test]
+    fn responses_format_reaches_gemini_and_preserves_reasoning() {
+        let req = request(json!({"reasoning":{"effort":"low"}}));
+        assert!(req.validate_response_format().is_ok());
+        assert_eq!(
+            req.reasoning.as_ref().unwrap().effort.as_deref(),
+            Some("low")
+        );
+        let (body, _, _, _) =
+            transform_openai_request(&req, "project", "gemini-3.7-flash-high", None);
+        assert_eq!(
+            body["request"]["generationConfig"]["responseMimeType"],
+            "application/json"
+        );
+        assert_eq!(
+            body["request"]["generationConfig"]["responseSchema"]["type"],
+            "object"
+        );
+    }
+
+    #[test]
+    fn active_tools_are_rejected_explicitly_and_disabled_tools_stay_in_request() {
+        let tools = json!([{"type":"function","function":{"name":"read_file","parameters":{"type":"object"}}}]);
+        let req = request(json!({"tools":tools}));
+        assert!(req
+            .validate_response_format()
+            .unwrap_err()
+            .contains("active tools"));
+        assert_eq!(req.tools.as_ref().unwrap().len(), 1);
+        let req = request(json!({"tools":tools,"tool_choice":"none"}));
+        assert!(req.validate_response_format().is_ok());
+        let (body, _, _, _) =
+            transform_openai_request(&req, "project", "gemini-3.7-flash-high", None);
+        assert!(body["request"].get("tools").is_none());
+        assert_eq!(req.tools.as_ref().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn legacy_format_has_precedence_and_missing_schema_is_rejected() {
+        let req = request(json!({"response_format":{"type":"json_object"}}));
+        assert_eq!(
+            req.effective_response_format().unwrap().r#type,
+            "json_object"
+        );
+        let req = request(json!({"text":{"format":{"type":"json_schema"}}}));
+        assert!(req.validate_response_format().is_err());
     }
 }
