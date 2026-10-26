@@ -721,13 +721,16 @@ impl AxumServer {
             )
             // 应用 AI 服务特定的层
             // 注意：Axum layer 执行顺序是从下往上（洋葱模型）
-            // 请求: ip_filter -> auth -> monitor -> handler
-            // 响应: handler -> monitor -> auth -> ip_filter
+            // Request: ip_filter -> auth -> decompression -> decoded size limit -> monitor -> handler.
             // monitor 需要在 auth 之后执行才能获取 UserTokenIdentity
             .layer(axum::middleware::from_fn_with_state(
                 state.clone(),
                 monitor_middleware,
             ))
+            .layer(axum::middleware::from_fn(
+                crate::proxy::middleware::request_body::validate_decoded_body,
+            ))
+            .layer(tower_http::decompression::RequestDecompressionLayer::new())
             .layer(axum::middleware::from_fn_with_state(
                 state.clone(),
                 auth_middleware,
@@ -1072,6 +1075,9 @@ impl AxumServer {
                 service_status_middleware,
             ))
             .layer(cors_layer())
+            .layer(axum::middleware::from_fn(
+                crate::proxy::middleware::internal::internal_loopback_middleware,
+            ))
             .layer(DefaultBodyLimit::max(max_body_size)) // 放宽 body 大小限制
             .with_state(state.clone());
 
@@ -3472,17 +3478,20 @@ async fn admin_import_custom_db(
     State(state): State<AppState>,
     Json(payload): Json<CustomDbRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    // [SECURITY] 禁止目录遍历
-    if payload.path.contains("..") {
-        return Err((
-            StatusCode::BAD_REQUEST,
+    let import_dir = std::env::var_os("ANTIGRAVITY_DB_IMPORT_DIR")
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| (
+            StatusCode::FORBIDDEN,
             Json(ErrorResponse {
-                error: "非法路径: 不允许目录遍历".to_string(),
+                error: "Remote database import requires ANTIGRAVITY_DB_IMPORT_DIR; native desktop file selection remains available".to_string(),
             }),
-        ));
-    }
-
-    let account = migration::import_from_custom_db_path(payload.path)
+        ))?;
+    let import_path = crate::utils::db_import_path::resolve_custom_db_import_path(
+        std::path::Path::new(&import_dir),
+        &payload.path,
+    )
+    .map_err(|error| (StatusCode::BAD_REQUEST, Json(ErrorResponse { error })))?;
+    let account = migration::import_from_custom_db_file(import_path)
         .await
         .map_err(|e| {
             (

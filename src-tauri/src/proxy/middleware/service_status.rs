@@ -11,26 +11,39 @@ pub async fn service_status_middleware(
     request: Request,
     next: Next,
 ) -> Response {
-    let path = request.uri().path();
-
-    // 管理接口、OAuth 回调和健康检查在停服后仍要可达。
-    // /internal/ 只放行本机回环，避免停服后公网仍能打到预热端点。
-    let internal_from_loopback = path.starts_with("/internal/")
-        && crate::proxy::middleware::ip_filter::is_direct_loopback(&request);
-    if path.starts_with("/api/")
-        || internal_from_loopback
-        || path == "/auth/callback"
-        || path == "/health"
-    {
-        return next.run(request).await;
-    }
-
-    let running = {
-        let r = state.is_running.read().await;
-        *r
+    let always_allowed = match allowed_while_stopped(&request) {
+        Ok(allowed) => allowed,
+        Err(status) => return status.into_response(),
     };
+    // Management and verified internal traffic must not wait for service-state writes.
+    let running = if always_allowed {
+        true
+    } else {
+        *state.is_running.read().await
+    };
+    service_status_middleware_with_running(running, request, next).await
+}
 
-    if !running {
+fn allowed_while_stopped(request: &Request) -> Result<bool, StatusCode> {
+    crate::proxy::middleware::internal::require_validated_internal_request(request)?;
+    let path = request.uri().path();
+    Ok(path.starts_with("/api/")
+        || path.starts_with("/internal/")
+        || path == "/auth/callback"
+        || path == "/health")
+}
+
+/// Share the production gate with router integration tests without recreating AppState.
+pub(crate) async fn service_status_middleware_with_running(
+    running: bool,
+    request: Request,
+    next: Next,
+) -> Response {
+    let always_allowed = match allowed_while_stopped(&request) {
+        Ok(allowed) => allowed,
+        Err(status) => return status.into_response(),
+    };
+    if !running && !always_allowed {
         return (
             StatusCode::SERVICE_UNAVAILABLE,
             "Proxy service is currently disabled".to_string(),

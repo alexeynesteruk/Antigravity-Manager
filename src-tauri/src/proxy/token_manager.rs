@@ -97,10 +97,19 @@ async fn update_account_json(
     let path = path.to_path_buf();
     tokio::task::spawn_blocking(move || {
         let _account_write = crate::modules::account::lock_account_file_updates()?;
-        let raw = std::fs::read_to_string(&path).map_err(|e| format!("读取文件失败: {}", e))?;
+        let account_id = path
+            .file_stem()
+            .and_then(|value| value.to_str())
+            .ok_or("Invalid account filename")?;
+        let directory = path.parent().ok_or("Invalid account directory")?;
+        let path = crate::utils::db_import_path::resolve_account_file_path(directory, account_id)?;
+        let raw = crate::utils::db_import_path::read_managed_account_file(directory, account_id)?;
         let mut content: serde_json::Value =
             serde_json::from_str(&raw).map_err(|e| format!("解析 JSON 失败: {}", e))?;
         update(&mut content);
+        if content.get("id").and_then(|value| value.as_str()) != Some(account_id) {
+            return Err("Account update cannot change its managed ID".to_string());
+        }
         let serialized = serde_json::to_string_pretty(&content)
             .map_err(|e| format!("序列化 JSON 失败: {}", e))?;
         std::fs::write(&path, serialized).map_err(|e| format!("写入文件失败: {}", e))
@@ -183,6 +192,8 @@ pub struct TokenManager {
     // [NEW] 按账号分配的同步刷新锁。
     // 用于实现 Double-Checked Locking，防止并发请求导致单个账号短时间内多次调用 OAuth Refresh。
     refresh_locks: Arc<DashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    // Serialize quota persistence and its cache projection, including cancelled callers.
+    quota_snapshot_lock: Arc<tokio::sync::Mutex<()>>,
 
     // [NEW] 记录账号连续 invalid_grant 失败次数，防止单次偶发网络抖动误停用账号
     invalid_grant_failures: Arc<DashMap<String, u32>>,
@@ -218,6 +229,21 @@ impl TokenManager {
         crate::modules::account::get_data_dir().unwrap_or_else(|_| self.data_dir.clone())
     }
 
+    fn resolve_managed_account_path(&self, account_id: &str) -> Result<PathBuf, String> {
+        crate::utils::db_import_path::resolve_account_file_path(
+            &self.resolved_data_dir().join("accounts"),
+            account_id,
+        )
+    }
+
+    fn read_managed_account(&self, account_id: &str) -> Result<serde_json::Value, String> {
+        let raw = crate::utils::db_import_path::read_managed_account_file(
+            &self.resolved_data_dir().join("accounts"),
+            account_id,
+        )?;
+        serde_json::from_str(&raw).map_err(|_| "Managed account file is malformed".to_string())
+    }
+
     /// 创建新的 TokenManager
     pub fn new(data_dir: PathBuf) -> Self {
         Self {
@@ -234,6 +260,7 @@ impl TokenManager {
                 crate::models::CircuitBreakerConfig::default(),
             )),
             refresh_locks: Arc::new(DashMap::new()),
+            quota_snapshot_lock: Arc::new(tokio::sync::Mutex::new(())),
             invalid_grant_failures: Arc::new(DashMap::new()),
             project_id_locks: Arc::new(DashMap::new()),
             project_id_failures: Arc::new(DashMap::new()),
@@ -455,7 +482,7 @@ impl TokenManager {
             (
                 entry.email.clone(),
                 entry.refresh_token.clone(),
-                entry.account_path.clone(),
+                self.resolve_managed_account_path(account_id)?,
             )
         };
 
@@ -612,7 +639,7 @@ impl TokenManager {
         &self,
         account_id: &str,
         access_token: &str,
-        account_path: &std::path::Path,
+        _account_path: &std::path::Path,
         timeout_duration: std::time::Duration,
     ) -> String {
         // 快速路径：内存中已存在有效 project_id 则直接复用
@@ -637,7 +664,10 @@ impl TokenManager {
 
         let token_access_token = access_token.to_string();
         let acct_id = account_id.to_string();
-        let write_path = account_path.to_path_buf();
+        let write_path = match self.resolve_managed_account_path(account_id) {
+            Ok(path) => path,
+            Err(_) => return DEFAULT_PROJECT_ID.to_string(),
+        };
 
         let resolve_op = async {
             let _guard = resolve_mu.lock().await;
@@ -783,7 +813,11 @@ impl TokenManager {
             let entry = entry.map_err(|e| format!("读取目录项失败: {}", e))?;
             let path = entry.path();
 
-            if path.extension().and_then(|s| s.to_str()) != Some("json") {
+            if path.extension().and_then(|s| s.to_str()) != Some("json")
+                || !entry
+                    .file_type()
+                    .is_ok_and(|kind| kind.is_file() && !kind.is_symlink())
+            {
                 continue;
             }
 
@@ -867,14 +901,7 @@ impl TokenManager {
 
     /// 重新加载指定账号（用于配额更新后的实时同步）
     pub async fn reload_account(&self, account_id: &str) -> Result<(), String> {
-        let path = self
-            .data_dir
-            .join("accounts")
-            .join(format!("{}.json", account_id));
-        if !path.exists() {
-            self.remove_account(account_id);
-            return Err(format!("账号文件不存在: {:?}", path));
-        }
+        let path = self.resolve_managed_account_path(account_id)?;
 
         // 实体文件是账号状态的真实权威来源。
         // 若 accounts.json 索引标记了停用，且实体文件也确实停用，则快速从内存池移除；
@@ -901,7 +928,7 @@ impl TokenManager {
                         })
                         .unwrap_or(false);
                     if is_disabled
-                        && Self::get_account_state_on_disk(&path).await
+                        && self.get_account_state_on_disk(account_id).await
                             == OnDiskAccountState::Disabled
                     {
                         self.remove_account(account_id);
@@ -979,12 +1006,30 @@ impl TokenManager {
     /// Note: this is intentionally tolerant to transient read/parse failures (e.g. concurrent
     /// writes). Failures are reported as `Unknown` so callers can skip without purging the in-memory
     /// token pool.
-    async fn get_account_state_on_disk(account_path: &std::path::PathBuf) -> OnDiskAccountState {
+    async fn get_account_state_on_disk(&self, account_id: &str) -> OnDiskAccountState {
         const MAX_RETRIES: usize = 2;
         const RETRY_DELAY_MS: u64 = 5;
 
         for attempt in 0..=MAX_RETRIES {
-            let content = match tokio::fs::read_to_string(account_path).await {
+            use crate::utils::db_import_path::ManagedPathError;
+            let account_path = match crate::utils::db_import_path::resolve_account_file_path_checked(
+                &self.resolved_data_dir().join("accounts"),
+                account_id,
+            ) {
+                Ok(path) => path,
+                Err(ManagedPathError::Invalid(_)) => return OnDiskAccountState::Disabled,
+                Err(ManagedPathError::Io(error))
+                    if error.kind() == std::io::ErrorKind::NotFound =>
+                {
+                    return OnDiskAccountState::Disabled;
+                }
+                Err(ManagedPathError::Io(_)) if attempt < MAX_RETRIES => {
+                    tokio::time::sleep(std::time::Duration::from_millis(RETRY_DELAY_MS)).await;
+                    continue;
+                }
+                Err(ManagedPathError::Io(_)) => return OnDiskAccountState::Unknown,
+            };
+            let content = match tokio::fs::read_to_string(&account_path).await {
                 Ok(c) => c,
                 Err(e) => {
                     // If the file is gone, the in-memory token is definitely stale.
@@ -1020,6 +1065,9 @@ impl TokenManager {
                 }
             };
 
+            if account.get("id").and_then(|value| value.as_str()) != Some(account_id) {
+                return OnDiskAccountState::Disabled;
+            }
             let disabled = account
                 .get("disabled")
                 .and_then(|v| v.as_bool())
@@ -1046,10 +1094,16 @@ impl TokenManager {
 
     /// 加载单个账号
     async fn load_single_account(&self, path: &PathBuf) -> Result<Option<ProxyToken>, String> {
-        let content = std::fs::read_to_string(path).map_err(|e| format!("读取文件失败: {}", e))?;
-
-        let mut account: serde_json::Value =
-            serde_json::from_str(&content).map_err(|e| format!("解析 JSON 失败: {}", e))?;
+        let filename_id = path
+            .file_stem()
+            .and_then(|value| value.to_str())
+            .ok_or("Invalid account filename")?;
+        let trusted_path = self.resolve_managed_account_path(filename_id)?;
+        if std::fs::canonicalize(path).map_err(|_| "Account file is unavailable")? != trusted_path {
+            return Err("Account file must stay in the managed directory".to_string());
+        }
+        let mut account = self.read_managed_account(filename_id)?;
+        let path = &trusted_path;
 
         // [修复 #1344] 先检查账号是否被手动禁用(非配额保护原因)
         let is_proxy_disabled = account
@@ -1158,7 +1212,7 @@ impl TokenManager {
         }
 
         // Safety check: verify state on disk again to handle concurrent mid-parse writes
-        if Self::get_account_state_on_disk(path).await == OnDiskAccountState::Disabled {
+        if self.get_account_state_on_disk(filename_id).await == OnDiskAccountState::Disabled {
             tracing::debug!("Account file {:?} is disabled on disk, skipping.", path);
             return Ok(None);
         }
@@ -1619,9 +1673,11 @@ impl TokenManager {
         legacy_claude_quota
     }
 
-    fn get_available_models_from_json(account_path: &PathBuf) -> Option<HashSet<String>> {
-        let content = std::fs::read_to_string(account_path).ok()?;
-        let account: serde_json::Value = serde_json::from_str(&content).ok()?;
+    fn get_available_models_from_managed_account(
+        &self,
+        account_id: &str,
+    ) -> Option<HashSet<String>> {
+        let account = self.read_managed_account(account_id).ok()?;
         let models = account.get("quota")?.get("models")?.as_array()?;
         let mut result = HashSet::new();
         for model in models {
@@ -1719,12 +1775,10 @@ impl TokenManager {
             None => return mapped_model.to_string(),
         };
 
-        let account_path = match self.tokens.get(account_id) {
-            Some(token) => token.account_path.clone(),
-            None => return mapped_model.to_string(),
-        };
-
-        let available_models = match Self::get_available_models_from_json(&account_path) {
+        if !self.tokens.contains_key(account_id) {
+            return mapped_model.to_string();
+        }
+        let available_models = match self.get_available_models_from_managed_account(account_id) {
             Some(models) if !models.is_empty() => models,
             _ => return mapped_model.to_string(),
         };
@@ -2767,7 +2821,10 @@ impl TokenManager {
                     .cloned()
                 {
                     // 检查账号是否可用（未限流、未被配额保护）
-                    match Self::get_account_state_on_disk(&preferred_token.account_path).await {
+                    match self
+                        .get_account_state_on_disk(&preferred_token.account_id)
+                        .await
+                    {
                         OnDiskAccountState::Disabled => {
                             tracing::warn!(
                                 "🔒 [FIX #820] Preferred account {} is disabled on disk, purging and falling back",
@@ -3268,7 +3325,7 @@ impl TokenManager {
 
             // Safety net: avoid selecting an account that has been disabled on disk but still
             // exists in the in-memory snapshot (e.g. stale cache + sticky session binding).
-            match Self::get_account_state_on_disk(&token.account_path).await {
+            match self.get_account_state_on_disk(&token.account_id).await {
                 OnDiskAccountState::Disabled => {
                     tracing::warn!(
                         "Selected account {} is disabled on disk, purging and retrying",
@@ -3371,13 +3428,7 @@ impl TokenManager {
     }
 
     async fn disable_account(&self, account_id: &str, reason: &str) -> Result<(), String> {
-        let path = if let Some(entry) = self.tokens.get(account_id) {
-            entry.account_path.clone()
-        } else {
-            self.resolved_data_dir()
-                .join("accounts")
-                .join(format!("{}.json", account_id))
-        };
+        let path = self.resolve_managed_account_path(account_id)?;
 
         let now = chrono::Utc::now().timestamp();
         let reason_owned = reason.to_string();
@@ -3402,12 +3453,7 @@ impl TokenManager {
         account_id: &str,
         token_response: &crate::modules::oauth::TokenResponse,
     ) -> Result<(), String> {
-        let path = self
-            .tokens
-            .get(account_id)
-            .ok_or("账号不存在")?
-            .account_path
-            .clone();
+        let path = self.resolve_managed_account_path(account_id)?;
         let now = chrono::Utc::now().timestamp();
         let access_token = token_response.access_token.clone();
         let expires_in = token_response.expires_in;
@@ -3683,17 +3729,13 @@ impl TokenManager {
     }
 
     fn clear_all_persisted_live_limits(&self, account_id: &str) -> bool {
-        let path = self
-            .data_dir
-            .join("accounts")
-            .join(format!("{}.json", account_id));
+        let Ok(path) = self.resolve_managed_account_path(account_id) else {
+            return false;
+        };
         let Ok(_account_write) = crate::modules::account::lock_account_file_updates() else {
             return false;
         };
-        let Ok(raw) = std::fs::read_to_string(&path) else {
-            return false;
-        };
-        let Ok(mut content) = serde_json::from_str::<serde_json::Value>(&raw) else {
+        let Ok(mut content) = self.read_managed_account(account_id) else {
             return false;
         };
         let Some(live_limits) = content
@@ -3866,13 +3908,7 @@ impl TokenManager {
     /// - `model`: 可选的目标模型名称，用于模型级别配额重置时间匹配
     pub fn get_quota_reset_time(&self, account_id: &str, model: Option<&str>) -> Option<String> {
         // 直接用 account_id 查找账号文件（文件名是 {account_id}.json）
-        let account_path = self
-            .data_dir
-            .join("accounts")
-            .join(format!("{}.json", account_id));
-
-        let content = std::fs::read_to_string(&account_path).ok()?;
-        let account: serde_json::Value = serde_json::from_str(&content).ok()?;
+        let account = self.read_managed_account(account_id).ok()?;
         let models = account
             .get("quota")
             .and_then(|q| q.get("models"))
@@ -3980,6 +4016,100 @@ impl TokenManager {
         }
     }
 
+    fn replace_cached_model_snapshot(token: &mut ProxyToken, quota: &crate::models::QuotaData) {
+        let mut model_quotas = HashMap::new();
+        let mut model_limits = HashMap::new();
+        let mut available_models = HashSet::new();
+        let mut model_metadata = HashMap::new();
+        for model in &quota.models {
+            let name = model.name.trim().to_lowercase();
+            if name.is_empty() {
+                continue;
+            }
+            let normalized = crate::proxy::common::model_mapping::normalize_to_standard_id(&name)
+                .unwrap_or_else(|| name.clone());
+            model_quotas
+                .entry(normalized)
+                .and_modify(|quota: &mut i32| *quota = (*quota).max(model.percentage))
+                .or_insert(model.percentage);
+            model_quotas.insert(name.clone(), model.percentage);
+            available_models.insert(name.clone());
+            if let Some(limit) = model
+                .max_output_tokens
+                .and_then(|limit| u64::try_from(limit).ok())
+            {
+                model_limits.insert(name.clone(), limit);
+            }
+            model_metadata.insert(name, crate::models::quota::ModelListingMeta::from(model));
+        }
+
+        token.model_quotas = model_quotas;
+        token.model_limits = model_limits;
+        token.available_models = available_models;
+        token.model_metadata = model_metadata;
+    }
+
+    async fn sync_refreshed_model_snapshot(
+        &self,
+        account_id: &str,
+        mut quota: crate::models::QuotaData,
+    ) -> Result<crate::models::QuotaData, String> {
+        let snapshot_guard = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            self.quota_snapshot_lock.clone().lock_owned(),
+        )
+        .await
+        .map_err(|_| "Timed out waiting to synchronize the quota snapshot".to_string())?;
+        let accounts_dir = self.resolved_data_dir().join("accounts");
+        let account_id = account_id.to_string();
+        let tokens = self.tokens.clone();
+        let accepted =
+            tokio::task::spawn_blocking(move || -> Result<crate::models::QuotaData, String> {
+                // Move the owned guard into the worker: cancellation must not allow a queued
+                // older write to finish after a newer snapshot has already updated the cache.
+                let _snapshot_guard = snapshot_guard;
+                {
+                    let _account_write = crate::modules::account::lock_account_file_updates()?;
+                    let path = crate::utils::db_import_path::resolve_account_file_path(
+                        &accounts_dir,
+                        &account_id,
+                    )?;
+                    let raw = crate::utils::db_import_path::read_managed_account_file(
+                        &accounts_dir,
+                        &account_id,
+                    )?;
+                    let mut account: serde_json::Value =
+                        serde_json::from_str(&raw).map_err(|error| error.to_string())?;
+                    if let Some(existing) = account.get("quota").cloned().and_then(|value| {
+                        serde_json::from_value::<crate::models::QuotaData>(value).ok()
+                    }) {
+                        if quota.last_updated < existing.last_updated {
+                            quota = existing;
+                        } else {
+                            quota.merge_previous_observations(&existing);
+                        }
+                    } else {
+                        quota.ensure_subscription_tier();
+                    }
+                    // Preserve credentials, validation/protection flags and all live limits.
+                    account["quota"] =
+                        serde_json::to_value(&quota).map_err(|error| error.to_string())?;
+                    let serialized =
+                        serde_json::to_vec_pretty(&account).map_err(|error| error.to_string())?;
+                    crate::utils::fs::write_atomic(&path, &serialized)?;
+                }
+                if let Some(mut token) = tokens.get_mut(&account_id) {
+                    Self::replace_cached_model_snapshot(&mut token, &quota);
+                }
+                Ok(quota)
+            })
+            .await
+            .map_err(|error| format!("Quota snapshot worker failed: {error}"))??;
+        // A successful positive snapshot cannot erase a still-active live quota lock.
+        self.sync_image_scheduler_accounts();
+        Ok(accepted)
+    }
+
     /// 实时刷新配额并精确锁定账号
     ///
     /// 当 429 发生时调用此方法:
@@ -4024,18 +4154,20 @@ impl TokenManager {
         tracing::info!("账号 {} 正在实时刷新配额...", email);
         match crate::modules::quota::fetch_quota(&access_token, email, Some(&account_id)).await {
             Ok((quota_data, _project_id)) => {
-                // [NEW] 实时刷新成功后，立即同步最新配额数据至内存 token.model_quotas 缓存
-                if let Some(mut token) = self.tokens.get_mut(&account_id) {
-                    for m in &quota_data.models {
-                        let norm_name =
-                            crate::proxy::common::model_mapping::normalize_to_standard_id(&m.name)
-                                .unwrap_or_else(|| m.name.clone());
-                        token.model_quotas.insert(norm_name, m.percentage as i32);
-                        token
-                            .model_quotas
-                            .insert(m.name.clone(), m.percentage as i32);
+                let quota_data = match self
+                    .sync_refreshed_model_snapshot(&account_id, quota_data)
+                    .await
+                {
+                    Ok(accepted) => accepted,
+                    Err(error) => {
+                        tracing::warn!(
+                            "Failed to synchronize refreshed model snapshot for {}: {}",
+                            account_id,
+                            error
+                        );
+                        return false;
                     }
-                }
+                };
 
                 // 3. 从最新配额中提取匹配模型的 reset_time
                 let normalized_model = model
@@ -4492,18 +4624,10 @@ impl TokenManager {
             return;
         };
 
-        let path = if let Some(entry) = self.tokens.get(account_id) {
-            entry.account_path.clone()
-        } else {
-            self.resolved_data_dir()
-                .join("accounts")
-                .join(format!("{}.json", account_id))
-        };
-
-        let Ok(raw) = std::fs::read_to_string(&path) else {
+        let Ok(path) = self.resolve_managed_account_path(account_id) else {
             return;
         };
-        let Ok(mut content) = serde_json::from_str::<serde_json::Value>(&raw) else {
+        let Ok(mut content) = self.read_managed_account(account_id) else {
             return;
         };
 
@@ -4543,12 +4667,8 @@ impl TokenManager {
         let model_key = crate::proxy::common::model_mapping::normalize_to_standard_id(raw_model)
             .unwrap_or_else(|| raw_model.to_string());
 
-        let path = if let Some(entry) = self.tokens.get(account_id) {
-            entry.account_path.clone()
-        } else {
-            self.resolved_data_dir()
-                .join("accounts")
-                .join(format!("{}.json", account_id))
+        let Ok(path) = self.resolve_managed_account_path(account_id) else {
+            return;
         };
 
         let Ok(_account_write) = crate::modules::account::lock_account_file_updates() else {
@@ -4569,6 +4689,10 @@ impl TokenManager {
         let Ok(mut content) = serde_json::from_str::<serde_json::Value>(&raw) else {
             return;
         };
+
+        if content.get("id").and_then(|value| value.as_str()) != Some(account_id) {
+            return;
+        }
 
         let Some(live_limits) = content
             .get_mut("live_limited_models")
@@ -5068,11 +5192,12 @@ impl TokenManager {
             // Keep the raw quota model IDs for /v1/models discovery. `model_quotas`
             // intentionally stores normalized protection buckets (e.g. gemini-3-flash),
             // but clients need concrete usable IDs such as gemini-3-flash-agent.
-            if let Some(raw_models) = Self::get_available_models_from_json(&token.account_path) {
-                for model_id in raw_models {
-                    all_models.insert(model_id);
-                }
-            }
+            let Some(raw_models) =
+                self.get_available_models_from_managed_account(&token.account_id)
+            else {
+                continue;
+            };
+            all_models.extend(raw_models);
 
             // Also keep normalized bucket IDs for existing quota/protection behavior.
             for model_id in token.model_quotas.keys() {
@@ -5089,6 +5214,9 @@ impl TokenManager {
         let mut all_meta = std::collections::HashMap::new();
         for entry in self.tokens.iter() {
             let token = entry.value();
+            if self.read_managed_account(&token.account_id).is_err() {
+                continue;
+            }
             for (name, meta) in &token.model_metadata {
                 all_meta
                     .entry(name.clone())
@@ -5131,6 +5259,7 @@ impl TokenManager {
         block_until: i64,
         reason: &str,
     ) -> Result<(), String> {
+        let path = self.resolve_managed_account_path(account_id)?;
         // 1. Update memory
         if let Some(mut token) = self.tokens.get_mut(account_id) {
             token.validation_blocked = true;
@@ -5138,14 +5267,6 @@ impl TokenManager {
         }
 
         // 2. Persist to disk
-        let path = self
-            .data_dir
-            .join("accounts")
-            .join(format!("{}.json", account_id));
-        if !path.exists() {
-            return Err(format!("Account file not found: {:?}", path));
-        }
-
         // [NEW] 尝试从消息中提取验证链接 (#1522)
         let extracted_url = if let Ok(parsed_json) =
             serde_json::from_str::<serde_json::Value>(reason)
@@ -5258,6 +5379,296 @@ mod tests {
     use super::*;
     use std::cmp::Ordering;
     use std::time::Duration;
+
+    #[tokio::test]
+    async fn refreshed_model_snapshot_returns_accepted_quota_for_lock_decisions() {
+        let root = tempfile::tempdir().unwrap();
+        let accounts = root.path().join("accounts");
+        std::fs::create_dir(&accounts).unwrap();
+        let make_quota = |updated, percentage, reset_time| {
+            serde_json::from_value::<crate::models::QuotaData>(serde_json::json!({
+                "models":[{"name":"gemini-3-flash","percentage":percentage,"reset_time":reset_time}],
+                "last_updated":updated
+            }))
+            .unwrap()
+        };
+        let recovered = make_quota(200, 80, "");
+        std::fs::write(
+            accounts.join("snapshot-lock.json"),
+            serde_json::json!({"id":"snapshot-lock","quota":recovered}).to_string(),
+        )
+        .unwrap();
+        let manager = TokenManager::new(root.path().to_path_buf());
+        manager.tokens.insert(
+            "snapshot-lock".to_string(),
+            create_test_token("snapshot-lock", Some("PRO"), 1.0, None, Some(80)),
+        );
+
+        // A delayed exhausted response must not supply a future lock deadline after
+        // a newer recovery has already been persisted by another refresh.
+        let accepted = manager
+            .sync_refreshed_model_snapshot(
+                "snapshot-lock",
+                make_quota(150, 0, "2099-01-01T00:00:00Z"),
+            )
+            .await
+            .unwrap();
+        assert_eq!(accepted.last_updated, 200);
+        assert_eq!(accepted.models[0].percentage, 80);
+        assert!(accepted.models[0].reset_time.is_empty());
+        assert_eq!(
+            manager.tokens.get("snapshot-lock").unwrap().model_quotas["gemini-3-flash"],
+            80
+        );
+    }
+
+    #[tokio::test]
+    async fn refreshed_model_snapshot_preserves_partial_summary_and_rejects_older_concurrent_catalog(
+    ) {
+        let root = tempfile::tempdir().unwrap();
+        let accounts = root.path().join("accounts");
+        std::fs::create_dir(&accounts).unwrap();
+        let path = accounts.join("snapshot-order.json");
+        let make_quota = |name: &str, observed: i64, groups: serde_json::Value| {
+            serde_json::from_value::<crate::models::QuotaData>(serde_json::json!({
+                "models":[{"name":name,"percentage":90,"reset_time":""}],
+                "last_updated":observed, "quota_groups":groups
+            }))
+            .unwrap()
+        };
+        let mut initial = make_quota(
+            "gemini-4-argon-high",
+            100,
+            serde_json::json!([{
+                "display_name":"Gemini Models", "buckets":[{
+                    "bucket_id":"gemini-weekly", "window":"weekly", "remaining_fraction":0.0,
+                    "reset_time":"2099-01-01T00:00:00Z", "observed_at":100_000
+                }]
+            }]),
+        );
+        initial.subscription_tier = Some("PRO".to_string());
+        std::fs::write(
+            &path,
+            serde_json::json!({"id":"snapshot-order","quota":initial}).to_string(),
+        )
+        .unwrap();
+        let manager = TokenManager::new(root.path().to_path_buf());
+        manager.tokens.insert(
+            "snapshot-order".to_string(),
+            create_test_token("snapshot-order", Some("PRO"), 1.0, None, Some(90)),
+        );
+        let older = make_quota("gemini-4-argon-high", 150, serde_json::Value::Null);
+        let newest = make_quota(
+            "gemini-9-flash-high",
+            200,
+            serde_json::json!([{
+                "display_name":"Gemini Models", "buckets":[{
+                    "bucket_id":"gemini-5h", "window":"5h", "remaining_fraction":0.8,
+                    "reset_time":"2098-01-01T00:00:00Z", "observed_at":200_000
+                }, {
+                    "bucket_id":"gemini-weekly", "window":"weekly", "remaining_fraction":1.0,
+                    "reset_time":"2099-01-01T00:00:00Z", "observed_at":50_000
+                }]
+            }]),
+        );
+        let (old_result, new_result) = tokio::join!(
+            manager.sync_refreshed_model_snapshot("snapshot-order", older.clone()),
+            manager.sync_refreshed_model_snapshot("snapshot-order", newest),
+        );
+        old_result.unwrap();
+        new_result.unwrap();
+        // A slow response that arrives after a later observation must not resurrect Argon.
+        manager
+            .sync_refreshed_model_snapshot("snapshot-order", older)
+            .await
+            .unwrap();
+        let disk = manager.read_managed_account("snapshot-order").unwrap();
+        let persisted: crate::models::QuotaData =
+            serde_json::from_value(disk["quota"].clone()).unwrap();
+        assert_eq!(persisted.last_updated, 200);
+        assert_eq!(persisted.subscription_tier.as_deref(), Some("PRO"));
+        assert_eq!(persisted.models[0].name, "gemini-9-flash-high");
+        let buckets = &persisted.quota_groups.as_ref().unwrap()[0].buckets;
+        assert_eq!(buckets.len(), 2);
+        let weekly = buckets
+            .iter()
+            .find(|bucket| bucket.bucket_id == "gemini-weekly")
+            .unwrap();
+        assert_eq!(weekly.observed_at, Some(100_000));
+        assert_eq!(weekly.remaining_fraction, 0.0);
+        let token = manager.tokens.get("snapshot-order").unwrap();
+        assert!(token.available_models.contains("gemini-9-flash-high"));
+        assert!(!TokenManager::token_supports_advanced_model(
+            &token,
+            "gemini-4-argon-high"
+        ));
+    }
+
+    #[tokio::test]
+    async fn refreshed_model_snapshot_removes_stale_eligibility_and_preserves_account_state() {
+        let root = tempfile::tempdir().unwrap();
+        let accounts = root.path().join("accounts");
+        std::fs::create_dir(&accounts).unwrap();
+        let path = accounts.join("snapshot-account.json");
+        let live_limits =
+            serde_json::json!({"gemini-3.1-flash-image":{"until":123456789,"message":"keep"}});
+        std::fs::write(
+            &path,
+            serde_json::json!({
+                "id":"snapshot-account", "disabled":false, "proxy_disabled":false,
+                "token":{"access_token":"keep-token"}, "validation_blocked":true,
+                "protected_models":["claude"], "live_limited_models":live_limits,
+                "quota":{"models":[{"name":"gemini-4-argon-high","percentage":90}]}
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let manager = TokenManager::new(root.path().to_path_buf());
+        let mut token = create_test_token("snapshot-account", Some("PRO"), 0.4, None, Some(90));
+        token.account_path = path.clone();
+        token.validation_blocked = true;
+        token.protected_models.insert("claude".to_string());
+        token
+            .available_models
+            .insert("gemini-4-argon-high".to_string());
+        token.model_quotas.insert("gemini-4-argon".to_string(), 90);
+        token
+            .model_limits
+            .insert("gemini-4-argon-high".to_string(), 65_536);
+        token
+            .model_metadata
+            .insert("gemini-4-argon-high".to_string(), Default::default());
+        assert!(TokenManager::token_supports_advanced_model(
+            &token,
+            "gemini-4-argon-high"
+        ));
+        manager.tokens.insert("snapshot-account".to_string(), token);
+        let deadline = (chrono::Utc::now() + chrono::Duration::hours(1)).to_rfc3339();
+        assert!(manager.rate_limit_tracker.set_lockout_until_iso_with_cap(
+            "snapshot-account",
+            &deadline,
+            crate::proxy::rate_limit::RateLimitReason::QuotaExhausted,
+            Some("gemini-3.1-flash-image".to_string()),
+            false,
+        ));
+
+        let mut quota = crate::models::QuotaData::new();
+        quota.models.push(
+            serde_json::from_value(serde_json::json!({
+                "name":"gemini-3.1-flash-image", "percentage":88,
+                "reset_time":"", "max_output_tokens":4096,
+                "display_name":"Current image model"
+            }))
+            .unwrap(),
+        );
+        manager
+            .sync_refreshed_model_snapshot("snapshot-account", quota)
+            .await
+            .unwrap();
+
+        let token = manager.tokens.get("snapshot-account").unwrap();
+        assert!(!TokenManager::token_supports_advanced_model(
+            &token,
+            "gemini-4-argon-high"
+        ));
+        assert!(!token.available_models.contains("gemini-4-argon-high"));
+        assert!(!token.model_quotas.contains_key("gemini-4-argon"));
+        assert!(!token.model_limits.contains_key("gemini-4-argon-high"));
+        assert!(!token.model_metadata.contains_key("gemini-4-argon-high"));
+        assert_eq!(token.model_quotas.get("gemini-3.1-flash-image"), Some(&88));
+        assert_eq!(
+            token.model_limits.get("gemini-3.1-flash-image"),
+            Some(&4096)
+        );
+        assert!(token.validation_blocked);
+        assert!(token.protected_models.contains("claude"));
+        assert_eq!(token.health_score, 0.4);
+        drop(token);
+        assert!(manager
+            .rate_limit_tracker
+            .is_rate_limited("snapshot-account", Some("gemini-3.1-flash-image")));
+        let disk = manager.read_managed_account("snapshot-account").unwrap();
+        assert_eq!(disk["live_limited_models"], live_limits);
+        assert_eq!(disk["token"]["access_token"], "keep-token");
+        assert_eq!(disk["validation_blocked"], true);
+        let discovery = manager.get_all_collected_models();
+        assert!(!discovery.contains("gemini-4-argon-high"));
+        assert!(discovery.contains("gemini-3.1-flash-image"));
+    }
+
+    #[tokio::test]
+    async fn managed_account_discovery_ignores_cached_paths_and_rejects_mismatched_files() {
+        let root = tempfile::tempdir().unwrap();
+        let accounts = root.path().join("accounts");
+        std::fs::create_dir(&accounts).unwrap();
+        let path = accounts.join("acc1.json");
+        std::fs::write(
+            &path,
+            serde_json::json!({
+                "id":"acc1", "quota":{"models":[{"name":"managed-model","percentage":90}]}
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let outside = root.path().join("outside.json");
+        std::fs::write(
+            &outside,
+            serde_json::json!({
+                "id":"acc1", "quota":{"models":[{"name":"outside-model","percentage":90}]}
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let manager = TokenManager::new(root.path().to_path_buf());
+        let mut token = create_test_token("acc1", Some("PRO"), 1.0, None, Some(90));
+        token.account_path = outside;
+        token.model_quotas.insert("cached-model".to_string(), 90);
+        token
+            .model_metadata
+            .insert("cached-model".to_string(), Default::default());
+        manager.tokens.insert("acc1".to_string(), token);
+
+        let models = manager.get_all_collected_models();
+        assert!(models.contains("managed-model"));
+        assert!(!models.contains("outside-model"));
+        std::fs::write(&path, r#"{"id":"another-account","quota":{"models":[]}}"#).unwrap();
+        assert!(manager.get_all_collected_models().is_empty());
+        assert!(manager.get_all_model_metadata().is_empty());
+        assert_eq!(
+            manager.get_account_state_on_disk("acc1").await,
+            OnDiskAccountState::Disabled
+        );
+        assert!(manager.reload_account("../outside").await.is_err());
+        assert!(manager.tokens.contains_key("acc1"));
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn managed_account_sharing_conflict_is_unknown_until_the_file_is_available() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let root = tempfile::tempdir().unwrap();
+        let accounts = root.path().join("accounts");
+        std::fs::create_dir(&accounts).unwrap();
+        let path = accounts.join("acc1.json");
+        std::fs::write(&path, r#"{"id":"acc1","disabled":false}"#).unwrap();
+        let manager = TokenManager::new(root.path().to_path_buf());
+        let locked = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .share_mode(0)
+            .open(&path)
+            .unwrap();
+        assert_eq!(
+            manager.get_account_state_on_disk("acc1").await,
+            OnDiskAccountState::Unknown
+        );
+        drop(locked);
+        assert_eq!(
+            manager.get_account_state_on_disk("acc1").await,
+            OnDiskAccountState::Enabled
+        );
+    }
 
     fn weekly_quota_account(now: i64) -> serde_json::Value {
         let reset = |seconds| {
@@ -6232,6 +6643,17 @@ mod tests {
             available_models: std::collections::HashSet::new(),
             model_metadata: HashMap::new(),
         }
+    }
+
+    fn persist_managed_test_token(root: &std::path::Path, token: &mut ProxyToken) {
+        let accounts = root.join("accounts");
+        std::fs::create_dir_all(&accounts).unwrap();
+        token.account_path = accounts.join(format!("{}.json", token.account_id));
+        std::fs::write(
+            &token.account_path,
+            serde_json::json!({"id":token.account_id,"disabled":false}).to_string(),
+        )
+        .unwrap();
     }
 
     /// 测试排序比较函数（与 get_token_internal 中的逻辑一致）
@@ -7236,7 +7658,7 @@ mod tests {
         quotas1.insert("claude".to_string(), 100);
         let mut limits1 = HashMap::new();
         limits1.insert("claude-sonnet-4-6".to_string(), 64000);
-        let token1 = ProxyToken {
+        let mut token1 = ProxyToken {
             account_id: "acc_pro_no_55".to_string(),
             access_token: "token1".to_string(),
             refresh_token: "refresh1".to_string(),
@@ -7266,7 +7688,7 @@ mod tests {
         quotas2.insert("claude".to_string(), 80);
         let mut limits2 = HashMap::new();
         limits2.insert("claude-sonnet-5-5-high".to_string(), 128000);
-        let token2 = ProxyToken {
+        let mut token2 = ProxyToken {
             account_id: "acc_pro_has_55".to_string(),
             access_token: "token2".to_string(),
             refresh_token: "refresh2".to_string(),
@@ -7311,16 +7733,8 @@ mod tests {
         ));
 
         // 写入虚拟的 account json 文件以防磁盘检查失败
-        std::fs::write(
-            &token1.account_path,
-            serde_json::json!({"disabled": false}).to_string(),
-        )
-        .unwrap();
-        std::fs::write(
-            &token2.account_path,
-            serde_json::json!({"disabled": false}).to_string(),
-        )
-        .unwrap();
+        persist_managed_test_token(temp_dir.path(), &mut token1);
+        persist_managed_test_token(temp_dir.path(), &mut token2);
 
         let account_id_2 = token2.account_id.clone();
 
@@ -7366,7 +7780,7 @@ mod tests {
         let mut limits = HashMap::new();
         limits.insert("gemini-3-pro-high".to_string(), 64000);
 
-        let token1 = ProxyToken {
+        let mut token1 = ProxyToken {
             account_id: "acc_transient_1".to_string(),
             access_token: "token1".to_string(),
             refresh_token: "refresh1".to_string(),
@@ -7391,11 +7805,7 @@ mod tests {
             model_metadata: HashMap::new(),
         };
 
-        std::fs::write(
-            &token1.account_path,
-            serde_json::json!({"disabled": false}).to_string(),
-        )
-        .unwrap();
+        persist_managed_test_token(temp_dir.path(), &mut token1);
 
         manager.tokens.insert(token1.account_id.clone(), token1);
 
@@ -7647,9 +8057,6 @@ mod tests {
         let acc1_path = accounts_dir.join(format!("{}.json", acc1_id));
         let acc2_path = accounts_dir.join(format!("{}.json", acc2_id));
 
-        std::fs::write(&acc1_path, r#"{"disabled":false}"#).unwrap();
-        std::fs::write(&acc2_path, r#"{"disabled":false}"#).unwrap();
-
         let manager = TokenManager::new(temp_dir.path().to_path_buf());
 
         let target_model = "claude-sonnet-4-6";
@@ -7671,6 +8078,9 @@ mod tests {
         token2.account_id = acc2_id.to_string();
         token2.account_path = acc2_path;
         token2.model_quotas = quotas2;
+
+        persist_managed_test_token(temp_dir.path(), &mut token1);
+        persist_managed_test_token(temp_dir.path(), &mut token2);
 
         manager.tokens.insert(acc1_id.to_string(), token1);
         manager.tokens.insert(acc2_id.to_string(), token2);
@@ -7714,9 +8124,6 @@ mod tests {
         let pref_path = accounts_dir.join(format!("{}.json", acc_pref_id));
         let alt_path = accounts_dir.join(format!("{}.json", acc_alt_id));
 
-        std::fs::write(&pref_path, r#"{"disabled":false}"#).unwrap();
-        std::fs::write(&alt_path, r#"{"disabled":false}"#).unwrap();
-
         let manager = TokenManager::new(temp_dir.path().to_path_buf());
 
         let target_model = "gemini-3.8-flash-high";
@@ -7738,6 +8145,9 @@ mod tests {
         token2.account_id = acc_alt_id.to_string();
         token2.account_path = alt_path;
         token2.model_quotas = quotas2;
+
+        persist_managed_test_token(temp_dir.path(), &mut token1);
+        persist_managed_test_token(temp_dir.path(), &mut token2);
 
         manager.tokens.insert(acc_pref_id.to_string(), token1);
         manager.tokens.insert(acc_alt_id.to_string(), token2);
@@ -7789,19 +8199,8 @@ mod tests {
         token_b.model_quotas = quotas_b;
         token_b.weekly_reset_time = Some(now_ts + 432_000); // 5 天后
 
-        std::fs::write(
-            temp_dir.path().join("acc_expiring.json"),
-            r#"{"disabled":false}"#,
-        )
-        .unwrap();
-        std::fs::write(
-            temp_dir.path().join("acc_distant.json"),
-            r#"{"disabled":false}"#,
-        )
-        .unwrap();
-
-        token_a.account_path = temp_dir.path().join("acc_expiring.json");
-        token_b.account_path = temp_dir.path().join("acc_distant.json");
+        persist_managed_test_token(temp_dir.path(), &mut token_a);
+        persist_managed_test_token(temp_dir.path(), &mut token_b);
 
         manager.tokens.insert(token_a.account_id.clone(), token_a);
         manager.tokens.insert(token_b.account_id.clone(), token_b);
@@ -7848,19 +8247,8 @@ mod tests {
         token_b.model_quotas = quotas_b;
         token_b.weekly_reset_time = Some(now_ts + 28800); // 8 小时后
 
-        std::fs::write(
-            temp_dir.path().join("acc_sooner.json"),
-            r#"{"disabled":false}"#,
-        )
-        .unwrap();
-        std::fs::write(
-            temp_dir.path().join("acc_later.json"),
-            r#"{"disabled":false}"#,
-        )
-        .unwrap();
-
-        token_a.account_path = temp_dir.path().join("acc_sooner.json");
-        token_b.account_path = temp_dir.path().join("acc_later.json");
+        persist_managed_test_token(temp_dir.path(), &mut token_a);
+        persist_managed_test_token(temp_dir.path(), &mut token_b);
 
         manager.tokens.insert(token_a.account_id.clone(), token_a);
         manager.tokens.insert(token_b.account_id.clone(), token_b);
@@ -7905,19 +8293,8 @@ mod tests {
         token_b.model_quotas = quotas_b;
         token_b.weekly_reset_time = Some(now_ts + 518_400); // 6 天后
 
-        std::fs::write(
-            temp_dir.path().join("acc_low.json"),
-            r#"{"disabled":false}"#,
-        )
-        .unwrap();
-        std::fs::write(
-            temp_dir.path().join("acc_high.json"),
-            r#"{"disabled":false}"#,
-        )
-        .unwrap();
-
-        token_a.account_path = temp_dir.path().join("acc_low.json");
-        token_b.account_path = temp_dir.path().join("acc_high.json");
+        persist_managed_test_token(temp_dir.path(), &mut token_a);
+        persist_managed_test_token(temp_dir.path(), &mut token_b);
 
         manager.tokens.insert(token_a.account_id.clone(), token_a);
         manager.tokens.insert(token_b.account_id.clone(), token_b);
@@ -7964,19 +8341,8 @@ mod tests {
         token_b.model_quotas = quotas_b;
         token_b.weekly_reset_time = Some(now_ts + 432_000); // 5 天后
 
-        std::fs::write(
-            temp_dir.path().join("acc_zero.json"),
-            r#"{"disabled":false}"#,
-        )
-        .unwrap();
-        std::fs::write(
-            temp_dir.path().join("acc_has.json"),
-            r#"{"disabled":false}"#,
-        )
-        .unwrap();
-
-        token_a.account_path = temp_dir.path().join("acc_zero.json");
-        token_b.account_path = temp_dir.path().join("acc_has.json");
+        persist_managed_test_token(temp_dir.path(), &mut token_a);
+        persist_managed_test_token(temp_dir.path(), &mut token_b);
 
         manager.tokens.insert(token_a.account_id.clone(), token_a);
         manager.tokens.insert(token_b.account_id.clone(), token_b);
@@ -8211,19 +8577,8 @@ mod tests {
         token_b.model_quotas = quotas_b;
         token_b.weekly_reset_time = Some(now_ts + 432_000); // 5 天后
 
-        std::fs::write(
-            temp_dir.path().join("acc_depleted.json"),
-            r#"{"disabled":false}"#,
-        )
-        .unwrap();
-        std::fs::write(
-            temp_dir.path().join("acc_healthy.json"),
-            r#"{"disabled":false}"#,
-        )
-        .unwrap();
-
-        token_a.account_path = temp_dir.path().join("acc_depleted.json");
-        token_b.account_path = temp_dir.path().join("acc_healthy.json");
+        persist_managed_test_token(temp_dir.path(), &mut token_a);
+        persist_managed_test_token(temp_dir.path(), &mut token_b);
 
         manager.tokens.insert(token_a.account_id.clone(), token_a);
         manager.tokens.insert(token_b.account_id.clone(), token_b);
@@ -8244,6 +8599,12 @@ mod tests {
     #[tokio::test]
     async fn test_get_all_model_metadata_collection_and_bare_derivation() {
         let temp_dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(temp_dir.path().join("accounts")).unwrap();
+        std::fs::write(
+            temp_dir.path().join("accounts/acc_test_meta.json"),
+            r#"{"id":"acc_test_meta","quota":{"models":[]}}"#,
+        )
+        .unwrap();
         let manager = TokenManager::new(temp_dir.path().to_path_buf());
 
         let mut meta = HashMap::new();

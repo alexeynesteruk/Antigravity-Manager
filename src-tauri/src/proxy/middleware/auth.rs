@@ -162,6 +162,7 @@ async fn auth_middleware_internal(
         || path == "/props"
         || path == "/v1/props";
     let is_internal_endpoint = path.starts_with("/internal/");
+    crate::proxy::middleware::internal::require_validated_internal_request(&request)?;
     if !path.contains("event_logging") && !is_health_check {
         tracing::info!("Request: {} {}", method, path);
     } else {
@@ -173,17 +174,9 @@ async fn auth_middleware_internal(
         return Ok(next.run(request).await);
     }
 
-    // 内部端点 (/internal/*) 保护：仅供本机内部进程调度（如配额轮询内部预热）。
-    // 1. 本机直接 TCP 回环：免鉴权直接放行。
-    // 2. 任何非回环来源：无论鉴权模式（即使 auth_mode=Off）或是否提供有效 API Key，一律直接拒绝 (403 Forbidden)。
+    // The outer guard authenticated a process-local credential and the TCP loopback peer.
     if is_internal_endpoint {
-        if crate::proxy::middleware::ip_filter::is_direct_loopback(&request) {
-            tracing::debug!("Loopback internal endpoint bypassed auth: {}", path);
-            return Ok(next.run(request).await);
-        } else {
-            tracing::warn!("Blocked non-loopback access to internal endpoint: {}", path);
-            return Err(StatusCode::FORBIDDEN);
-        }
+        return Ok(next.run(request).await);
     }
 
     let security = security.read().await.clone();
@@ -399,6 +392,9 @@ mod tests {
             .layer(axum::middleware::from_fn_with_state(
                 strict_security(),
                 auth_middleware,
+            ))
+            .layer(axum::middleware::from_fn(
+                crate::proxy::middleware::internal::internal_loopback_middleware,
             ));
         let request = Request::builder()
             .uri("/v1beta/models?key=valid%2Bkey&alt=sse&key=duplicate")
@@ -488,12 +484,19 @@ mod tests {
             .layer(axum::middleware::from_fn_with_state(
                 security.clone(),
                 auth_middleware,
+            ))
+            .layer(axum::middleware::from_fn(
+                crate::proxy::middleware::internal::internal_loopback_middleware,
             ));
 
         // 1. 本机回环来源（带 ConnectInfo） -> 允许访问 (200 OK)
         let mut req_loopback = Request::builder()
             .method("POST")
             .uri("/internal/warmup")
+            .header(
+                crate::proxy::middleware::internal::INTERNAL_REQUEST_CREDENTIAL_HEADER,
+                crate::proxy::middleware::internal::internal_request_credential(),
+            )
             .body(axum::body::Body::empty())
             .unwrap();
         req_loopback

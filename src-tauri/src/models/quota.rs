@@ -193,6 +193,50 @@ impl QuotaData {
         }
     }
 
+    /// Preserve previously observed buckets when the auxiliary summary is absent or partial.
+    pub(crate) fn merge_previous_observations(&mut self, existing: &Self) {
+        // A failed/partial summary is not evidence that a previously observed bucket recovered.
+        if let Some(old_groups) = &existing.quota_groups {
+            let groups = self.quota_groups.get_or_insert_with(Vec::new);
+            for old_group in old_groups {
+                let index = groups
+                    .iter()
+                    .position(|g| g.display_name == old_group.display_name)
+                    .unwrap_or_else(|| {
+                        groups.push(crate::models::quota::QuotaGroup {
+                            buckets: Vec::new(),
+                            ..old_group.clone()
+                        });
+                        groups.len() - 1
+                    });
+                for old_bucket in &old_group.buckets {
+                    let mut previous = old_bucket.clone();
+                    let observed_at = *previous
+                        .observed_at
+                        .get_or_insert(existing.last_updated.saturating_mul(1000));
+                    if let Some(current) = groups[index]
+                        .buckets
+                        .iter_mut()
+                        .find(|b| b.bucket_id == previous.bucket_id)
+                    {
+                        let current_observed_at = current
+                            .observed_at
+                            .unwrap_or(self.last_updated.saturating_mul(1000));
+                        if current_observed_at <= observed_at {
+                            *current = previous;
+                        }
+                    } else {
+                        groups[index].buckets.push(previous);
+                    }
+                }
+            }
+        }
+        if self.subscription_tier.is_none() {
+            self.subscription_tier = existing.subscription_tier.clone();
+        }
+        self.ensure_subscription_tier();
+    }
+
     pub fn add_model(&mut self, model: ModelQuota) {
         self.models.push(model);
     }

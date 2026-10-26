@@ -788,6 +788,10 @@ pub async fn warmup_model_directly(
         .unwrap_or_else(|_| rquest::Client::new());
     let resp = client
         .post(&warmup_url)
+        .header(
+            crate::proxy::middleware::internal::INTERNAL_REQUEST_CREDENTIAL_HEADER,
+            crate::proxy::middleware::internal::internal_request_credential(),
+        )
         .header("Content-Type", "application/json")
         .json(&body)
         .send()

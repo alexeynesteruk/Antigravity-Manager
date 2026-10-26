@@ -891,6 +891,10 @@ pub async fn test_model_connectivity(
     let resp = client
         .post(&warmup_url)
         .header("Content-Type", "application/json")
+        .header(
+            crate::proxy::middleware::internal::INTERNAL_REQUEST_CREDENTIAL_HEADER,
+            crate::proxy::middleware::internal::internal_request_credential(),
+        )
         .json(&body)
         .send()
         .await

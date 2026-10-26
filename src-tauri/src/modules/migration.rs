@@ -244,9 +244,12 @@ pub async fn import_from_v1() -> Result<Vec<Account>, String> {
 
 /// Import account from custom database path
 pub async fn import_from_custom_db_path(path_str: String) -> Result<Account, String> {
+    import_from_custom_db_file(PathBuf::from(path_str)).await
+}
+
+pub async fn import_from_custom_db_file(path: PathBuf) -> Result<Account, String> {
     use crate::modules::oauth;
 
-    let path = PathBuf::from(path_str);
     if !path.exists() {
         return Err(format!("File does not exist: {:?}", path));
     }
@@ -457,9 +460,10 @@ pub fn extract_oauth_state_from_file(db_path: &PathBuf) -> Result<ImportedOAuthS
         return Err(format!("Database file not found: {:?}", db_path));
     }
 
-    // Connect to database
-    let conn = rusqlite::Connection::open(db_path)
-        .map_err(|e| format!("Failed to open database: {}", e))?;
+    // Import only reads credentials; never create or modify a selected database.
+    let conn =
+        rusqlite::Connection::open_with_flags(db_path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .map_err(|e| format!("Failed to open database: {}", e))?;
 
     // 1. Try the new format (>= 1.16.5)
     // Key: antigravityUnifiedStateSync.oauthToken

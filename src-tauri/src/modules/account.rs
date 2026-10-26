@@ -784,6 +784,19 @@ mod tests {
     }
 
     #[test]
+    fn managed_account_rejects_mismatched_identity_before_self_healing() {
+        let dir = TestDataDir::new();
+        create_account_file(dir.path(), "real-account", "real@example.com");
+        let source = dir.path().join("accounts/real-account.json");
+        let target = dir.path().join("accounts/other-account.json");
+        let raw = fs::read_to_string(&source).unwrap() + "}";
+        fs::write(&target, &raw).unwrap();
+        assert!(load_account_at_path(&target).is_err());
+        assert_eq!(fs::read_to_string(&target).unwrap(), raw);
+        assert!(validate_account_file_identity(&source, "../outside").is_err());
+    }
+
+    #[test]
     fn task_quota_refresh_keeps_unexpired_live_limit() {
         let _guard = SHARED_TEST_ENV_LOCK
             .lock()
@@ -1291,8 +1304,20 @@ fn rebuild_index_from_accounts_in_dir(data_dir: &PathBuf) -> Result<AccountIndex
         if let Ok(entries) = fs::read_dir(&accounts_dir) {
             for entry in entries.filter_map(|e| e.ok()) {
                 let path = entry.path();
+                if !entry
+                    .file_type()
+                    .is_ok_and(|kind| kind.is_file() && !kind.is_symlink())
+                {
+                    continue;
+                }
                 if path.extension().map_or(false, |ext| ext == "json") {
                     if let Some(account_id) = path.file_stem().and_then(|s| s.to_str()) {
+                        let Ok(path) = crate::utils::db_import_path::resolve_account_file_path(
+                            &accounts_dir,
+                            account_id,
+                        ) else {
+                            continue;
+                        };
                         match load_account_at_path(&path) {
                             Ok(account) => {
                                 summaries.push(AccountSummary {
@@ -1345,6 +1370,14 @@ fn rebuild_index_from_accounts_in_dir(data_dir: &PathBuf) -> Result<AccountIndex
 }
 
 /// Load account from a specific path with self-healing support for trailing characters/corrupted suffixes
+fn validate_account_file_identity(path: &std::path::Path, account_id: &str) -> Result<(), String> {
+    crate::utils::db_import_path::validate_account_id(account_id)?;
+    if path.file_stem().and_then(|value| value.to_str()) != Some(account_id) {
+        return Err("Account ID does not match its managed filename".to_string());
+    }
+    Ok(())
+}
+
 fn load_account_at_path(account_path: &PathBuf) -> Result<Account, String> {
     let content = fs::read_to_string(account_path)
         .map_err(|e| format!("failed_to_read_account_data: {}", e))?;
@@ -1360,6 +1393,8 @@ fn load_account_at_path(account_path: &PathBuf) -> Result<Account, String> {
             {
                 let mut de = serde_json::Deserializer::from_str(&content);
                 if let Ok(account) = serde::Deserialize::deserialize(&mut de) {
+                    let account: Account = account;
+                    validate_account_file_identity(account_path, &account.id)?;
                     crate::modules::logger::log_warn(&format!(
                         "Self-healing account JSON at {:?}: recovered valid account data from trailing characters, saving clean file",
                         account_path
@@ -1371,6 +1406,8 @@ fn load_account_at_path(account_path: &PathBuf) -> Result<Account, String> {
             return Err(format!("failed_to_parse_account_data: {}", err_msg));
         }
     };
+
+    validate_account_file_identity(account_path, &account.id)?;
 
     // Self-healing: if subscription_tier is missing or unnormalized, heal it and persist to disk
     if let Some(ref mut quota) = account.quota {
@@ -1470,12 +1507,14 @@ pub fn save_account_index(index: &AccountIndex) -> Result<(), String> {
 /// Load account data
 pub fn load_account(account_id: &str) -> Result<Account, String> {
     let accounts_dir = get_accounts_dir()?;
-    let account_path = accounts_dir.join(format!("{}.json", account_id));
+    let account_path =
+        crate::utils::db_import_path::resolve_account_file_path(&accounts_dir, account_id)?;
     load_account_at_path(&account_path)
 }
 
 /// Save account data at specific file path (thread-safe and atomic)
 fn save_account_at_path(account_path: &PathBuf, account: &Account) -> Result<(), String> {
+    validate_account_file_identity(account_path, &account.id)?;
     let _lock = get_account_lock(&account.id);
     let _guard = _lock.lock().unwrap();
 
@@ -1489,7 +1528,8 @@ fn save_account_at_path(account_path: &PathBuf, account: &Account) -> Result<(),
 /// Save account data (thread-safe and atomic)
 pub fn save_account(account: &Account) -> Result<(), String> {
     let accounts_dir = get_accounts_dir()?;
-    let account_path = accounts_dir.join(format!("{}.json", account.id));
+    let account_path =
+        crate::utils::db_import_path::resolve_account_write_path(&accounts_dir, &account.id)?;
     save_account_at_path(&account_path, account)
 }
 
@@ -1680,6 +1720,9 @@ pub fn upsert_account(
 
 /// Delete account
 pub fn delete_account(account_id: &str) -> Result<(), String> {
+    let accounts_dir = get_accounts_dir()?;
+    let account_path =
+        crate::utils::db_import_path::resolve_account_write_path(&accounts_dir, account_id)?;
     let _lock = ACCOUNT_INDEX_LOCK
         .lock()
         .map_err(|e| format!("failed_to_acquire_lock: {}", e))?;
@@ -1701,9 +1744,6 @@ pub fn delete_account(account_id: &str) -> Result<(), String> {
     save_account_index(&index)?;
 
     // Delete account file
-    let accounts_dir = get_accounts_dir()?;
-    let account_path = accounts_dir.join(format!("{}.json", account_id));
-
     if account_path.exists() {
         fs::remove_file(&account_path)
             .map_err(|e| format!("failed_to_delete_account_file: {}", e))?;
@@ -1717,14 +1757,17 @@ pub fn delete_account(account_id: &str) -> Result<(), String> {
 
 /// Batch delete accounts (atomic index operation)
 pub fn delete_accounts(account_ids: &[String]) -> Result<(), String> {
+    let accounts_dir = get_accounts_dir()?;
+    let account_paths: Vec<_> = account_ids
+        .iter()
+        .map(|id| crate::utils::db_import_path::resolve_account_write_path(&accounts_dir, id))
+        .collect::<Result<_, _>>()?;
     let _lock = ACCOUNT_INDEX_LOCK
         .lock()
         .map_err(|e| format!("failed_to_acquire_lock: {}", e))?;
     let mut index = load_account_index()?;
 
-    let accounts_dir = get_accounts_dir()?;
-
-    for account_id in account_ids {
+    for (account_id, account_path) in account_ids.iter().zip(account_paths) {
         // Remove from index
         index.accounts.retain(|s| &s.id != account_id);
 
@@ -1734,7 +1777,6 @@ pub fn delete_accounts(account_ids: &[String]) -> Result<(), String> {
         }
 
         // Delete account file
-        let account_path = accounts_dir.join(format!("{}.json", account_id));
         if account_path.exists() {
             let _ = fs::remove_file(&account_path);
         }

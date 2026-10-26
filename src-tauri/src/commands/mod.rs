@@ -1406,17 +1406,16 @@ pub async fn update_account_label(account_id: String, label: String) -> Result<(
     ));
 
     // 1. 读取账号文件
+    let _account_write = modules::account::lock_account_file_updates()?;
     let data_dir = modules::account::get_data_dir()?;
-    let account_path = data_dir
-        .join("accounts")
-        .join(format!("{}.json", account_id));
-
-    if !account_path.exists() {
-        return Err(format!("账号文件不存在: {}", account_id));
-    }
-
-    let content =
-        std::fs::read_to_string(&account_path).map_err(|e| format!("读取账号文件失败: {}", e))?;
+    let account_path = crate::utils::db_import_path::resolve_account_file_path(
+        &data_dir.join("accounts"),
+        &account_id,
+    )?;
+    let content = crate::utils::db_import_path::read_managed_account_file(
+        &data_dir.join("accounts"),
+        &account_id,
+    )?;
 
     let mut account_json: serde_json::Value =
         serde_json::from_str(&content).map_err(|e| format!("解析账号文件失败: {}", e))?;
@@ -1431,7 +1430,8 @@ pub async fn update_account_label(account_id: String, label: String) -> Result<(
     // 3. 保存到磁盘
     let json_str = serde_json::to_string_pretty(&account_json)
         .map_err(|e| format!("序列化账号数据失败: {}", e))?;
-    std::fs::write(&account_path, json_str).map_err(|e| format!("写入账号文件失败: {}", e))?;
+    crate::utils::fs::write_atomic(&account_path, json_str.as_bytes())
+        .map_err(|e| format!("写入账号文件失败: {}", e))?;
 
     modules::logger::log_info(&format!(
         "账号标签已更新: {} ({})",
