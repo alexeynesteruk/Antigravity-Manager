@@ -1,5 +1,37 @@
 # Advanced Configuration and Experimental Features
 
+## Remote database imports
+
+The Web/headless endpoint `POST /api/accounts/import/db-custom` requires the
+`ANTIGRAVITY_DB_IMPORT_DIR` environment variable. Set it to a directory containing
+database files prepared by the server administrator, and send a filename:
+
+```json
+{"path":"state.vscdb"}
+```
+
+The endpoint returns 403 when the directory is not configured, and 400 for an
+absolute path, a directory, a symbolic link, or a filename outside that directory.
+Imports open SQLite databases read-only. Keep the import directory writable only
+by trusted local operators. Native desktop file selection continues to accept a
+full path through the desktop command.
+
+## Compressed AI requests
+
+AI protocol endpoints accept `Content-Encoding: gzip`. Authentication runs before
+decompression. `ABV_MAX_BODY_SIZE` limits the decoded request size in bytes
+(default `104857600`, or 100 MiB); malformed gzip returns 400 and an oversized
+decoded body returns 413 before request monitoring or model dispatch.
+
+## Startup client fingerprint
+
+Desktop and headless startup use the configured `proxy.hub_version` and
+`proxy.hub_cl`, or the local/built-in fallback, immediately. Discovery runs in the
+background with a bounded network timeout. It preserves settings saved while
+discovery is running and retains the verified version/build pair when the updater
+reports a new version without a matching build number. Explicit configuration
+overrides remain authoritative.
+
 Antigravity v3.3.35 introduces `ExperimentalConfig`, a set of experimental feature switches enabled by default, aimed at improving the system's robustness and compatibility. These settings live in `src-tauri/src/proxy/config.rs` and are not yet exposed in the UI.
 
 ## Feature List
