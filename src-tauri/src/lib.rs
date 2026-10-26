@@ -461,10 +461,15 @@ pub fn run() {
                     }
 
                     // Initialize Hub fingerprint from config or detection
-                    crate::modules::hub_version::update_hub_fingerprint(
+                    let startup_fingerprint = crate::modules::hub_version::update_hub_fingerprint(
                         config.proxy.hub_version.as_deref(),
                         config.proxy.hub_cl.as_deref(),
                     );
+                    tokio::spawn(crate::modules::hub_version::refresh_hub_fingerprint_if_unchanged(
+                        startup_fingerprint,
+                        config.proxy.hub_version.clone(),
+                        config.proxy.hub_cl.clone(),
+                    ));
 
                     // Start proxy service
                     if let Err(e) = commands::proxy::internal_start_proxy_service(
@@ -567,9 +572,16 @@ pub fn run() {
             tauri::async_runtime::spawn(async move {
                 // Load config
                 if let Ok(config) = modules::config::load_app_config() {
-                    crate::modules::hub_version::update_hub_fingerprint(
+                    let startup_fingerprint = crate::modules::hub_version::update_hub_fingerprint(
                         config.proxy.hub_version.as_deref(),
                         config.proxy.hub_cl.as_deref(),
+                    );
+                    tauri::async_runtime::spawn(
+                        crate::modules::hub_version::refresh_hub_fingerprint_if_unchanged(
+                            startup_fingerprint,
+                            config.proxy.hub_version.clone(),
+                            config.proxy.hub_cl.clone(),
+                        ),
                     );
                     let state = handle.state::<commands::proxy::ProxyServiceState>();
                     let cf_state = handle.state::<commands::cloudflared::CloudflaredState>();

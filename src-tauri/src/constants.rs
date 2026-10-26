@@ -216,11 +216,11 @@ pub static SESSION_ID: LazyLock<String> = LazyLock::new(|| uuid::Uuid::new_v4().
 
 /// Antigravity 官方语言服务枢纽 (Antigravity Hub) 版本号
 /// 对应官方出站 User-Agent: antigravity/hub/{OFFICIAL_HUB_VERSION}
-pub const OFFICIAL_HUB_VERSION: &str = "2.23.1";
+pub const OFFICIAL_HUB_VERSION: &str = "2.24.0";
 
 /// Antigravity 官方内部代码仓库 (Google Piper Monorepo) 变更集编号 (Changelist Number / CL)
 /// 官方每一个正式版本发布均对应确定的构建提交点，全球正版客户端保持统一，切勿随机变动
-pub const OFFICIAL_HUB_CL: &str = "998881661";
+pub const OFFICIAL_HUB_CL: &str = "1000335682";
 
 /// Returns the official Antigravity Hub User-Agent matching the upstream egress signature:
 /// format: "antigravity/hub/{OFFICIAL_HUB_VERSION} (aidev_client; os_type={os}; arch={arch}; cl={OFFICIAL_HUB_CL})"

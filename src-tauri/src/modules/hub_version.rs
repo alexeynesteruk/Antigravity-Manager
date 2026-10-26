@@ -170,6 +170,27 @@ pub fn try_detect_local_hub_version() -> Option<String> {
     None
 }
 
+/// Installed metadata supplies a version but no matching build number. Do not
+/// combine an arbitrary local version with the compiled baseline's CL.
+fn fingerprint_from_local_version(
+    version: String,
+    custom_cl: Option<&str>,
+) -> Option<HubFingerprint> {
+    let custom_cl = custom_cl.map(str::trim).filter(|value| !value.is_empty());
+    if custom_cl.is_none() && version != OFFICIAL_HUB_VERSION {
+        debug!(version = %version,
+            "Local Hub version has no verified build number; using the known baseline pair");
+        return None;
+    }
+    let cl = custom_cl.unwrap_or(OFFICIAL_HUB_CL).to_string();
+    Some(HubFingerprint {
+        user_agent: build_hub_user_agent(&version, &cl),
+        version,
+        cl,
+        source: HubFingerprintSource::Local,
+    })
+}
+
 /// 同步解析 Hub 客户端指纹（不发起任何外部网络 I/O，安全可靠）
 /// 优先级: 用户手动自定义 > 本地安装探测 > 稳态基准
 pub fn resolve_hub_fingerprint_sync(
@@ -203,12 +224,9 @@ pub fn resolve_hub_fingerprint_sync(
 
     // 3. 尝试本地已安装探测
     if let Some(local_ver) = try_detect_local_hub_version() {
-        return HubFingerprint {
-            version: local_ver.clone(),
-            cl: final_cl.clone(),
-            user_agent: build_hub_user_agent(&local_ver, &final_cl),
-            source: HubFingerprintSource::Local,
-        };
+        if let Some(fingerprint) = fingerprint_from_local_version(local_ver, clean_cl) {
+            return fingerprint;
+        }
     }
 
     // 4. 稳态基准兜底
@@ -263,12 +281,9 @@ pub async fn resolve_hub_fingerprint_async(
 
     // 4. 尝试本地已安装探测
     if let Some(local_ver) = try_detect_local_hub_version() {
-        return HubFingerprint {
-            version: local_ver.clone(),
-            cl: final_cl.clone(),
-            user_agent: build_hub_user_agent(&local_ver, &final_cl),
-            source: HubFingerprintSource::Local,
-        };
+        if let Some(fingerprint) = fingerprint_from_local_version(local_ver, clean_cl) {
+            return fingerprint;
+        }
     }
 
     // 5. 稳态基准兜底
@@ -334,9 +349,131 @@ pub async fn detect_and_update_hub_fingerprint(
     resolved
 }
 
+/// Startup discovery must not overwrite a setting saved while the remote
+/// manifest was in flight. Keep the synchronous baseline until discovery ends.
+pub async fn refresh_hub_fingerprint_if_unchanged(
+    expected: HubFingerprint,
+    custom_version: Option<String>,
+    custom_cl: Option<String>,
+) {
+    let resolved =
+        resolve_hub_fingerprint_async(custom_version.as_deref(), custom_cl.as_deref()).await;
+    if !startup_pair_is_verified(&resolved, custom_cl.as_deref()) {
+        warn!(version = %resolved.version,
+            "Detected Hub version has no matching verified build number; retaining startup fingerprint");
+        return;
+    }
+    let mut current = CACHED_HUB_FINGERPRINT
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if publish_if_unchanged(&mut current, &expected, resolved) {
+        info!(version = %current.version, source = %current.source,
+            "Hub startup fingerprint discovery completed");
+    }
+}
+
+fn startup_pair_is_verified(resolved: &HubFingerprint, custom_cl: Option<&str>) -> bool {
+    // Automatic local/remote detection supplies a version, not its matching CL.
+    // Explicit overrides remain authoritative; automatic results require the
+    // known version/build pair before replacing the startup fingerprint.
+    resolved.source == HubFingerprintSource::Custom
+        || custom_cl.is_some_and(|value| !value.trim().is_empty())
+        || (resolved.version == OFFICIAL_HUB_VERSION && resolved.cl == OFFICIAL_HUB_CL)
+}
+
+fn publish_if_unchanged(
+    current: &mut HubFingerprint,
+    expected: &HubFingerprint,
+    resolved: HubFingerprint,
+) -> bool {
+    if current.version != expected.version
+        || current.cl != expected.cl
+        || current.source != expected.source
+        || current.user_agent != expected.user_agent
+    {
+        return false;
+    }
+    *current = resolved;
+    true
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn startup_discovery_requires_a_verified_remote_version_build_pair() {
+        let mut remote = HubFingerprint {
+            version: OFFICIAL_HUB_VERSION.into(),
+            cl: OFFICIAL_HUB_CL.into(),
+            user_agent: build_hub_user_agent(OFFICIAL_HUB_VERSION, OFFICIAL_HUB_CL),
+            source: HubFingerprintSource::Remote,
+        };
+        assert!(startup_pair_is_verified(&remote, None));
+        remote.version = "99.0.0".into();
+        assert!(!startup_pair_is_verified(&remote, None));
+        assert!(!startup_pair_is_verified(&remote, Some(" ")));
+        assert!(startup_pair_is_verified(&remote, Some("12345")));
+        remote.source = HubFingerprintSource::Local;
+        assert!(!startup_pair_is_verified(&remote, None));
+        assert!(startup_pair_is_verified(&remote, Some("12345")));
+    }
+
+    #[test]
+    fn local_discovery_requires_its_matching_build_number() {
+        let known = fingerprint_from_local_version(OFFICIAL_HUB_VERSION.into(), None).unwrap();
+        assert_eq!(known.version, OFFICIAL_HUB_VERSION);
+        assert_eq!(known.cl, OFFICIAL_HUB_CL);
+        assert_eq!(known.source, HubFingerprintSource::Local);
+        assert!(startup_pair_is_verified(&known, None));
+
+        for version in ["2.23.1", "99.0.0"] {
+            assert!(fingerprint_from_local_version(version.into(), None).is_none());
+            assert!(fingerprint_from_local_version(version.into(), Some(" ")).is_none());
+            let overridden =
+                fingerprint_from_local_version(version.into(), Some(" 12345 ")).unwrap();
+            assert_eq!(overridden.version, version);
+            assert_eq!(overridden.cl, "12345");
+            assert!(overridden.user_agent.contains("cl=12345"));
+            assert!(startup_pair_is_verified(&overridden, Some("12345")));
+        }
+    }
+
+    #[test]
+    fn explicit_version_override_keeps_its_existing_semantics() {
+        let custom = resolve_hub_fingerprint_sync(Some("3.0.0"), None);
+        assert_eq!(custom.version, "3.0.0");
+        assert_eq!(custom.cl, OFFICIAL_HUB_CL);
+        assert_eq!(custom.source, HubFingerprintSource::Custom);
+        assert!(startup_pair_is_verified(&custom, None));
+    }
+
+    #[test]
+    fn startup_discovery_preserves_settings_saved_during_detection() {
+        let baseline = HubFingerprint {
+            version: "2.24.0".into(),
+            cl: "1000335682".into(),
+            user_agent: build_hub_user_agent("2.24.0", "1000335682"),
+            source: HubFingerprintSource::Baseline,
+        };
+        let remote = HubFingerprint {
+            version: "2.25.0".into(),
+            source: HubFingerprintSource::Remote,
+            ..baseline.clone()
+        };
+        let mut current = baseline.clone();
+        assert!(publish_if_unchanged(
+            &mut current,
+            &baseline,
+            remote.clone()
+        ));
+        let custom = resolve_hub_fingerprint_sync(Some("3.0.0"), Some("12345"));
+        current = custom.clone();
+        assert!(!publish_if_unchanged(&mut current, &baseline, remote));
+        assert_eq!(current.version, custom.version);
+        assert_eq!(current.cl, custom.cl);
+        assert_eq!(current.source, HubFingerprintSource::Custom);
+    }
 
     #[test]
     fn test_build_hub_user_agent() {

@@ -203,52 +203,110 @@ fn get_version_windows(exe_path: &PathBuf) -> Result<AntigravityVersion, String>
     Err("Version information not found in executable".to_string())
 }
 
-/// Linux: 从 package.json 或 --version 参数读取
-#[cfg(target_os = "linux")]
+/// Read only installation metadata. Executing an Electron GUI with --version can
+/// launch it or focus the existing window through single-instance IPC.
+#[cfg(any(target_os = "linux", test))]
 fn get_version_linux(exe_path: &PathBuf) -> Result<AntigravityVersion, String> {
-    use std::process::Command;
-
-    // 方法1 (优先): 尝试从安装目录的 package.json 读取，避免执行可执行文件意外拉起 GUI
-    if let Some(parent) = exe_path.parent() {
-        let package_json = parent.join("resources/app/package.json");
-        if package_json.exists() {
-            if let Ok(content) = fs::read_to_string(&package_json) {
-                if let Ok(json) = serde_json::from_str::<serde_json::Value>(&content) {
-                    if let Some(version) = json.get("version").and_then(|v| v.as_str()) {
-                        return Ok(AntigravityVersion {
-                            short_version: version.to_string(),
-                            bundle_version: version.to_string(),
-                        });
+    let resolved = std::fs::canonicalize(exe_path).unwrap_or_else(|_| exe_path.clone());
+    let mut roots = Vec::new();
+    for path in [&resolved, exe_path] {
+        if let Some(parent) = path.parent() {
+            if !roots.contains(&parent.to_path_buf()) {
+                roots.push(parent.to_path_buf());
+            }
+            if parent.file_name().is_some_and(|name| name == "bin") {
+                if let Some(root) = parent.parent() {
+                    roots.push(root.to_path_buf());
+                }
+            }
+        }
+    }
+    // Stay anchored to the selected installation rather than reporting a
+    // different application's version from an unrelated global directory.
+    for root in &roots {
+        for relative in [
+            "resources/app/package.json",
+            "resources/app/product.json",
+            "package.json",
+            "product.json",
+        ] {
+            if let Ok(file) = std::fs::File::open(root.join(relative)) {
+                use std::io::Read;
+                let mut raw = String::new();
+                if file.take(1024 * 1024).read_to_string(&mut raw).is_ok() {
+                    if let Some(version) = version_from_package_json(raw.as_bytes()) {
+                        return Ok(version);
                     }
                 }
             }
         }
     }
-
-    // 方法2 (兜底): 尝试执行 --version (仅在无法从 package.json 获取时执行)
-    let output = Command::new(exe_path).arg("--version").output();
-
-    if let Ok(result) = output {
-        if result.status.success() {
-            let raw_version = String::from_utf8_lossy(&result.stdout).trim().to_string();
-            if !raw_version.is_empty() {
-                let version = extract_semver(&raw_version).unwrap_or_else(|| {
-                    raw_version
-                        .lines()
-                        .next()
-                        .unwrap_or_default()
-                        .trim()
-                        .to_string()
-                });
-                return Ok(AntigravityVersion {
-                    short_version: version.clone(),
-                    bundle_version: raw_version,
-                });
-            }
+    for root in roots {
+        if let Some(version) = version_from_asar(&root.join("resources/app.asar")) {
+            return Ok(version);
         }
     }
+    Err("Unable to statically determine Antigravity version on Linux".to_string())
+}
 
-    Err("Unable to determine Antigravity version on Linux".to_string())
+#[cfg(any(target_os = "linux", test))]
+fn version_from_package_json(bytes: &[u8]) -> Option<AntigravityVersion> {
+    let json: serde_json::Value = serde_json::from_slice(bytes).ok()?;
+    let version = json.get("version")?.as_str()?.trim();
+    let numeric_core = version.split(['-', '+']).next()?;
+    let components: Vec<_> = numeric_core.split('.').collect();
+    if components.len() < 3
+        || components
+            .iter()
+            .any(|part| part.is_empty() || !part.bytes().all(|byte| byte.is_ascii_digit()))
+        || !version
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b".-+".contains(&byte))
+    {
+        return None;
+    }
+    Some(AntigravityVersion {
+        short_version: numeric_core.to_string(),
+        bundle_version: version.to_string(),
+    })
+}
+
+/// Electron ASAR stores package.json at an offset relative to the end of its
+/// Pickle header. Parse that entry, never an arbitrary dependency's version.
+#[cfg(any(target_os = "linux", test))]
+fn version_from_asar(path: &std::path::Path) -> Option<AntigravityVersion> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut file = std::fs::File::open(path).ok()?;
+    let mut prefix = [0u8; 16];
+    file.read_exact(&mut prefix).ok()?;
+    if u32::from_le_bytes(prefix[..4].try_into().ok()?) != 4 {
+        return None;
+    }
+    let header_size = u32::from_le_bytes(prefix[4..8].try_into().ok()?) as u64;
+    let json_size = u32::from_le_bytes(prefix[12..16].try_into().ok()?) as u64;
+    if header_size > 4 * 1024 * 1024 || json_size > header_size.checked_sub(8)? {
+        return None;
+    }
+    let mut header = vec![0; json_size as usize];
+    file.read_exact(&mut header).ok()?;
+    let header: serde_json::Value = serde_json::from_slice(&header).ok()?;
+    let package = header.get("files")?.get("package.json")?;
+    if package.get("unpacked").and_then(|v| v.as_bool()) == Some(true) {
+        return None;
+    }
+    let offset = package.get("offset")?.as_str()?.parse::<u64>().ok()?;
+    let size = package.get("size")?.as_u64()?;
+    if size > 1024 * 1024 {
+        return None;
+    }
+    let start = 8u64.checked_add(header_size)?.checked_add(offset)?;
+    if start.checked_add(size)? > file.metadata().ok()?.len() {
+        return None;
+    }
+    file.seek(SeekFrom::Start(start)).ok()?;
+    let mut bytes = vec![0; size as usize];
+    file.read_exact(&mut bytes).ok()?;
+    version_from_package_json(&bytes)
 }
 
 /// 判断是否为新版本 (>= 1.16.5)
@@ -275,6 +333,97 @@ pub fn compare_version(v1: &str, v2: &str) -> std::cmp::Ordering {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn linux_version_reads_selected_installation_without_launching_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let executable = dir.path().join("antigravity");
+        std::fs::write(&executable, b"not an executable").unwrap();
+        assert!(get_version_linux(&executable).is_err());
+        let app = dir.path().join("resources/app");
+        std::fs::create_dir_all(&app).unwrap();
+        std::fs::write(app.join("package.json"), br#"{"version":"2.24.0"}"#).unwrap();
+        assert_eq!(
+            get_version_linux(&executable).unwrap().short_version,
+            "2.24.0"
+        );
+        std::fs::write(app.join("package.json"), b"broken").unwrap();
+        std::fs::write(app.join("product.json"), br#"{"version":"2.25.0"}"#).unwrap();
+        assert_eq!(
+            get_version_linux(&executable).unwrap().short_version,
+            "2.25.0"
+        );
+    }
+
+    #[test]
+    fn asar_version_comes_from_root_package_and_bounds_archive_reads() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("app.asar");
+        let package = br#"{"version":"2.24.0"}"#;
+        let make_archive = |offset: &str, size: u64| {
+            let header = serde_json::json!({"files": {
+                "dependency": {"version": "99.99.99"},
+                "package.json": {"offset":offset,"size":size}
+            }})
+            .to_string();
+            let padded = (header.len() + 3) & !3;
+            let header_size = 8 + padded;
+            let mut archive = Vec::new();
+            for value in [
+                4,
+                header_size as u32,
+                header_size as u32 - 4,
+                header.len() as u32,
+            ] {
+                archive.extend_from_slice(&value.to_le_bytes());
+            }
+            archive.extend_from_slice(header.as_bytes());
+            archive.resize(8 + header_size, 0);
+            archive.extend_from_slice(package);
+            archive
+        };
+        std::fs::write(&path, make_archive("0", package.len() as u64)).unwrap();
+        assert_eq!(version_from_asar(&path).unwrap().short_version, "2.24.0");
+        std::fs::write(&path, make_archive("18446744073709551615", 20)).unwrap();
+        assert!(version_from_asar(&path).is_none());
+        std::fs::write(&path, make_archive("0", 2 * 1024 * 1024)).unwrap();
+        assert!(version_from_asar(&path).is_none());
+    }
+
+    #[test]
+    fn static_version_metadata_preserves_prerelease_and_build_suffixes() {
+        for value in ["2.24.0-beta.1", "2.24.0-dev", "2.24.0+build.7"] {
+            let raw = serde_json::json!({"version":value}).to_string();
+            let parsed = version_from_package_json(raw.as_bytes()).unwrap();
+            assert_eq!(parsed.short_version, "2.24.0");
+            assert_eq!(parsed.bundle_version, value);
+        }
+        assert!(version_from_package_json(br#"{"version":"2.24.nope"}"#).is_none());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_version_follows_symlink_and_never_executes_missing_metadata() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+        let dir = tempfile::tempdir().unwrap();
+        let install = dir.path().join("installation");
+        std::fs::create_dir(&install).unwrap();
+        let executable = install.join("antigravity");
+        let marker = install.join("launched");
+        std::fs::write(
+            &executable,
+            format!("#!/bin/sh\ntouch '{}'\necho 2.24.0\n", marker.display()),
+        )
+        .unwrap();
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let link = dir.path().join("launcher");
+        symlink(&executable, &link).unwrap();
+        assert!(get_version_linux(&link).is_err());
+        assert!(!marker.exists());
+        std::fs::write(install.join("package.json"), br#"{"version":"2.24.0"}"#).unwrap();
+        assert_eq!(get_version_linux(&link).unwrap().short_version, "2.24.0");
+        assert!(!marker.exists());
+    }
 
     #[test]
     fn test_version_comparison() {
