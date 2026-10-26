@@ -1,4 +1,3 @@
-use std::fs::File;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use uuid::Uuid;
@@ -61,7 +60,16 @@ fn atomic_replace_file(src: &Path, dst: &Path) -> Result<(), String> {
 /// 3. Replace target file via atomic rename (`MoveFileExW` with `MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH` on Windows, `fs::rename` on POSIX).
 /// 4. If any step fails, remove the temporary file.
 pub fn write_atomic<P: AsRef<Path>>(target_path: P, content: &[u8]) -> Result<(), String> {
-    let target = target_path.as_ref();
+    write_atomic_impl(target_path.as_ref(), content, false)
+}
+
+/// Keep Unix credentials owner-readable from temporary-file creation through
+/// atomic replacement, rather than applying permissions after writing secrets.
+pub fn write_private_atomic<P: AsRef<Path>>(target_path: P, content: &[u8]) -> Result<(), String> {
+    write_atomic_impl(target_path.as_ref(), content, true)
+}
+
+fn write_atomic_impl(target: &Path, content: &[u8], private: bool) -> Result<(), String> {
     let parent_dir = target
         .parent()
         .ok_or_else(|| "Target path has no parent directory".to_string())?;
@@ -73,7 +81,17 @@ pub fn write_atomic<P: AsRef<Path>>(target_path: P, content: &[u8]) -> Result<()
     let temp_filename = format!("{}.tmp.{}", file_name, Uuid::new_v4());
     let temp_path: PathBuf = parent_dir.join(temp_filename);
 
-    let mut file = File::create(&temp_path)
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    if private {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    #[cfg(not(unix))]
+    let _ = private;
+    let mut file = options
+        .open(&temp_path)
         .map_err(|e| format!("Failed to create temporary file {:?}: {}", temp_path, e))?;
 
     if let Err(e) = file.write_all(content) {
@@ -107,6 +125,25 @@ pub fn write_atomic<P: AsRef<Path>>(target_path: P, content: &[u8]) -> Result<()
 mod tests {
     use super::*;
     use std::fs;
+
+    #[test]
+    fn private_atomic_write_replaces_credentials_without_exposing_permissions() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("credential");
+        for data in [b"first".as_slice(), b"replacement".as_slice()] {
+            write_private_atomic(&path, data).unwrap();
+            assert_eq!(fs::read(&path).unwrap(), data);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                assert_eq!(
+                    fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                    0o600
+                );
+            }
+            assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 1);
+        }
+    }
 
     #[test]
     fn test_write_atomic_basic() {
