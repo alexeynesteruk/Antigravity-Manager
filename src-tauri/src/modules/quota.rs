@@ -55,6 +55,141 @@ struct DeprecatedModelInfo {
     new_model_id: String,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ModelQuotaFamily {
+    Gemini,
+    ThirdParty,
+    Argon,
+}
+
+fn model_quota_family(name: &str) -> Option<ModelQuotaFamily> {
+    let name = name.to_ascii_lowercase();
+    if name.contains("argon") {
+        Some(ModelQuotaFamily::Argon)
+    } else if name.starts_with("claude") || name.starts_with("gpt") {
+        Some(ModelQuotaFamily::ThirdParty)
+    } else if name.starts_with("gemini") {
+        Some(ModelQuotaFamily::Gemini)
+    } else {
+        None
+    }
+}
+
+fn quota_family_from_identity(identity: &str) -> Option<ModelQuotaFamily> {
+    let identity = identity.to_ascii_lowercase();
+    if identity.contains("argon") {
+        Some(ModelQuotaFamily::Argon)
+    } else if identity.contains("claude") || identity.contains("gpt") || identity.contains("3p") {
+        Some(ModelQuotaFamily::ThirdParty)
+    } else if identity.contains("gemini") {
+        Some(ModelQuotaFamily::Gemini)
+    } else {
+        None
+    }
+}
+
+fn bucket_quota_family(
+    group: &crate::models::quota::QuotaGroup,
+    bucket: &crate::models::quota::QuotaBucket,
+) -> Option<ModelQuotaFamily> {
+    // Prefer this bucket's identity over display labels and never borrow a sibling bucket.
+    quota_family_from_identity(&bucket.bucket_id)
+        .or_else(|| {
+            bucket
+                .display_name
+                .as_deref()
+                .and_then(quota_family_from_identity)
+        })
+        .or_else(|| quota_family_from_identity(&group.display_name))
+}
+
+fn valid_quota_fraction(value: f64) -> Option<f64> {
+    value.is_finite().then(|| value.clamp(0.0, 1.0))
+}
+
+fn quota_models_from_catalog(
+    models: std::collections::HashMap<String, crate::models::OfficialModelInfo>,
+    groups: Option<&[crate::models::quota::QuotaGroup]>,
+) -> Vec<crate::models::quota::ModelQuota> {
+    models
+        .into_iter()
+        .filter_map(|(name, info)| {
+            let lower = name.to_ascii_lowercase();
+            if info.is_internal == Some(true)
+                || !["gemini", "claude", "gpt", "image", "imagen"]
+                    .iter()
+                    .any(|prefix| lower.starts_with(prefix))
+            {
+                return None;
+            }
+
+            let family = model_quota_family(&name);
+            let model_quota = info.quota_info.as_ref().and_then(|quota| {
+                valid_quota_fraction(quota.remaining_fraction?)
+                    .map(|fraction| (fraction, quota.reset_time.clone().unwrap_or_default()))
+            });
+            let group_quotas: Vec<_> = groups
+                .unwrap_or_default()
+                .iter()
+                .flat_map(|group| {
+                    group.buckets.iter().filter(move |bucket| {
+                        family.is_some() && bucket_quota_family(group, bucket) == family
+                    })
+                })
+                .filter_map(|bucket| {
+                    valid_quota_fraction(bucket.remaining_fraction)
+                        .map(|fraction| (fraction, bucket.reset_time.clone()))
+                })
+                .collect();
+
+            // The global catalog alone does not grant access to an experimental quota pool.
+            // Keep explicit per-model evidence when the auxiliary summary endpoint is unavailable.
+            if family == Some(ModelQuotaFamily::Argon)
+                && model_quota.is_none()
+                && group_quotas.is_empty()
+            {
+                return None;
+            }
+
+            // Every applicable window limits the request. A healthy group must never overwrite
+            // a model-specific zero, nor may a 5h bucket hide an exhausted weekly bucket.
+            let limiting_quota = model_quota.into_iter().chain(group_quotas).min_by(|a, b| {
+                a.0.total_cmp(&b.0).then_with(|| {
+                    let reset_timestamp = |value: &str| {
+                        chrono::DateTime::parse_from_rfc3339(value)
+                            .ok()
+                            .map(|date| date.timestamp())
+                    };
+                    reset_timestamp(&b.1).cmp(&reset_timestamp(&a.1))
+                })
+            });
+            // Preserve catalog discovery even without quotaInfo. Unknown quota is not 100%.
+            let (percentage, reset_time) = limiting_quota
+                .map(|(fraction, reset)| ((fraction * 100.0).round() as i32, reset))
+                .unwrap_or((0, String::new()));
+
+            Some(crate::models::quota::ModelQuota {
+                name,
+                percentage,
+                reset_time,
+                display_name: info.display_name,
+                supports_images: info.supports_images,
+                supports_thinking: info.supports_thinking,
+                thinking_budget: info
+                    .thinking_budget
+                    .and_then(|value| i32::try_from(value).ok()),
+                recommended: info.recommended,
+                max_tokens: info.max_tokens.and_then(|value| i32::try_from(value).ok()),
+                max_output_tokens: info
+                    .max_output_tokens
+                    .and_then(|value| i32::try_from(value).ok()),
+                model: Some(info.model),
+                supported_mime_types: info.supported_mime_types,
+            })
+        })
+        .collect()
+}
+
 // ---- retrieveUserQuotaSummary 响应反序列化结构 ----
 
 #[derive(Debug, Deserialize)]
@@ -425,143 +560,26 @@ pub async fn fetch_quota_with_cache(
                 // 动态更新官方全量模型结构体目录缓存
                 crate::models::OfficialModelCatalog::update(quota_response.models.clone());
 
-                for (name, info) in quota_response.models {
-                    if let Some(quota_info) = info.quota_info {
-                        let percentage = quota_info
-                            .remaining_fraction
-                            .map(|f| (f * 100.0) as i32)
-                            .unwrap_or(0);
+                // Grouped windows are the authoritative fallback when the model catalog
+                // omits quotaInfo (Ref #3737). Fetch before projecting catalog entries.
+                let quota_groups =
+                    fetch_quota_summary(access_token, email, project_id.as_deref(), account_id)
+                        .await;
+                quota_data.models =
+                    quota_models_from_catalog(quota_response.models, quota_groups.as_deref());
 
-                        let reset_time = quota_info.reset_time.clone().unwrap_or_default();
-
-                        // Only keep models we care about (exclude internal chat models)
-                        if name.starts_with("gemini")
-                            || name.starts_with("claude")
-                            || name.starts_with("gpt")
-                            || name.starts_with("image")
-                            || name.starts_with("imagen")
-                        {
-                            let model_quota = crate::models::quota::ModelQuota {
-                                name,
-                                percentage,
-                                reset_time,
-                                display_name: info.display_name,
-                                supports_images: info.supports_images,
-                                supports_thinking: info.supports_thinking,
-                                thinking_budget: info.thinking_budget.map(|v| v as i32),
-                                recommended: info.recommended,
-                                max_tokens: info.max_tokens.map(|v| v as i32),
-                                max_output_tokens: info.max_output_tokens.map(|v| v as i32),
-                                model: Some(info.model),
-                                supported_mime_types: info.supported_mime_types,
-                            };
-                            quota_data.add_model(model_quota);
-                        }
-                    }
-                }
-
-                // Parse deprecated model routing rules
                 if let Some(deprecated) = quota_response.deprecated_model_ids {
                     for (old_id, info) in deprecated {
-                        // Register forwarding rules (including those mapping to gemini-pro-agent)
                         quota_data
                             .model_forwarding_rules
                             .insert(old_id, info.new_model_id);
                     }
                 }
 
-                // 归一化订阅等级。注意：**不再**用模型列表做兜底推断
-                // （fetchAvailableModels 对免费号和 Pro 号返回完全相同的全量目录）。
-                let final_tier =
-                    crate::models::quota::resolve_subscription_tier(subscription_tier.as_deref());
-                quota_data.subscription_tier = Some(final_tier);
-
-                // Best-effort: fetch grouped quota summary (weekly + 5h windows).
-                // Failure here must not block the primary quota result.
-                let quota_groups =
-                    fetch_quota_summary(access_token, email, project_id.as_deref(), account_id)
-                        .await;
-
-                // [FIX #3426] Fuse real bucket quotas into models so UI doesn't show fake 100%
-                if let Some(ref groups) = quota_groups {
-                    for model in quota_data.models.iter_mut() {
-                        let name_lower = model.name.to_lowercase();
-                        let is_argon = name_lower.contains("argon");
-                        let is_claude_or_gpt = !is_argon
-                            && (name_lower.starts_with("claude") || name_lower.starts_with("gpt"));
-                        let is_gemini = !is_argon && name_lower.starts_with("gemini");
-
-                        for group in groups {
-                            let gname = group.display_name.to_lowercase();
-                            let is_argon_group = gname.contains("argon");
-                            let is_claude_group = !is_argon_group
-                                && (gname.contains("claude")
-                                    || gname.contains("gpt")
-                                    || gname.contains("3p"));
-                            let is_gemini_group = !is_argon_group
-                                && !is_claude_group
-                                && (gname.contains("gemini")
-                                    || (!gname.contains("claude")
-                                        && !gname.contains("gpt")
-                                        && !gname.contains("3p")));
-
-                            let matches_group = if is_argon {
-                                is_argon_group
-                            } else if is_claude_or_gpt {
-                                is_claude_group
-                            } else if is_gemini {
-                                is_gemini_group
-                            } else {
-                                false
-                            };
-
-                            if matches_group {
-                                // 找到 5h 桶和 weekly 桶，综合计算受限程度最大的实际可用配额
-                                let bucket_5h = group.buckets.iter().find(|b| {
-                                    let win = b.window.to_lowercase();
-                                    let bid = b.bucket_id.to_lowercase();
-                                    win.contains("5h")
-                                        || bid.contains("5h")
-                                        || win.contains("hour")
-                                        || bid.contains("hour")
-                                });
-                                let bucket_weekly = group.buckets.iter().find(|b| {
-                                    let win = b.window.to_lowercase();
-                                    let bid = b.bucket_id.to_lowercase();
-                                    win.contains("week")
-                                        || bid.contains("week")
-                                        || win.contains("7d")
-                                        || bid.contains("7d")
-                                });
-
-                                let chosen_bucket = match (bucket_5h, bucket_weekly) {
-                                    (Some(h), Some(w)) => {
-                                        // 若周配额耗尽 (<= 0.001)，模型直接受限于周配额，重置时间使用周重置
-                                        if w.remaining_fraction <= 0.001 {
-                                            Some(w)
-                                        } else if h.remaining_fraction <= w.remaining_fraction {
-                                            Some(h)
-                                        } else {
-                                            Some(w)
-                                        }
-                                    }
-                                    (Some(h), None) => Some(h),
-                                    (None, Some(w)) => Some(w),
-                                    _ => group.buckets.first(),
-                                };
-
-                                if let Some(b) = chosen_bucket {
-                                    model.percentage =
-                                        (b.remaining_fraction * 100.0).round() as i32;
-                                    if !b.reset_time.is_empty() {
-                                        model.reset_time = b.reset_time.clone();
-                                    }
-                                    break;
-                                }
-                            }
-                        }
-                    }
-                }
+                // Subscription eligibility comes from loadCodeAssist, never catalog presence.
+                quota_data.subscription_tier = Some(
+                    crate::models::quota::resolve_subscription_tier(subscription_tier.as_deref()),
+                );
 
                 quota_data.quota_groups = quota_groups;
 
@@ -1138,6 +1156,156 @@ pub async fn warm_up_account(account_id: &str) -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn model_catalog(
+        name: &str,
+        info: serde_json::Value,
+    ) -> std::collections::HashMap<String, crate::models::OfficialModelInfo> {
+        std::collections::HashMap::from([(name.to_string(), serde_json::from_value(info).unwrap())])
+    }
+
+    fn quota_group(
+        bucket_id: &str,
+        fraction: f64,
+        reset: &str,
+    ) -> crate::models::quota::QuotaGroup {
+        serde_json::from_value(json!({
+            "display_name": "Localized group label",
+            "buckets": [{
+                "bucket_id": bucket_id,
+                "window": "weekly",
+                "remaining_fraction": fraction,
+                "reset_time": reset
+            }]
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn catalog_model_without_quota_info_uses_real_group_quota() {
+        let groups = [quota_group("gemini-weekly", 0.37, "2026-11-01T00:00:00Z")];
+        let models = quota_models_from_catalog(
+            model_catalog(
+                "gemini-9-flash-high",
+                json!({"model":"MODEL_FUTURE", "supportsThinking":true}),
+            ),
+            Some(&groups),
+        );
+        assert_eq!(models.len(), 1);
+        assert_eq!(models[0].percentage, 37);
+        assert_eq!(models[0].reset_time, "2026-11-01T00:00:00Z");
+        assert_eq!(models[0].model.as_deref(), Some("MODEL_FUTURE"));
+        assert_eq!(models[0].supports_thinking, Some(true));
+    }
+
+    #[test]
+    fn quota_fusion_keeps_the_most_restrictive_model_and_group_window() {
+        let groups = [
+            quota_group("gemini-5h", 0.91, "2026-10-26T10:00:00Z"),
+            quota_group("gemini-weekly", 0.0, "2026-11-01T00:00:00Z"),
+        ];
+        let models = quota_models_from_catalog(
+            model_catalog(
+                "gemini-9-flash",
+                json!({"quotaInfo":{"remainingFraction":0.6}}),
+            ),
+            Some(&groups),
+        );
+        assert_eq!(models[0].percentage, 0);
+        assert_eq!(models[0].reset_time, "2026-11-01T00:00:00Z");
+
+        let groups = [quota_group("gemini-weekly", 0.91, "2026-11-01T00:00:00Z")];
+        let models = quota_models_from_catalog(
+            model_catalog(
+                "gemini-9-flash",
+                json!({"quotaInfo":{"remainingFraction":0.0,"resetTime":"2026-10-27T00:00:00Z"}}),
+            ),
+            Some(&groups),
+        );
+        assert_eq!(models[0].percentage, 0);
+        assert_eq!(models[0].reset_time, "2026-10-27T00:00:00Z");
+    }
+
+    #[test]
+    fn argon_never_borrows_the_general_gemini_quota() {
+        let general = quota_group("gemini-weekly", 0.99, "2026-11-01T00:00:00Z");
+        assert!(quota_models_from_catalog(
+            model_catalog("gemini-4-argon-high", json!({})),
+            Some(&[general.clone()]),
+        )
+        .is_empty());
+
+        let groups = [
+            general,
+            quota_group("gemini-argon-wtu-weekly", 0.0, "2026-11-02T00:00:00Z"),
+        ];
+        let models = quota_models_from_catalog(
+            model_catalog("gemini-4-argon-high", json!({})),
+            Some(&groups),
+        );
+        assert_eq!(models.len(), 1);
+        assert_eq!(models[0].percentage, 0);
+        assert_eq!(models[0].reset_time, "2026-11-02T00:00:00Z");
+    }
+
+    #[test]
+    fn failed_summary_does_not_discard_explicit_model_quota() {
+        let models = quota_models_from_catalog(
+            model_catalog(
+                "gemini-4-argon-low",
+                json!({"quotaInfo":{"remainingFraction":0.42}}),
+            ),
+            None,
+        );
+        assert_eq!(models.len(), 1);
+        assert_eq!(models[0].percentage, 42);
+    }
+
+    #[test]
+    fn mixed_group_only_contributes_the_matching_bucket() {
+        let mut group = quota_group("gemini-weekly", 0.0, "2026-11-01T00:00:00Z");
+        group.display_name = "Gemini Models".to_string();
+        group
+            .buckets
+            .extend(quota_group("gemini-argon-weekly", 0.35, "2026-11-02T00:00:00Z").buckets);
+        let models = quota_models_from_catalog(
+            model_catalog("gemini-4-argon-high", json!({})),
+            Some(&[group]),
+        );
+        assert_eq!(models[0].percentage, 35);
+        assert_eq!(models[0].reset_time, "2026-11-02T00:00:00Z");
+    }
+
+    #[test]
+    fn missing_quota_is_preserved_as_unknown_without_inventing_availability() {
+        let models = quota_models_from_catalog(model_catalog("gemini-9-flash", json!({})), None);
+        assert_eq!(models.len(), 1);
+        assert_eq!(models[0].percentage, 0);
+        assert!(models[0].reset_time.is_empty());
+
+        let groups = [quota_group("3p-weekly", 0.8, "2026-11-01T00:00:00Z")];
+        let models =
+            quota_models_from_catalog(model_catalog("gemini-9-flash", json!({})), Some(&groups));
+        assert_eq!(models[0].percentage, 0);
+    }
+
+    #[test]
+    fn third_party_models_use_their_own_bucket_and_internal_models_are_omitted() {
+        let groups = [
+            quota_group("gemini-weekly", 0.95, "2026-11-01T00:00:00Z"),
+            quota_group("3p-weekly", 0.24, "2026-11-02T00:00:00Z"),
+        ];
+        let models = quota_models_from_catalog(
+            model_catalog("claude-sonnet-9-high", json!({})),
+            Some(&groups),
+        );
+        assert_eq!(models[0].percentage, 24);
+        assert!(quota_models_from_catalog(
+            model_catalog("gemini-internal", json!({"isInternal":true})),
+            Some(&groups)
+        )
+        .is_empty());
+    }
 
     #[test]
     fn test_quota_and_load_project_endpoints_health_reordering() {

@@ -42,12 +42,13 @@ static CLAUDE_TO_GEMINI: Lazy<HashMap<&'static str, &'static str>> = Lazy::new(|
     m.insert("gpt-3.5-turbo", "gemini-3.6-flash-medium");
 
     // ── Gemini 内部 ID 映射与淘汰模型平滑重定向 ──
-    // 下游公开名。Google generate 内部只接受 agent 协议 id：high → gemini-pro-agent
-    m.insert("gemini-3.1-pro-high", "gemini-pro-agent");
-    m.insert("gemini-3.1-pro", "gemini-pro-agent");
-    m.insert("gemini-3.1-pro-preview", "gemini-pro-agent");
-    m.insert("gemini-3-pro-high", "gemini-pro-agent");
-    m.insert("gemini-3-pro", "gemini-pro-agent");
+    // Route legacy Pro aliases to the current upstream high-tier model.
+    m.insert("gemini-pro-agent", "gemini-3.1-pro-high");
+    m.insert("gemini-3.1-pro-high", "gemini-3.1-pro-high");
+    m.insert("gemini-3.1-pro", "gemini-3.1-pro-high");
+    m.insert("gemini-3.1-pro-preview", "gemini-3.1-pro-high");
+    m.insert("gemini-3-pro-high", "gemini-3.1-pro-high");
+    m.insert("gemini-3-pro", "gemini-3.1-pro-high");
 
     m.insert("gemini-3.1-flash-lite", "gemini-3.1-flash-lite");
     m.insert("gemini-3.1-flash-image", "gemini-3.1-flash-image");
@@ -63,9 +64,9 @@ static CLAUDE_TO_GEMINI: Lazy<HashMap<&'static str, &'static str>> = Lazy::new(|
     m.insert("veo-2.0-generate-001", "veo-2.0-generate-001");
 
     m.insert("gemini-3-flash", "gemini-3.8-flash-high");
-    m.insert("gemini-1.5-pro", "gemini-pro-agent");
-    m.insert("gemini-2.0-pro", "gemini-pro-agent");
-    m.insert("gemini-2.5-pro", "gemini-pro-agent");
+    m.insert("gemini-1.5-pro", "gemini-3.1-pro-high");
+    m.insert("gemini-2.0-pro", "gemini-3.1-pro-high");
+    m.insert("gemini-2.5-pro", "gemini-3.1-pro-high");
     m.insert("gemini-1.5-flash", "gemini-3.8-flash-high");
     m.insert("gemini-2.0-flash", "gemini-3.8-flash-high");
     m.insert("gemini-2.5-flash", "gemini-3.6-flash-medium");
@@ -230,7 +231,7 @@ pub fn map_claude_model_to_gemini(input: &str) -> String {
         | "gemini-3.1-pro-preview"
         | "gemini-3.1-pro"
         | "gemini-3-pro-high"
-        | "gemini-3.1-pro-high" => return "gemini-pro-agent".to_string(),
+        | "gemini-3.1-pro-high" => return "gemini-3.1-pro-high".to_string(),
         "gemini-3-pro-low" => return "gemini-3.1-pro-low".to_string(),
         "gemini-1.5-flash" | "gemini-2.0-flash" | "gemini-3-flash" => {
             return "gemini-3.8-flash-high".to_string()
@@ -306,13 +307,17 @@ pub fn is_model_compliant_with_baseline(model: &str) -> bool {
     let lower = model.to_lowercase();
     let m = lower.trim();
 
+    if m == "gemini-pro-agent" {
+        return false;
+    }
+
     // 过滤内部任务与测试模型
     if m.starts_with("chat_") || m.contains("internal") || m.contains("-exp") {
         return false;
     }
 
     // 特许放行的官方白名单模型（包含官方 agent 与 tab 预览模型）
-    if m == "gemini-pro-agent"
+    if m == "gemini-3.1-pro-high"
         || m == "gemini-3-flash-agent"
         || m == "gemini-3-flash"
         || m == "tab_flash_lite_preview"
@@ -957,6 +962,29 @@ mod tests {
     use super::*;
 
     #[test]
+    fn retired_pro_alias_migrates_without_overriding_custom_routes() {
+        let empty = HashMap::new();
+        for alias in ["gemini-pro-agent", "gemini-3.1-pro", "gemini-3-pro-preview"] {
+            assert_eq!(resolve_model_route(alias, &empty), "gemini-3.1-pro-high");
+        }
+        assert!(!is_model_compliant_with_baseline("gemini-pro-agent"));
+        let custom = HashMap::from([(
+            "gemini-pro-agent".to_string(),
+            "my-private-model".to_string(),
+        )]);
+        assert_eq!(
+            resolve_model_route("gemini-pro-agent", &custom),
+            "my-private-model"
+        );
+        let wildcard =
+            HashMap::from([("gemini-*-pro*".to_string(), "my-private-model".to_string())]);
+        assert_eq!(
+            resolve_model_route("gemini-3.1-pro", &wildcard),
+            "my-private-model"
+        );
+    }
+
+    #[test]
     fn test_model_mapping() {
         assert_eq!(
             map_claude_model_to_gemini("claude-3-5-sonnet-20241022"),
@@ -1008,7 +1036,7 @@ mod tests {
         // 旧 Pro 公开名必须落到上游可生成的真实 id。
         assert_eq!(
             map_claude_model_to_gemini("gemini-3-pro-high"),
-            "gemini-pro-agent"
+            "gemini-3.1-pro-high"
         );
         assert_eq!(
             map_claude_model_to_gemini("gemini-3-pro-low"),
@@ -1082,7 +1110,7 @@ mod tests {
     fn test_mappings_continued() {
         assert_eq!(
             map_claude_model_to_gemini("gemini-3.1-pro-high"),
-            "gemini-pro-agent"
+            "gemini-3.1-pro-high"
         );
         assert_eq!(
             map_claude_model_to_gemini("gemini-3.1-pro-low"),
@@ -1091,16 +1119,16 @@ mod tests {
         // 裸 Pro / 旧别名默认落到 high 的真实上游 id
         assert_eq!(
             map_claude_model_to_gemini("gemini-3-pro"),
-            "gemini-pro-agent"
+            "gemini-3.1-pro-high"
         );
         assert_eq!(
             map_claude_model_to_gemini("gemini-3.1-pro"),
-            "gemini-pro-agent"
+            "gemini-3.1-pro-high"
         );
         // 真实上游 id 不得被系统默认映射映回公开名（Issue #3551）
         assert_eq!(
-            map_claude_model_to_gemini("gemini-pro-agent"),
-            "gemini-pro-agent"
+            map_claude_model_to_gemini("gemini-3.1-pro-high"),
+            "gemini-3.1-pro-high"
         );
         assert_eq!(
             map_claude_model_to_gemini("gemini-3-flash-agent"),
@@ -1109,11 +1137,11 @@ mod tests {
         let empty = HashMap::new();
         assert_eq!(
             resolve_model_route("gemini-3.1-pro-high", &empty),
-            "gemini-pro-agent"
+            "gemini-3.1-pro-high"
         );
         assert_eq!(
-            resolve_model_route("gemini-pro-agent", &empty),
-            "gemini-pro-agent"
+            resolve_model_route("gemini-3.1-pro-high", &empty),
+            "gemini-3.1-pro-high"
         );
         assert_eq!(
             resolve_model_route("gemini-3-flash-agent", &empty),
@@ -1139,7 +1167,7 @@ mod tests {
         );
         assert_eq!(
             map_claude_model_to_gemini("gemini-2.5-pro"),
-            "gemini-pro-agent"
+            "gemini-3.1-pro-high"
         );
         assert_eq!(
             map_claude_model_to_gemini("gemini-3.1-flash-lite"),
@@ -1389,7 +1417,7 @@ mod tests {
             "tab_jump_flash_lite_preview"
         ));
         assert!(is_model_compliant_with_baseline("tab_flash_lite_preview"));
-        assert!(is_model_compliant_with_baseline("gemini-pro-agent"));
+        assert!(is_model_compliant_with_baseline("gemini-3.1-pro-high"));
         assert!(is_model_compliant_with_baseline("gemini-3-flash-agent"));
         assert!(is_model_compliant_with_baseline("gemini-3-flash"));
         assert!(is_model_compliant_with_baseline("gemini-3.1-pro"));
@@ -1407,7 +1435,7 @@ mod tests {
         );
         assert_eq!(
             resolve_model_route_with_effort("gemini-3.1-pro", &empty, Some("high")),
-            "gemini-pro-agent"
+            "gemini-3.1-pro-high"
         );
 
         // Pro has no medium upstream variant; the nearest high tier must also
@@ -1415,14 +1443,14 @@ mod tests {
         for effort in ["medium", "xhigh", "max"] {
             assert_eq!(
                 resolve_model_route_with_effort("gemini-3.1-pro", &empty, Some(effort)),
-                "gemini-pro-agent"
+                "gemini-3.1-pro-high"
             );
         }
 
         // 2. 衍生裸模型 gemini-3.1-pro 缺省 effort 遵循 pick_optimal_default_tier 决策链 (取高于 low 的最低档 -> high)
         assert_eq!(
             resolve_model_route_with_effort("gemini-3.1-pro", &empty, None),
-            "gemini-pro-agent"
+            "gemini-3.1-pro-high"
         );
 
         // 3. 衍生裸模型 gemini-3.5-flash 缺省 effort 遵循决策链 (取 low)
@@ -1438,11 +1466,11 @@ mod tests {
         );
         assert_eq!(
             resolve_model_route_with_effort("gemini-3.1-pro-high", &empty, None),
-            "gemini-pro-agent"
+            "gemini-3.1-pro-high"
         );
         assert_eq!(
             resolve_model_route_with_effort("gemini-3.1-pro-high", &empty, Some("low")),
-            "gemini-pro-agent"
+            "gemini-3.1-pro-high"
         );
     }
 
@@ -1460,8 +1488,8 @@ mod tests {
         // A physical ID selected by a protocol's variant resolver must not be
         // reinterpreted using a conflicting client effort.
         assert_eq!(
-            resolve_model_route_with_effort("gemini-pro-agent", &HashMap::new(), Some("low")),
-            "gemini-pro-agent"
+            resolve_model_route_with_effort("gemini-3.1-pro-high", &HashMap::new(), Some("low")),
+            "gemini-3.1-pro-high"
         );
     }
 

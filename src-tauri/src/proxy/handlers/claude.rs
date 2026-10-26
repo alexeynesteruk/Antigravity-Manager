@@ -715,7 +715,7 @@ mod variant_tests {
 
         apply_variant(&mut request, effort, Some(1_000)).expect("Gemini 3.1 Pro must resolve");
 
-        assert_eq!(request.model, "gemini-pro-agent");
+        assert_eq!(request.model, "gemini-3.1-pro-high");
     }
 
     #[test]
@@ -1847,6 +1847,10 @@ pub async fn handle_messages(
 
         last_email = Some(email.clone());
         info!("✓ Using account: {} (type: {})", email, config.request_type);
+
+        let mapped_model = token_manager
+            .resolve_dynamic_model_for_account(&account_id, &mapped_model)
+            .await;
 
         // 方案 A：移除后台任务静默降级策略，请求直通客户端指定的模型，与 OpenAI 协议保持一致
         let mut request_with_mapped = request_for_body.clone();

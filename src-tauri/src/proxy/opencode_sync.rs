@@ -2532,7 +2532,10 @@ mod tests {
         let variants = build_variants_object(Some(VariantType::Gemini3Pro))
             .expect("Gemini 3.1 Pro variants must be configured");
 
-        for (name, expected_id) in [("low", "gemini-3.1-pro-low"), ("high", "gemini-pro-agent")] {
+        for (name, expected_id) in [
+            ("low", "gemini-3.1-pro-low"),
+            ("high", "gemini-3.1-pro-high"),
+        ] {
             let variant = &variants[name];
             let effort = variant["effort"]
                 .as_str()
@@ -4379,8 +4382,8 @@ mod canonical_family_tests {
                         "gemini-3.1-pro".to_string(),
                         "gemini-3.1-pro-high".to_string(),
                         "gemini-pro".to_string(),
-                        "gemini-3.1-pro-low".to_string(),
                         "gemini-pro-agent".to_string(),
+                        "gemini-3.1-pro-low".to_string(),
                     ],
                 },
             ]

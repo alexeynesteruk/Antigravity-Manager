@@ -859,11 +859,8 @@ fn should_enable_thinking_by_default(model: &str) -> bool {
 
 /// Whether the mapped target model supports Gemini `thinkingConfig`.
 ///
-/// `gemini-pro-agent` is the mapped target of `gemini-3.1-pro-high` /
-/// `gemini-3-pro-high` (`model_mapping.rs`) and is a forced-thinking Pro agent
-/// model. It is kept in sync with the OpenAI protocol path
-/// (`openai/request.rs` `is_gemini_3_thinking` includes `-pro-agent`) and the
-/// model spec `SPEC_PRO_AGENT { include_thoughts: true }` (`variant_mapping.rs`).
+/// Current Gemini Pro IDs and the accepted legacy `gemini-pro-agent` alias
+/// retain thinking support through the shared model specification helpers.
 fn model_supports_thinking(mapped_model: &str) -> bool {
     if crate::proxy::thinking_store::model_forces_server_thinking(mapped_model) {
         return true;
