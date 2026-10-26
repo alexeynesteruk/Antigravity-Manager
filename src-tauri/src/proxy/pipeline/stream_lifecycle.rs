@@ -164,6 +164,11 @@ where
                         Some(chunk_result) => {
                             match chunk_result {
                                 Ok(chunk) => {
+                                    // Empty transport items are not activity and cannot renew a
+                                    // stalled stream's grace period.
+                                    if chunk.is_empty() {
+                                        continue;
+                                    }
                                     buffer.extend_from_slice(&chunk);
                                     while let Some(pos) = buffer.iter().position(|&b| b == b'\n') {
                                         let line_raw = buffer.split_to(pos + 1);
@@ -320,15 +325,14 @@ where
                     };
 
                     if last_activity.elapsed() >= std::time::Duration::from_secs(phase_timeout_secs) {
-                        // [关键自适应跃迁：思考至正文过渡断崖检测]
-                        // 若处于思考期，且静默时间达到稳态滑动超时，但正文/工具调用尚未产生，
-                        // 说明思考吐字已完成，上游正处于生成正文或大工具调用的计算静默期（过渡断崖 Transition Cliff）。
-                        // 此时绝不可直接超时误杀，而应自动跃迁至 Transition 状态，重置时间基准点，
-                        // 赋予独立的 transition_secs (180s) 宽限期，并继续下发心跳保活。
-                        if phase == StreamPhase::Thinking && !handler.has_content() {
+                        // Upstream may buffer a large tool call after thinking or a short
+                        // textual preamble. Grant one bounded transition period per idle
+                        // interval; local heartbeats do not renew it.
+                        if matches!(phase, StreamPhase::Thinking | StreamPhase::Streaming) {
                             tracing::info!(
-                                "[{}] 思考流静默已达 {}s，检测到过渡断崖 (Transition Cliff)，自动跃迁至 Transition 状态并开启 {}s 宽限期",
+                                "[{}] {:?} stream idle for {}s; allowing {}s transition grace",
                                 config.adapter_name,
+                                phase,
                                 phase_timeout_secs,
                                 config.transition_secs
                             );
@@ -614,19 +618,19 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn test_lifecycle_idle_timeout_after_content_gracefully_finalizes() {
         let mock_stream = async_stream::stream! {
             yield Ok::<_, String>(Bytes::from("data: partial content\n"));
-            // 保持静默超过稳态滑动超时 (streaming_sliding_secs = 1s)
-            tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+            // Exceed both sliding timeout and transition grace.
+            tokio::time::sleep(std::time::Duration::from_secs(4)).await;
             yield Ok::<_, String>(Bytes::from("data: unreachable\n"));
         };
 
         let handler = MockHandler::new(false, false);
         let config =
             StreamLifecycleConfig::new("test", "test_fn", "trace_idle_after_content".to_string())
-                .with_timeouts(5, 5, 1)
+                .with_timeouts(5, 1, 1)
                 .with_heartbeat_secs(1);
         let mut stream = run_stream_lifecycle(Box::pin(mock_stream), handler, config);
 
@@ -652,6 +656,174 @@ mod tests {
             "Must NOT propagate raw Err on idle timeout after content"
         );
         assert!(!full_output.contains("unreachable"));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_lifecycle_streaming_preamble_survives_large_tool_call_buffering() {
+        let mock_stream = async_stream::stream! {
+            yield Ok::<_, String>(Bytes::from("data: preamble\n"));
+            tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+            yield Ok::<_, String>(Bytes::from("data: large_tool_call\n"));
+        };
+        let config = StreamLifecycleConfig::new("test", "test_fn", "preamble_grace".to_string())
+            .with_timeouts(5, 4, 1)
+            .with_heartbeat_secs(1);
+        let output: Vec<_> = run_stream_lifecycle(
+            Box::pin(mock_stream),
+            MockHandler::new(false, false),
+            config,
+        )
+        .collect()
+        .await;
+
+        assert!(output.iter().all(Result::is_ok));
+        let text = output
+            .into_iter()
+            .map(|item| String::from_utf8_lossy(&item.unwrap()).into_owned())
+            .collect::<String>();
+        assert!(text.contains("processed:data: preamble"));
+        assert!(text.contains("processed:data: large_tool_call"));
+        assert_eq!(text.matches("[finalized]").count(), 1);
+        assert!(!text.contains("[initial_error]"));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_lifecycle_empty_chunks_and_heartbeats_do_not_renew_transition_grace() {
+        let mock_stream = async_stream::stream! {
+            yield Ok::<_, String>(Bytes::from("data: preamble\n"));
+            for _ in 0..6 {
+                tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+                yield Ok::<_, String>(Bytes::new());
+            }
+            yield Ok::<_, String>(Bytes::from("data: unreachable\n"));
+        };
+        let config = StreamLifecycleConfig::new("test", "test_fn", "bounded_grace".to_string())
+            .with_timeouts(5, 1, 1)
+            .with_heartbeat_secs(1);
+        let output: Vec<_> = run_stream_lifecycle(
+            Box::pin(mock_stream),
+            MockHandler::new(false, false),
+            config,
+        )
+        .collect()
+        .await;
+
+        assert!(output.iter().all(Result::is_ok));
+        let text = output
+            .into_iter()
+            .map(|item| String::from_utf8_lossy(&item.unwrap()).into_owned())
+            .collect::<String>();
+        assert!(text.contains("processed:data: preamble"));
+        assert!(text.contains(": ping"));
+        assert!(!text.contains("unreachable"));
+        assert_eq!(text.matches("[finalized]").count(), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn loopback_transport_streams_buffered_tools_then_closes_on_terminal_without_upstream_eof(
+    ) {
+        use axum::{body::Body, routing::get, Router};
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        };
+        use std::time::Duration;
+
+        struct AbortListener(tokio::task::JoinHandle<()>);
+        impl Drop for AbortListener {
+            fn drop(&mut self) {
+                self.0.abort();
+            }
+        }
+
+        async fn serve(router: Router) -> (String, AbortListener) {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let url = format!("http://{}/sse", listener.local_addr().unwrap());
+            let task = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+            (url, AbortListener(task))
+        }
+
+        let upstream_calls = Arc::new(AtomicUsize::new(0));
+        let upstream_counter = upstream_calls.clone();
+        let upstream = Router::new().route(
+            "/sse",
+            get(move || {
+                upstream_counter.fetch_add(1, Ordering::SeqCst);
+                async {
+                    let stream = async_stream::stream! {
+                        yield Ok::<_, std::io::Error>(Bytes::from("data: preamble\n"));
+                        // Cross the steady-state idle timeout before the tool
+                        // payload arrives over a real HTTP connection.
+                        tokio::time::sleep(Duration::from_millis(1500)).await;
+                        yield Ok(Bytes::from("data: large_tool_"));
+                        yield Ok(Bytes::from("call\ndata: terminal_stop\n"));
+                        // A terminal protocol event must close downstream now,
+                        // while the upstream TCP response remains open.
+                        tokio::time::sleep(Duration::from_secs(20)).await;
+                        yield Ok(Bytes::from("data: unreachable\n"));
+                    };
+                    (
+                        [("content-type", "text/event-stream")],
+                        Body::from_stream(stream),
+                    )
+                }
+            }),
+        );
+        let (upstream_url, _upstream_listener) = serve(upstream).await;
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .connect_timeout(Duration::from_secs(2))
+            .timeout(Duration::from_secs(8))
+            .build()
+            .unwrap();
+        let upstream_client = client.clone();
+        let downstream = Router::new().route(
+            "/sse",
+            get(move || {
+                let upstream_url = upstream_url.clone();
+                let client = upstream_client.clone();
+                async move {
+                    let response = client.get(upstream_url).send().await.unwrap();
+                    let config =
+                        StreamLifecycleConfig::new("test", "loopback", "real_transport".into())
+                            .with_timeouts(5, 4, 1)
+                            .with_heartbeat_secs(1);
+                    let stream = run_stream_lifecycle(
+                        Box::pin(response.bytes_stream()),
+                        MockHandler::new(false, false),
+                        config,
+                    );
+                    (
+                        [("content-type", "text/event-stream")],
+                        Body::from_stream(stream),
+                    )
+                }
+            }),
+        );
+        let (downstream_url, _downstream_listener) = serve(downstream).await;
+        let clients = (0..4).map(|_| {
+            let client = client.clone();
+            let url = downstream_url.clone();
+            async move {
+                let response = client.get(url).send().await.unwrap();
+                assert_eq!(response.status(), reqwest::StatusCode::OK);
+                let text = tokio::time::timeout(Duration::from_secs(6), response.text())
+                    .await
+                    .expect("terminal event must close the HTTP body before upstream EOF")
+                    .unwrap();
+                assert!(text.contains("processed:data: preamble"));
+                assert!(text.contains("processed:data: large_tool_call"));
+                assert_eq!(text.matches("processed:data: terminal_stop").count(), 1);
+                assert!(
+                    !text.contains("[finalized]"),
+                    "terminal event must not finalize twice"
+                );
+                assert!(!text.contains("[initial_error]"));
+                assert!(!text.contains("unreachable"));
+            }
+        });
+        futures::future::join_all(clients).await;
+        assert_eq!(upstream_calls.load(Ordering::SeqCst), 4);
     }
 
     #[tokio::test]
