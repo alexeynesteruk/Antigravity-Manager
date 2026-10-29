@@ -21,10 +21,12 @@ pub async fn ip_filter_middleware(
         request
             .extensions_mut()
             .insert(ResolvedClientIp(ip.clone()));
-    } else if security_config.whitelist.enabled {
+    } else if security_config.whitelist.enabled || peer_ip(&request).is_some() {
+        // A trusted proxy with an invalid forwarding chain must not inherit the
+        // proxy's own whitelist/token permissions. Reject it before auth and logs.
         return create_blocked_response(
             "unknown",
-            "Unable to verify the client IP for the whitelist.",
+            "Unable to verify the client IP.",
         );
     }
 
@@ -313,7 +315,8 @@ fn trusted_ip(ip: std::net::IpAddr, patterns: &[String]) -> bool {
 }
 
 /// Walk from the TCP peer toward the client, stopping at the first untrusted hop.
-/// Malformed/ambiguous chains fail closed to the peer, never to a second header.
+/// Malformed/ambiguous forwarding headers have no verified identity. Falling
+/// back to a trusted proxy's address could grant its whitelist/token permissions.
 pub fn resolve_client_ip(request: &Request, trusted: &[String]) -> Option<String> {
     let peer = peer_ip(request)?;
     let fallback = || Some(peer.to_string());
@@ -323,18 +326,18 @@ pub fn resolve_client_ip(request: &Request, trusted: &[String]) -> Option<String
     let mut xff = request.headers().get_all("x-forwarded-for").iter();
     if let Some(header) = xff.next() {
         if xff.next().is_some() {
-            return fallback();
+            return None;
         }
         let Ok(raw) = header.to_str() else {
-            return fallback();
+            return None;
         };
         let mut chain = Vec::new();
         for part in raw.split(',') {
             if chain.len() >= 64 {
-                return fallback();
+                return None;
             }
             let Ok(ip) = part.trim().parse::<std::net::IpAddr>() else {
-                return fallback();
+                return None;
             };
             chain.push(canonical_ip(ip));
         }
@@ -350,11 +353,10 @@ pub fn resolve_client_ip(request: &Request, trusted: &[String]) -> Option<String
     let mut xri = request.headers().get_all("x-real-ip").iter();
     if let Some(header) = xri.next() {
         if xri.next().is_some() {
-            return fallback();
+            return None;
         }
-        if let Some(ip) = header.to_str().ok().and_then(|s| s.trim().parse().ok()) {
-            return Some(canonical_ip(ip).to_string());
-        }
+        let ip = header.to_str().ok()?.trim().parse().ok()?;
+        return Some(canonical_ip(ip).to_string());
     }
     fallback()
 }
@@ -390,6 +392,68 @@ fn create_blocked_response(ip: &str, message: &str) -> Response {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn malformed_proxy_headers_cannot_inherit_the_proxys_whitelist() {
+        use tower::ServiceExt;
+        let _dir = crate::proxy::monitor::prompt_log_tests::TestDataDir::new();
+        security_db::init_db().unwrap();
+        security_db::add_to_whitelist("127.0.0.1", Some("local reverse proxy")).unwrap();
+        let state = crate::proxy::server::config_reload_tests::test_state();
+        {
+            let mut security = state.security.write().await;
+            security.security_monitor.trusted_proxies = vec!["127.0.0.1".into()];
+            security.security_monitor.whitelist.enabled = true;
+        }
+        let app = axum::Router::new()
+            .route("/", axum::routing::get(|| async { StatusCode::NO_CONTENT }))
+            .layer(axum::middleware::from_fn_with_state(
+                state.clone(),
+                ip_filter_middleware,
+            ));
+        // A common reverse proxy appends the real client to the caller's XFF.
+        // Neither that malformed chain nor a duplicate/invalid alternative may
+        // fall back to the whitelisted loopback peer and reach the handler.
+        for (name, value, duplicate) in [
+            ("x-forwarded-for", "garbage, 203.0.113.8", false),
+            ("x-forwarded-for", "203.0.113.8", true),
+            ("x-real-ip", "garbage", false),
+            ("x-real-ip", "203.0.113.8", true),
+        ] {
+            let mut request = request_from("127.0.0.1".parse().unwrap(), None);
+            request.headers_mut().insert(name, value.parse().unwrap());
+            if duplicate {
+                request
+                    .headers_mut()
+                    .append(name, "192.0.2.99".parse().unwrap());
+            }
+            assert_eq!(
+                app.clone().oneshot(request).await.unwrap().status(),
+                StatusCode::FORBIDDEN
+            );
+        }
+        // The same invalid identity is rejected with the whitelist disabled,
+        // before token ACLs could treat the proxy itself as the caller.
+        state.security.write().await.security_monitor.whitelist.enabled = false;
+        assert_eq!(
+            app.clone()
+                .oneshot(request_from(
+                    "127.0.0.1".parse().unwrap(),
+                    Some("garbage, 203.0.113.8"),
+                ))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            app.oneshot(request_from("127.0.0.1".parse().unwrap(), None))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::NO_CONTENT
+        );
+    }
 
     #[tokio::test]
     async fn rejected_gemini_queries_never_persist_url_credentials() {
@@ -484,19 +548,13 @@ mod tests {
             request
                 .headers_mut()
                 .insert("x-real-ip", "192.0.2.99".parse().unwrap());
-            assert_eq!(
-                resolve_client_ip(&request, &trusted).as_deref(),
-                Some("127.0.0.1")
-            );
+            assert_eq!(resolve_client_ip(&request, &trusted), None);
         }
         let mut request = request_from("127.0.0.1".parse().unwrap(), Some("203.0.113.8"));
         request
             .headers_mut()
             .append("x-forwarded-for", "192.0.2.99".parse().unwrap());
-        assert_eq!(
-            resolve_client_ip(&request, &trusted).as_deref(),
-            Some("127.0.0.1")
-        );
+        assert_eq!(resolve_client_ip(&request, &trusted), None);
         request
             .extensions_mut()
             .insert(ResolvedClientIp("203.0.113.8".into()));
