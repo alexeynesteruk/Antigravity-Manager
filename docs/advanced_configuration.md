@@ -16,6 +16,78 @@ Imports open SQLite databases read-only. Keep the import directory writable only
 by trusted local operators. Native desktop file selection continues to accept a
 full path through the desktop command.
 
+## Browser clients and reverse proxies
+
+The Security settings page and `proxy.security_monitor` support these fields:
+
+```json
+{
+  "trusted_proxies": ["127.0.0.1/32", "::1/128"],
+  "cors_allowed_origins": ["https://client.example.com"]
+}
+```
+
+Both lists default to empty. Forwarded client IPs are accepted only from configured
+TCP peers, resolving the trusted chain from right to left. The same verified IP
+controls access lists, user-token IP limits, and access logs. List only proxies
+you operate; an empty list uses the TCP peer directly.
+
+Browser origins are exact scheme/host/port values, without paths. The hosted UI
+works on its own origin. The desktop origin requires the configured API key.
+Other browser clients need an explicit entry; native clients may omit `Origin`.
+The same policy applies to Responses WebSocket handshakes. A literal `*` is an
+explicit opt-in to unrestricted browser origins.
+
+`ABV_TRUSTED_PROXIES` and `ABV_CORS_ALLOWED_ORIGINS` override the lists with
+comma-separated values; setting either variable to an empty string clears its
+list. Changes apply to subsequent requests without restarting the proxy.
+
+OAuth callbacks require a matching, unexpired pending authorization flow. State
+is reserved once and tied to its redirect URI and OAuth client before exchanging
+an authorization code. Manual completion uses the same flow lifecycle.
+
+## Account concurrency and imports
+
+`proxy.account_max_concurrency` sets the default simultaneous requests per
+account. It defaults to `0` (unlimited). An account's `max_concurrency` can override
+it: `null` inherits the pool default and `0` explicitly allows unlimited requests.
+The API Proxy scheduling settings and account details expose the same controls.
+Streaming requests retain their slot until the stream finishes or is dropped.
+When no account can accept work, the gateway returns a bounded busy response.
+
+Account imports and quota refreshes use bounded concurrency. Legacy migrations
+validate account IDs and destinations, write the backup and account files, and
+replace the index only after those writes succeed. Account snapshots containing
+OAuth credentials are not stored in browser local storage.
+
+## Raw usage and diagnostics
+
+Missing usage fields remain unknown; explicit zero remains zero. Statistics keep
+upstream-reported totals separately from input/output breakdowns. Cache hit rates
+use only requests with reported cache fields, and the dashboard displays coverage.
+Older records without that provenance are shown as unknown rather than relabeled
+as newly measured data. Model pricing remains a nominal estimate.
+
+Set `proxy.debug_logging.enabled` to enable diagnostics. The additional
+`proxy.debug_logging.metadata_only` flag defaults to `false`, preserving existing
+payload-capture behavior. Enable it to record dispatch identity, endpoint origin,
+status and raw usage without capturing prompt/tool bodies. The Settings page
+exposes the same mode. Event parsing and queued writes are bounded; oversized
+diagnostic events do not block the response stream. Existing log files are not
+rewritten when this mode changes.
+
+## Named Cloudflare tunnels
+
+For an authenticated named tunnel, `cloudflared.custom_domain` can specify a
+public URL such as `https://api.example.com`. `ABV_CLOUDFLARED_DOMAIN` overrides it.
+The URL takes precedence over hostnames discovered in cloudflared logs; leaving
+it unset retains automatic discovery. Only valid HTTP(S) origins are accepted.
+
+Starting a public tunnel requires a nonempty proxy API key and authentication.
+Authentication remains required while an owned tunnel process is active, even if
+the stored local authentication preference is changed. Stopping the tunnel
+restores that preference. Tunnel management affects only its own child process.
+
 ## Compressed AI requests
 
 AI protocol endpoints accept `Content-Encoding: gzip`. Authentication runs before
