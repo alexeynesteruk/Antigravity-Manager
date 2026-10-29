@@ -184,11 +184,6 @@ impl StreamingState {
 
         if let Some(u) = usage {
             message["usage"] = json!(u);
-        } else {
-            message["usage"] = json!({
-                "input_tokens": 0,
-                "output_tokens": 0
-            });
         }
 
         let result = self.emit(
@@ -235,20 +230,9 @@ impl StreamingState {
 
         let mut chunks = Vec::new();
 
-        // Thinking 块结束时发送暂存的签名（上游未下发时回退到会话签名）。
-        // **绝不发明哨兵** —— 哨兵是"跳过校验"开关而非假合法签名，
-        // 下发给客户端只会污染其历史；且官方流量里出现 0/23 次，不属于 Antigravity 协议。
-        // 真签名的恢复由网关侧 SQL 状态机（`hydrate`）与终审 `place_turn_signature` 承担。
+        // 只下发本响应收到的签名；会话旧值不证明属于这个思考块。
         if self.block_type == BlockType::Thinking {
-            let signature = if self.signatures.has_pending() {
-                self.signatures.consume()
-            } else {
-                self.session_id.as_deref().and_then(|sid| {
-                    crate::proxy::SignatureCache::global().get_session_signature(sid)
-                })
-            };
-
-            if let Some(sig) = signature {
+            if let Some(sig) = self.signatures.consume() {
                 chunks.push(self.emit_delta("signature_delta", json!({ "signature": sig })));
             }
         }
@@ -402,8 +386,16 @@ impl StreamingState {
             "end_turn"
         };
 
-        let effective_usage = usage_metadata.or(self.last_usage.as_ref());
-        let usage = effective_usage
+        if let Some(reported) = usage_metadata {
+            if let Some(previous) = self.last_usage.as_mut() {
+                previous.merge(reported.clone());
+            } else {
+                self.last_usage = Some(reported.clone());
+            }
+        }
+        let usage = self
+            .last_usage
+            .as_ref()
             .map(|u| {
                 // [FIX] Record actual token usage for calibrator learning
                 // Now properly pairs estimated tokens from request with actual tokens from response
@@ -422,11 +414,7 @@ impl StreamingState {
                 }
                 to_claude_usage(u, self.scaling_enabled, self.context_limit)
             })
-            .unwrap_or(Usage {
-                input_tokens: 0,
-                output_tokens: 0,
-                ..Default::default()
-            });
+            .unwrap_or(Usage::default());
 
         chunks.push(self.emit(
             "message_delta",
@@ -1140,6 +1128,75 @@ impl<'a> PartProcessor<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn partial_native_usage_survives_the_actual_claude_stream_and_collector() {
+        use futures::StreamExt;
+        let frames = [
+            json!({
+                "responseId":"partial-fixture","modelVersion":"gemini-fixture",
+                "candidates":[{"content":{"role":"model","parts":[{"text":"Known partial answer"}]}}],
+                "usageMetadata":{"promptTokenCount":100,"cachedContentTokenCount":80}
+            }),
+            json!({
+                "candidates":[{"finishReason":"STOP"}],
+                "usageMetadata":{"candidatesTokenCount":20,"thoughtsTokenCount":3,"totalTokenCount":123}
+            }),
+        ];
+        let native =
+            futures::stream::iter(frames.map(|frame| {
+                Ok::<Bytes, std::io::Error>(Bytes::from(format!("data: {frame}\n\n")))
+            }));
+        let mapped = super::super::create_claude_sse_stream(
+            Box::pin(native),
+            "usage-fixture".into(),
+            "fixture@test".into(),
+            None,
+            false,
+            1_000_000,
+            None,
+            0,
+            None,
+            Vec::new(),
+        );
+        let collected = super::super::collect_stream_to_json(
+            mapped.map(|chunk| chunk.map_err(std::io::Error::other)),
+        )
+        .await
+        .unwrap();
+        assert_eq!(collected.usage.input_tokens, Some(20));
+        assert_eq!(collected.usage.output_tokens, Some(23));
+        assert_eq!(
+            collected.usage.output_tokens_details.as_ref().unwrap()["thinking_tokens"],
+            3
+        );
+        assert_eq!(collected.usage.cache_read_input_tokens, Some(80));
+    }
+
+    #[test]
+    fn thinking_block_only_emits_its_own_received_signature() {
+        let session = format!("t:stream-own-signature:{}", uuid::Uuid::new_v4());
+        SignatureCache::global().cache_session_signature(&session, "previous-response".into(), 0);
+        let mut state = StreamingState::new();
+        state.session_id = Some(session);
+        state.start_block(
+            BlockType::Thinking,
+            json!({"type":"thinking","thinking":""}),
+        );
+        let chunks = state.end_block();
+        assert!(!chunks
+            .iter()
+            .any(|chunk| String::from_utf8_lossy(chunk).contains("signature_delta")));
+        state.start_block(
+            BlockType::Thinking,
+            json!({"type":"thinking","thinking":""}),
+        );
+        state.signatures.store(Some("this-response".into()));
+        let chunks = state.end_block();
+        assert!(chunks
+            .iter()
+            .any(|chunk| String::from_utf8_lossy(chunk).contains("this-response")));
+    }
 
     #[test]
     fn test_signature_manager() {

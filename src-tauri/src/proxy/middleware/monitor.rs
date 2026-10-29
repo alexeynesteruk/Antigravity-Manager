@@ -523,45 +523,53 @@ fn record_user_token_usage(
 }
 
 fn extract_cached_tokens(usage: &Value) -> Option<u32> {
-    let c = crate::proxy::pipeline::CanonicalUsage::from_gemini(usage);
-    if c.cached_tokens > 0 {
-        Some(c.cached_tokens)
-    } else {
-        None
-    }
+    crate::proxy::pipeline::CanonicalUsage::from_gemini(usage).cached_tokens
 }
 
 fn extract_input_tokens(usage: &Value) -> Option<u32> {
-    let has_field = usage.get("prompt_tokens").is_some()
-        || usage.get("input_tokens").is_some()
-        || usage.get("total_input_tokens").is_some()
-        || usage.get("promptTokenCount").is_some();
-    if !has_field {
-        return None;
-    }
-    let c = crate::proxy::pipeline::CanonicalUsage::from_gemini(usage);
-    Some(c.total_input_tokens)
+    crate::proxy::pipeline::CanonicalUsage::from_gemini(usage).total_input_tokens
 }
 
 fn extract_reasoning_tokens(usage: &Value) -> Option<u32> {
-    let c = crate::proxy::pipeline::CanonicalUsage::from_gemini(usage);
-    if c.reasoning_tokens > 0 {
-        Some(c.reasoning_tokens)
-    } else {
-        None
-    }
+    crate::proxy::pipeline::CanonicalUsage::from_gemini(usage).reasoning_tokens
 }
 
 fn extract_output_tokens(usage: &Value) -> Option<u32> {
-    let has_field = usage.get("completion_tokens").is_some()
-        || usage.get("output_tokens").is_some()
-        || usage.get("total_output_tokens").is_some()
-        || usage.get("candidatesTokenCount").is_some();
-    if !has_field {
-        return None;
+    crate::proxy::pipeline::CanonicalUsage::from_gemini(usage).output_tokens
+}
+
+fn merge_reported_usage(
+    log: &mut ProxyRequestLog,
+    current: &mut serde_json::Map<String, Value>,
+    usage: &Value,
+) {
+    if let Some(reported) = usage.as_object() {
+        current.extend(reported.clone());
     }
-    let c = crate::proxy::pipeline::CanonicalUsage::from_gemini(usage);
-    Some(c.output_tokens)
+    log.input_tokens = extract_input_tokens(usage).or(log.input_tokens);
+    log.output_tokens = extract_output_tokens(usage).or(log.output_tokens);
+    log.cached_tokens = extract_cached_tokens(usage).or(log.cached_tokens);
+    log.reasoning_tokens = extract_reasoning_tokens(usage).or(log.reasoning_tokens);
+    log.total_tokens = crate::proxy::pipeline::CanonicalUsage::from_gemini(usage)
+        .total_tokens
+        .or(log.total_tokens);
+}
+
+fn apply_captured_usage(
+    log: &mut ProxyRequestLog,
+    usage: &mut serde_json::Map<String, Value>,
+    captured: Option<&serde_json::Map<String, Value>>,
+) {
+    if let Some(captured) = captured {
+        *usage = captured.clone();
+        let actual =
+            crate::proxy::pipeline::CanonicalUsage::from_gemini(&Value::Object(captured.clone()));
+        log.input_tokens = actual.total_input_tokens;
+        log.output_tokens = actual.output_tokens;
+        log.cached_tokens = actual.cached_tokens;
+        log.reasoning_tokens = actual.reasoning_tokens;
+        log.total_tokens = actual.total_tokens;
+    }
 }
 
 fn build_canonical_consolidated_response(
@@ -574,7 +582,7 @@ fn build_canonical_consolidated_response(
     timing_obj: serde_json::Map<String, Value>,
     usage_obj: Option<serde_json::Map<String, Value>>,
 ) -> Value {
-    // 权威网关签名回填：若当前签名为空，尝试通过工具调用ID或会话ID从网关状态机(内存 L1 / SQLite L2 DB 思考持久化)恢复
+    // 只采用本响应签名或原工具 ID 对应的签名；会话最新值不证明当前响应来源。
     if thinking_signature.is_empty() {
         for tc in &tool_calls {
             if let Some(call_id) = tc.get("id").and_then(|v| v.as_str()) {
@@ -584,33 +592,6 @@ fn build_canonical_consolidated_response(
                     }) {
                         thinking_signature = sig;
                         break;
-                    }
-                }
-            }
-        }
-        if thinking_signature.is_empty() {
-            // 1. 优先按当前轮次的思考文本片段精准直捞专属签名
-            if !thinking_content.is_empty() {
-                let trimmed = thinking_content.trim();
-                let snippet = crate::proxy::mappers::common_utils::safe_truncate_str(trimmed, 32);
-                if let Some(sig) =
-                    crate::modules::proxy_db::lookup_signature_by_thought_snippet(snippet)
-                {
-                    thinking_signature = sig;
-                }
-            }
-
-            // 2. 兜底按会话状态机与会话数据库查找最新签名
-            if thinking_signature.is_empty() {
-                if let Some(sid) = session_id {
-                    if let Some(sig) =
-                        crate::proxy::SignatureCache::global().get_session_signature(sid)
-                    {
-                        thinking_signature = sig;
-                    } else if let Some(sig) =
-                        crate::modules::proxy_db::lookup_latest_thinking_signature(sid)
-                    {
-                        thinking_signature = sig;
                     }
                 }
             }
@@ -668,6 +649,7 @@ fn consolidate_non_streaming_response(
     log: &ProxyRequestLog,
     headers_map: &serde_json::Map<String, Value>,
     upstream_attempts: Option<Vec<crate::proxy::upstream::client::FallbackAttemptLog>>,
+    captured_usage: Option<&serde_json::Map<String, Value>>,
 ) -> Option<Value> {
     // 若本就已是统一的 consolidated 格式 (例如带有顶层 thinking/tool_calls 且无 choices/candidates)，直接返回 None
     if (raw_json.get("thinking").is_some()
@@ -896,40 +878,45 @@ fn consolidate_non_streaming_response(
     }
 
     // 提取 Token 用量与缓存命中率
-    let usage_source = raw_json
-        .get("usage")
-        .or_else(|| raw_json.get("usageMetadata"));
-    let mut usage_obj = serde_json::Map::new();
+    let captured_value = captured_usage.map(|usage| Value::Object(usage.clone()));
+    let usage_source = captured_value.as_ref().or_else(|| {
+        raw_json
+            .get("usage")
+            .or_else(|| raw_json.get("usageMetadata"))
+    });
+    let mut usage_obj = usage_source
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default();
     let input_toks = log
         .input_tokens
-        .or_else(|| usage_source.and_then(extract_input_tokens))
-        .unwrap_or(0);
+        .or_else(|| usage_source.and_then(extract_input_tokens));
     let output_toks = log
         .output_tokens
-        .or_else(|| usage_source.and_then(extract_output_tokens))
-        .unwrap_or(0);
+        .or_else(|| usage_source.and_then(extract_output_tokens));
     let cached_toks = log
         .cached_tokens
-        .or_else(|| usage_source.and_then(extract_cached_tokens))
-        .unwrap_or(0);
+        .or_else(|| usage_source.and_then(extract_cached_tokens));
     let reasoning_toks = usage_source.and_then(extract_reasoning_tokens).unwrap_or(0);
 
-    let total_in = if cached_toks > input_toks {
-        input_toks + cached_toks
-    } else {
-        input_toks
-    };
-    let total_toks = total_in + output_toks;
+    let total_in = input_toks;
+    let total_toks = log.total_tokens.or_else(|| {
+        usage_source.and_then(|usage| {
+            crate::proxy::pipeline::CanonicalUsage::from_gemini(usage).total_tokens
+        })
+    });
 
-    usage_obj.insert("input_tokens".to_string(), serde_json::json!(total_in));
-    usage_obj.insert("output_tokens".to_string(), serde_json::json!(output_toks));
+    usage_obj
+        .entry("input_tokens".to_string())
+        .or_insert(serde_json::json!(total_in));
+    usage_obj
+        .entry("output_tokens".to_string())
+        .or_insert(serde_json::json!(output_toks));
     usage_obj.insert("total_tokens".to_string(), serde_json::json!(total_toks));
-    if cached_toks > 0 {
-        usage_obj.insert("cached_tokens".to_string(), serde_json::json!(cached_toks));
-        if total_in > 0 {
-            let hit_rate = (cached_toks as f64 / total_in as f64 * 100.0)
-                .min(100.0)
-                .max(0.0);
+    usage_obj.insert("cached_tokens".to_string(), serde_json::json!(cached_toks));
+    if let Some((cached, input)) = cached_toks.zip(total_in) {
+        if input > 0 {
+            let hit_rate = cached as f64 / input as f64 * 100.0;
             usage_obj.insert(
                 "cache_hit_rate".to_string(),
                 serde_json::json!(format!("{:.1}%", hit_rate)),
@@ -960,8 +947,16 @@ pub async fn monitor_middleware(
     request: Request,
     next: Next,
 ) -> Response {
-    let _logging_enabled = state.monitor.is_enabled();
+    let debug_cfg = state.debug_logging.read().await.clone();
+    monitor_request(state.monitor, debug_cfg, request, next).await
+}
 
+async fn monitor_request(
+    monitor: std::sync::Arc<crate::proxy::monitor::ProxyMonitor>,
+    debug_cfg: crate::proxy::config::DebugLoggingConfig,
+    request: Request,
+    next: Next,
+) -> Response {
     let method = request.method().to_string();
     let uri = request.uri().to_string();
 
@@ -971,21 +966,7 @@ pub async fn monitor_middleware(
 
     let start = Instant::now();
 
-    // Extract client IP from headers (X-Forwarded-For or X-Real-IP)
-    // IMPORTANT: Extract from Request headers, not Response headers (since we want the client's IP)
-    // Note: We need to do this BEFORE consuming the request body if possible, or extract it from the original request
-    let client_ip = request
-        .headers()
-        .get("x-forwarded-for")
-        .and_then(|v| v.to_str().ok())
-        .map(|s| s.split(',').next().unwrap_or(s).trim().to_string())
-        .or_else(|| {
-            request
-                .headers()
-                .get("x-real-ip")
-                .and_then(|v| v.to_str().ok())
-                .map(|s| s.to_string())
-        });
+    let client_ip = crate::proxy::middleware::ip_filter::extract_client_ip(&request);
 
     let user_agent = request
         .headers()
@@ -1081,13 +1062,19 @@ pub async fn monitor_middleware(
         request
     };
 
+    let log_id = uuid::Uuid::new_v4().to_string();
     let upstream_holder = UpstreamRequestBodyHolder::new();
+    upstream_holder.configure_diagnostics(debug_cfg, log_id.clone());
     let mut request = request;
     request.extensions_mut().insert(upstream_holder.clone());
 
-    let response = crate::proxy::monitor::CURRENT_UPSTREAM_CAPTURE
-        .scope(upstream_holder.clone(), next.run(request))
-        .await;
+    let request_budget = crate::proxy::pipeline::budget::current();
+    let response = crate::proxy::monitor::scope_upstream_work(
+        upstream_holder.clone(),
+        request_budget.clone(),
+        next.run(request),
+    )
+    .await;
     let upstream_request_body = upstream_holder.take();
     let upstream_request_headers = upstream_holder.take_headers();
     let upstream_attempts = upstream_holder.take_attempts();
@@ -1102,8 +1089,7 @@ pub async fn monitor_middleware(
     // 过滤噪音请求，避免客户端探针刷屏淹没真实业务日志 (Issue #3498 + `/v1/models` 轮询刷屏 + 三方网关探活)
     // 胶囊开关关闭时（默认）：所有 GET 成功请求与 POST 探针成功请求不记录、不落库；失败请求与非探针业务请求始终记录。
     // 详见 `should_skip_request_log` 的行为边界说明。
-    let capture_health_enabled =
-        state.monitor.is_capture_health_logs() || should_log_health_checks();
+    let capture_health_enabled = monitor.is_capture_health_logs() || should_log_health_checks();
     if should_skip_request_log(
         &method,
         response.status(),
@@ -1171,9 +1157,8 @@ pub async fn monitor_middleware(
         .and_then(|v| v.to_str().ok())
         .map(|s| s.to_string());
 
-    let monitor = state.monitor.clone();
     let mut log = ProxyRequestLog {
-        id: uuid::Uuid::new_v4().to_string(),
+        id: log_id,
         timestamp: chrono::Utc::now().timestamp_millis(),
         method,
         url: uri,
@@ -1194,6 +1179,8 @@ pub async fn monitor_middleware(
         input_tokens: None,
         output_tokens: None,
         cached_tokens: None,
+        total_tokens: None,
+        physical_requests: None,
         reasoning_tokens: None,
         protocol,
         username,
@@ -1207,146 +1194,152 @@ pub async fn monitor_middleware(
         let start_instant = start;
         let attempts_for_stream = upstream_attempts.clone();
 
-        tokio::spawn(async move {
-            let stream_start = std::time::Instant::now();
-            let mut all_stream_data = Vec::new();
-            let mut last_few_bytes = Vec::new();
+        tokio::spawn(crate::proxy::monitor::scope_upstream_work(
+            upstream_holder.clone(),
+            request_budget.clone(),
+            async move {
+                let stream_start = std::time::Instant::now();
+                let mut all_stream_data = Vec::new();
+                let mut last_few_bytes = Vec::new();
 
-            while let Some(chunk_res) = next_chunk_while_receiver_open(&mut stream, &tx).await {
-                if let Ok(chunk) = chunk_res {
-                    all_stream_data.extend_from_slice(&chunk);
+                while let Some(chunk_res) = next_chunk_while_receiver_open(&mut stream, &tx).await {
+                    if let Ok(chunk) = chunk_res {
+                        let remaining = MAX_RESPONSE_LOG_SIZE.saturating_sub(all_stream_data.len());
+                        all_stream_data.extend_from_slice(&chunk[..remaining.min(chunk.len())]);
 
-                    if chunk.len() > 8192 {
-                        last_few_bytes = chunk.slice(chunk.len() - 8192..).to_vec();
-                    } else {
-                        last_few_bytes.extend_from_slice(&chunk);
-                        if last_few_bytes.len() > 8192 {
-                            last_few_bytes.drain(0..last_few_bytes.len() - 8192);
-                        }
-                    }
-                    if tx.send(Ok::<_, axum::Error>(chunk)).await.is_err() {
-                        break;
-                    }
-                } else if let Err(e) = chunk_res {
-                    if tx.send(Err(axum::Error::new(e))).await.is_err() {
-                        break;
-                    }
-                }
-            }
-            drop(stream);
-
-            let stream_ms = stream_start.elapsed().as_micros() as f64 / 1000.0;
-            let total_ms = start_instant.elapsed().as_micros() as f64 / 1000.0;
-            log.duration = total_ms.round() as u64;
-
-            let mut headers_map: serde_json::Map<String, Value> = log
-                .response_headers
-                .as_ref()
-                .and_then(|h| serde_json::from_str(h).ok())
-                .unwrap_or_default();
-
-            headers_map.insert(
-                "x-timing-stream-ms".to_string(),
-                serde_json::json!(format!("{:.3}", stream_ms)),
-            );
-            headers_map.insert(
-                "x-timing-total-ms".to_string(),
-                serde_json::json!(format!("{:.3}", total_ms)),
-            );
-            log.response_headers = serde_json::to_string(&Value::Object(headers_map.clone())).ok();
-
-            // Parse and consolidate stream data into readable format
-            if let Ok(full_response) = std::str::from_utf8(&all_stream_data) {
-                let mut thinking_content = String::new();
-                let mut response_content = String::new();
-                let mut thinking_signature = String::new();
-                let mut tool_calls: Vec<Value> = Vec::new();
-                let mut cached_tokens: Option<u32> = None;
-                let mut reasoning_tokens: Option<u32> = None;
-
-                for line in full_response.lines() {
-                    if !line.starts_with("data: ") {
-                        continue;
-                    }
-                    let json_str = line.trim_start_matches("data: ").trim();
-                    if json_str == "[DONE]" {
-                        continue;
-                    }
-
-                    if let Ok(json) = serde_json::from_str::<Value>(json_str) {
-                        if let Some(mv) = json.get("modelVersion").and_then(|v| v.as_str()) {
-                            if !mv.trim().is_empty() {
-                                log.upstream_model = Some(mv.to_string());
+                        if chunk.len() > 8192 {
+                            last_few_bytes = chunk.slice(chunk.len() - 8192..).to_vec();
+                        } else {
+                            last_few_bytes.extend_from_slice(&chunk);
+                            if last_few_bytes.len() > 8192 {
+                                last_few_bytes.drain(0..last_few_bytes.len() - 8192);
                             }
                         }
+                        if tx.send(Ok::<_, axum::Error>(chunk)).await.is_err() {
+                            break;
+                        }
+                    } else if let Err(e) = chunk_res {
+                        if tx.send(Err(axum::Error::new(e))).await.is_err() {
+                            break;
+                        }
+                    }
+                }
+                drop(stream);
+                log.physical_requests = upstream_holder.physical_requests();
+                log.upstream_request_body = upstream_holder.take().or(log.upstream_request_body);
+                log.upstream_request_headers = upstream_holder
+                    .take_headers()
+                    .or(log.upstream_request_headers);
+                let captured_usage = upstream_holder.usage();
 
-                        // OpenAI format: choices[0].delta.content / reasoning_content / tool_calls
-                        if let Some(choices) = json.get("choices").and_then(|c| c.as_array()) {
-                            for choice in choices {
-                                if let Some(delta) = choice.get("delta") {
-                                    // Thinking/reasoning content
-                                    if let Some(thinking) =
-                                        delta.get("reasoning_content").and_then(|v| v.as_str())
-                                    {
-                                        thinking_content.push_str(thinking);
-                                    }
-                                    // Thinking signature in OpenAI delta
-                                    if let Some(sig) = delta
-                                        .get("signature")
-                                        .or_else(|| delta.get("thought_signature"))
-                                        .and_then(|v| v.as_str())
-                                    {
-                                        thinking_signature = sig.to_string();
-                                    }
-                                    // Main response content
-                                    if let Some(content) =
-                                        delta.get("content").and_then(|v| v.as_str())
-                                    {
-                                        response_content.push_str(content);
-                                    }
-                                    // Tool calls
-                                    if let Some(delta_tool_calls) =
-                                        delta.get("tool_calls").and_then(|t| t.as_array())
-                                    {
-                                        for tc in delta_tool_calls {
-                                            if let Some(index) =
-                                                tc.get("index").and_then(|i| i.as_u64())
-                                            {
-                                                let idx = index as usize;
-                                                while tool_calls.len() <= idx {
-                                                    tool_calls.push(serde_json::json!({
+                let stream_ms = stream_start.elapsed().as_micros() as f64 / 1000.0;
+                let total_ms = start_instant.elapsed().as_micros() as f64 / 1000.0;
+                log.duration = total_ms.round() as u64;
+
+                let mut headers_map: serde_json::Map<String, Value> = log
+                    .response_headers
+                    .as_ref()
+                    .and_then(|h| serde_json::from_str(h).ok())
+                    .unwrap_or_default();
+
+                headers_map.insert(
+                    "x-timing-stream-ms".to_string(),
+                    serde_json::json!(format!("{:.3}", stream_ms)),
+                );
+                headers_map.insert(
+                    "x-timing-total-ms".to_string(),
+                    serde_json::json!(format!("{:.3}", total_ms)),
+                );
+                log.response_headers =
+                    serde_json::to_string(&Value::Object(headers_map.clone())).ok();
+
+                // Parse and consolidate stream data into readable format
+                if let Ok(full_response) = std::str::from_utf8(&all_stream_data) {
+                    let mut thinking_content = String::new();
+                    let mut response_content = String::new();
+                    let mut thinking_signature = String::new();
+                    let mut tool_calls: Vec<Value> = Vec::new();
+                    let mut usage_obj = serde_json::Map::new();
+
+                    for line in full_response.lines() {
+                        if !line.starts_with("data: ") {
+                            continue;
+                        }
+                        let json_str = line.trim_start_matches("data: ").trim();
+                        if json_str == "[DONE]" {
+                            continue;
+                        }
+
+                        if let Ok(json) = serde_json::from_str::<Value>(json_str) {
+                            // OpenAI format: choices[0].delta.content / reasoning_content / tool_calls
+                            if let Some(choices) = json.get("choices").and_then(|c| c.as_array()) {
+                                for choice in choices {
+                                    if let Some(delta) = choice.get("delta") {
+                                        // Thinking/reasoning content
+                                        if let Some(thinking) =
+                                            delta.get("reasoning_content").and_then(|v| v.as_str())
+                                        {
+                                            thinking_content.push_str(thinking);
+                                        }
+                                        // Thinking signature in OpenAI delta
+                                        if let Some(sig) = delta
+                                            .get("signature")
+                                            .or_else(|| delta.get("thought_signature"))
+                                            .and_then(|v| v.as_str())
+                                        {
+                                            thinking_signature = sig.to_string();
+                                        }
+                                        // Main response content
+                                        if let Some(content) =
+                                            delta.get("content").and_then(|v| v.as_str())
+                                        {
+                                            response_content.push_str(content);
+                                        }
+                                        // Tool calls
+                                        if let Some(delta_tool_calls) =
+                                            delta.get("tool_calls").and_then(|t| t.as_array())
+                                        {
+                                            for tc in delta_tool_calls {
+                                                if let Some(index) =
+                                                    tc.get("index").and_then(|i| i.as_u64())
+                                                {
+                                                    let idx = index as usize;
+                                                    while tool_calls.len() <= idx {
+                                                        tool_calls.push(serde_json::json!({
                                                         "id": "",
                                                         "type": "function",
                                                         "function": { "name": "", "arguments": "" }
                                                     }));
-                                                }
-                                                let current_tc = &mut tool_calls[idx];
-                                                if let Some(id) =
-                                                    tc.get("id").and_then(|v| v.as_str())
-                                                {
-                                                    current_tc["id"] =
-                                                        Value::String(id.to_string());
-                                                }
-                                                if let Some(func) = tc.get("function") {
-                                                    if let Some(name) =
-                                                        func.get("name").and_then(|v| v.as_str())
-                                                    {
-                                                        current_tc["function"]["name"] =
-                                                            Value::String(name.to_string());
                                                     }
-                                                    if let Some(args) = func
-                                                        .get("arguments")
-                                                        .and_then(|v| v.as_str())
+                                                    let current_tc = &mut tool_calls[idx];
+                                                    if let Some(id) =
+                                                        tc.get("id").and_then(|v| v.as_str())
                                                     {
-                                                        let old_args = current_tc["function"]
-                                                            ["arguments"]
-                                                            .as_str()
-                                                            .unwrap_or("");
-                                                        current_tc["function"]["arguments"] =
-                                                            Value::String(format!(
-                                                                "{}{}",
-                                                                old_args, args
-                                                            ));
+                                                        current_tc["id"] =
+                                                            Value::String(id.to_string());
+                                                    }
+                                                    if let Some(func) = tc.get("function") {
+                                                        if let Some(name) = func
+                                                            .get("name")
+                                                            .and_then(|v| v.as_str())
+                                                        {
+                                                            current_tc["function"]["name"] =
+                                                                Value::String(name.to_string());
+                                                        }
+                                                        if let Some(args) = func
+                                                            .get("arguments")
+                                                            .and_then(|v| v.as_str())
+                                                        {
+                                                            let old_args = current_tc["function"]
+                                                                ["arguments"]
+                                                                .as_str()
+                                                                .unwrap_or("");
+                                                            current_tc["function"]["arguments"] =
+                                                                Value::String(format!(
+                                                                    "{}{}",
+                                                                    old_args, args
+                                                                ));
+                                                        }
                                                     }
                                                 }
                                             }
@@ -1354,158 +1347,236 @@ pub async fn monitor_middleware(
                                     }
                                 }
                             }
-                        }
 
-                        // Gemini format: candidates[0].content.parts
-                        if let Some(candidates) = json.get("candidates").and_then(|c| c.as_array())
-                        {
-                            for cand in candidates {
-                                if let Some(content) = cand.get("content") {
-                                    if let Some(parts) =
-                                        content.get("parts").and_then(|p| p.as_array())
-                                    {
-                                        for part in parts {
-                                            if let Some(text) =
-                                                part.get("text").and_then(|t| t.as_str())
-                                            {
-                                                if part
-                                                    .get("thought")
-                                                    .and_then(|t| t.as_bool())
-                                                    .unwrap_or(false)
+                            // Gemini format: candidates[0].content.parts
+                            if let Some(candidates) =
+                                json.get("candidates").and_then(|c| c.as_array())
+                            {
+                                for cand in candidates {
+                                    if let Some(content) = cand.get("content") {
+                                        if let Some(parts) =
+                                            content.get("parts").and_then(|p| p.as_array())
+                                        {
+                                            for part in parts {
+                                                if let Some(text) =
+                                                    part.get("text").and_then(|t| t.as_str())
                                                 {
-                                                    thinking_content.push_str(text);
-                                                } else {
-                                                    response_content.push_str(text);
-                                                }
-                                            }
-                                            let sig = part
-                                                .get("thoughtSignature")
-                                                .or_else(|| part.get("thought_signature"))
-                                                .or_else(|| part.get("signature"))
-                                                .or_else(|| {
-                                                    part.get("functionCall")
-                                                        .and_then(|fc| fc.get("thoughtSignature"))
-                                                })
-                                                .or_else(|| {
-                                                    part.get("functionCall")
-                                                        .and_then(|fc| fc.get("thought_signature"))
-                                                })
-                                                .and_then(|s| s.as_str());
-                                            if let Some(s) = sig {
-                                                thinking_signature = s.to_string();
-                                            }
-                                            if let Some(fc) = part.get("functionCall") {
-                                                if let Some(name) =
-                                                    fc.get("name").and_then(|n| n.as_str())
-                                                {
-                                                    let call_id = if let Some(id_str) = fc
-                                                        .get("id")
-                                                        .and_then(|i| i.as_str())
-                                                        .filter(|s| !s.is_empty())
+                                                    if part
+                                                        .get("thought")
+                                                        .and_then(|t| t.as_bool())
+                                                        .unwrap_or(false)
                                                     {
-                                                        id_str.to_string()
+                                                        thinking_content.push_str(text);
                                                     } else {
-                                                        crate::proxy::thinking_store::synthesize_tool_id(
+                                                        response_content.push_str(text);
+                                                    }
+                                                }
+                                                let sig = part
+                                                    .get("thoughtSignature")
+                                                    .or_else(|| part.get("thought_signature"))
+                                                    .or_else(|| part.get("signature"))
+                                                    .or_else(|| {
+                                                        part.get("functionCall").and_then(|fc| {
+                                                            fc.get("thoughtSignature")
+                                                        })
+                                                    })
+                                                    .or_else(|| {
+                                                        part.get("functionCall").and_then(|fc| {
+                                                            fc.get("thought_signature")
+                                                        })
+                                                    })
+                                                    .and_then(|s| s.as_str());
+                                                if let Some(s) = sig {
+                                                    thinking_signature = s.to_string();
+                                                }
+                                                if let Some(fc) = part.get("functionCall") {
+                                                    if let Some(name) =
+                                                        fc.get("name").and_then(|n| n.as_str())
+                                                    {
+                                                        let call_id = if let Some(id_str) = fc
+                                                            .get("id")
+                                                            .and_then(|i| i.as_str())
+                                                            .filter(|s| !s.is_empty())
+                                                        {
+                                                            id_str.to_string()
+                                                        } else {
+                                                            crate::proxy::thinking_store::synthesize_tool_id(
                                                             name,
                                                             fc.get("args"),
                                                             "root",
                                                             tool_calls.len(),
                                                         )
-                                                    };
-                                                    let args = fc
-                                                        .get("args")
-                                                        .map(|a| a.to_string())
-                                                        .unwrap_or_else(|| "{}".to_string());
-                                                    tool_calls.push(serde_json::json!({
+                                                        };
+                                                        let args = fc
+                                                            .get("args")
+                                                            .map(|a| a.to_string())
+                                                            .unwrap_or_else(|| "{}".to_string());
+                                                        tool_calls.push(serde_json::json!({
                                                         "id": call_id,
                                                         "type": "function",
                                                         "function": { "name": name, "arguments": args }
                                                     }));
+                                                    }
                                                 }
                                             }
                                         }
                                     }
                                 }
                             }
-                        }
 
-                        // Claude/Anthropic format: content_block_start, content_block_delta, etc.
-                        let msg_type = json.get("type").and_then(|t| t.as_str());
-                        match msg_type {
-                            Some("content_block_start") => {
-                                if let (Some(index), Some(block)) = (
-                                    json.get("index").and_then(|i| i.as_u64()),
-                                    json.get("content_block"),
-                                ) {
-                                    let idx = index as usize;
-                                    if block.get("type").and_then(|t| t.as_str())
-                                        == Some("tool_use")
-                                    {
-                                        let id =
-                                            block.get("id").and_then(|v| v.as_str()).unwrap_or("");
-                                        let name = block
-                                            .get("name")
-                                            .and_then(|v| v.as_str())
-                                            .unwrap_or("");
-                                        while tool_calls.len() <= idx {
-                                            tool_calls.push(Value::Null);
+                            // Claude/Anthropic format: content_block_start, content_block_delta, etc.
+                            let msg_type = json.get("type").and_then(|t| t.as_str());
+                            match msg_type {
+                                Some("content_block_start") => {
+                                    if let (Some(index), Some(block)) = (
+                                        json.get("index").and_then(|i| i.as_u64()),
+                                        json.get("content_block"),
+                                    ) {
+                                        let idx = index as usize;
+                                        if block.get("type").and_then(|t| t.as_str())
+                                            == Some("tool_use")
+                                        {
+                                            let id = block
+                                                .get("id")
+                                                .and_then(|v| v.as_str())
+                                                .unwrap_or("");
+                                            let name = block
+                                                .get("name")
+                                                .and_then(|v| v.as_str())
+                                                .unwrap_or("");
+                                            while tool_calls.len() <= idx {
+                                                tool_calls.push(Value::Null);
+                                            }
+                                            tool_calls[idx] = serde_json::json!({
+                                                "id": id,
+                                                "type": "function",
+                                                "function": { "name": name, "arguments": "" }
+                                            });
                                         }
-                                        tool_calls[idx] = serde_json::json!({
-                                            "id": id,
-                                            "type": "function",
-                                            "function": { "name": name, "arguments": "" }
-                                        });
-                                    }
-                                    if let Some(thinking) =
-                                        block.get("thinking").and_then(|v| v.as_str())
-                                    {
-                                        thinking_content.push_str(thinking);
-                                    }
-                                    if let Some(sig) = block
-                                        .get("signature")
-                                        .or_else(|| block.get("thought_signature"))
-                                        .or_else(|| block.get("thoughtSignature"))
-                                        .and_then(|v| v.as_str())
-                                    {
-                                        thinking_signature = sig.to_string();
+                                        if let Some(thinking) =
+                                            block.get("thinking").and_then(|v| v.as_str())
+                                        {
+                                            thinking_content.push_str(thinking);
+                                        }
+                                        if let Some(sig) = block
+                                            .get("signature")
+                                            .or_else(|| block.get("thought_signature"))
+                                            .or_else(|| block.get("thoughtSignature"))
+                                            .and_then(|v| v.as_str())
+                                        {
+                                            thinking_signature = sig.to_string();
+                                        }
                                     }
                                 }
-                            }
-                            Some("content_block_delta") => {
-                                if let (Some(index), Some(delta)) = (
-                                    json.get("index").and_then(|i| i.as_u64()),
-                                    json.get("delta"),
-                                ) {
-                                    let idx = index as usize;
+                                Some("content_block_delta") => {
+                                    if let (Some(index), Some(delta)) = (
+                                        json.get("index").and_then(|i| i.as_u64()),
+                                        json.get("delta"),
+                                    ) {
+                                        let idx = index as usize;
 
-                                    // Tool use input delta (Anthropic 官方协议为 partial_json 增量)
-                                    let delta_json = delta
-                                        .get("partial_json")
-                                        .or_else(|| delta.get("input_json_delta"))
-                                        .or_else(|| delta.get("text"))
-                                        .and_then(|v| v.as_str());
+                                        // Tool use input delta (Anthropic 官方协议为 partial_json 增量)
+                                        let delta_json = delta
+                                            .get("partial_json")
+                                            .or_else(|| delta.get("input_json_delta"))
+                                            .or_else(|| delta.get("text"))
+                                            .and_then(|v| v.as_str());
 
-                                    if let Some(delta_str) = delta_json {
-                                        if idx < tool_calls.len() && !tool_calls[idx].is_null() {
-                                            let old_args = tool_calls[idx]["function"]["arguments"]
-                                                .as_str()
-                                                .unwrap_or("");
-                                            tool_calls[idx]["function"]["arguments"] =
-                                                Value::String(format!("{}{}", old_args, delta_str));
+                                        if let Some(delta_str) = delta_json {
+                                            if idx < tool_calls.len() && !tool_calls[idx].is_null()
+                                            {
+                                                let old_args = tool_calls[idx]["function"]
+                                                    ["arguments"]
+                                                    .as_str()
+                                                    .unwrap_or("");
+                                                tool_calls[idx]["function"]["arguments"] =
+                                                    Value::String(format!(
+                                                        "{}{}",
+                                                        old_args, delta_str
+                                                    ));
+                                            }
+                                        }
+                                        // Legacy/Native thinking block
+                                        if let Some(thinking) =
+                                            delta.get("thinking").and_then(|v| v.as_str())
+                                        {
+                                            thinking_content.push_str(thinking);
+                                        }
+                                        // Thinking signature in delta (Claude signature_delta or direct signature)
+                                        if let Some(sig) = delta
+                                            .get("signature")
+                                            .or_else(|| delta.get("thought_signature"))
+                                            .or_else(|| delta.get("thoughtSignature"))
+                                            .and_then(|v| v.as_str())
+                                        {
+                                            thinking_signature = sig.to_string();
+                                        }
+                                        // Text content
+                                        if let Some(text) =
+                                            delta.get("text").and_then(|v| v.as_str())
+                                        {
+                                            response_content.push_str(text);
                                         }
                                     }
-                                    // Legacy/Native thinking block
+                                }
+                                Some("response.output_text.delta") => {
+                                    if let Some(text) = json.get("delta").and_then(|v| v.as_str()) {
+                                        response_content.push_str(text);
+                                    }
+                                }
+                                Some("response.reasoning_summary_text.delta") => {
+                                    if let Some(text) = json.get("delta").and_then(|v| v.as_str()) {
+                                        thinking_content.push_str(text);
+                                    }
+                                }
+                                Some("response.output_item.added") => {
+                                    if let Some(item) = json.get("item") {
+                                        if item.get("type").and_then(|t| t.as_str())
+                                            == Some("function_call")
+                                        {
+                                            let name = item
+                                                .get("name")
+                                                .and_then(|v| v.as_str())
+                                                .unwrap_or("");
+                                            let id = item
+                                                .get("call_id")
+                                                .and_then(|v| v.as_str())
+                                                .unwrap_or("");
+                                            tool_calls.push(serde_json::json!({
+                                                "id": id,
+                                                "type": "function",
+                                                "function": { "name": name, "arguments": "" }
+                                            }));
+                                        }
+                                    }
+                                }
+                                Some("response.function_call_arguments.delta") => {
+                                    if let Some(delta) = json.get("delta").and_then(|v| v.as_str())
+                                    {
+                                        if let Some(last_tc) = tool_calls.last_mut() {
+                                            let old_args = last_tc["function"]["arguments"]
+                                                .as_str()
+                                                .unwrap_or("");
+                                            last_tc["function"]["arguments"] =
+                                                Value::String(format!("{}{}", old_args, delta));
+                                        }
+                                    }
+                                }
+                                _ => {}
+                            }
+
+                            // Legacy Claude delta (for older implementations or simplified streams)
+                            if msg_type.is_none() {
+                                if let Some(delta) = json.get("delta") {
+                                    // Thinking block
                                     if let Some(thinking) =
                                         delta.get("thinking").and_then(|v| v.as_str())
                                     {
                                         thinking_content.push_str(thinking);
                                     }
-                                    // Thinking signature in delta (Claude signature_delta or direct signature)
-                                    if let Some(sig) = delta
-                                        .get("signature")
-                                        .or_else(|| delta.get("thought_signature"))
-                                        .or_else(|| delta.get("thoughtSignature"))
-                                        .and_then(|v| v.as_str())
+                                    // Thinking signature
+                                    if let Some(sig) =
+                                        delta.get("signature").and_then(|v| v.as_str())
                                     {
                                         thinking_signature = sig.to_string();
                                     }
@@ -1515,342 +1586,179 @@ pub async fn monitor_middleware(
                                     }
                                 }
                             }
-                            Some("message_delta") => {
-                                if let Some(delta) = json.get("delta") {
-                                    if let Some(usage) = delta.get("usage") {
-                                        if let Some(output_tokens) =
-                                            usage.get("output_tokens").and_then(|v| v.as_u64())
-                                        {
-                                            log.output_tokens = Some(output_tokens as u32);
-                                        }
-                                    }
-                                }
-                            }
-                            Some("response.output_text.delta") => {
-                                if let Some(text) = json.get("delta").and_then(|v| v.as_str()) {
-                                    response_content.push_str(text);
-                                }
-                            }
-                            Some("response.reasoning_summary_text.delta") => {
-                                if let Some(text) = json.get("delta").and_then(|v| v.as_str()) {
-                                    thinking_content.push_str(text);
-                                }
-                            }
-                            Some("response.output_item.added") => {
-                                if let Some(item) = json.get("item") {
-                                    if item.get("type").and_then(|t| t.as_str())
-                                        == Some("function_call")
-                                    {
-                                        let name =
-                                            item.get("name").and_then(|v| v.as_str()).unwrap_or("");
-                                        let id = item
-                                            .get("call_id")
-                                            .and_then(|v| v.as_str())
-                                            .unwrap_or("");
-                                        tool_calls.push(serde_json::json!({
-                                            "id": id,
-                                            "type": "function",
-                                            "function": { "name": name, "arguments": "" }
-                                        }));
-                                    }
-                                }
-                            }
-                            Some("response.function_call_arguments.delta") => {
-                                if let Some(delta) = json.get("delta").and_then(|v| v.as_str()) {
-                                    if let Some(last_tc) = tool_calls.last_mut() {
-                                        let old_args =
-                                            last_tc["function"]["arguments"].as_str().unwrap_or("");
-                                        last_tc["function"]["arguments"] =
-                                            Value::String(format!("{}{}", old_args, delta));
-                                    }
-                                }
-                            }
-                            _ => {}
-                        }
 
-                        // Legacy Claude delta (for older implementations or simplified streams)
-                        if msg_type.is_none() {
-                            if let Some(delta) = json.get("delta") {
-                                // Thinking block
-                                if let Some(thinking) =
-                                    delta.get("thinking").and_then(|v| v.as_str())
-                                {
-                                    thinking_content.push_str(thinking);
-                                }
-                                // Thinking signature
-                                if let Some(sig) = delta.get("signature").and_then(|v| v.as_str()) {
-                                    thinking_signature = sig.to_string();
-                                }
-                                // Text content
-                                if let Some(text) = delta.get("text").and_then(|v| v.as_str()) {
-                                    response_content.push_str(text);
-                                }
-                            }
-                        }
-
-                        // Token usage extraction
-                        if let Some(usage) = json
-                            .get("usage")
-                            .or(json.get("usageMetadata"))
-                            .or(json.get("response").and_then(|r| r.get("usage")))
-                            .or(json.get("response").and_then(|r| r.get("usageMetadata")))
-                        {
-                            log.input_tokens = extract_input_tokens(usage);
-                            log.output_tokens = extract_output_tokens(usage);
-                            cached_tokens = cached_tokens.or_else(|| extract_cached_tokens(usage));
-                            log.cached_tokens = log.cached_tokens.or(cached_tokens);
-                            reasoning_tokens =
-                                reasoning_tokens.or_else(|| extract_reasoning_tokens(usage));
-                            log.reasoning_tokens = log.reasoning_tokens.or(reasoning_tokens);
-
-                            if log.input_tokens.is_none() && log.output_tokens.is_none() {
-                                log.output_tokens = usage
-                                    .get("total_tokens")
-                                    .or(usage.get("totalTokenCount"))
-                                    .and_then(|v| v.as_u64())
-                                    .map(|v| v as u32);
+                            // Token usage extraction
+                            if let Some(usage) = json
+                                .get("usage")
+                                .or(json.get("usageMetadata"))
+                                .or(json.get("response").and_then(|r| r.get("usage")))
+                                .or(json.get("response").and_then(|r| r.get("usageMetadata")))
+                                .or(json.get("message").and_then(|message| message.get("usage")))
+                                .or(json.get("delta").and_then(|delta| delta.get("usage")))
+                            {
+                                merge_reported_usage(&mut log, &mut usage_obj, usage);
                             }
                         }
                     }
-                }
 
-                // [Timing Diagnostics] 注入耗时诊断元数据 (秒)
-                let mut timing_obj = serde_json::Map::new();
-                if let Some(clean) = headers_map
-                    .get("x-timing-clean-ms")
-                    .and_then(|v| v.as_str())
-                {
-                    if let Ok(n) = clean.parse::<f64>() {
-                        timing_obj.insert("clean_s".to_string(), serde_json::json!(n / 1000.0));
+                    // [Timing Diagnostics] 注入耗时诊断元数据 (秒)
+                    let mut timing_obj = serde_json::Map::new();
+                    if let Some(clean) = headers_map
+                        .get("x-timing-clean-ms")
+                        .and_then(|v| v.as_str())
+                    {
+                        if let Ok(n) = clean.parse::<f64>() {
+                            timing_obj.insert("clean_s".to_string(), serde_json::json!(n / 1000.0));
+                        }
                     }
-                }
-                if let Some(norm) = headers_map.get("x-timing-norm-ms").and_then(|v| v.as_str()) {
-                    if let Ok(n) = norm.parse::<f64>() {
-                        timing_obj.insert("norm_s".to_string(), serde_json::json!(n / 1000.0));
+                    if let Some(norm) = headers_map.get("x-timing-norm-ms").and_then(|v| v.as_str())
+                    {
+                        if let Ok(n) = norm.parse::<f64>() {
+                            timing_obj.insert("norm_s".to_string(), serde_json::json!(n / 1000.0));
+                        }
                     }
-                }
-                if let Some(th) = headers_map
-                    .get("x-timing-thinking-ms")
-                    .and_then(|v| v.as_str())
-                {
-                    if let Ok(n) = th.parse::<f64>() {
-                        timing_obj.insert("thinking_s".to_string(), serde_json::json!(n / 1000.0));
+                    if let Some(th) = headers_map
+                        .get("x-timing-thinking-ms")
+                        .and_then(|v| v.as_str())
+                    {
+                        if let Ok(n) = th.parse::<f64>() {
+                            timing_obj
+                                .insert("thinking_s".to_string(), serde_json::json!(n / 1000.0));
+                        }
                     }
-                }
-                let mut ttft_val = 0.0;
-                if let Some(ttft) = headers_map.get("x-timing-ttft-ms").and_then(|v| v.as_str()) {
-                    if let Ok(n) = ttft.parse::<f64>() {
-                        ttft_val = n / 1000.0;
-                        timing_obj.insert("ttft_s".to_string(), serde_json::json!(ttft_val));
+                    let mut ttft_val = 0.0;
+                    if let Some(ttft) = headers_map.get("x-timing-ttft-ms").and_then(|v| v.as_str())
+                    {
+                        if let Ok(n) = ttft.parse::<f64>() {
+                            ttft_val = n / 1000.0;
+                            timing_obj.insert("ttft_s".to_string(), serde_json::json!(ttft_val));
+                        }
                     }
-                }
-                if let Some(oh) = headers_map
-                    .get("x-timing-ttft-overhead-ms")
-                    .and_then(|v| v.as_str())
-                {
-                    if let Ok(n) = oh.parse::<f64>() {
-                        let overhead_s = n / 1000.0;
-                        if overhead_s > 0.0 {
-                            timing_obj.insert(
-                                "ttft_overhead_s".to_string(),
-                                serde_json::json!(overhead_s),
-                            );
-                            if ttft_val > 0.0 {
+                    if let Some(oh) = headers_map
+                        .get("x-timing-ttft-overhead-ms")
+                        .and_then(|v| v.as_str())
+                    {
+                        if let Ok(n) = oh.parse::<f64>() {
+                            let overhead_s = n / 1000.0;
+                            if overhead_s > 0.0 {
                                 timing_obj.insert(
-                                    "ttft_total_wait_s".to_string(),
-                                    serde_json::json!(ttft_val + overhead_s),
+                                    "ttft_overhead_s".to_string(),
+                                    serde_json::json!(overhead_s),
+                                );
+                                if ttft_val > 0.0 {
+                                    timing_obj.insert(
+                                        "ttft_total_wait_s".to_string(),
+                                        serde_json::json!(ttft_val + overhead_s),
+                                    );
+                                }
+                            }
+                        }
+                    }
+
+                    if let Some(attempts) = attempts_for_stream {
+                        if !attempts.is_empty() {
+                            timing_obj.insert(
+                                "ttft_attempts".to_string(),
+                                serde_json::to_value(&attempts).unwrap_or(serde_json::Value::Null),
+                            );
+                        }
+                    }
+                    timing_obj.insert(
+                        "stream_s".to_string(),
+                        serde_json::json!(stream_ms / 1000.0),
+                    );
+                    timing_obj.insert("total_s".to_string(), serde_json::json!(total_ms / 1000.0));
+
+                    apply_captured_usage(&mut log, &mut usage_obj, captured_usage.as_ref());
+                    let has_actual_content = !response_content.is_empty()
+                        || !tool_calls.is_empty()
+                        || !thinking_content.is_empty();
+
+                    if has_actual_content
+                        || log.input_tokens.is_some()
+                        || log.output_tokens.is_some()
+                        || !usage_obj.is_empty()
+                    {
+                        let input_toks = log.input_tokens;
+                        let output_toks = log.output_tokens;
+                        let cached_toks = log.cached_tokens;
+                        let reasoning_toks = log.reasoning_tokens.unwrap_or(0);
+
+                        let total_in = input_toks;
+                        let total_toks = log.total_tokens;
+
+                        usage_obj
+                            .entry("input_tokens".to_string())
+                            .or_insert(serde_json::json!(total_in));
+                        usage_obj
+                            .entry("output_tokens".to_string())
+                            .or_insert(serde_json::json!(output_toks));
+                        usage_obj.insert("total_tokens".to_string(), serde_json::json!(total_toks));
+                        usage_obj
+                            .insert("cached_tokens".to_string(), serde_json::json!(cached_toks));
+                        if let Some((cached, input)) = cached_toks.zip(total_in) {
+                            if input > 0 {
+                                let hit_rate = cached as f64 / input as f64 * 100.0;
+                                usage_obj.insert(
+                                    "cache_hit_rate".to_string(),
+                                    serde_json::json!(format!("{:.1}%", hit_rate)),
                                 );
                             }
                         }
-                    }
-                }
-
-                if let Some(attempts) = attempts_for_stream {
-                    if !attempts.is_empty() {
-                        timing_obj.insert(
-                            "ttft_attempts".to_string(),
-                            serde_json::to_value(&attempts).unwrap_or(serde_json::Value::Null),
-                        );
-                    }
-                }
-                timing_obj.insert(
-                    "stream_s".to_string(),
-                    serde_json::json!(stream_ms / 1000.0),
-                );
-                timing_obj.insert("total_s".to_string(), serde_json::json!(total_ms / 1000.0));
-
-                // 优先从 tail 兜底提取 token（若当前尚无 token 数据）
-                if log.input_tokens.is_none() && log.output_tokens.is_none() {
-                    if let Ok(full_tail) = std::str::from_utf8(&last_few_bytes) {
-                        for line in full_tail.lines().rev() {
-                            if line.starts_with("data: ")
-                                && (line.contains("\"usage\"")
-                                    || line.contains("\"usageMetadata\""))
-                            {
-                                let json_str = line.trim_start_matches("data: ").trim();
-                                if let Ok(json) = serde_json::from_str::<Value>(json_str) {
-                                    if let Some(mv) =
-                                        json.get("modelVersion").and_then(|v| v.as_str())
-                                    {
-                                        if !mv.trim().is_empty() {
-                                            log.upstream_model = Some(mv.to_string());
-                                        }
-                                    }
-
-                                    if let Some(usage) = json
-                                        .get("usage")
-                                        .or(json.get("usageMetadata"))
-                                        .or(json.get("response").and_then(|r| r.get("usage")))
-                                        .or(json
-                                            .get("response")
-                                            .and_then(|r| r.get("usageMetadata")))
-                                    {
-                                        log.input_tokens = extract_input_tokens(usage);
-                                        log.output_tokens = extract_output_tokens(usage);
-                                        cached_tokens =
-                                            cached_tokens.or_else(|| extract_cached_tokens(usage));
-                                        log.cached_tokens = log.cached_tokens.or(cached_tokens);
-                                        reasoning_tokens = reasoning_tokens
-                                            .or_else(|| extract_reasoning_tokens(usage));
-                                        break;
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-
-                let has_actual_content = !response_content.is_empty()
-                    || !tool_calls.is_empty()
-                    || !thinking_content.is_empty();
-
-                let mut usage_obj = serde_json::Map::new();
-                if has_actual_content || log.input_tokens.is_some() || log.output_tokens.is_some() {
-                    let input_toks = log.input_tokens.unwrap_or(0);
-                    let output_toks = log.output_tokens.unwrap_or(0);
-                    let cached_toks = cached_tokens.or(log.cached_tokens).unwrap_or(0);
-                    let reasoning_toks = reasoning_tokens.unwrap_or(0);
-
-                    let total_in = if cached_toks > input_toks {
-                        input_toks + cached_toks
-                    } else {
-                        input_toks
-                    };
-                    let total_toks = total_in + output_toks;
-
-                    usage_obj.insert("input_tokens".to_string(), serde_json::json!(total_in));
-                    usage_obj.insert("output_tokens".to_string(), serde_json::json!(output_toks));
-                    usage_obj.insert("total_tokens".to_string(), serde_json::json!(total_toks));
-                    if cached_toks > 0 {
-                        usage_obj
-                            .insert("cached_tokens".to_string(), serde_json::json!(cached_toks));
-                        if total_in > 0 {
-                            let hit_rate = (cached_toks as f64 / total_in as f64 * 100.0)
-                                .min(100.0)
-                                .max(0.0);
+                        if reasoning_toks > 0 {
                             usage_obj.insert(
-                                "cache_hit_rate".to_string(),
-                                serde_json::json!(format!("{:.1}%", hit_rate)),
+                                "reasoning_tokens".to_string(),
+                                serde_json::json!(reasoning_toks),
                             );
                         }
                     }
-                    if reasoning_toks > 0 {
-                        usage_obj.insert(
-                            "reasoning_tokens".to_string(),
-                            serde_json::json!(reasoning_toks),
+
+                    // 🌟 构建统一的满血简要版响应报文 (包含网关权威签名回填与确定性 Tool ID)
+                    let consolidated = build_canonical_consolidated_response(
+                        thinking_content,
+                        thinking_signature,
+                        response_content,
+                        tool_calls,
+                        log.session_id.as_deref(),
+                        &log.id,
+                        timing_obj,
+                        if usage_obj.is_empty() {
+                            None
+                        } else {
+                            Some(usage_obj)
+                        },
+                    );
+
+                    if consolidated
+                        .as_object()
+                        .map(|m| m.is_empty())
+                        .unwrap_or(true)
+                    {
+                        // Fallback: store raw SSE data if parsing failed
+                        log.response_body = Some(full_response.to_string());
+                    } else {
+                        log.response_body = Some(
+                            serde_json::to_string_pretty(&consolidated)
+                                .unwrap_or_else(|_| full_response.to_string()),
                         );
                     }
-                }
-
-                // 🌟 构建统一的满血简要版响应报文 (包含网关权威签名回填与确定性 Tool ID)
-                let consolidated = build_canonical_consolidated_response(
-                    thinking_content,
-                    thinking_signature,
-                    response_content,
-                    tool_calls,
-                    log.session_id.as_deref(),
-                    &log.id,
-                    timing_obj,
-                    if usage_obj.is_empty() {
-                        None
-                    } else {
-                        Some(usage_obj)
-                    },
-                );
-
-                if consolidated
-                    .as_object()
-                    .map(|m| m.is_empty())
-                    .unwrap_or(true)
-                {
-                    // Fallback: store raw SSE data if parsing failed
-                    log.response_body = Some(full_response.to_string());
                 } else {
-                    log.response_body = Some(
-                        serde_json::to_string_pretty(&consolidated)
-                            .unwrap_or_else(|_| full_response.to_string()),
-                    );
+                    log.response_body = Some(format!(
+                        "[Binary Stream Data: {} bytes]",
+                        all_stream_data.len()
+                    ));
                 }
-            } else {
-                log.response_body = Some(format!(
-                    "[Binary Stream Data: {} bytes]",
-                    all_stream_data.len()
-                ));
-            }
 
-            // Fallback token extraction from tail if not already extracted
-            if log.input_tokens.is_none() && log.output_tokens.is_none() {
-                if let Ok(full_tail) = std::str::from_utf8(&last_few_bytes) {
-                    for line in full_tail.lines().rev() {
-                        if line.starts_with("data: ")
-                            && (line.contains("\"usage\"") || line.contains("\"usageMetadata\""))
-                        {
-                            let json_str = line.trim_start_matches("data: ").trim();
-                            if let Ok(json) = serde_json::from_str::<Value>(json_str) {
-                                if let Some(usage) = json
-                                    .get("usage")
-                                    .or(json.get("usageMetadata"))
-                                    .or(json.get("response").and_then(|r| r.get("usage")))
-                                    .or(json.get("response").and_then(|r| r.get("usageMetadata")))
-                                {
-                                    log.input_tokens = extract_input_tokens(usage);
-                                    log.output_tokens = extract_output_tokens(usage);
-                                    log.cached_tokens =
-                                        log.cached_tokens.or_else(|| extract_cached_tokens(usage));
-                                    break;
-                                }
-                            }
-                        }
-                    }
+                if log.status >= 400 {
+                    log.error = Some("Stream Error or Failed".to_string());
                 }
-            }
 
-            if log.status >= 400 {
-                log.error = Some("Stream Error or Failed".to_string());
-            }
+                // Record User Token Usage
+                record_user_token_usage(&user_token_identity, &log, user_agent.clone());
 
-            // Fallback input token estimation prefers the transit (upstream) body
-            if log.input_tokens.is_none() {
-                let estimated = log
-                    .upstream_request_body
-                    .as_ref()
-                    .or(log.request_body.as_ref())
-                    .map(|body| {
-                        crate::proxy::mappers::context_manager::estimate_raw_tokens_from_payload(
-                            body,
-                        )
-                    })
-                    .unwrap_or(0);
-                if estimated > 0 {
-                    log.input_tokens = Some(estimated);
-                }
-            }
-
-            // Record User Token Usage
-            record_user_token_usage(&user_token_identity, &log, user_agent.clone());
-
-            monitor.log_request(log).await;
-        });
+                monitor.log_request(log).await;
+            },
+        ));
 
         Response::from_parts(
             parts,
@@ -1873,8 +1781,20 @@ pub async fn monitor_middleware(
         log.response_headers = serde_json::to_string(&Value::Object(headers_map.clone())).ok();
 
         let (parts, body) = response.into_parts();
-        match axum::body::to_bytes(body, MAX_RESPONSE_LOG_SIZE).await {
+        match crate::proxy::monitor::scope_upstream_work(
+            upstream_holder.clone(),
+            request_budget.clone(),
+            axum::body::to_bytes(body, MAX_RESPONSE_LOG_SIZE),
+        )
+        .await
+        {
             Ok(bytes) => {
+                log.physical_requests = upstream_holder.physical_requests();
+                log.upstream_request_body = upstream_holder.take().or(log.upstream_request_body);
+                log.upstream_request_headers = upstream_holder
+                    .take_headers()
+                    .or(log.upstream_request_headers);
+                let captured_usage = upstream_holder.usage();
                 if let Ok(s) = std::str::from_utf8(&bytes) {
                     if let Ok(json) = serde_json::from_str::<Value>(&s) {
                         if let Some(mv) = json
@@ -1901,16 +1821,16 @@ pub async fn monitor_middleware(
                             log.reasoning_tokens = log
                                 .reasoning_tokens
                                 .or_else(|| extract_reasoning_tokens(usage));
-
-                            if log.input_tokens.is_none() && log.output_tokens.is_none() {
-                                log.output_tokens = usage
-                                    .get("total_tokens")
-                                    .or(usage.get("totalTokenCount"))
-                                    .and_then(|v| v.as_u64())
-                                    .map(|v| v as u32);
-                            }
+                            log.total_tokens =
+                                crate::proxy::pipeline::CanonicalUsage::from_gemini(usage)
+                                    .total_tokens;
                         }
                     }
+                    apply_captured_usage(
+                        &mut log,
+                        &mut serde_json::Map::new(),
+                        captured_usage.as_ref(),
+                    );
                     if is_image_route {
                         log.response_body = serde_json::from_str::<Value>(&s)
                             .ok()
@@ -1923,6 +1843,7 @@ pub async fn monitor_middleware(
                             &log,
                             &headers_map,
                             upstream_attempts.clone(),
+                            captured_usage.as_ref(),
                         ) {
                             log.response_body = serde_json::to_string_pretty(&canonical)
                                 .ok()
@@ -1943,21 +1864,6 @@ pub async fn monitor_middleware(
                     log.error = log.response_body.clone();
                 }
 
-                // Fallback input token estimation prefers the transit (upstream) body
-                if log.input_tokens.is_none() {
-                    let estimated = log
-                        .upstream_request_body
-                        .as_ref()
-                        .or(log.request_body.as_ref())
-                        .map(|body| {
-                            crate::proxy::mappers::context_manager::estimate_raw_tokens_from_payload(body)
-                        })
-                        .unwrap_or(0);
-                    if estimated > 0 {
-                        log.input_tokens = Some(estimated);
-                    }
-                }
-
                 // Record User Token Usage
                 record_user_token_usage(&user_token_identity, &log, user_agent.clone());
 
@@ -1965,6 +1871,12 @@ pub async fn monitor_middleware(
                 Response::from_parts(parts, Body::from(bytes))
             }
             Err(_) => {
+                log.physical_requests = upstream_holder.physical_requests();
+                apply_captured_usage(
+                    &mut log,
+                    &mut serde_json::Map::new(),
+                    upstream_holder.usage().as_ref(),
+                );
                 log.response_body = Some("[Response too large (>100MB)]".to_string());
 
                 // Record User Token Usage (even if too large)
@@ -1975,6 +1887,12 @@ pub async fn monitor_middleware(
             }
         }
     } else {
+        log.physical_requests = upstream_holder.physical_requests();
+        apply_captured_usage(
+            &mut log,
+            &mut serde_json::Map::new(),
+            upstream_holder.usage().as_ref(),
+        );
         log.response_body = Some(format!("[{}]", content_type));
 
         // Record User Token Usage
@@ -2368,6 +2286,77 @@ mod tests {
                 None
             ),
             "真实用户问答绝不可被误杀"
+        );
+    }
+}
+
+#[cfg(test)]
+mod raw_usage_regressions {
+    use super::*;
+    use serde_json::json;
+    #[test]
+    fn partial_raw_usage_wins_over_client_display_values_and_survives_minute_queries() {
+        let _data = crate::proxy::monitor::prompt_log_tests::TestDataDir::new();
+        crate::modules::token_stats::init_db().unwrap();
+        let raw =
+            json!({"promptTokenCount":100,"cachedContentTokenCount":80,"totalTokenCount":123});
+        let mut log = crate::proxy::monitor::prompt_log_tests::sample_log("raw-partial", 0);
+        log.input_tokens = Some(20);
+        log.output_tokens = Some(0);
+        let capture = UpstreamRequestBodyHolder::new();
+        capture.record_dispatch();
+        capture.record_usage(&raw);
+        let mut stored = serde_json::Map::new();
+        apply_captured_usage(&mut log, &mut stored, capture.usage().as_ref());
+        assert_eq!(
+            (
+                log.input_tokens,
+                log.output_tokens,
+                log.cached_tokens,
+                log.total_tokens
+            ),
+            (Some(100), None, Some(80), Some(123))
+        );
+        crate::modules::token_stats::record_usage(
+            "raw@test",
+            "gemini",
+            log.input_tokens,
+            log.output_tokens,
+            log.cached_tokens,
+            log.reasoning_tokens,
+            log.total_tokens,
+        )
+        .unwrap();
+        let minute = crate::modules::token_stats::get_minute_stats(0, 1)
+            .unwrap()
+            .remove(0);
+        assert_eq!(minute.total_tokens, 123);
+        assert_eq!(minute.output_reported_requests, 0);
+        assert_eq!(minute.cache_reported_requests, 1);
+        assert_eq!(minute.cache_reported_input_tokens, 100);
+        assert_eq!(
+            crate::modules::token_stats::get_model_trend_minute(0, 1).unwrap()[0].model_data
+                ["gemini"],
+            Some(123)
+        );
+    }
+    #[test]
+    fn new_physical_response_never_inherits_previous_partial_usage() {
+        let capture = UpstreamRequestBodyHolder::new();
+        capture.record_dispatch();
+        capture.record_usage(&json!({"promptTokenCount":100,"cachedContentTokenCount":80}));
+        capture.record_dispatch();
+        capture.record_usage(&json!({"candidatesTokenCount":2}));
+        let mut log = crate::proxy::monitor::prompt_log_tests::sample_log("physical", 0);
+        apply_captured_usage(
+            &mut log,
+            &mut serde_json::Map::new(),
+            capture.usage().as_ref(),
+        );
+        assert_eq!(capture.physical_requests(), Some(2));
+        assert_eq!(
+            (log.input_tokens, log.cached_tokens, log.output_tokens),
+            (None, None, Some(2))
         );
     }
 }

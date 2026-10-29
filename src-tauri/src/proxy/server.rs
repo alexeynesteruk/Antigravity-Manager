@@ -300,6 +300,10 @@ struct AccountResponse {
     quota: Option<QuotaResponse>,
     device_bound: bool,
     last_used: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    qos_status: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    qos_reset_seconds: Option<u64>,
 }
 
 #[derive(Serialize)]
@@ -410,6 +414,8 @@ fn to_account_response(
         validation_blocked_until: account.validation_blocked_until,
         validation_blocked_reason: account.validation_blocked_reason.clone(),
         validation_url: account.validation_url.clone(),
+        qos_status: account.qos_status.clone(),
+        qos_reset_seconds: account.qos_reset_seconds,
     }
 }
 
@@ -602,6 +608,7 @@ impl AxumServer {
             admin_auth_middleware, auth_middleware, cors_layer, ip_filter_middleware,
             monitor_middleware, service_status_middleware,
         };
+        use crate::proxy::stage_trace::stage_trace_middleware;
 
         // 1. 构建主 AI 代理路由 (遵循 auth_mode 配置)
         let proxy_routes = Router::new()
@@ -721,8 +728,9 @@ impl AxumServer {
             )
             // 应用 AI 服务特定的层
             // 注意：Axum layer 执行顺序是从下往上（洋葱模型）
-            // Request: ip_filter -> auth -> decompression -> decoded size limit -> monitor -> handler.
+            // Request: service status -> ip_filter -> auth -> decompression -> decoded size limit -> monitor -> handler.
             // monitor 需要在 auth 之后执行才能获取 UserTokenIdentity
+            // decompression 置于 auth 之后可防止未鉴权的大体积解压缩炸弹攻击，同时置于 monitor 之前确保审计层获得真实解码请求文本与模型字段
             .layer(axum::middleware::from_fn_with_state(
                 state.clone(),
                 monitor_middleware,
@@ -738,7 +746,16 @@ impl AxumServer {
             .layer(axum::middleware::from_fn_with_state(
                 state.clone(),
                 ip_filter_middleware,
-            ));
+            ))
+            // Pausing AI dispatch must not disable the account-management UI,
+            // admin API, OAuth callback, or static assets needed to resume it.
+            .layer(axum::middleware::from_fn_with_state(
+                state.clone(),
+                service_status_middleware,
+            ))
+            // 阶段时间线中间件置于最外层：确保鉴权/IP 拦截也会留下“请求到过网关”的痕迹，
+            // 且客户端中途断开时由 Drop 守卫落一条 canceled 到 error.log。
+            .layer(axum::middleware::from_fn(stage_trace_middleware));
 
         // 2. 构建管理 API (强制鉴权)
         let admin_routes = Router::new()
@@ -751,6 +768,14 @@ impl AxumServer {
             .route("/accounts/switch", post(admin_switch_account))
             .route("/accounts/refresh", post(admin_refresh_all_quotas))
             .route("/accounts/:accountId", delete(admin_delete_account))
+            .route(
+                "/accounts/:accountId/concurrency",
+                post(admin_set_account_concurrency),
+            )
+            .route(
+                "/accounts/:accountId/release-qos",
+                post(admin_release_account_qos_jail),
+            )
             .route("/accounts/:accountId/bind-device", post(admin_bind_device))
             .route(
                 "/accounts/:accountId/device-profiles",
@@ -920,6 +945,14 @@ impl AxumServer {
                 "/proxy/thinking-store/count",
                 get(admin_get_thinking_store_count),
             )
+            .route(
+                "/proxy/signature-cache/stats",
+                get(admin_get_signature_cache_stats),
+            )
+            .route(
+                "/proxy/signature-cache/clear",
+                post(admin_clear_signature_cache),
+            )
             .route("/logs/:logId", get(admin_get_proxy_log_detail))
             // Debug Console (Log Bridge)
             .route("/debug/enable", post(admin_enable_debug_console))
@@ -954,6 +987,7 @@ impl AxumServer {
                 get(admin_get_token_stats_account_trend_daily),
             )
             .route("/accounts/bulk-delete", post(admin_delete_accounts))
+            .route("/accounts/batch-import", post(admin_batch_import_accounts))
             .route("/accounts/export", post(admin_export_accounts))
             .route("/accounts/reorder", post(admin_reorder_accounts))
             .route("/accounts/:accountId/quota", get(admin_fetch_account_quota))
@@ -1054,6 +1088,10 @@ impl AxumServer {
             .layer(axum::middleware::from_fn_with_state(
                 state.clone(),
                 admin_auth_middleware,
+            ))
+            .layer(axum::middleware::from_fn_with_state(
+                state.clone(),
+                ip_filter_middleware,
             ));
 
         // 3. 整合并应用全局层
@@ -1070,11 +1108,11 @@ impl AxumServer {
             // 公开路由 (无需鉴权)
             .route("/auth/callback", get(handle_oauth_callback))
             // 应用全局监控与状态层 (外层)
-            .layer(axum::middleware::from_fn_with_state(
-                state.clone(),
-                service_status_middleware,
-            ))
             .layer(cors_layer())
+            .layer(axum::middleware::from_fn_with_state(
+                security_state.clone(),
+                crate::proxy::middleware::cors::origin_policy_middleware,
+            ))
             .layer(axum::middleware::from_fn(
                 crate::proxy::middleware::internal::internal_loopback_middleware,
             ))
@@ -1384,6 +1422,27 @@ async fn admin_list_accounts(
                     .map(|groups| groups.iter().map(quota_group_to_dto).collect()),
             });
 
+            let qos_state = state.token_manager.qos_guardian.get_state(&acc.id);
+            let qos_status = match qos_state {
+                crate::proxy::qos_guardian::AccountQoSState::Suspicious { .. } => {
+                    Some("suspicious".to_string())
+                }
+                crate::proxy::qos_guardian::AccountQoSState::Jailed { .. } => {
+                    Some("jailed".to_string())
+                }
+                crate::proxy::qos_guardian::AccountQoSState::Probing { .. } => {
+                    Some("probing".to_string())
+                }
+                crate::proxy::qos_guardian::AccountQoSState::HalfOpen { .. } => {
+                    Some("half_open".to_string())
+                }
+                crate::proxy::qos_guardian::AccountQoSState::Healthy => None,
+            };
+            let qos_reset_seconds = state
+                .token_manager
+                .qos_guardian
+                .get_jailed_remaining_seconds(&acc.id);
+
             AccountResponse {
                 id: acc.id,
                 email: acc.email,
@@ -1405,6 +1464,8 @@ async fn admin_list_accounts(
                 quota,
                 device_bound: acc.device_profile.is_some(),
                 last_used: acc.last_used,
+                qos_status,
+                qos_reset_seconds,
             }
         })
         .collect();
@@ -1467,6 +1528,27 @@ async fn admin_get_current_account(
                     .map(|groups| groups.iter().map(quota_group_to_dto).collect()),
             });
 
+            let qos_state = state.token_manager.qos_guardian.get_state(&acc.id);
+            let qos_status = match qos_state {
+                crate::proxy::qos_guardian::AccountQoSState::Suspicious { .. } => {
+                    Some("suspicious".to_string())
+                }
+                crate::proxy::qos_guardian::AccountQoSState::Jailed { .. } => {
+                    Some("jailed".to_string())
+                }
+                crate::proxy::qos_guardian::AccountQoSState::Probing { .. } => {
+                    Some("probing".to_string())
+                }
+                crate::proxy::qos_guardian::AccountQoSState::HalfOpen { .. } => {
+                    Some("half_open".to_string())
+                }
+                crate::proxy::qos_guardian::AccountQoSState::Healthy => None,
+            };
+            let qos_reset_seconds = state
+                .token_manager
+                .qos_guardian
+                .get_jailed_remaining_seconds(&acc.id);
+
             AccountResponse {
                 id: acc.id,
                 email: acc.email,
@@ -1488,6 +1570,8 @@ async fn admin_get_current_account(
                 quota,
                 device_bound: acc.device_profile.is_some(),
                 last_used: acc.last_used,
+                qos_status,
+                qos_reset_seconds,
             }
         })
     } else {
@@ -1533,6 +1617,46 @@ async fn admin_add_account(
         )
     })?;
     Ok(Json(to_account_response(&account, &current_id)))
+}
+
+async fn admin_release_account_qos_jail(
+    State(state): State<AppState>,
+    axum::extract::Path(account_id): axum::extract::Path<String>,
+) -> impl IntoResponse {
+    state.token_manager.release_account_qos_jail(&account_id);
+    StatusCode::OK
+}
+
+#[derive(Deserialize)]
+struct AccountConcurrencyRequest {
+    #[serde(alias = "maxConcurrency")]
+    max_concurrency: Option<u32>,
+}
+
+async fn admin_set_account_concurrency(
+    State(state): State<AppState>,
+    Path(account_id): Path<String>,
+    Json(payload): Json<AccountConcurrencyRequest>,
+) -> Result<StatusCode, (StatusCode, Json<ErrorResponse>)> {
+    let id = account_id.clone();
+    let limit = payload.max_concurrency;
+    tokio::task::spawn_blocking(move || {
+        crate::modules::account::update_account_max_concurrency(&id, limit)
+    })
+    .await
+    .map_err(|error| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                error: error.to_string(),
+            }),
+        )
+    })?
+    .map_err(|error| (StatusCode::BAD_REQUEST, Json(ErrorResponse { error })))?;
+    state
+        .token_manager
+        .update_account_max_concurrency(&account_id, limit);
+    Ok(StatusCode::NO_CONTENT)
 }
 
 async fn admin_delete_account(
@@ -1934,6 +2058,9 @@ async fn admin_save_config(
     }
     state.proxy_pool_manager.sync_bindings_from_config().await;
     state
+        .token_manager
+        .set_default_max_concurrency(new_config.proxy.account_max_concurrency);
+    state
         .upstream
         .set_user_agent_override(new_config.proxy.user_agent_override.clone())
         .await;
@@ -1951,6 +2078,7 @@ async fn admin_save_config(
     crate::proxy::update_image_thinking_mode(new_config.proxy.image_thinking_mode.clone());
     crate::proxy::update_multimodal_config(new_config.proxy.multimodal.clone());
     crate::proxy::update_stream_timeout_config(new_config.proxy.stream_timeouts.clone());
+    crate::proxy::update_upload_timeout_config(new_config.proxy.upload_timeouts.clone());
     crate::proxy::config::update_global_audit_config(
         new_config.proxy.experimental.payload_storage_mode.clone(),
         new_config.proxy.experimental.log_retention_days,
@@ -2294,6 +2422,33 @@ async fn admin_get_thinking_store_count() -> impl IntoResponse {
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(json!({ "error": e })),
         ),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": e.to_string() })),
+        ),
+    }
+}
+
+async fn admin_get_signature_cache_stats() -> impl IntoResponse {
+    (
+        StatusCode::OK,
+        Json(json!({
+            "profile": crate::proxy::cache_profile(),
+            "stats": crate::proxy::signature_cache::signature_cache_stats(),
+            "thinking": crate::proxy::thinking_store::thinking_store_stats(),
+        })),
+    )
+}
+
+async fn admin_clear_signature_cache() -> impl IntoResponse {
+    let res = tokio::task::spawn_blocking(|| {
+        let before = crate::proxy::signature_cache::signature_cache_stats().l1_entries;
+        crate::proxy::SignatureCache::global().clear();
+        before
+    })
+    .await;
+    match res {
+        Ok(before) => (StatusCode::OK, Json(json!({ "cleared": before }))),
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(json!({ "error": e.to_string() })),
@@ -2937,15 +3092,54 @@ async fn admin_update_last_check_time(
     Ok(StatusCode::OK)
 }
 
-async fn admin_save_update_settings(Json(settings): Json<serde_json::Value>) -> impl IntoResponse {
-    if let Ok(s) =
-        serde_json::from_value::<crate::modules::update_checker::UpdateSettings>(settings)
-    {
-        let _ = crate::modules::update_checker::save_update_settings(&s);
-        StatusCode::OK
-    } else {
-        StatusCode::BAD_REQUEST
+/// Web 模式请求体：
+/// - `Wrapped`：前端 `invoke` 映射原样透传的 `{"settings": { ... }}`；
+/// - `Flat`：Headless/CLI 直接平铺的字段（保留既有调用方式）。
+///
+/// `UpdateSettingsPatch` 的字段全部可选，因此必须先尝试 `Wrapped`，
+/// 否则平铺变体会把外层 `settings` 当作未知字段忽略并得到空补丁。
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum SaveUpdateSettingsPayload {
+    Wrapped {
+        settings: crate::modules::update_checker::UpdateSettingsPatch,
+    },
+    Flat(crate::modules::update_checker::UpdateSettingsPatch),
+}
+
+impl SaveUpdateSettingsPayload {
+    fn into_patch(self) -> crate::modules::update_checker::UpdateSettingsPatch {
+        match self {
+            Self::Wrapped { settings } => settings,
+            Self::Flat(settings) => settings,
+        }
     }
+}
+
+async fn admin_save_update_settings(
+    Json(payload): Json<SaveUpdateSettingsPayload>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    let patch = payload.into_patch();
+    if patch.is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                error: "Empty update settings patch: expected at least one of \
+                        auto_check, last_check_time, check_interval_hours, update_channel"
+                    .to_string(),
+            }),
+        ));
+    }
+
+    // 局部合并后落盘，并把无效的持久化错误如实返回，避免“写了但没生效”的静默成功。
+    let settings = crate::modules::update_checker::patch_update_settings(patch).map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse { error: e }),
+        )
+    })?;
+
+    Ok(Json(settings))
 }
 
 async fn admin_is_auto_launch_enabled() -> impl IntoResponse {
@@ -2981,6 +3175,26 @@ async fn admin_delete_accounts(
         )
     })?;
     Ok(StatusCode::OK)
+}
+
+async fn admin_batch_import_accounts(
+    State(state): State<AppState>,
+    Json(payload): Json<Vec<crate::models::ImportAccountEntry>>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    let result = crate::modules::account::batch_import_accounts_logic(None, payload)
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse { error: e }),
+            )
+        })?;
+
+    if let Err(e) = state.token_manager.load_accounts().await {
+        tracing::warn!("[API] Failed to reload accounts after batch import: {}", e);
+    }
+
+    Ok((StatusCode::OK, Json(result)))
 }
 
 #[derive(Deserialize)]
@@ -3691,10 +3905,31 @@ async fn admin_get_cli_config_content(
 #[derive(Deserialize)]
 struct OAuthParams {
     code: String,
-    #[allow(dead_code)]
     state: Option<String>,
     #[allow(dead_code)]
     scope: Option<String>,
+}
+
+fn html_escape(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&#39;")
+}
+
+async fn finish_web_oauth(
+    state: &AppState,
+    code: &str,
+    redirect: &str,
+    client: &str,
+) -> Result<(), String> {
+    let token =
+        crate::modules::oauth::exchange_code_with_client(code, redirect, Some(client)).await?;
+    state.account_service.process_oauth_token(token).await?;
+    state.token_manager.reload_all_accounts().await?;
+    Ok(())
 }
 
 async fn handle_oauth_callback(
@@ -3712,36 +3947,14 @@ async fn handle_oauth_callback(
         .and_then(|h| h.to_str().ok());
     let redirect_uri = get_oauth_redirect_uri(port, host, proto);
 
-    match state
-        .token_manager
-        .exchange_code(&code, &redirect_uri)
-        .await
-    {
-        Ok(refresh_token) => {
-            match state.token_manager.get_user_info(&refresh_token).await {
-                Ok(user_info) => {
-                    let email = user_info.email;
-                    if let Err(e) = state
-                        .token_manager
-                        .add_account(&email, &refresh_token)
-                        .await
-                    {
-                        error!("Failed to add account: {}", e);
-                        return Ok(Html(format!(
-                            r#"<html><body><h1>Authorization Failed</h1><p>Failed to save account: {}</p></body></html>"#,
-                            e
-                        )));
-                    }
-                }
-                Err(e) => {
-                    error!("Failed to get user info: {}", e);
-                    return Ok(Html(format!(
-                        r#"<html><body><h1>Authorization Failed</h1><p>Failed to get user info: {}</p></body></html>"#,
-                        e
-                    )));
-                }
-            }
-
+    let nonce = params.state.as_deref().ok_or(StatusCode::BAD_REQUEST)?;
+    let client_key =
+        crate::modules::oauth_server::claim_pending_oauth_callback(Some(nonce), &redirect_uri)
+            .map_err(|_| StatusCode::BAD_REQUEST)?;
+    let result = finish_web_oauth(&state, &code, &redirect_uri, &client_key).await;
+    crate::modules::oauth_server::finish_pending_oauth_callback(nonce);
+    match result {
+        Ok(()) => {
             // Success HTML
             Ok(Html(format!(
                 r#"
@@ -3806,7 +4019,7 @@ async fn handle_oauth_callback(
             error!("OAuth exchange failed: {}", e);
             Ok(Html(format!(
                 r#"<html><body><h1>Authorization Failed</h1><p>Error: {}</p></body></html>"#,
-                e
+                html_escape(&e)
             )))
         }
     }
@@ -3838,77 +4051,36 @@ async fn admin_prepare_oauth_url_web(
     let state_str = uuid::Uuid::new_v4().to_string();
 
     // 初始化授权流状态，以及后台处理器
-    let (auth_url, mut code_rx) = crate::modules::oauth_server::prepare_oauth_flow_manually(
-        redirect_uri.clone(),
-        state_str.clone(),
-        client_query.oauth_client_key,
-    )
-    .map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ErrorResponse { error: e }),
+    let (auth_url, mut code_rx, client_key) =
+        crate::modules::oauth_server::prepare_oauth_flow_manually(
+            redirect_uri.clone(),
+            state_str.clone(),
+            client_query.oauth_client_key,
         )
-    })?;
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse { error: e }),
+            )
+        })?;
 
     // 启动后台任务处理回调/手动提交的代码
-    let token_manager = state.token_manager.clone();
-    let redirect_uri_clone = redirect_uri.clone();
+    let background_state = state.clone();
+    let flow_nonce = state_str.clone();
     tokio::spawn(async move {
-        match code_rx.recv().await {
-            Some(Ok(code)) => {
-                crate::modules::logger::log_info(
-                    "Consuming manually submitted OAuth code in background",
-                );
-                // 为 Web 回调提供简化的后端处理流程
-                match crate::modules::oauth::exchange_code(&code, &redirect_uri_clone).await {
-                    Ok(token_resp) => {
-                        // Success! Now add/upsert account
-                        if let Some(refresh_token) = &token_resp.refresh_token {
-                            match token_manager.get_user_info(refresh_token).await {
-                                Ok(user_info) => {
-                                    if let Err(e) = token_manager
-                                        .add_account(&user_info.email, refresh_token)
-                                        .await
-                                    {
-                                        crate::modules::logger::log_error(&format!(
-                                            "Failed to save account in background OAuth: {}",
-                                            e
-                                        ));
-                                    } else {
-                                        crate::modules::logger::log_info(&format!(
-                                            "Successfully added account {} via background OAuth",
-                                            user_info.email
-                                        ));
-                                    }
-                                }
-                                Err(e) => {
-                                    crate::modules::logger::log_error(&format!(
-                                        "Failed to fetch user info in background OAuth: {}",
-                                        e
-                                    ));
-                                }
-                            }
-                        } else {
-                            crate::modules::logger::log_error(
-                                "Background OAuth error: Google did not return a refresh_token.",
-                            );
-                        }
-                    }
-                    Err(e) => {
-                        crate::modules::logger::log_error(&format!(
-                            "Background OAuth exchange failed: {}",
-                            e
-                        ));
-                    }
+        match tokio::time::timeout(std::time::Duration::from_secs(10 * 60), code_rx.recv()).await {
+            Ok(Some(Ok(code))) => {
+                if let Err(error) =
+                    finish_web_oauth(&background_state, &code, &redirect_uri, &client_key).await
+                {
+                    error!("Background OAuth exchange failed: {}", error);
                 }
             }
-            Some(Err(e)) => {
-                crate::modules::logger::log_error(&format!("Background OAuth flow error: {}", e));
-            }
-            None => {
-                crate::modules::logger::log_info("Background OAuth flow channel closed");
-            }
+            Ok(Some(Err(error))) => error!("Background OAuth failed: {}", error),
+            Ok(None) => {}
+            Err(_) => error!("Background OAuth flow expired"),
         }
+        crate::modules::oauth_server::finish_pending_oauth_callback(&flow_nonce);
     });
 
     Ok(Json(serde_json::json!({
@@ -5147,6 +5319,80 @@ mod gateway_integration_tests {
                 String::from_utf8_lossy(&body).contains("node budget"),
                 "{path}"
             );
+        }
+    }
+}
+
+#[cfg(test)]
+mod save_update_settings_payload_tests {
+    use super::SaveUpdateSettingsPayload;
+    use crate::modules::update_checker::UpdateChannel;
+
+    #[test]
+    fn accepts_wrapped_web_invoke_body() {
+        // 复现 Issue #3754：Web 模式前端经 invoke 映射发送的 {"settings": {...}}
+        let payload: SaveUpdateSettingsPayload = serde_json::from_value(serde_json::json!({
+            "settings": { "auto_check": false, "update_channel": "beta" }
+        }))
+        .expect("wrapped web body should deserialize");
+
+        let patch = payload.into_patch();
+        assert_eq!(patch.auto_check, Some(false));
+        assert_eq!(patch.update_channel, Some(UpdateChannel::Beta));
+        assert_eq!(patch.last_check_time, None);
+        assert!(!patch.is_empty());
+    }
+
+    #[test]
+    fn accepts_flat_headless_body() {
+        let payload: SaveUpdateSettingsPayload = serde_json::from_value(serde_json::json!({
+            "auto_check": true,
+            "last_check_time": 0,
+            "check_interval_hours": 12,
+            "update_channel": "stable"
+        }))
+        .expect("flat headless body should deserialize");
+
+        let patch = payload.into_patch();
+        assert_eq!(patch.auto_check, Some(true));
+        assert_eq!(patch.last_check_time, Some(0));
+        assert_eq!(patch.check_interval_hours, Some(12));
+        assert_eq!(patch.update_channel, Some(UpdateChannel::Stable));
+    }
+
+    #[test]
+    fn empty_patch_material_is_rejected() {
+        let payload: SaveUpdateSettingsPayload =
+            serde_json::from_value(serde_json::json!({ "unknown": 1 })).unwrap();
+        assert!(payload.into_patch().is_empty());
+    }
+}
+
+#[cfg(test)]
+mod oauth_callback_boundary_tests {
+    use super::*;
+    use tower::ServiceExt;
+
+    #[tokio::test]
+    async fn public_callback_rejects_unsolicited_codes_before_network_work() {
+        let _dir = crate::proxy::monitor::prompt_log_tests::TestDataDir::new();
+        let app = Router::new()
+            .route("/auth/callback", get(handle_oauth_callback))
+            .with_state(super::config_reload_tests::test_state());
+        for suffix in ["", "&state=uninitiated-nonce"] {
+            let request = axum::http::Request::builder()
+                .uri(format!("/auth/callback?code=attacker-code{suffix}"))
+                .header("host", "localhost:8045")
+                .body(axum::body::Body::empty())
+                .unwrap();
+            let response = tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                app.clone().oneshot(request),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
         }
     }
 }

@@ -1,6 +1,6 @@
 //! 出站流生命周期通用驱动器（模板方法模式）
 //!
-//! 统一接管所有出站协议（Claude、OpenAI 等）的通用流式生命周期：
+//! 统一接管所有出站协议（Claude、OpenAI、Gemini）的通用流式生命周期：
 //! 1. 3s 细粒度保活心跳（`: ping\n\n`）；
 //! 2. 120s 空闲静默安全熔断（`streaming_sliding_secs = 120`）；
 //! 3. 网络中断统一拦截与状态判断（`has_content` / `has_thinking`）；
@@ -824,6 +824,44 @@ mod tests {
         });
         futures::future::join_all(clients).await;
         assert_eq!(upstream_calls.load(Ordering::SeqCst), 4);
+    }
+
+    #[tokio::test]
+    async fn test_lifecycle_streaming_preamble_to_large_tool_call_cliff_auto_promotion() {
+        // 模拟真实业务场景（如 Gemini 4 Argon / Claude 生成巨型 Write/Edit 工具调用）：
+        // 模型先输出一段简短引导文本（如 "我将把重构后的漫画阅读..."，此时 has_content() == true 且 phase == Streaming），
+        // 随后 Google v1internal 上游进入整包缓冲巨型 functionCall JSON 的长静默期（超过 streaming_sliding_secs = 1s，但未超过 transition_secs = 4s）。
+        // 验证状态机在 Streaming 阶段首次达到滑动超时时同样自动跃迁至 Transition 赋予宽限期，
+        // 绝不在半句话处提前截断并伪造 end_turn！
+        let mock_stream = async_stream::stream! {
+            yield Ok::<_, String>(Bytes::from("data: preamble_text\n"));
+            tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+            yield Ok::<_, String>(Bytes::from("data: large_tool_call_payload\n"));
+        };
+
+        let handler = MockHandler::new(false, false);
+        let config =
+            StreamLifecycleConfig::new("test", "test_fn", "trace_streaming_cliff".to_string())
+                .with_timeouts(5, 4, 1)
+                .with_heartbeat_secs(1);
+        let mut stream = run_stream_lifecycle(Box::pin(mock_stream), handler, config);
+
+        let mut output = Vec::new();
+        while let Some(item) = stream.next().await {
+            if let Ok(b) = item {
+                output.push(String::from_utf8_lossy(&b).to_string());
+            }
+        }
+
+        let full_output = output.join("");
+        assert!(full_output.contains("processed:data: preamble_text"));
+        assert!(
+            full_output.contains("processed:data: large_tool_call_payload"),
+            "Stream must survive tool-call buffering cliff after preamble text and emit the buffered tool call payload"
+        );
+        assert!(full_output.contains("[finalized]"));
+        assert!(!full_output.contains("[truncated]"));
+        assert!(!full_output.contains("[initial_error]"));
     }
 
     #[tokio::test]

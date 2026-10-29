@@ -16,6 +16,10 @@ use crate::proxy::mappers::openai::{
 };
 // use crate::proxy::upstream::client::UpstreamClient; // 通过 state 获取
 use crate::proxy::debug_logger;
+use crate::proxy::pipeline::{
+    extract_image_generation_diagnostic, response_has_inline_image_data,
+    stream_chunk_has_image_data,
+};
 use crate::proxy::server::AppState;
 use crate::proxy::upstream::client::mask_email;
 
@@ -23,6 +27,16 @@ const MAX_RETRY_ATTEMPTS: usize = 3;
 const MAX_INPUT_IMAGE_BYTES: usize = 20 * 1024 * 1024;
 const MAX_TOTAL_INPUT_IMAGE_BYTES: usize = 32 * 1024 * 1024;
 const CODEX_VISIBLE_THOUGHT_MESSAGE_PREFIX: &str = "msg_thought_";
+
+fn bump_session_on_input_limit(
+    status: u16,
+    error_text: &str,
+    account_id: &str,
+    affinity_key: &str,
+) -> Option<u64> {
+    (status == 400 && error_text.contains("exceeds the maximum number of tokens"))
+        .then(|| crate::proxy::common::session::bump_session(account_id, affinity_key))
+}
 use super::common::{
     apply_retry_strategy, next_rotation_attempt, should_rotate_account, FailureStatusTracker,
     RequestRetryState, RetryStrategy,
@@ -280,66 +294,6 @@ fn stream_chunk_has_error_event(bytes: &[u8]) -> bool {
             payload.get("type").and_then(Value::as_str),
             Some("error" | "response.failed")
         ) || payload.get("error").is_some_and(|error| !error.is_null())
-    })
-}
-
-fn response_has_inline_image_data(value: &Value) -> bool {
-    let response = value.get("response").unwrap_or(value);
-    response
-        .get("candidates")
-        .and_then(Value::as_array)
-        .is_some_and(|candidates| {
-            candidates.iter().any(|candidate| {
-                candidate
-                    .get("content")
-                    .and_then(|content| content.get("parts"))
-                    .and_then(Value::as_array)
-                    .is_some_and(|parts| {
-                        parts.iter().any(|part| {
-                            part.get("inlineData")
-                                .or_else(|| part.get("inline_data"))
-                                .and_then(|image| image.get("data"))
-                                .and_then(Value::as_str)
-                                .is_some_and(|data| !data.is_empty())
-                        })
-                    })
-            })
-        })
-}
-
-fn text_has_nonempty_image_data_url(text: &str) -> bool {
-    let mut remaining = text;
-    while let Some(start) = remaining.find("data:image/") {
-        let candidate = &remaining[start..];
-        if let Some((_, encoded)) = candidate.split_once(";base64,") {
-            if encoded.chars().next().is_some_and(|first| {
-                !first.is_whitespace() && !matches!(first, '"' | '\\' | ')' | ']' | '}')
-            }) {
-                return true;
-            }
-        }
-        remaining = &candidate["data:image/".len()..];
-    }
-    false
-}
-
-fn value_has_nonempty_image_data_url(value: &Value) -> bool {
-    match value {
-        Value::String(text) => text_has_nonempty_image_data_url(text),
-        Value::Array(values) => values.iter().any(value_has_nonempty_image_data_url),
-        Value::Object(values) => values.values().any(value_has_nonempty_image_data_url),
-        _ => false,
-    }
-}
-
-fn stream_chunk_has_image_data(bytes: &[u8]) -> bool {
-    String::from_utf8_lossy(bytes).lines().any(|line| {
-        let Some(data) = line.trim_start().strip_prefix("data:") else {
-            return false;
-        };
-        serde_json::from_str::<Value>(data.trim())
-            .ok()
-            .is_some_and(|payload| value_has_nonempty_image_data_url(&payload))
     })
 }
 
@@ -852,28 +806,28 @@ fn convert_chat_response_to_responses(
             }));
         }
 
-        let text = choice
+        let raw_text = choice
             .message
             .content
             .as_ref()
             .map(openai_content_text)
             .unwrap_or_default();
-        let text = if structured_output {
-            crate::proxy::pipeline::structured_output::normalize_json_text(&text).into_owned()
+        let cleaned_text = if structured_output {
+            crate::proxy::pipeline::structured_output::normalize_json_text(&raw_text).into_owned()
         } else {
-            text
+            raw_text
         };
         let refusal = choice
             .message
             .refusal
             .as_deref()
             .filter(|refusal| !refusal.is_empty());
-        if !text.is_empty() || refusal.is_some() {
+        if !cleaned_text.is_empty() || refusal.is_some() {
             let mut content = Vec::new();
-            if !text.is_empty() {
+            if !cleaned_text.is_empty() {
                 content.push(json!({
                     "type": "output_text",
-                    "text": text,
+                    "text": cleaned_text,
                     "annotations": []
                 }));
             }
@@ -940,12 +894,104 @@ fn is_codex_transcript_only_assistant_message(item: &Value, text: &str) -> bool 
 
 #[cfg(test)]
 mod stream_peek_tests {
+    #[test]
+    fn responses_input_limit_bumps_the_same_affinity_used_by_its_mapper() {
+        use crate::proxy::common::session::{apply_upstream_session, current_bump};
+        use crate::proxy::mappers::openai::{transform_openai_request_with_session, OpenAIRequest};
+        let account = uuid::Uuid::new_v4().to_string();
+        let affinity = "a:responses-current-conversation";
+        let store = "t:responses-private-execution";
+        let _data = crate::proxy::monitor::prompt_log_tests::TestDataDir::new();
+        let token = crate::proxy::token_manager::ProxyToken {
+            account_id: account.clone(),
+            priority: 0,
+            access_token: "fixture".into(),
+            refresh_token: "fixture".into(),
+            expires_in: 3600,
+            timestamp: 0,
+            email: "fixture@invalid".into(),
+            account_path: Default::default(),
+            project_id: Some("project".into()),
+            subscription_tier: None,
+            remaining_quota: None,
+            protected_models: Default::default(),
+            health_score: 1.0,
+            reset_time: None,
+            weekly_reset_time: None,
+            validation_blocked: false,
+            validation_blocked_until: 0,
+            validation_url: None,
+            available_models: Default::default(),
+            model_metadata: Default::default(),
+            model_quotas: Default::default(),
+            model_limits: Default::default(),
+        };
+        let request: OpenAIRequest = serde_json::from_value(serde_json::json!({"model":"gemini-fixture","messages":[{"role":"user","content":"Same conversation"}]})).unwrap();
+        let (before, ..) = transform_openai_request_with_session(
+            &request,
+            "project",
+            "gemini-3.8-flash",
+            Some(&token),
+            affinity,
+            Some(store),
+            true,
+            false,
+        );
+        assert_eq!(
+            super::bump_session_on_input_limit(
+                400,
+                "The input token count exceeds the maximum number of tokens allowed 1048576",
+                &account,
+                affinity
+            ),
+            Some(1)
+        );
+        let (after, ..) = transform_openai_request_with_session(
+            &request,
+            "project",
+            "gemini-3.8-flash",
+            Some(&token),
+            affinity,
+            Some(store),
+            true,
+            false,
+        );
+        assert_ne!(
+            before["request"]["sessionId"],
+            after["request"]["sessionId"]
+        );
+        let mut actual = serde_json::json!({});
+        apply_upstream_session(&mut actual, &account, affinity);
+        assert_eq!(after["request"]["sessionId"], actual["sessionId"]);
+        assert_eq!(current_bump(&account, store), 0);
+        assert_eq!(
+            super::bump_session_on_input_limit(
+                429,
+                "exceeds the maximum number of tokens",
+                &account,
+                affinity
+            ),
+            None
+        );
+        assert_eq!(
+            super::bump_session_on_input_limit(
+                400,
+                "unrelated invalid request",
+                &account,
+                affinity
+            ),
+            None
+        );
+        assert_eq!(current_bump(&account, affinity), 1);
+    }
+
     use super::build_image_contents;
     use super::build_image_edit_body;
     use super::convert_chat_response_to_responses;
     use super::convert_codex_to_openai_request;
     use super::drop_leading_orphan_tool_history;
     use super::edit_size_input;
+    use super::extract_image_generation_diagnostic;
     use super::generation_image_size_param;
     use super::history_without_inline_media;
     use super::image_account_selection_target;
@@ -1070,6 +1116,71 @@ data: {"type":"response.failed","response":{"status":"failed","error":{"code":"u
 "#;
         assert!(!stream_chunk_has_image_data(empty_chunk));
         assert!(stream_chunk_has_image_data(image_chunk));
+    }
+
+    #[test]
+    fn test_extract_image_generation_diagnostic() {
+        use reqwest::StatusCode;
+
+        // 1. promptFeedback 安全策略拦截
+        let prompt_feedback = json!({
+            "promptFeedback": {
+                "blockReason": "SAFETY"
+            }
+        });
+        let diag = extract_image_generation_diagnostic(&prompt_feedback);
+        assert_eq!(diag.status, StatusCode::BAD_REQUEST);
+        assert!(diag.is_safety_or_policy);
+        assert!(diag.message.contains("blockReason: SAFETY"));
+
+        // 2. candidate finishReason 安全策略拦截
+        let cand_safety = json!({
+            "candidates": [{
+                "finishReason": "SAFETY"
+            }]
+        });
+        let diag = extract_image_generation_diagnostic(&cand_safety);
+        assert_eq!(diag.status, StatusCode::BAD_REQUEST);
+        assert!(diag.is_safety_or_policy);
+        assert!(diag.message.contains("finishReason: SAFETY"));
+
+        // 3. candidate 文本拒答部件
+        let text_refusal = json!({
+            "candidates": [{
+                "content": {
+                    "parts": [{
+                        "text": "I cannot create images of real people."
+                    }]
+                },
+                "finishReason": "STOP"
+            }]
+        });
+        let diag = extract_image_generation_diagnostic(&text_refusal);
+        assert_eq!(diag.status, StatusCode::BAD_REQUEST);
+        assert!(diag.is_safety_or_policy);
+        assert!(diag
+            .message
+            .contains("I cannot create images of real people."));
+
+        // 4. 空候选集
+        let empty_cand = json!({
+            "candidates": []
+        });
+        let diag = extract_image_generation_diagnostic(&empty_cand);
+        assert_eq!(diag.status, StatusCode::BAD_GATEWAY);
+        assert!(!diag.is_safety_or_policy);
+        assert!(diag.message.contains("empty candidates array"));
+
+        // 5. 嵌套 upstream error
+        let upstream_err = json!({
+            "error": {
+                "message": "Resource exhausted"
+            }
+        });
+        let diag = extract_image_generation_diagnostic(&upstream_err);
+        assert_eq!(diag.status, StatusCode::BAD_GATEWAY);
+        assert!(!diag.is_safety_or_policy);
+        assert!(diag.message.contains("Resource exhausted"));
     }
 
     #[test]
@@ -1478,6 +1589,174 @@ data: {"type":"response.failed","response":{"status":"failed","error":{"code":"u
     }
 
     #[test]
+    fn test_unwrap_outer_code_fence_safety() {
+        use crate::proxy::pipeline::structured_output::normalize_json_text as unwrap_outer_code_fence_if_structured;
+
+        // 1. 裸 JSON：安全透传，原样返回
+        let bare = r#"{"title": "Bug Fix", "description": "Fixes issue #3710"}"#;
+        assert_eq!(unwrap_outer_code_fence_if_structured(bare), bare);
+
+        // 2. 被 ```json ... ``` 严格包裹：整包解壳
+        let wrapped_json =
+            "```json\n{\"title\": \"Bug Fix\", \"description\": \"Fixes issue #3710\"}\n```";
+        assert_eq!(unwrap_outer_code_fence_if_structured(wrapped_json), bare);
+
+        // 3. 被 ``` ... ``` 严格包裹（无语言标识）：整包解壳
+        let wrapped_plain =
+            "```\n{\"title\": \"Bug Fix\", \"description\": \"Fixes issue #3710\"}\n```";
+        assert_eq!(unwrap_outer_code_fence_if_structured(wrapped_plain), bare);
+
+        // 4. 【零误杀保障】常规代码块：非 JSON 代码绝不破坏
+        let non_json = "```rust\nfn main() { println!(\"Hello\"); }\n```";
+        assert_eq!(unwrap_outer_code_fence_if_structured(non_json), non_json);
+
+        // 5. 【零误杀保障】字段内部包含反引号代码块的合法 JSON：绝不被内部反引号误杀
+        let inner_with_backticks = r#"{"title":"Summary","code":"```ts\nconst x = 1;\n```"}"#;
+        assert_eq!(
+            unwrap_outer_code_fence_if_structured(inner_with_backticks),
+            inner_with_backticks
+        );
+
+        // 6. 前后带有自然语言说明（非整包围栏包裹）：解壳函数保持原样返回
+        let conversational = "Here is the result:\n```json\n{\"a\":1}\n```\nHope it helps!";
+        assert_eq!(
+            unwrap_outer_code_fence_if_structured(conversational),
+            conversational
+        );
+    }
+
+    #[test]
+    fn test_convert_chat_response_to_responses_structured_vs_normal() {
+        use super::convert_chat_response_to_responses;
+
+        let wrapped_json =
+            "```json\n{\"title\": \"Issue 3710\", \"description\": \"Structured outputs\"}\n```";
+        let bare_json = "{\"title\": \"Issue 3710\", \"description\": \"Structured outputs\"}";
+
+        let chat_response = serde_json::from_value(json!({
+            "id": "chatcmpl_title",
+            "object": "chat.completion",
+            "created": 1,
+            "model": "gemini-3.8-flash-high",
+            "choices": [{
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": wrapped_json,
+                    "reasoning_content": null
+                },
+                "finish_reason": "stop"
+            }],
+            "usage": { "prompt_tokens": 5, "completion_tokens": 10, "total_tokens": 15 }
+        }))
+        .expect("chat response");
+
+        // is_structured_output = true: 剥离整包外层围栏，输出可供客户端原生 JSON.parse 解析的裸 JSON
+        let structured_val = convert_chat_response_to_responses(&chat_response, true);
+        let out_text = structured_val["output"][0]["content"][0]["text"]
+            .as_str()
+            .unwrap();
+        assert_eq!(out_text, bare_json);
+        assert!(serde_json::from_str::<serde_json::Value>(out_text).is_ok());
+
+        // is_structured_output = false (普通聊天会话): 100% 原始呈现，绝不剥离或丢弃
+        let normal_val = convert_chat_response_to_responses(&chat_response, false);
+        assert_eq!(
+            normal_val["output"][0]["content"][0]["text"]
+                .as_str()
+                .unwrap(),
+            wrapped_json
+        );
+    }
+
+    #[test]
+    fn test_responses_api_text_format_and_pipeline_tool_suppression() {
+        use super::convert_codex_to_openai_request;
+        use crate::proxy::mappers::openai::models::OpenAIRequest;
+        use crate::proxy::mappers::openai::request::transform_openai_request_with_session;
+        use crate::proxy::pipeline::InboundThinkingPipeline;
+
+        let input = json!({
+            "model": "gpt-6-luna",
+            "reasoning": { "effort": "low" },
+            "text": {
+                "format": {
+                    "type": "json_schema",
+                    "name": "codex_output_schema",
+                    "strict": true,
+                    "schema": {
+                        "type": "object",
+                        "properties": {
+                            "title": { "type": "string" },
+                            "description": { "type": "string" }
+                        },
+                        "required": ["title", "description"],
+                        "additionalProperties": false
+                    }
+                }
+            },
+            "tools": [{
+                "type": "function",
+                "function": {
+                    "name": "read_file",
+                    "description": "Read file contents",
+                    "parameters": { "type": "object" }
+                }
+            }],
+            "input": [
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": "Summarize this session."
+                }
+            ]
+        });
+
+        let converted = convert_codex_to_openai_request(input);
+        let openai_req: OpenAIRequest =
+            serde_json::from_value(converted).expect("deserialize OpenAIRequest");
+
+        let (mut gemini_payload, _, _, _) = transform_openai_request_with_session(
+            &openai_req,
+            "proj-test",
+            "gemini-3.8-flash-high",
+            None,
+            "sess-test",
+            Some("sess-test"),
+            true,
+            false,
+        );
+
+        let inner_req = &mut gemini_payload["request"];
+
+        // 1. 验证适配器层提取 text.format 并映射为 responseMimeType 与 responseSchema
+        assert_eq!(
+            inner_req["generationConfig"]["responseMimeType"],
+            "application/json"
+        );
+        assert_eq!(
+            inner_req["generationConfig"]["responseSchema"]["type"],
+            "object"
+        );
+        // 2. 验证 low effort 将 thinkingBudget 约束为 1024
+        assert_eq!(
+            inner_req["generationConfig"]["thinkingConfig"]["thinkingBudget"],
+            1024
+        );
+
+        // 3. 验证 Pipeline 统一拓扑对齐与工具抑制 (Pipeline First)
+        InboundThinkingPipeline::align_google_request_prefix_topology_with_model(
+            inner_req,
+            "gemini-3.8-flash-high",
+            None,
+        );
+        assert!(
+            inner_req.get("tools").is_none(),
+            "tools must be suppressed by pipeline when responseSchema is active"
+        );
+    }
+
+    #[test]
     fn identifies_codex_transcript_only_assistant_messages() {
         let thought = json!({
             "type": "message",
@@ -1833,6 +2112,12 @@ pub async fn handle_chat_completions(
     >,
     Json(mut body): Json<Value>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
+    let response_tenant = crate::proxy::thinking_store::tenant_component(
+        &headers,
+        user_identity
+            .as_ref()
+            .map(|identity| identity.token_id.as_str()),
+    );
     crate::proxy::pipeline::schema_limits::validate_request_tool_schemas(&body)
         .map_err(|error| (StatusCode::BAD_REQUEST, error))?;
 
@@ -1869,8 +2154,20 @@ pub async fn handle_chat_completions(
         .await;
     }
 
+    // [MODEL GATE] 入站模型闸门：缺失/不存在 → 404 model not exist；全池无配额 → 502 no quota accounts
+    if let Err(rejection) = crate::proxy::handlers::common::enforce_model_gate(
+        &state,
+        Some(body.get("model").and_then(|v| v.as_str()).unwrap_or("")),
+        "openai",
+        upstream_recorder.as_ref().map(|recorder| &recorder.0),
+    )
+    .await
+    {
+        return Ok(rejection);
+    }
+
     let debug_cfg = state.debug_logging.read().await.clone();
-    let original_body = debug_logger::is_enabled(&debug_cfg).then(|| {
+    let original_body = debug_logger::is_payload_enabled(&debug_cfg).then(|| {
         crate::proxy::payload_audit::reorder_payload_fields(&debug_value_without_inline_data(&body))
     });
 
@@ -1939,7 +2236,7 @@ pub async fn handle_chat_completions(
     );
     let mut force_rotate = false;
 
-    if debug_logger::is_enabled(&debug_cfg) {
+    if debug_logger::is_payload_enabled(&debug_cfg) {
         if let Some(ledger) = normalized_interaction_ledger {
             let payload = json!({
                 "kind": "normalized_interaction_ledger",
@@ -2147,7 +2444,9 @@ pub async fn handle_chat_completions(
     let mut failure_statuses = FailureStatusTracker::default();
     let mut used_attempts = 0;
     let mut retried_without_thinking = false;
+    let mut retried_tool_choice_conflict = false;
     let mut retried_with_budget_degraded = false;
+    let mut retried_with_image_omitted = false;
     let mut degraded_gemini_body: Option<Value> = None;
 
     // 2. 模型路由解析 (移到循环外以支持在所有路径返回 X-Mapped-Model)
@@ -2270,7 +2569,15 @@ pub async fn handle_chat_completions(
             }
         };
 
-        let in_flight_guard = Arc::new(token_manager.acquire_in_flight(&account_id));
+        let in_flight_guard = match token_manager.try_acquire_in_flight(&account_id) {
+            Ok(guard) => Arc::new(guard),
+            Err(error) => {
+                last_error = error;
+                failure_statuses.record(StatusCode::SERVICE_UNAVAILABLE);
+                force_rotate = true;
+                continue;
+            }
+        };
 
         // [NEW v4.1.29] 获取完整 Token 对象用于动态规格查询
         let proxy_token = token_manager.get_token_by_id(&account_id);
@@ -2295,6 +2602,7 @@ pub async fn handle_chat_completions(
                     &affinity_key,
                     None,
                     false,
+                    retried_without_thinking,
                 );
                 if retried_with_budget_degraded {
                     crate::proxy::pipeline::InboundThinkingPipeline::try_degrade_thinking_budget(
@@ -2304,6 +2612,14 @@ pub async fn handle_chat_completions(
                 (b, s, c, p)
             };
         let session_id = store_key.clone();
+        // [Signature-Retry] 400 签名错误后的重试：流水线统一去签名
+        if retried_without_thinking {
+            crate::proxy::pipeline::InboundThinkingPipeline::strip_signatures_for_retry(
+                &mut gemini_body,
+                Some(session_id.as_str()),
+                &mapped_model,
+            );
+        }
         let tf_micros = tf_start.elapsed().as_micros() as u64;
         let norm_total_micros = norm_start.elapsed().as_micros() as u64;
         norm_ms = norm_total_micros.saturating_sub(tf_micros) as f64 / 1000.0;
@@ -2317,13 +2633,14 @@ pub async fn handle_chat_completions(
             &mut gemini_body,
         );
         crate::proxy::mappers::common_utils::ensure_gemini_payload_ends_with_user(&mut gemini_body);
+        let estimated_input_tokens = crate::proxy::pipeline::estimate_tokens(&gemini_body);
         if let Some(ref recorder) = upstream_recorder {
             recorder.set_value(&gemini_body);
         }
-        let gemini_body_for_debug = debug_logger::is_enabled(&debug_cfg)
+        let gemini_body_for_debug = debug_logger::is_payload_enabled(&debug_cfg)
             .then(|| debug_value_without_inline_data(&gemini_body));
 
-        if debug_logger::is_enabled(&debug_cfg) {
+        if debug_logger::is_payload_enabled(&debug_cfg) {
             let payload = json!({
                 "kind": "v1internal_request",
                 "protocol": "openai",
@@ -2416,12 +2733,25 @@ pub async fn handle_chat_completions(
                 last_error = e.clone();
                 failure_statuses.record(StatusCode::BAD_GATEWAY);
                 drop(image_permit.take());
+                // 首字节预算耗尽不是账号故障：不计入账号冷却，也不跨账号重放同一 body
+                let first_byte_terminal =
+                    crate::proxy::upstream::client::is_first_byte_stage_failure(&e);
+                if !first_byte_terminal {
+                    token_manager.mark_account_transient_failure(&account_id, 30, &e);
+                }
                 debug!(
                     "OpenAI Request failed on attempt {}/{}: {}",
                     attempt + 1,
                     max_attempts,
                     e
                 );
+                if crate::proxy::upstream::client::is_terminal_replay_suppressed(&e) {
+                    tracing::warn!(
+                        first_byte = first_byte_terminal,
+                        "Stopping account rotation to avoid re-upload/prefill amplification"
+                    );
+                    break;
+                }
                 continue;
             }
         };
@@ -2433,7 +2763,7 @@ pub async fn handle_chat_completions(
             crate::proxy::handlers::common::encode_attempts_header(&fallback_attempts);
 
         // [NEW] 记录端点降级日志到 debug 文件
-        if call_result.has_fallback() && debug_logger::is_enabled(&debug_cfg) {
+        if call_result.has_fallback() && debug_logger::is_payload_enabled(&debug_cfg) {
             let fallback_entries: Vec<Value> = call_result
                 .fallback_attempts
                 .iter()
@@ -2469,9 +2799,12 @@ pub async fn handle_chat_completions(
         let upstream_url = response.url().to_string();
         let status = response.status();
         if status.is_success() {
-            token_manager.commit_session(&affinity_key, &account_id);
-            // [智能限流] 请求成功，重置该账号的连续失败计数
-            token_manager.mark_account_success(&account_id);
+            let track_image_success = config.request_type == "image_gen";
+            if !track_image_success {
+                token_manager.commit_session(&affinity_key, &account_id);
+                // [智能限流] 请求成功，重置该账号的连续失败计数
+                token_manager.mark_account_success(&account_id);
+            }
             // 5. 处理流式 vs 非流式
             if actual_stream {
                 use axum::body::Body;
@@ -2524,7 +2857,7 @@ pub async fn handle_chat_completions(
                 let mut openai_stream = create_openai_sse_stream_with_anchor(
                     gemini_stream,
                     openai_req.model.clone(),
-                    session_id,
+                    session_id.clone(),
                     message_count,
                     Some(client_tool_names.clone()),
                     include_usage,
@@ -2591,6 +2924,17 @@ pub async fn handle_chat_completions(
 
                             // We found real data!
                             ttft_ms = effective_attempt_start.elapsed().as_micros() as f64 / 1000.0;
+                            let is_thinking = effort_hint.is_some()
+                                || openai_req.model.to_lowercase().contains("thinking")
+                                || mapped_model.to_lowercase().contains("thinking");
+                            crate::proxy::handlers::common::report_qos_ttft(
+                                &token_manager,
+                                &account_id,
+                                Some(&session_id),
+                                ttft_ms,
+                                is_thinking,
+                                Some(estimated_input_tokens),
+                            );
                             if let Some(effective_item) =
                                 fallback_attempts.iter_mut().find(|a| a.is_effective)
                             {
@@ -2736,8 +3080,14 @@ pub async fn handle_chat_completions(
                             last_accessed: std::time::Instant::now(),
                         };
                         let rid = chat_response_id.clone();
+                        let response_tenant = response_tenant.clone();
                         tokio::spawn(async move {
-                            crate::proxy::http_session_store::save_session(rid, entry).await;
+                            crate::proxy::http_session_store::save_session_for_tenant(
+                                &response_tenant,
+                                rid,
+                                entry,
+                            )
+                            .await;
                         });
                     }
                     // 客户端请求流式，返回 SSE
@@ -2775,7 +3125,7 @@ pub async fn handle_chat_completions(
                     match collect_stream_to_json(combined_stream).await {
                         Ok(full_response) => {
                             info!("[{}] ✓ Stream collected and converted to JSON", trace_id);
-                            if debug_logger::is_enabled(&debug_cfg) {
+                            if debug_logger::is_payload_enabled(&debug_cfg) {
                                 let converted_response = serde_json::to_value(&full_response)
                                     .unwrap_or_else(
                                         |e| json!({ "serialization_error": e.to_string() }),
@@ -2836,6 +3186,17 @@ pub async fn handle_chat_completions(
             }
 
             ttft_ms = effective_attempt_start.elapsed().as_micros() as f64 / 1000.0;
+            let is_thinking = effort_hint.is_some()
+                || openai_req.model.to_lowercase().contains("thinking")
+                || mapped_model.to_lowercase().contains("thinking");
+            crate::proxy::handlers::common::report_qos_ttft(
+                &token_manager,
+                &account_id,
+                Some(&session_id),
+                ttft_ms,
+                is_thinking,
+                Some(estimated_input_tokens),
+            );
             if let Some(effective_item) = fallback_attempts.iter_mut().find(|a| a.is_effective) {
                 effective_item.duration_s = ttft_ms / 1000.0;
             }
@@ -2846,6 +3207,18 @@ pub async fn handle_chat_completions(
                 .json()
                 .await
                 .map_err(|e| (StatusCode::BAD_GATEWAY, format!("Parse error: {}", e)))?;
+
+            if let Some(usage) = gemini_resp
+                .get("response")
+                .unwrap_or(&gemini_resp)
+                .get("usageMetadata")
+            {
+                crate::proxy::monitor::record_upstream_usage(usage);
+                crate::proxy::debug_logger::log_upstream_json_usage(
+                    &json!({"usageMetadata":usage}),
+                )
+                .await;
+            }
 
             crate::proxy::thinking_store::capture_gemini_response(&session_id, &gemini_resp);
 
@@ -2879,7 +3252,7 @@ pub async fn handle_chat_completions(
                 message_count,
                 Some(&client_tool_names),
             );
-            if debug_logger::is_enabled(&debug_cfg) {
+            if debug_logger::is_payload_enabled(&debug_cfg) {
                 let converted_response = serde_json::to_value(&openai_response)
                     .unwrap_or_else(|e| json!({ "serialization_error": e.to_string() }));
                 let payload = json!({
@@ -2938,7 +3311,7 @@ pub async fn handle_chat_completions(
             status_code,
             error_text
         );
-        if debug_logger::is_enabled(&debug_cfg) {
+        if debug_logger::is_payload_enabled(&debug_cfg) {
             let payload = json!({
                 "kind": "upstream_response_error",
                 "protocol": "openai",
@@ -3013,9 +3386,9 @@ pub async fn handle_chat_completions(
         if crate::proxy::pipeline::UpstreamClassification::is_thinking_tool_choice_conflict(
             status_code,
             &error_text,
-        ) && !retried_without_thinking
+        ) && !retried_tool_choice_conflict
         {
-            retried_without_thinking = true;
+            retried_tool_choice_conflict = true;
             if let Some(req) = gemini_body
                 .get_mut("request")
                 .and_then(Value::as_object_mut)
@@ -3040,6 +3413,30 @@ pub async fn handle_chat_completions(
             );
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
             continue;
+        }
+
+        // [FIX Corrupted Image] 400 多模态图像解码/处理失败：自愈剔除损坏图片并在同账号原地重试
+        if classification.is_image_processing_error() && !retried_with_image_omitted {
+            let purged_count =
+                crate::proxy::mappers::common_utils::purge_corrupted_images_from_gemini_payload(
+                    &mut gemini_body,
+                );
+            if purged_count == 0 {
+                tracing::warn!(
+                    "[{}] Upstream 400 Unable to process input image detected, but no inline image was purged. Skipping retry to prevent duplicate 400.",
+                    trace_id
+                );
+            } else {
+                retried_with_image_omitted = true;
+                degraded_gemini_body = Some(gemini_body);
+                force_rotate = false;
+                tracing::warn!(
+                    "[{}] Upstream 400 Unable to process input image detected. In-place self-healing: purged {} image(s) to text placeholders on account {}, retrying.",
+                    trace_id, purged_count, email
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                continue;
+            }
         }
 
         if classification.is_model_not_found() {
@@ -3086,30 +3483,7 @@ pub async fn handle_chat_completions(
                 );
                 // 1. 精准定向净化 ThinkingStore 中的异构污染签名（保留思考文本与健康签名）
                 session_scope.purge_signatures(&mapped_model);
-                // 2. 剥离消息中的 signature，将 reasoning_content 降级为 text，阻断无签名 thought 重新生成
-                for msg in openai_req.messages.iter_mut() {
-                    msg.signature = None;
-                    if let Some(tool_calls) = &mut msg.tool_calls {
-                        for tc in tool_calls {
-                            tc.signature = None;
-                        }
-                    }
-                    if let Some(rc) = msg.reasoning_content.take() {
-                        if !crate::proxy::thinking_store::is_placeholder_thought(&rc) {
-                            match &mut msg.content {
-                                Some(OpenAIContent::String(s)) => {
-                                    *s = format!("{}\n\n{}", s, rc);
-                                }
-                                Some(OpenAIContent::Array(blocks)) => {
-                                    blocks.insert(0, OpenAIContentBlock::Text { text: rc });
-                                }
-                                None => {
-                                    msg.content = Some(OpenAIContent::String(rc));
-                                }
-                            }
-                        }
-                    }
-                }
+                // 2. 请求体不做特化：重试轮次由流水线统一将思考块降级为正文并清理签名
                 // 3. 保持同一账号原地重试
                 force_rotate = false;
                 continue;
@@ -3232,8 +3606,9 @@ pub async fn handle_chat_completions(
         // [FIX session-1M] 上游按 sessionId 在服务端累计会话输入,长工具循环会把累计推过 1M,
         // 之后该 sessionId 的所有请求都 400 "input token count exceeds ... 1048576"。
         // 给 (账号, 对话) 的 sessionId 升代并立即重试:新 sessionId = 上游全新会话,对话无感恢复。
-        if status_code == 400 && error_text.contains("exceeds the maximum number of tokens") {
-            let generation = crate::proxy::common::session::bump_session(&account_id, &store_key);
+        if let Some(generation) =
+            bump_session_on_input_limit(status_code, &error_text, &account_id, &affinity_key)
+        {
             tracing::warn!(
                 "[OpenAI] Upstream session token accumulation exceeded 1M on account {}. sessionId bumped to generation {}, retrying with a fresh upstream session.",
                 email, generation
@@ -3281,6 +3656,14 @@ pub async fn handle_chat_completions(
     Ok((final_status, headers, Json(dual_err)).into_response())
 }
 
+fn responses_input_items(value: Value) -> Vec<Value> {
+    match value {
+        Value::Array(items) => items,
+        Value::String(text) => vec![json!({"type":"message", "role":"user", "content":text})],
+        _ => Vec::new(),
+    }
+}
+
 fn responses_store_enabled(body: &Value) -> bool {
     body.get("store").and_then(Value::as_bool) != Some(false)
 }
@@ -3304,6 +3687,19 @@ pub async fn handle_completions(
     >,
     Json(mut body): Json<Value>,
 ) -> Response {
+    if body
+        .get("input")
+        .is_some_and(|value| !value.is_string() && !value.is_array())
+    {
+        return (StatusCode::BAD_REQUEST, Json(json!({"error":{"type":"invalid_request_error","message":"input must be a string or an array"}}))).into_response();
+    }
+    let response_tenant = crate::proxy::thinking_store::tenant_component(
+        &headers,
+        user_identity
+            .as_ref()
+            .map(|identity| identity.token_id.as_str()),
+    );
+
     if let Err(error) = crate::proxy::pipeline::schema_limits::validate_request_tool_schemas(&body)
     {
         return (StatusCode::BAD_REQUEST, error).into_response();
@@ -3315,7 +3711,7 @@ pub async fn handle_completions(
         serialized_json_len(&body)
     );
     let debug_cfg = state.debug_logging.read().await.clone();
-    let original_body = debug_logger::is_enabled(&debug_cfg).then(|| {
+    let original_body = debug_logger::is_payload_enabled(&debug_cfg).then(|| {
         crate::proxy::payload_audit::reorder_payload_fields(&debug_value_without_inline_data(&body))
     });
     let is_responses_api = is_responses_api_path(uri.path());
@@ -3352,15 +3748,16 @@ pub async fn handle_completions(
         let existing_input = body
             .as_object_mut()
             .and_then(|obj| obj.remove("input"))
-            .and_then(|value| match value {
-                Value::Array(items) => Some(items),
-                _ => None,
-            })
+            .map(responses_input_items)
             .unwrap_or_default();
 
         let merged = if let Some(ref prev_id) = previous_response_id {
             if let Some((session, parent)) =
-                crate::proxy::http_session_store::get_session_with_parent(prev_id).await
+                crate::proxy::http_session_store::get_session_with_parent_for_tenant(
+                    &response_tenant,
+                    prev_id,
+                )
+                .await
             {
                 stored_routing_session_id = Some(parent.routing_session_id().to_string());
                 let prepared = crate::proxy::http_session_store::prepare_session_input_with_storage(
@@ -3428,10 +3825,7 @@ pub async fn handle_completions(
         let input_items = body
             .as_object_mut()
             .and_then(|obj| obj.remove("input"))
-            .and_then(|value| match value {
-                Value::Array(items) => Some(items),
-                _ => None,
-            })
+            .map(responses_input_items)
             .unwrap_or_default();
         bounded_session_input = store_response.then(|| {
             session_delta_input
@@ -4061,7 +4455,7 @@ pub async fn handle_completions(
         effort_hint,
     );
     let trace_id = format!("req_{}", chrono::Utc::now().timestamp_subsec_millis());
-    if debug_logger::is_enabled(&debug_cfg) {
+    if debug_logger::is_payload_enabled(&debug_cfg) {
         if let Some(ledger) = normalized_interaction_ledger {
             let payload = json!({
                 "kind": "normalized_interaction_ledger",
@@ -4104,7 +4498,7 @@ pub async fn handle_completions(
     let mut ttft_ms = 0.0f64;
     let mut fallback_overhead_ms = 0.0f64;
 
-    if debug_logger::is_enabled(&debug_cfg) {
+    if debug_logger::is_payload_enabled(&debug_cfg) {
         let payload = json!({
             "kind": "original_request",
             "protocol": "openai",
@@ -4123,6 +4517,9 @@ pub async fn handle_completions(
 
     let mut force_rotate = false;
     let mut retried_with_budget_degraded = false;
+    let mut retried_without_thinking = false;
+    let mut retried_tool_choice_conflict = false;
+    let mut retried_with_image_omitted = false;
     let mut degraded_gemini_body: Option<Value> = None;
 
     while let Some(attempt) = next_rotation_attempt(
@@ -4194,7 +4591,15 @@ pub async fn handle_completions(
             }
         };
 
-        let in_flight_guard = Arc::new(token_manager.acquire_in_flight(&account_id));
+        let in_flight_guard = match token_manager.try_acquire_in_flight(&account_id) {
+            Ok(guard) => Arc::new(guard),
+            Err(error) => {
+                last_error = error;
+                failure_statuses.record(StatusCode::SERVICE_UNAVAILABLE);
+                force_rotate = true;
+                continue;
+            }
+        };
 
         let mapped_model = token_manager
             .resolve_dynamic_model_for_account(&account_id, &mapped_model)
@@ -4219,6 +4624,7 @@ pub async fn handle_completions(
                         &affinity_key,
                         signature_read_key.as_deref(),
                         true, // is_responses_api
+                        retried_without_thinking,
                     )
                 } else {
                     transform_openai_request_with_session(
@@ -4229,6 +4635,7 @@ pub async fn handle_completions(
                         &affinity_key,
                         None,
                         false,
+                        retried_without_thinking,
                     )
                 };
                 if retried_with_budget_degraded {
@@ -4239,6 +4646,14 @@ pub async fn handle_completions(
                 (b, r, m, p)
             };
         let session_id = session_id_str.clone();
+        // [Signature-Retry] 400 签名错误后的重试：流水线统一去签名
+        if retried_without_thinking {
+            crate::proxy::pipeline::InboundThinkingPipeline::strip_signatures_for_retry(
+                &mut gemini_body,
+                Some(session_id.as_str()),
+                &mapped_model,
+            );
+        }
         let tf_micros = tf_start.elapsed().as_micros() as u64;
         let norm_total_micros = norm_start.elapsed().as_micros() as u64;
         let norm_ms = norm_total_micros.saturating_sub(tf_micros) as f64 / 1000.0;
@@ -4255,9 +4670,9 @@ pub async fn handle_completions(
         if let Some(ref recorder) = upstream_recorder {
             recorder.set_value(&gemini_body);
         }
-        let gemini_body_for_debug = debug_logger::is_enabled(&debug_cfg)
+        let gemini_body_for_debug = debug_logger::is_payload_enabled(&debug_cfg)
             .then(|| debug_value_without_inline_data(&gemini_body));
-        if debug_logger::is_enabled(&debug_cfg) {
+        if debug_logger::is_payload_enabled(&debug_cfg) {
             let payload = json!({
                 "kind": "v1internal_request",
                 "protocol": "openai",
@@ -4355,12 +4770,25 @@ pub async fn handle_completions(
             Err(e) => {
                 last_error = e.clone();
                 failure_statuses.record(StatusCode::BAD_GATEWAY);
+                // 首字节预算耗尽不是账号故障：不计入账号冷却，也不跨账号重放同一 body
+                let first_byte_terminal =
+                    crate::proxy::upstream::client::is_first_byte_stage_failure(&e);
+                if !first_byte_terminal {
+                    token_manager.mark_account_transient_failure(&account_id, 30, &e);
+                }
                 debug!(
                     "Codex Request failed on attempt {}/{}: {}",
                     attempt + 1,
                     max_attempts,
                     e
                 );
+                if crate::proxy::upstream::client::is_terminal_replay_suppressed(&e) {
+                    tracing::warn!(
+                        first_byte = first_byte_terminal,
+                        "Stopping account rotation to avoid re-upload/prefill amplification"
+                    );
+                    break;
+                }
                 continue;
             }
         };
@@ -4375,9 +4803,12 @@ pub async fn handle_completions(
         let upstream_url = response.url().to_string();
         let status = response.status();
         if status.is_success() {
-            token_manager.commit_session(&affinity_key, &account_id);
-            // [智能限流] 请求成功，重置该账号的连续失败计数
-            token_manager.mark_account_success(&account_id);
+            let track_image_success = config.request_type == "image_gen";
+            if !track_image_success {
+                token_manager.commit_session(&affinity_key, &account_id);
+                // [智能限流] 请求成功，重置该账号的连续失败计数
+                token_manager.mark_account_success(&account_id);
+            }
 
             if list_response {
                 use axum::body::Body;
@@ -4580,6 +5011,7 @@ pub async fn handle_completions(
                         let save_instructions = session_save_instructions;
                         let save_model = openai_req.model.clone();
                         let rid = response_id_for_save.clone();
+                        let response_tenant = response_tenant.clone();
                         tokio::spawn(async move {
                             if let Ok((outputs, ack_tx)) = completion_rx.await {
                                 let outputs = outputs
@@ -4588,7 +5020,8 @@ pub async fn handle_completions(
                                     .collect();
                                 save_session_unless_response_cancelled(
                                     ack_tx,
-                                    crate::proxy::http_session_store::save_session_delta(
+                                    crate::proxy::http_session_store::save_session_delta_for_tenant(
+                                        &response_tenant,
                                         rid,
                                         save_parent,
                                         save_input,
@@ -4788,7 +5221,8 @@ pub async fn handle_completions(
                                     .filter_map(into_history_without_inline_media)
                                     .collect();
                                 if store_response {
-                                    crate::proxy::http_session_store::save_session_delta(
+                                    crate::proxy::http_session_store::save_session_delta_for_tenant(
+                                        &response_tenant,
                                         response_id_for_save.clone(),
                                         session_parent,
                                         session_save_input,
@@ -4799,7 +5233,7 @@ pub async fn handle_completions(
                                     )
                                     .await;
                                 }
-                                if debug_logger::is_enabled(&debug_cfg) {
+                                if debug_logger::is_payload_enabled(&debug_cfg) {
                                     let payload = json!({
                                         "kind": "exchange_summary",
                                         "protocol": "openai",
@@ -4882,7 +5316,7 @@ pub async fn handle_completions(
                                 "choices": choices,
                                 "usage": chat_resp.usage
                             });
-                            if debug_logger::is_enabled(&debug_cfg) {
+                            if debug_logger::is_payload_enabled(&debug_cfg) {
                                 let payload = json!({
                                     "kind": "exchange_summary",
                                     "protocol": "openai",
@@ -4961,6 +5395,17 @@ pub async fn handle_completions(
                 }
             };
 
+            if let Some(usage) = gemini_resp
+                .get("response")
+                .unwrap_or(&gemini_resp)
+                .get("usageMetadata")
+            {
+                crate::proxy::monitor::record_upstream_usage(usage);
+                crate::proxy::debug_logger::log_upstream_json_usage(
+                    &json!({"usageMetadata":usage}),
+                )
+                .await;
+            }
             crate::proxy::thinking_store::capture_gemini_response(&session_id_str, &gemini_resp);
 
             let chat_resp = transform_openai_response(
@@ -4977,7 +5422,7 @@ pub async fn handle_completions(
                     &chat_resp,
                     openai_req.expects_json_output(),
                 );
-                if debug_logger::is_enabled(&debug_cfg) {
+                if debug_logger::is_payload_enabled(&debug_cfg) {
                     let payload = json!({
                         "kind": "exchange_summary",
                         "protocol": "openai",
@@ -5035,7 +5480,7 @@ pub async fn handle_completions(
                 "choices": choices,
                 "usage": chat_resp.usage
             });
-            if debug_logger::is_enabled(&debug_cfg) {
+            if debug_logger::is_payload_enabled(&debug_cfg) {
                 let payload = json!({
                     "kind": "exchange_summary",
                     "protocol": "openai",
@@ -5093,6 +5538,12 @@ pub async fn handle_completions(
             status_code,
             error_text
         );
+        if let Some(generation) =
+            bump_session_on_input_limit(status_code, &error_text, &account_id, &affinity_key)
+        {
+            tracing::warn!("[Codex-Upstream] Session input limit exceeded; generation {} for account {}, retrying with the existing request loop.", generation, email);
+            continue;
+        }
 
         // 3. 统一流水线判定与标记限流状态(用于 UI 显示)
         let classification = crate::proxy::pipeline::UpstreamClassification::classify(
@@ -5127,9 +5578,9 @@ pub async fn handle_completions(
         if crate::proxy::pipeline::UpstreamClassification::is_thinking_tool_choice_conflict(
             status_code,
             &error_text,
-        ) && !retried_with_budget_degraded
+        ) && !retried_tool_choice_conflict
         {
-            retried_with_budget_degraded = true;
+            retried_tool_choice_conflict = true;
             if let Some(req) = gemini_body
                 .get_mut("request")
                 .and_then(Value::as_object_mut)
@@ -5154,6 +5605,50 @@ pub async fn handle_completions(
             );
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
             continue;
+        }
+
+        // [FIX Signature] 400 思考签名无效：清库 + 流水线去签名，同账号原地重试
+        if classification.is_thought_signature_error() {
+            if !retried_without_thinking {
+                retried_without_thinking = true;
+                tracing::warn!(
+                    "[{}] Pipeline: Thinking signature error detected on upstream (HTTP {}). Purging corrupted signatures and retrying on same account.",
+                    trace_id, status_code
+                );
+                session_scope.purge_signatures(&mapped_model);
+                force_rotate = false;
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                continue;
+            } else {
+                tracing::warn!(
+                    "[{}] Pipeline: Thinking signature error persisted after retry without thinking. Terminating retry loop.",
+                    trace_id
+                );
+            }
+        }
+
+        // [FIX Corrupted Image] 400 多模态图像解码/处理失败：自愈剔除损坏图片并在同账号原地重试
+        if classification.is_image_processing_error() && !retried_with_image_omitted {
+            let purged_count =
+                crate::proxy::mappers::common_utils::purge_corrupted_images_from_gemini_payload(
+                    &mut gemini_body,
+                );
+            if purged_count == 0 {
+                tracing::warn!(
+                    "[{}] Upstream 400 Unable to process input image detected, but no inline image was purged. Skipping retry to prevent duplicate 400.",
+                    trace_id
+                );
+            } else {
+                retried_with_image_omitted = true;
+                degraded_gemini_body = Some(gemini_body);
+                force_rotate = false;
+                tracing::warn!(
+                    "[{}] Upstream 400 Unable to process input image detected. In-place self-healing: purged {} image(s) to text placeholders on account {}, retrying.",
+                    trace_id, purged_count, email
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                continue;
+            }
         }
 
         if classification.is_model_not_found() {
@@ -5300,10 +5795,13 @@ pub fn resolve_model_token_limits(model_id: &str) -> (i64, i64) {
         }
         let lower = model_id.to_lowercase();
         if lower.contains("claude") {
-            return (200_000, 8_192);
+            if lower.contains("5-5") || lower.contains("5.5") {
+                return (1_000_000, 128_000);
+            }
+            return (200_000, 64_000);
         }
         if lower.contains("gpt") || lower.contains("o1") || lower.contains("o3") {
-            return (128_000, 16_384);
+            return (131_072, 32_768);
         }
     }
     (1_048_576, 65_536)
@@ -5358,22 +5856,26 @@ mod model_probe_compatibility_tests {
     #[test]
     fn test_resolve_model_token_limits() {
         let (ctx, out) = resolve_model_token_limits("gemini-3.8-flash-high");
-        assert_eq!(ctx, 1_048_576);
+        assert!(ctx >= 131_072, "ctx={ctx}");
         assert_eq!(out, 65_536);
 
         // Aliased model inherits mapped official model limits
         let (ctx_aliased, out_aliased) = resolve_model_token_limits("gpt-4o");
-        assert_eq!(ctx_aliased, 1_048_576);
-        assert_eq!(out_aliased, 65_536);
+        assert!(ctx_aliased >= 131_072, "ctx_aliased={ctx_aliased}");
+        assert_eq!(
+            (ctx_aliased, out_aliased),
+            resolve_model_token_limits("gemini-3.8-flash-high"),
+            "gpt-4o must expose the limits of its configured built-in target"
+        );
 
         // Uncataloged fallbacks
         let (ctx_claude, out_claude) = resolve_model_token_limits("custom-claude-unknown");
         assert_eq!(ctx_claude, 200_000);
-        assert_eq!(out_claude, 8_192);
+        assert_eq!(out_claude, 64_000);
 
         let (ctx_gpt, out_gpt) = resolve_model_token_limits("unknown-gpt-custom");
-        assert_eq!(ctx_gpt, 128_000);
-        assert_eq!(out_gpt, 16_384);
+        assert_eq!(ctx_gpt, 131_072);
+        assert_eq!(out_gpt, 32_768);
 
         let (ctx_def, out_def) = resolve_model_token_limits("");
         assert_eq!(ctx_def, 1_048_576);
@@ -5414,7 +5916,18 @@ pub async fn handle_list_models(State(state): State<AppState>) -> impl IntoRespo
     let data: Vec<_> = model_ids
         .into_iter()
         .map(|id| {
-            let (ctx_len, out_len) = resolve_model_token_limits(&id);
+            let (fallback_ctx, fallback_out) = resolve_model_token_limits(&id);
+            let meta = metadata_map
+                .get(&id)
+                .or_else(|| metadata_map.get(&id.to_lowercase()));
+            let ctx_len = meta
+                .and_then(|m| m.max_tokens)
+                .map(|v| v as i64)
+                .unwrap_or(fallback_ctx);
+            let out_len = meta
+                .and_then(|m| m.max_output_tokens)
+                .map(|v| v as i64)
+                .unwrap_or(fallback_out);
             let mut obj = json!({
                 "id": id,
                 "object": "model",
@@ -5425,12 +5938,11 @@ pub async fn handle_list_models(State(state): State<AppState>) -> impl IntoRespo
                 "max_input_tokens": ctx_len,
                 "max_model_len": ctx_len,
                 "max_tokens": ctx_len,
+                "input_token_limit": ctx_len,
                 "max_completion_tokens": out_len,
                 "max_output_tokens": out_len,
+                "output_token_limit": out_len,
             });
-            let meta = metadata_map
-                .get(&id)
-                .or_else(|| metadata_map.get(&id.to_lowercase()));
             if let Some(m) = meta {
                 if let Ok(serde_json::Value::Object(map)) = serde_json::to_value(m) {
                     if let Some(target) = obj.as_object_mut() {
@@ -5460,6 +5972,18 @@ pub async fn handle_retrieve_model(
         find_dynamic_model, get_all_dynamic_models_metadata,
     };
 
+    // [MODEL GATE] GET /v1/models/:model 探测端点同样接入门禁（含已下线模型族 404）
+    if let Err(rejection) = crate::proxy::handlers::common::enforce_model_gate(
+        &state,
+        Some(model.as_str()),
+        "openai",
+        None,
+    )
+    .await
+    {
+        return rejection;
+    }
+
     let only_raw = *state.only_raw_quota_models.read().await;
     let resolved_id = if let Some(matched_id) = find_dynamic_model(
         &state.custom_mapping,
@@ -5477,13 +6001,25 @@ pub async fn handle_retrieve_model(
     };
 
     if let Some(matched_id) = resolved_id {
-        let (ctx_len, out_len) = resolve_model_token_limits(&matched_id);
+        let (fallback_ctx, fallback_out) = resolve_model_token_limits(&matched_id);
         let metadata_map = get_all_dynamic_models_metadata(
             &state.custom_mapping,
             Some(&state.token_manager),
             only_raw,
         )
         .await;
+
+        let meta = metadata_map
+            .get(&matched_id)
+            .or_else(|| metadata_map.get(&matched_id.to_lowercase()));
+        let ctx_len = meta
+            .and_then(|m| m.max_tokens)
+            .map(|v| v as i64)
+            .unwrap_or(fallback_ctx);
+        let out_len = meta
+            .and_then(|m| m.max_output_tokens)
+            .map(|v| v as i64)
+            .unwrap_or(fallback_out);
 
         let mut obj = json!({
             "id": matched_id,
@@ -5495,12 +6031,11 @@ pub async fn handle_retrieve_model(
             "max_input_tokens": ctx_len,
             "max_model_len": ctx_len,
             "max_tokens": ctx_len,
+            "input_token_limit": ctx_len,
             "max_completion_tokens": out_len,
             "max_output_tokens": out_len,
+            "output_token_limit": out_len,
         });
-        let meta = metadata_map
-            .get(&matched_id)
-            .or_else(|| metadata_map.get(&matched_id.to_lowercase()));
         if let Some(m) = meta {
             if let Ok(serde_json::Value::Object(map)) = serde_json::to_value(m) {
                 if let Some(target) = obj.as_object_mut() {
@@ -5536,9 +6071,17 @@ pub async fn handle_chat_redirection(
     upstream_recorder: Option<
         axum::extract::Extension<crate::proxy::monitor::UpstreamRequestBodyHolder>,
     >,
+    identity: Option<axum::extract::Extension<crate::proxy::middleware::auth::UserTokenIdentity>>,
     Json(body): Json<Value>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
-    handle_chat_completions(State(state), headers, upstream_recorder, None, Json(body)).await
+    handle_chat_completions(
+        State(state),
+        headers,
+        upstream_recorder,
+        identity,
+        Json(body),
+    )
+    .await
 }
 
 async fn intercept_chat_to_image(
@@ -6034,8 +6577,29 @@ pub async fn handle_images_generations_internal(
                                             &account_id,
                                             Some(&model_to_use),
                                         );
+                                    return Ok((json, email));
                                 }
-                                return Ok((json, email));
+
+                                // [Fixes #3756] 上游虽返回 200，但未包含合法图片数据（如安全策略拦截、拒答或空候选集）
+                                let diag = extract_image_generation_diagnostic(&json);
+                                tracing::warn!(
+                                    account = %email,
+                                    status = %diag.status,
+                                    reason = %diag.message,
+                                    "[Images] Upstream returned 200 OK without inline image data"
+                                );
+                                failure_statuses.record(diag.status);
+                                last_error = diag.message.clone();
+
+                                // 若被安全策略拦截（提示词违规或模型拒答），换账号重试相同 Prompt 毫无意义且会白白浪费额度，直接终态返回
+                                if diag.is_safety_or_policy {
+                                    return Err((diag.status, diag.message));
+                                }
+
+                                // 其它情况（如格式漂移或偶发空候选集）标记换号重试
+                                force_rotate = true;
+                                drop(image_permit.take());
+                                continue;
                             }
                             Err(e) => {
                                 return Err((
@@ -6525,8 +7089,27 @@ pub async fn handle_images_edits(
                                         &account_id,
                                         Some(&model_to_use),
                                     );
+                                    return Ok((json, response_format.clone(), email));
                                 }
-                                return Ok((json, response_format.clone(), email));
+
+                                // [Fixes #3756] 上游编辑接口虽返回 200，但未包含合法图片数据
+                                let diag = extract_image_generation_diagnostic(&json);
+                                tracing::warn!(
+                                    account = %email,
+                                    status = %diag.status,
+                                    reason = %diag.message,
+                                    "[Images] Upstream edit returned 200 OK without inline image data"
+                                );
+                                failure_statuses.record(diag.status);
+                                last_error = diag.message.clone();
+
+                                if diag.is_safety_or_policy {
+                                    return Err((diag.status, diag.message));
+                                }
+
+                                force_rotate = true;
+                                drop(image_permit.take());
+                                continue;
                             }
                             Err(e) => {
                                 return Err((
@@ -6783,12 +7366,26 @@ struct WebsocketSessionState {
 pub async fn handle_responses_websocket(
     ws: WebSocketUpgrade,
     headers: HeaderMap,
+    identity: Option<axum::extract::Extension<crate::proxy::middleware::auth::UserTokenIdentity>>,
     State(state): State<AppState>,
 ) -> Response {
-    ws.on_upgrade(move |socket| handle_websocket_session(socket, headers, state))
+    if let Err(status) = crate::proxy::middleware::cors::validate_websocket_origin(
+        &headers,
+        &*state.security.read().await,
+    ) {
+        return status.into_response();
+    }
+    ws.on_upgrade(move |socket| {
+        handle_websocket_session(socket, headers, state, identity.map(|identity| identity.0))
+    })
 }
 
-async fn handle_websocket_session(mut socket: WebSocket, headers: HeaderMap, state: AppState) {
+async fn handle_websocket_session(
+    mut socket: WebSocket,
+    headers: HeaderMap,
+    state: AppState,
+    identity: Option<crate::proxy::middleware::auth::UserTokenIdentity>,
+) {
     tracing::info!("Codex responses websocket: client connected");
     let mut session_state = WebsocketSessionState {
         last_request: None,
@@ -6835,160 +7432,215 @@ async fn handle_websocket_session(mut socket: WebSocket, headers: HeaderMap, sta
             }
         };
         drop(text);
-        let ws_trace_id = format!("ws_{}", chrono::Utc::now().timestamp_subsec_millis());
-        let debug_cfg = state.debug_logging.read().await.clone();
-        if debug_logger::is_enabled(&debug_cfg) {
+        // A WebSocket may stay open for hours; every response.create is a new request.
+        let capture = crate::proxy::monitor::UpstreamRequestBodyHolder::new();
+        capture.configure_diagnostics(
+            state.debug_logging.read().await.clone(),
+            Uuid::new_v4().to_string(),
+        );
+        let budget = crate::proxy::pipeline::budget::RequestContext::new(
+            crate::proxy::pipeline::budget::deadline_now(),
+        );
+        crate::proxy::monitor::scope_upstream_work(
+            capture,
+            Some(budget),
+            handle_websocket_turn(
+                &mut socket,
+                &headers,
+                &state,
+                identity.as_ref(),
+                &mut session_state,
+                payload,
+            ),
+        )
+        .await;
+    }
+}
+
+async fn handle_websocket_turn(
+    socket: &mut WebSocket,
+    headers: &HeaderMap,
+    state: &AppState,
+    identity: Option<&crate::proxy::middleware::auth::UserTokenIdentity>,
+    session_state: &mut WebsocketSessionState,
+    payload: Value,
+) {
+    let ws_trace_id = format!("ws_{}", chrono::Utc::now().timestamp_subsec_millis());
+    let debug_cfg = state.debug_logging.read().await.clone();
+    if debug_logger::is_payload_enabled(&debug_cfg) {
+        let payload_log = json!({
+            "kind": "codex_websocket_raw_request",
+            "protocol": "codex_websocket",
+            "trace_id": ws_trace_id,
+            "payload": debug_value_without_inline_data(&payload),
+        });
+        debug_logger::write_exchange_payload(
+            &debug_cfg,
+            Some(&ws_trace_id),
+            "codex_websocket_raw_request",
+            &payload_log,
+        )
+        .await;
+    }
+
+    if should_handle_prewarm_locally(&payload, &session_state) {
+        let (created, completed) = handle_prewarm_locally(&payload, session_state);
+        let _ = socket.send(Message::Text(created.to_string())).await;
+        let _ = socket.send(Message::Text(completed.to_string())).await;
+        if debug_logger::is_payload_enabled(&debug_cfg) {
             let payload_log = json!({
-                "kind": "codex_websocket_raw_request",
+                "kind": "codex_websocket_local_response",
                 "protocol": "codex_websocket",
                 "trace_id": ws_trace_id,
-                "payload": debug_value_without_inline_data(&payload),
+                "events": [created, completed],
             });
             debug_logger::write_exchange_payload(
                 &debug_cfg,
                 Some(&ws_trace_id),
-                "codex_websocket_raw_request",
+                "codex_websocket_local_response",
                 &payload_log,
             )
             .await;
         }
+        return;
+    }
 
-        if should_handle_prewarm_locally(&payload, &session_state) {
-            let (created, completed) = handle_prewarm_locally(&payload, &mut session_state);
-            let _ = socket.send(Message::Text(created.to_string())).await;
-            let _ = socket.send(Message::Text(completed.to_string())).await;
-            if debug_logger::is_enabled(&debug_cfg) {
-                let payload_log = json!({
-                    "kind": "codex_websocket_local_response",
-                    "protocol": "codex_websocket",
-                    "trace_id": ws_trace_id,
-                    "events": [created, completed],
-                });
-                debug_logger::write_exchange_payload(
-                    &debug_cfg,
-                    Some(&ws_trace_id),
-                    "codex_websocket_local_response",
-                    &payload_log,
-                )
-                .await;
-            }
-            continue;
-        }
-
-        let normalized = match normalize_responses_websocket_request(payload, &mut session_state) {
-            Ok(n) => n,
-            Err(e) => {
-                let error_ev = json!({
-                    "type": "error",
-                    "error": {
-                        "message": e,
-                        "type": "invalid_request_error"
-                    }
-                });
-                let _ = socket.send(Message::Text(error_ev.to_string())).await;
-                continue;
-            }
-        };
-
-        let openai_body = convert_codex_to_openai_request(normalized);
-        let structured_output = openai_body
-            .get("response_format")
-            .or_else(|| openai_body.get("text").and_then(|t| t.get("format")))
-            .and_then(|f| f.get("type"))
-            .and_then(Value::as_str)
-            .is_some_and(|t| matches!(t, "json_object" | "json_schema"));
-        let response_result = handle_chat_completions(
-            State(state.clone()),
-            headers.clone(),
-            None,
-            None,
-            Json(openai_body),
-        )
-        .await;
-
-        let response = match response_result {
-            Ok(res) => res.into_response(),
-            Err((status, err_msg)) => {
-                let error_ev = json!({
-                    "type": "error",
-                    "error": {
-                        "message": err_msg,
-                        "type": "server_error",
-                        "code": status.as_u16().to_string()
-                    }
-                });
-                let _ = socket.send(Message::Text(error_ev.to_string())).await;
-                continue;
-            }
-        };
-
-        if !response.status().is_success() {
+    let normalized = match normalize_responses_websocket_request(payload, session_state) {
+        Ok(n) => n,
+        Err(e) => {
             let error_ev = json!({
                 "type": "error",
                 "error": {
-                    "message": format!("Upstream returned status {}", response.status()),
-                    "type": "server_error"
+                    "message": e,
+                    "type": "invalid_request_error"
                 }
             });
             let _ = socket.send(Message::Text(error_ev.to_string())).await;
-            continue;
+            return;
         }
+    };
 
-        let body = response.into_body();
-        let mut stream = body.into_data_stream();
+    let openai_body = convert_codex_to_openai_request(normalized);
+    let structured_output = openai_body
+        .get("response_format")
+        .or_else(|| openai_body.get("text").and_then(|t| t.get("format")))
+        .and_then(|f| f.get("type"))
+        .and_then(Value::as_str)
+        .is_some_and(|t| matches!(t, "json_object" | "json_schema"));
+    let response_result = handle_chat_completions(
+        State(state.clone()),
+        headers.clone(),
+        crate::proxy::monitor::CURRENT_UPSTREAM_CAPTURE
+            .try_with(Clone::clone)
+            .ok()
+            .map(axum::extract::Extension),
+        identity.cloned().map(axum::extract::Extension),
+        Json(openai_body),
+    )
+    .await;
 
-        let mut translation_state = TranslationState {
-            response_id: format!("resp-{}", &Uuid::new_v4().to_string()[..24]),
-            item_id: format!("item-{}", &Uuid::new_v4().to_string()[..16]),
-            message_output_index: None,
-            next_output_index: 0,
-            tool_output_indices: std::collections::HashMap::new(),
-            message_item_added: false,
-            content_part_added: false,
-            accumulated_text: String::new(),
-            structured_output,
-            tool_calls: std::collections::HashMap::new(),
-            tool_calls_added: std::collections::HashSet::new(),
-        };
+    let response = match response_result {
+        Ok(res) => res.into_response(),
+        Err((status, err_msg)) => {
+            let error_ev = json!({
+                "type": "error",
+                "error": {
+                    "message": err_msg,
+                    "type": "server_error",
+                    "code": status.as_u16().to_string()
+                }
+            });
+            let _ = socket.send(Message::Text(error_ev.to_string())).await;
+            return;
+        }
+    };
 
-        let created_ev = json!({
-            "type": "response.created",
-            "response": {
-                "id": &translation_state.response_id,
-                "object": "response",
-                "status": "in_progress",
-                "output": []
+    if !response.status().is_success() {
+        let error_ev = json!({
+            "type": "error",
+            "error": {
+                "message": format!("Upstream returned status {}", response.status()),
+                "type": "server_error"
             }
         });
-        let mut outgoing_ws_events = Vec::new();
-        send_ws_event(&mut socket, &mut outgoing_ws_events, &created_ev).await;
+        let _ = socket.send(Message::Text(error_ev.to_string())).await;
+        return;
+    }
 
-        let mut buffer = bytes::BytesMut::new();
-        while let Some(chunk_res) = stream.next().await {
-            let chunk = match chunk_res {
-                Ok(c) => c,
-                Err(e) => {
-                    tracing::warn!("Stream chunk error: {:?}", e);
+    let body = response.into_body();
+    let mut stream = body.into_data_stream();
+
+    let mut translation_state = TranslationState {
+        response_id: format!("resp-{}", &Uuid::new_v4().to_string()[..24]),
+        item_id: format!("item-{}", &Uuid::new_v4().to_string()[..16]),
+        message_output_index: None,
+        next_output_index: 0,
+        tool_output_indices: std::collections::HashMap::new(),
+        message_item_added: false,
+        content_part_added: false,
+        accumulated_text: String::new(),
+        structured_output,
+        tool_calls: std::collections::HashMap::new(),
+        tool_calls_added: std::collections::HashSet::new(),
+    };
+
+    let created_ev = json!({
+        "type": "response.created",
+        "response": {
+            "id": &translation_state.response_id,
+            "object": "response",
+            "status": "in_progress",
+            "output": []
+        }
+    });
+    let mut outgoing_ws_events = Vec::new();
+    send_ws_event(socket, &mut outgoing_ws_events, &created_ev).await;
+
+    let mut buffer = bytes::BytesMut::new();
+    while let Some(chunk_res) = stream.next().await {
+        let chunk = match chunk_res {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::warn!("Stream chunk error: {:?}", e);
+                break;
+            }
+        };
+        buffer.extend_from_slice(&chunk);
+        while let Some(pos) = buffer.iter().position(|&b| b == b'\n') {
+            let line_raw = buffer.split_to(pos + 1);
+            if let Ok(line_str) = std::str::from_utf8(&line_raw) {
+                let line = line_str.trim();
+                if line.is_empty() || !line.starts_with("data: ") {
+                    continue;
+                }
+                let json_part = line.trim_start_matches("data: ").trim();
+                if json_part == "[DONE]" {
                     break;
                 }
-            };
-            buffer.extend_from_slice(&chunk);
-            while let Some(pos) = buffer.iter().position(|&b| b == b'\n') {
-                let line_raw = buffer.split_to(pos + 1);
-                if let Ok(line_str) = std::str::from_utf8(&line_raw) {
-                    let line = line_str.trim();
-                    if line.is_empty() || !line.starts_with("data: ") {
-                        continue;
-                    }
-                    let json_part = line.trim_start_matches("data: ").trim();
-                    if json_part == "[DONE]" {
-                        break;
-                    }
+                if let Ok(chunk_json) = serde_json::from_str::<Value>(json_part) {
+                    translate_openai_chunk_to_ws(
+                        &chunk_json,
+                        &mut translation_state,
+                        socket,
+                        &mut outgoing_ws_events,
+                    )
+                    .await;
+                }
+            }
+        }
+    }
+
+    if !buffer.is_empty() {
+        if let Ok(line_str) = std::str::from_utf8(&buffer) {
+            let line = line_str.trim();
+            if line.starts_with("data: ") {
+                let json_part = line.trim_start_matches("data: ").trim();
+                if json_part != "[DONE]" {
                     if let Ok(chunk_json) = serde_json::from_str::<Value>(json_part) {
                         translate_openai_chunk_to_ws(
                             &chunk_json,
                             &mut translation_state,
-                            &mut socket,
+                            socket,
                             &mut outgoing_ws_events,
                         )
                         .await;
@@ -6996,60 +7648,40 @@ async fn handle_websocket_session(mut socket: WebSocket, headers: HeaderMap, sta
                 }
             }
         }
+    }
 
-        if !buffer.is_empty() {
-            if let Ok(line_str) = std::str::from_utf8(&buffer) {
-                let line = line_str.trim();
-                if line.starts_with("data: ") {
-                    let json_part = line.trim_start_matches("data: ").trim();
-                    if json_part != "[DONE]" {
-                        if let Ok(chunk_json) = serde_json::from_str::<Value>(json_part) {
-                            translate_openai_chunk_to_ws(
-                                &chunk_json,
-                                &mut translation_state,
-                                &mut socket,
-                                &mut outgoing_ws_events,
-                            )
-                            .await;
-                        }
-                    }
-                }
-            }
-        }
-
-        let completed_output = finalize_ws_events(
-            &mut translation_state,
-            &mut socket,
-            &mut session_state,
-            &mut outgoing_ws_events,
+    let completed_output = finalize_ws_events(
+        &mut translation_state,
+        socket,
+        session_state,
+        &mut outgoing_ws_events,
+    )
+    .await;
+    if debug_logger::is_payload_enabled(&debug_cfg) {
+        let payload_log = json!({
+            "kind": "codex_websocket_converted_response",
+            "protocol": "codex_websocket",
+            "trace_id": ws_trace_id,
+            "events": debug_value_without_inline_data(&Value::Array(outgoing_ws_events)),
+            "completed_output": debug_value_without_inline_data(&completed_output),
+        });
+        debug_logger::write_exchange_payload(
+            &debug_cfg,
+            Some(&ws_trace_id),
+            "codex_websocket_converted_response",
+            &payload_log,
         )
         .await;
-        if debug_logger::is_enabled(&debug_cfg) {
-            let payload_log = json!({
-                "kind": "codex_websocket_converted_response",
-                "protocol": "codex_websocket",
-                "trace_id": ws_trace_id,
-                "events": debug_value_without_inline_data(&Value::Array(outgoing_ws_events)),
-                "completed_output": debug_value_without_inline_data(&completed_output),
-            });
-            debug_logger::write_exchange_payload(
-                &debug_cfg,
-                Some(&ws_trace_id),
-                "codex_websocket_converted_response",
-                &payload_log,
-            )
-            .await;
-        }
-
-        session_state.last_response_output =
-            into_history_without_inline_media(completed_output).unwrap_or_else(|| json!([]));
-        session_state.last_response_id = translation_state.response_id.clone();
-        session_state.last_response_pending_tool_call_ids = translation_state
-            .tool_calls
-            .values()
-            .map(|(_, call_id, _, _)| call_id.clone())
-            .collect();
     }
+
+    session_state.last_response_output =
+        into_history_without_inline_media(completed_output).unwrap_or_else(|| json!([]));
+    session_state.last_response_id = translation_state.response_id.clone();
+    session_state.last_response_pending_tool_call_ids = translation_state
+        .tool_calls
+        .values()
+        .map(|(_, call_id, _, _)| call_id.clone())
+        .collect();
 }
 
 fn should_handle_prewarm_locally(payload: &Value, state: &WebsocketSessionState) -> bool {
@@ -7197,10 +7829,7 @@ fn normalize_response_subsequent_request(
     let mut merged_input = last_request
         .as_object_mut()
         .and_then(|obj| obj.remove("input"))
-        .and_then(|value| match value {
-            Value::Array(items) => Some(items),
-            _ => None,
-        })
+        .map(responses_input_items)
         .unwrap_or_default();
 
     // 上一轮请求的 input 已按所有权移入 merged_input。
@@ -7213,10 +7842,7 @@ fn normalize_response_subsequent_request(
     let current_input = payload
         .as_object_mut()
         .and_then(|obj| obj.remove("input"))
-        .and_then(|value| match value {
-            Value::Array(items) => Some(items),
-            _ => None,
-        })
+        .map(responses_input_items)
         .unwrap_or_default();
     for item in current_input {
         let t = item.get("type").and_then(|v| v.as_str()).unwrap_or("");
@@ -8039,7 +8665,6 @@ fn split_namespace_tool_name(qualified_name: &str) -> (String, Option<String>) {
     (name.to_string(), None)
 }
 
-const INTERNAL_BACKGROUND_TASK: &str = "gemini-3.1-flash-lite";
 const CONTEXT_SUMMARY_PROMPT: &str = r#"You are a context compression specialist. Your task is to create a structured XML snapshot of the conversation history.
 
 This snapshot will become the Agent's ONLY memory of the past. All key details, plans, errors, and user instructions MUST be preserved.
@@ -8208,20 +8833,25 @@ async fn try_compress_openai_with_summary(
         name: None,
     });
 
+    // 兜底简单任务模型完全由当前号池动态推导（优先最新 flash-low，其次无后缀 flash），绝不硬编码
+    let background_model =
+        crate::proxy::common::model_gate::pick_background_model_from_pool(token_manager.as_ref())
+            .ok_or_else(|| "No flash model available in the current quota pool".to_string())?;
+
     let mut summary_request = original_request.clone();
     summary_request.messages = summary_messages;
-    summary_request.model = INTERNAL_BACKGROUND_TASK.to_string();
+    summary_request.model = background_model.to_string();
     summary_request.stream = false;
     summary_request.max_tokens = Some(8000);
     summary_request.temperature = Some(0.3);
 
     debug!(
         "[{}] [Layer-3] [OpenAI] Calling {} for summary generation",
-        trace_id, INTERNAL_BACKGROUND_TASK
+        trace_id, background_model
     );
 
     let xml_summary = call_openai_gemini_sync(
-        INTERNAL_BACKGROUND_TASK,
+        &background_model,
         &summary_request,
         token_manager,
         upstream,
@@ -8500,5 +9130,26 @@ mod tool_call_memory_tests {
         assert!(cache
             .get(&format!("tiny-{}", TOOL_CALL_CACHE_CAP + 9))
             .is_some());
+    }
+}
+
+#[cfg(test)]
+mod responses_input_normalization_tests {
+    use super::*;
+    #[test]
+    fn string_input_is_a_real_user_message_in_http_and_websocket_normalization() {
+        let expected = json!([{"type":"message","role":"user","content":"Keep my request"}]);
+        assert_eq!(
+            json!(responses_input_items(json!("Keep my request"))),
+            expected
+        );
+        let converted = convert_codex_to_openai_request(
+            json!({"model":"gemini-test","input":"Keep my request"}),
+        );
+        assert_eq!(converted["messages"][0]["content"], "Keep my request");
+        assert_eq!(
+            responses_input_items(expected.clone()),
+            expected.as_array().unwrap().clone()
+        );
     }
 }

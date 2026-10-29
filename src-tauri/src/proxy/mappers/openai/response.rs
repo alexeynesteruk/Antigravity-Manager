@@ -341,6 +341,15 @@ pub fn transform_openai_response(
     let usage = raw.get("usageMetadata").map(|u| {
         let canonical = crate::proxy::pipeline::CanonicalUsage::from_gemini(u);
         let mut usage = super::models::OpenAIUsage::from(&canonical);
+        usage.raw_output_tokens = u
+            .get("total_output_tokens")
+            .and_then(Value::as_u64)
+            .map(|v| v as u32);
+        usage.gemini_total_tokens = u
+            .get("total_tokens")
+            .and_then(Value::as_u64)
+            .or_else(|| u.get("totalTokenCount").and_then(Value::as_u64))
+            .map(|v| v as u32);
         usage.input_tokens_by_modality = u.get("input_tokens_by_modality").cloned();
         usage.total_tool_use_tokens = u
             .get("total_tool_use_tokens")
@@ -416,9 +425,9 @@ mod tests {
 
         assert!(result.usage.is_some());
         let usage = result.usage.unwrap();
-        assert_eq!(usage.prompt_tokens, 100);
-        assert_eq!(usage.completion_tokens, 50);
-        assert_eq!(usage.total_tokens, 150);
+        assert_eq!(usage.prompt_tokens, Some(100));
+        assert_eq!(usage.completion_tokens, Some(50));
+        assert_eq!(usage.total_tokens, Some(150));
         assert!(usage.prompt_tokens_details.is_some());
         assert_eq!(usage.prompt_tokens_details.unwrap().cached_tokens, Some(25));
     }
@@ -451,9 +460,9 @@ mod tests {
         let result = transform_openai_response(&gemini_resp, Some("session-123"), 1, None);
         let usage = result.usage.unwrap();
 
-        assert_eq!(usage.prompt_tokens, 7);
-        assert_eq!(usage.completion_tokens, 42);
-        assert_eq!(usage.total_tokens, 49);
+        assert_eq!(usage.prompt_tokens, Some(7));
+        assert_eq!(usage.completion_tokens, Some(42));
+        assert_eq!(usage.total_tokens, Some(49));
         assert_eq!(
             usage
                 .completion_tokens_details

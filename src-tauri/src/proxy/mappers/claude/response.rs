@@ -461,11 +461,38 @@ impl NonStreamingProcessor {
             .usage_metadata
             .as_ref()
             .map(|u| to_claude_usage(u, self.scaling_enabled, self.context_limit))
-            .unwrap_or(Usage {
-                input_tokens: 0,
-                output_tokens: 0,
-                ..Default::default()
-            });
+            .unwrap_or(Usage::default());
+
+        let mut content = self.content_blocks.clone();
+        if content.is_empty() {
+            // [Fixes #3756] 对齐 OpenAI 映射策略：若 candidates 为空或未产出内容，但存在 promptFeedback 或 finishReason: SAFETY，补全拒绝说明
+            if let Some(feedback) = &gemini_response.prompt_feedback {
+                let reason = feedback
+                    .get("blockReason")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("SAFETY");
+                content.push(ContentBlock::Text {
+                    text: format!(
+                        "Request was blocked due to safety policy (blockReason: {}).",
+                        reason
+                    ),
+                });
+            } else if let Some(fr) = finish_reason {
+                let fr_upper = fr.to_ascii_uppercase();
+                if fr_upper == "SAFETY"
+                    || fr_upper == "BLOCKLIST"
+                    || fr_upper == "PROHIBITED_CONTENT"
+                    || fr_upper == "SPII"
+                {
+                    content.push(ContentBlock::Text {
+                        text: format!(
+                            "Content generation was blocked due to safety policy (finishReason: {}).",
+                            fr
+                        ),
+                    });
+                }
+            }
+        }
 
         ClaudeResponse {
             id: gemini_response.response_id.clone().unwrap_or_else(|| {
@@ -474,7 +501,7 @@ impl NonStreamingProcessor {
             type_: "message".to_string(),
             role: "assistant".to_string(),
             model: gemini_response.model_version.clone().unwrap_or_default(),
-            content: self.content_blocks.clone(),
+            content,
             stop_reason: stop_reason.to_string(),
             stop_sequence: None,
             usage,
@@ -519,7 +546,9 @@ mod tests {
                 index: Some(0),
                 grounding_metadata: None,
             }]),
+            prompt_feedback: None,
             usage_metadata: Some(UsageMetadata {
+                thoughts_token_count: None,
                 prompt_token_count: Some(10),
                 candidates_token_count: Some(5),
                 total_token_count: Some(15),
@@ -582,6 +611,7 @@ mod tests {
                 index: Some(0),
                 grounding_metadata: None,
             }]),
+            prompt_feedback: None,
             usage_metadata: None,
             model_version: Some("gemini-2.5-flash".to_string()),
             response_id: Some("resp_456".to_string()),

@@ -1,3 +1,7 @@
+import { CacheCoverage } from './CacheCoverage';
+import { NominalCostBreakdown } from './NominalCostBreakdown';
+import { reportedTokens } from './usageMetrics';
+import type { CacheMetrics, NominalCostTotals, UsageCoverage } from './usageMetrics';
 import React, { useMemo, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { motion } from 'framer-motion';
@@ -26,7 +30,7 @@ import { ModelShareItem } from './TopModelsShareCard';
 import { DayUsagePoint } from './ActivityHeatmapCard';
 import { AccountTokenStats, TokenStatsAggregated } from '../../pages/TokenStats';
 
-interface TokenStatsSummary {
+interface TokenStatsSummary extends UsageCoverage {
     total_input_tokens: number;
     total_output_tokens: number;
     total_cached_tokens: number;
@@ -51,7 +55,8 @@ interface AppleBentoViewProps {
     chartType: 'bar' | 'area';
     timeRange: 'minute' | 'hourly' | 'daily' | 'weekly' | 'all';
     totalEstimatedCost: number;
-    cacheMetrics: { hitRate: number; savings: number };
+    cacheMetrics: CacheMetrics;
+    nominalCosts: NominalCostTotals;
     formatNumber: (n: number) => string;
     formatCurrency: (n: number) => string;
     switchChartType: (t: 'bar' | 'area') => void;
@@ -80,6 +85,7 @@ export const AppleBentoView: React.FC<AppleBentoViewProps> = ({
     timeRange,
     totalEstimatedCost,
     cacheMetrics,
+    nominalCosts,
     formatNumber,
     formatCurrency,
     switchChartType,
@@ -393,12 +399,12 @@ export const AppleBentoView: React.FC<AppleBentoViewProps> = ({
                         {/* 中间主指标 */}
                         <div className="my-2">
                             <div className="text-3xl font-extrabold tracking-tight text-gray-900 dark:text-white font-mono leading-none">
-                                {formatNumber(summary.total_tokens)}
+                                {reportedTokens(summary.total_tokens, summary.total_reported_requests) === null ? '—' : formatNumber(summary.total_tokens)}
                             </div>
                             <div className="text-[11px] text-gray-400 dark:text-gray-500 mt-2 flex items-center gap-1.5 font-mono">
-                                <span>{t('token_stats.input_short', '入')} {formatNumber(summary.total_input_tokens)}</span>
+                                <span>{t('token_stats.input_short', '入')} {reportedTokens(summary.total_input_tokens, summary.input_reported_requests) === null ? '—' : formatNumber(summary.total_input_tokens)}</span>
                                 <span className="text-gray-300 dark:text-gray-600">/</span>
-                                <span>{t('token_stats.output_short', '出')} {formatNumber(summary.total_output_tokens)}</span>
+                                <span>{t('token_stats.output_short', '出')} {reportedTokens(summary.total_output_tokens, summary.output_reported_requests) === null ? '—' : formatNumber(summary.total_output_tokens)}</span>
                             </div>
                         </div>
 
@@ -476,15 +482,12 @@ export const AppleBentoView: React.FC<AppleBentoViewProps> = ({
                         {/* 中间主指标 */}
                         <div className="my-2">
                             <div className="text-3xl font-extrabold tracking-tight text-emerald-600 dark:text-emerald-400 font-mono leading-none">
-                                ${totalEstimatedCost.toFixed(2)}
-                            </div>
-                            <div className="text-[11px] text-gray-400 dark:text-gray-500 mt-2 truncate">
-                                {t('token_stats.pricing_snapshot_hint', '基于当前单价快照加权累计')}
+                                <NominalCostBreakdown costs={nominalCosts} formatCurrency={formatCurrency} />
                             </div>
                         </div>
 
                         <div className="flex items-center justify-between text-[11px] font-mono text-gray-400 dark:text-gray-500 pt-2 border-t border-black/[0.04] dark:border-base-200">
-                            <span>{t('token_stats.billing_baseline', '实时计费基线')}</span>
+                            <span>{t('token_stats.nominal_cost', 'Nominal estimate')}</span>
                             <button
                                 onClick={() => setShowPricingModal(true)}
                                 className="text-emerald-600 dark:text-emerald-400 hover:underline flex items-center gap-0.5 font-sans font-medium"
@@ -548,20 +551,20 @@ export const AppleBentoView: React.FC<AppleBentoViewProps> = ({
                         <div className="my-2">
                             <div className="flex items-center gap-2">
                                 <span className="text-3xl font-extrabold tracking-tight text-gray-900 dark:text-white font-mono leading-none">
-                                    {formatNumber(summary.total_cached_tokens)}
+                                    {reportedTokens(summary.total_cached_tokens, summary.cache_reported_requests) === null ? '—' : formatNumber(summary.total_cached_tokens)}
                                 </span>
                                 <span className="text-[11px] font-bold px-1.5 py-0.5 rounded-md bg-[#30b0c7]/10 text-[#30b0c7] border border-[#30b0c7]/20 shrink-0">
-                                    {cacheMetrics.hitRate.toFixed(1)}% 命中
+                                    {cacheMetrics.hitRate === null ? '—' : `${cacheMetrics.hitRate.toFixed(1)}%`}
                                 </span>
                             </div>
                             <div className="text-[11px] text-gray-400 dark:text-gray-500 mt-2 font-mono truncate">
-                                {t('token_stats.saved_funds', '节省资金约 ${{amount}}', { amount: cacheMetrics.savings.toFixed(2) })}
+                                <CacheCoverage metrics={cacheMetrics} />
                             </div>
                         </div>
 
                         <div className="flex items-center justify-between text-[11px] font-mono text-gray-400 dark:text-gray-500 pt-2 border-t border-black/[0.04] dark:border-base-200">
                             <span>{t('token_stats.context_reuse', '智能上下文复用')}</span>
-                            <span className="text-[#30b0c7] font-medium">{t('token_stats.zero_latency', '0 延时吞吐')}</span>
+                            <span className="text-[#30b0c7] font-medium">{t('token_stats.reported_fields', 'Reported fields')}</span>
                         </div>
                     </div>
 
@@ -825,6 +828,10 @@ export const AppleBentoView: React.FC<AppleBentoViewProps> = ({
                             <span className="text-[11px] text-gray-400 dark:text-gray-400">{t('token_stats.cost_per_million', '单位百万人次成本')}</span>
                             <span className="text-base font-bold font-mono text-emerald-600 dark:text-emerald-400 mt-0.5">
                                 {summary && summary.total_tokens > 0
+                                    && summary.cache_reported_requests === summary.total_requests
+                                    && summary.output_reported_requests === summary.total_requests
+                                    && summary.total_reported_requests === summary.total_requests
+                                    && nominalCosts.pricedModels === nominalCosts.totalModels
                                     ? `$${((totalEstimatedCost / summary.total_tokens) * 1_000_000).toFixed(2)}`
                                     : '$0.00'} <span className="text-[10px] font-normal text-gray-400">/ 1M</span>
                             </span>
@@ -886,7 +893,7 @@ export const AppleBentoView: React.FC<AppleBentoViewProps> = ({
                                         </div>
                                         <div className="w-20 text-right font-mono flex items-baseline justify-end gap-1.5 flex-shrink-0">
                                             <span className="text-gray-900 dark:text-base-content font-semibold">
-                                                {formatNumber(item.total_tokens)}
+                                                {(item.total_reported_requests ?? 0) > 0 ? formatNumber(item.total_tokens) : '—'}
                                             </span>
                                             <span className="text-[10px] text-gray-400">
                                                 {pct.toFixed(0)}%
@@ -900,7 +907,7 @@ export const AppleBentoView: React.FC<AppleBentoViewProps> = ({
 
                     <div className="flex items-center justify-between text-[11px] font-mono text-gray-400 dark:text-gray-500 pt-2.5 border-t border-black/[0.03] dark:border-base-200">
                         <span>{t('token_stats.top_models_load', 'Top 5 模型承载大部负荷')}</span>
-                        <span>{t('token_stats.cost_accumulated', '费用累计: ${{amount}}', { amount: topModels.reduce((acc, cur) => acc + cur.cost, 0).toFixed(2) })}</span>
+                        <span>{t('token_stats.nominal_subtotal', 'Nominal subtotal')}: {topModels.some(model => model.cost !== null) ? formatCurrency(topModels.reduce((sum, model) => sum + (model.cost ?? 0), 0)) : '—'}</span>
                     </div>
                 </div>
 
@@ -951,7 +958,7 @@ export const AppleBentoView: React.FC<AppleBentoViewProps> = ({
                                         </div>
                                         <div className="w-20 text-right font-mono flex items-baseline justify-end gap-1.5 flex-shrink-0">
                                             <span className="text-gray-900 dark:text-base-content font-semibold">
-                                                {formatNumber(acc.total_tokens)}
+                                                {(acc.total_reported_requests ?? 0) > 0 ? formatNumber(acc.total_tokens) : '—'}
                                             </span>
                                             <span className="text-[10px] text-gray-400">
                                                 {acc.request_count} {t('token_stats.times', '次')}

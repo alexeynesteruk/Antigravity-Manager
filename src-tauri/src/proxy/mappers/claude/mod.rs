@@ -205,8 +205,13 @@ fn process_sse_line(
 
     // 捕获 usageMetadata（无论是否携带 finishReason，均持续缓存在 state.last_usage 中）
     if let Some(usage_val) = raw_json.get("usageMetadata") {
+        crate::proxy::monitor::record_upstream_usage(usage_val);
         if let Ok(parsed_usage) = serde_json::from_value::<UsageMetadata>(usage_val.clone()) {
-            state.last_usage = Some(parsed_usage);
+            if let Some(previous) = state.last_usage.as_mut() {
+                previous.merge(parsed_usage);
+            } else {
+                state.last_usage = Some(parsed_usage);
+            }
         }
     }
 
@@ -294,28 +299,16 @@ fn process_sse_line(
                 finish_reason
             );
         } else {
-            let usage = raw_json
-                .get("usageMetadata")
-                .and_then(|u| serde_json::from_value::<UsageMetadata>(u.clone()).ok())
-                .or_else(|| state.last_usage.clone());
+            let usage = state.last_usage.clone();
 
             if let Some(ref u) = usage {
-                let cached_tokens = u.cached_content_token_count.unwrap_or(0);
-                let cache_info = if cached_tokens > 0 {
-                    format!(", Cached: {}", cached_tokens)
-                } else {
-                    String::new()
-                };
-
                 tracing::info!(
-                    "[{}] ✓ Stream completed | Account: {} | In: {} tokens | Out: {} tokens{}",
+                    "[{}] ✓ Stream completed | Account: {} | In: {:?} tokens | Out: {:?} tokens | Cached: {:?}",
                     trace_id,
                     email,
-                    u.prompt_token_count
-                        .unwrap_or(0)
-                        .saturating_sub(cached_tokens),
-                    u.candidates_token_count.unwrap_or(0),
-                    cache_info
+                    u.prompt_token_count,
+                    u.candidates_token_count,
+                    u.cached_content_token_count
                 );
             }
 

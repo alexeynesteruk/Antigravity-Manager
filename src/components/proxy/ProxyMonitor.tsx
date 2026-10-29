@@ -10,6 +10,7 @@ import { formatCompactNumber } from '../../utils/format';
 import { useAccountStore } from '../../stores/useAccountStore';
 import { isTauri } from '../../utils/env';
 import { RequestDetailModal } from './RequestDetailModal';
+import { QoSStatusBadge } from '../accounts/QoSStatusBadge';
 
 
 interface ProxyRequestLog {
@@ -122,6 +123,16 @@ const LogTable: React.FC<LogTableProps> = ({
     onLogClick,
     t
 }) => {
+    const { accounts } = useAccountStore();
+    const accountQosByEmail = useMemo(() => {
+        const map = new Map<string, 'suspicious' | 'jailed' | 'probing' | 'half_open'>();
+        accounts.forEach(acc => {
+            if (acc.email && acc.qos_status) {
+                map.set(acc.email.toLowerCase(), acc.qos_status);
+            }
+        });
+        return map;
+    }, [accounts]);
     const containerRef = useRef<HTMLDivElement>(null);
     const [containerWidth, setContainerWidth] = useState<number>(0);
     const isResizingRef = useRef(false);
@@ -417,8 +428,35 @@ const LogTable: React.FC<LogTableProps> = ({
 
                                  {/* 4. 服务账号 */}
                                  <td style={{ width: `${colWidths.account}px`, maxWidth: `${colWidths.account}px` }} className="py-2.5 px-3 align-middle overflow-hidden box-border">
-                                     <div className="text-gray-700 dark:text-gray-300 font-sans text-xs truncate max-w-full" title={log.account_email || ''}>
-                                         {log.account_email ? log.account_email.replace(/(.{3}).*(@.*)/, '$1***$2') : '-'}
+                                     <div className="flex items-center gap-1.5 min-w-0 max-w-full">
+                                         {(() => {
+                                             const account = log.account_email || '';
+                                             // 网关前置拦截哨兵：账号列直接亮出拒答原因（亮色/暗色都保持高对比度）
+                                             if (account === 'model not exist' || account === 'no quota accounts') {
+                                                 const isNotFound = account === 'model not exist';
+                                                 return (
+                                                     <span
+                                                         className={`inline-flex items-center font-sans font-semibold text-[11px] leading-none px-1.5 py-0.5 rounded whitespace-nowrap ${isNotFound
+                                                             ? 'text-rose-600 bg-rose-50 dark:text-rose-300 dark:bg-rose-500/15'
+                                                             : 'text-amber-600 bg-amber-50 dark:text-amber-300 dark:bg-amber-500/15'}`}
+                                                         title={account}
+                                                     >
+                                                         {account}
+                                                     </span>
+                                                 );
+                                             }
+                                             return (
+                                                 <span className="text-gray-700 dark:text-gray-300 font-sans text-xs truncate" title={account}>
+                                                     {account ? account.replace(/(.{3}).*(@.*)/, '$1***$2') : '-'}
+                                                 </span>
+                                             );
+                                         })()}
+                                         {log.account_email && accountQosByEmail.get(log.account_email.toLowerCase()) && (
+                                             <QoSStatusBadge
+                                                 status={accountQosByEmail.get(log.account_email.toLowerCase())}
+                                                 size="xs"
+                                             />
+                                         )}
                                      </div>
                                  </td>
 
@@ -696,6 +734,7 @@ export const ProxyMonitor: React.FC<ProxyMonitorProps> = ({ className }) => {
             ]) as ProxyStats;
 
             if (currentStats) setStats(currentStats);
+            fetchAccounts();
         } catch (e: any) {
             console.error("Failed to load proxy data", e);
             if (e.message === 'Request timeout') {
@@ -811,11 +850,12 @@ export const ProxyMonitor: React.FC<ProxyMonitorProps> = ({ className }) => {
                             return merged.slice(0, 100);
                         });
 
-                        // Fetch stats and total count from backend instead of local calculation
+                        // Fetch stats, total count and latest account QoS states from backend
                         try {
                             const [currentStats, count] = await Promise.all([
                                 invoke<ProxyStats>('get_proxy_stats'),
-                                invoke<number>('get_proxy_logs_count_filtered', { filter: '', errorsOnly: false })
+                                invoke<number>('get_proxy_logs_count_filtered', { filter: '', errorsOnly: false }),
+                                fetchAccounts()
                             ]);
                             if (isMountedRef.current) {
                                 if (currentStats) setStats(currentStats);

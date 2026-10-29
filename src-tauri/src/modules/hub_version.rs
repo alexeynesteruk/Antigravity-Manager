@@ -477,10 +477,10 @@ mod tests {
 
     #[test]
     fn test_build_hub_user_agent() {
-        let ua = build_hub_user_agent("2.23.1", "998881661");
-        assert!(ua.starts_with("antigravity/hub/2.23.1"));
+        let ua = build_hub_user_agent("2.24.0", "1000335682");
+        assert!(ua.starts_with("antigravity/hub/2.24.0"));
         assert!(ua.contains("aidev_client"));
-        assert!(ua.contains("cl=998881661"));
+        assert!(ua.contains("cl=1000335682"));
     }
 
     #[test]
@@ -489,7 +489,7 @@ mod tests {
         assert_eq!(fp.version, "3.0.0");
         assert_eq!(fp.cl, "12345678");
         assert_eq!(fp.source, HubFingerprintSource::Custom);
-        assert!(fp.user_agent.contains("2.23.1") == false);
+        assert!(!fp.user_agent.contains("2.24.0"));
         assert!(fp.user_agent.contains("3.0.0"));
     }
 

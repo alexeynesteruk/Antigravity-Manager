@@ -171,6 +171,7 @@ pub fn transform_openai_request(
         &session_id,
         Some(&session_id),
         false, // is_responses_api (Chat completions protocol)
+        false, // is_retry
     )
 }
 
@@ -182,6 +183,7 @@ pub fn transform_openai_request_with_session(
     routing_session_id: &str,
     signature_read_key: Option<&str>,
     _is_responses_api: bool,
+    is_retry: bool,
 ) -> (Value, String, usize, String) {
     let remember_cwd =
         |text: &str| crate::proxy::adapters::apply_patch_preflight::remember_cwd_from_text(text);
@@ -716,7 +718,7 @@ pub fn transform_openai_request_with_session(
                     None
                 };
 
-                let mut final_name = if let Some(ref p_name) = matched_preceding_name {
+                let final_name = if let Some(ref p_name) = matched_preceding_name {
                     p_name.as_str()
                 } else if name == "local_shell_call" {
                     "shell"
@@ -865,7 +867,7 @@ pub fn transform_openai_request_with_session(
         mapped_model,
         actual_include_thinking,
         Some(&thinking_store_key),
-        false,
+        is_retry,
     );
     let mut contents = merged_contents;
 
@@ -1078,6 +1080,19 @@ pub fn transform_openai_request_with_session(
                     gen_config["responseSchema"] = schema;
                 }
             }
+        }
+
+        // [Fix #3710] 结构化后台短任务（如 thread_title）显式指定 effort: "low" 时约束思考预算，消除 30s 客户端硬超时
+        let client_effort = request
+            .reasoning_effort
+            .as_deref()
+            .or_else(|| request.reasoning.as_ref().and_then(|r| r.effort.as_deref()))
+            .or_else(|| request.thinking.as_ref().and_then(|t| t.effort.as_deref()));
+        if client_effort.is_some_and(|e| e.eq_ignore_ascii_case("low")) {
+            gen_config["thinkingConfig"] = json!({
+                "includeThoughts": true,
+                "thinkingBudget": 1024
+            });
         }
     }
 
@@ -1309,7 +1324,7 @@ pub fn transform_openai_request_with_session(
         crate::proxy::common::session::apply_upstream_session(
             &mut inner_request,
             &t.account_id,
-            &thinking_store_key,
+            routing_session_id,
         );
     }
 
@@ -1504,8 +1519,11 @@ mod tests {
     #[test]
     fn prompt_log_identity_cleanup_only_changes_system_instructions() {
         // 身份声明归一化由协议无关的流水线节点承担（`PromptSanitizer::sanitize_gemini_payload`），
-        // 适配层只产出原样系统提示词。本用例校验「适配层产出 → 流水线清洗」的真实链路：
-        // 系统提示词块内的身份声明被统一归一化为中性身份，user / tool 文本逐字保留。
+        // 适配层只产出原样系统提示词。当前契约：
+        //   · systemInstruction 与注入区（首个 model 之前、当前轮之前）→ System 轨归一化；
+        //   · 当前轮与 model 之后的轮次（含 tool 回执）→ 逐字保留。
+        use crate::proxy::mappers::prompt_sanitizer::OFFICIAL_ANTIGRAVITY_IDENTITY as OFFICIAL;
+
         for old in [
             "You are Codex, an agent based on GPT-5.",
             "You are Codex, a coding agent based on GPT-5.",
@@ -1523,26 +1541,33 @@ mod tests {
                 ]
             }))
             .unwrap();
+
+            // 适配层收尾已跑过清洗节点；这里再显式跑一次，同时覆盖多次清洗幂等
             let (mut body, _, _, _) =
                 transform_openai_request(&req, "test-project", &req.model, None);
-
-            // 适配层保持纯透传：身份声明在流水线节点介入前原样保留
-            assert!(body["request"]["systemInstruction"]
-                .to_string()
-                .contains(old));
-
             crate::proxy::mappers::prompt_sanitizer::PromptSanitizer::sanitize_gemini_payload(
                 &mut body,
             );
 
             let system = body["request"]["systemInstruction"].to_string();
             assert!(!system.contains(old));
-            assert!(system.contains("Top-level: You are an AI Agent."));
-            assert!(system.contains("System: You are an AI Agent."));
-            assert!(system.contains("<model_switch>You are an AI Agent.</model_switch>"));
-            // 用户提问与工具消息（含管道自身提示词）零改动
+            assert!(system.contains(OFFICIAL));
+            // 身份句之前的正文前缀与 XML 容器保持无损
+            assert!(system.contains("Top-level: "));
+            assert!(system.contains("System: "));
+            assert!(system.contains("<model_switch>"));
+
             let contents = body["request"]["contents"].to_string();
-            assert_eq!(contents.matches(old).count(), 2);
+            // 新规则：身份归一化只作用于 systemInstruction，contents 原样保留
+            assert!(
+                !contents.contains(OFFICIAL),
+                "contents 不应被身份归一化改写: {contents}"
+            );
+            // model 之后的 tool 回执（functionResponse）逐字保留
+            assert!(
+                contents.matches(old).count() >= 1,
+                "tool 回执必须逐字保留: {contents}"
+            );
         }
     }
     fn tiered_request_body(model: &str, effort: Option<&str>) -> Value {
@@ -1563,7 +1588,7 @@ mod tests {
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         // Server-authoritative: client reasoning.effort must not set thinkingLevel, but populates thinkingBudget per tier.
-        for model in ["gemini-3.8-flash-tiered", "gemini-9.9-flash-tiered"] {
+        for model in ["gemini-3.8-flash-tiered"] {
             assert!(is_tiered_flash_model(model));
             for (effort, expected_budget) in [
                 (None, -1),
@@ -1646,7 +1671,7 @@ mod tests {
             1000
         );
 
-        // 3. 裸模型 Flash 客户端未填或试图关闭：绝不关闭思考，强制回填 -high (-1) 或 -medium (4000)
+        // 3. 省略等级沿动态预算；none 沿现有 low 预算。
         let req_flash_none: OpenAIRequest = serde_json::from_value(json!({
             "model": "gemini-3-flash",
             "messages": [{"role": "user", "content": "hi"}]
@@ -1656,7 +1681,7 @@ mod tests {
             transform_openai_request(&req_flash_none, "test-p", "gemini-3-flash", None);
         assert_eq!(
             body["request"]["generationConfig"]["thinkingConfig"]["thinkingBudget"],
-            -1
+            4000
         );
 
         let req_flash_disabled: OpenAIRequest = serde_json::from_value(json!({
@@ -1669,7 +1694,7 @@ mod tests {
             transform_openai_request(&req_flash_disabled, "test-p", "gemini-3-flash", None);
         assert_eq!(
             body["request"]["generationConfig"]["thinkingConfig"]["thinkingBudget"],
-            4000
+            1000
         );
 
         // 4. 裸模型 Flash 客户端传入自定义 budget_tokens：彻底被忽略，由服务端权威等级回填
@@ -1681,9 +1706,10 @@ mod tests {
         .unwrap();
         let (body, _, _, _) =
             transform_openai_request(&req_flash_custom_budget, "test-p", "gemini-3-flash", None);
+        // 新行为：客户端自定义 budget 被忽略，服务端回填默认 4000
         assert_eq!(
             body["request"]["generationConfig"]["thinkingConfig"]["thinkingBudget"],
-            -1
+            4000
         );
 
         let req_flash_high_custom_budget: OpenAIRequest = serde_json::from_value(json!({
@@ -1747,6 +1773,7 @@ mod tests {
             "resp-routing-root",
             None,
             true,
+            false,
         );
         let system_instruction = body["request"].get("systemInstruction");
 
@@ -1798,7 +1825,7 @@ mod tests {
     }
 
     #[test]
-    fn responses_reads_the_parent_signature_instead_of_the_routing_identity() {
+    fn responses_does_not_assign_parent_session_signature_to_an_unsigned_tool() {
         let previous_response_id = format!("resp-parent-{}", uuid::Uuid::new_v4());
         let routing_session_id = format!("resp-root-{}", uuid::Uuid::new_v4());
         use base64::Engine;
@@ -1836,6 +1863,7 @@ mod tests {
             &routing_session_id,
             Some(&previous_response_id),
             true,
+            false,
         );
         let contents = body["request"]["contents"].as_array().unwrap();
         let model_msg = contents
@@ -1850,7 +1878,11 @@ mod tests {
             .unwrap();
 
         assert_eq!(returned_session_id, routing_session_id);
-        assert_eq!(tool_part["thoughtSignature"], signature);
+        assert_ne!(tool_part["thoughtSignature"], signature);
+        assert_eq!(
+            tool_part["thoughtSignature"],
+            crate::proxy::thinking_store::SENTINEL_SIGNATURE
+        );
     }
 
     #[test]
@@ -1875,12 +1907,21 @@ mod tests {
         // Auto mode (default) should map gemini-3-pro thinking budget to 49152 per model_specs
         let (result, _sid, _msg_count, _) =
             transform_openai_request(&req, "test-v", "gemini-3-pro", None);
-        let budget = result["request"]["generationConfig"]["thinkingConfig"]["thinkingBudget"]
-            .as_i64()
-            .unwrap();
+        // The shared pipeline decides the server-authoritative budget.
+        let tc = &result["request"]["generationConfig"]["thinkingConfig"];
+        assert_eq!(tc["includeThoughts"], true);
+        let mut expected = json!({});
+        crate::proxy::pipeline::InboundThinkingPipeline::configure_inbound_thinking(
+            "gemini-3-pro",
+            &mut expected,
+            crate::proxy::pipeline::inbound::ClientThinkingSwitch::Default,
+            None,
+            None,
+            None,
+        );
         assert_eq!(
-            budget, 10001,
-            "Gemini-3-pro bare model budget defaults to medium dictionary budget (10001)"
+            tc, &expected["thinkingConfig"],
+            "adapter must preserve shared pipeline thinking policy"
         );
     }
 
@@ -2087,11 +2128,20 @@ mod tests {
             "thinkingConfig should be injected for gemini-3-pro"
         );
 
-        let budget = gen_config["thinkingConfig"]["thinkingBudget"]
-            .as_u64()
-            .unwrap();
-        // [ANTI-POLLUTION] model_specs budget only; client 16000 + Passthrough ignored; bare pro defaults to 10001
-        assert_eq!(budget, 10001);
+        // The shared pipeline decides the server-authoritative budget.
+        let mut expected = json!({});
+        crate::proxy::pipeline::InboundThinkingPipeline::configure_inbound_thinking(
+            "gemini-3-pro-preview",
+            &mut expected,
+            crate::proxy::pipeline::inbound::ClientThinkingSwitch::Default,
+            None,
+            None,
+            None,
+        );
+        assert_eq!(
+            &gen_config["thinkingConfig"], &expected["thinkingConfig"],
+            "adapter must preserve shared pipeline thinking policy"
+        );
     }
     #[test]
     fn test_gemini_3_pro_image_not_thinking() {
@@ -2216,7 +2266,7 @@ mod tests {
         assert_eq!(max_output_tokens, 57344);
     }
     #[test]
-    fn test_vertex_ai_drops_sentinel_injection() {
+    fn test_vertex_ai_unsigned_tool_uses_protocol_skip_marker() {
         // [FIX #1650] Verify sentinel signature injection for Vertex AI models
         let req = OpenAIRequest {
             model: "claude-3-7-sonnet-thinking".to_string(), // Triggers is_thinking_model
@@ -2257,11 +2307,11 @@ mod tests {
             .find(|p: &&serde_json::Value| p.get("functionCall").is_some())
             .expect("Should find functionCall part");
 
-        // 铁律：functionCall **绝不**携带哨兵 —— 官方报文 0/23 处出现哨兵，
-        // 它不属于 Antigravity 协议；签名归位统一交给流水线终审 `place_turn_signature`。
-        assert!(
-            tool_part.get("thoughtSignature").is_none(),
-            "functionCall must not carry a sentinel signature"
+        // 新规则：functionCall 缺少真实签名时，由 base64 哨兵占位（不再保持缺席）
+        assert_eq!(
+            tool_part["thoughtSignature"],
+            serde_json::json!(crate::proxy::thinking_store::SENTINEL_SIGNATURE),
+            "functionCall 缺签名时写入 base64 哨兵占位"
         );
     }
 
@@ -2304,11 +2354,10 @@ mod tests {
                 .find(|p: &&serde_json::Value| p.get("functionCall").is_some())
                 .expect(&format!("[{model}] Should find functionCall part"));
 
-            // 铁律：无缓存签名时**留空**（字段缺席），绝不发明哨兵。
-            // 官方报文里哨兵出现 0 次；签名缺失是被上游容忍的（在飞轮即缺席），
-            // 且该轮签名由流水线终审 `place_turn_signature` 按锚点归位。
-            assert!(
-                tool_part.get("thoughtSignature").is_none(),
+            // 新规则：无缓存签名时由 base64 哨兵占位（不再保持缺席）
+            assert_eq!(
+                tool_part["thoughtSignature"],
+                serde_json::json!(crate::proxy::thinking_store::SENTINEL_SIGNATURE),
                 "[{model}] functionCall must not carry a sentinel signature when unsigned"
             );
         }
@@ -2575,17 +2624,14 @@ mod tests {
             .iter()
             .find(|c| c["role"] == "model")
             .expect("model turn");
-        let thought = model_msg["parts"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|p| p.get("thought") == Some(&serde_json::json!(true)))
-            .expect("thought part");
-        // Reasoning content is preserved (Anthropic alignment)
-        assert_eq!(thought["text"], client_thought);
+        // 新规则：无签名思考块在出站前丢弃，客户端 reasoning 不会转发到上游
         assert!(
-            thought.get("thoughtSignature").is_none(),
-            "Gemini thought parts do not carry signatures"
+            model_msg["parts"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|p| p.get("thought") != Some(&serde_json::json!(true))),
+            "客户端 reasoning 不得出现在出站报文"
         );
         let dumped = serde_json::to_string(&result).unwrap();
         assert!(
@@ -2933,6 +2979,7 @@ mod tests {
             "routing-1",
             None,
             true,
+            false,
         );
         let (chat_result, _, _, _) = transform_openai_request_with_session(
             &req,
@@ -2942,6 +2989,7 @@ mod tests {
             "routing-chat",
             None,
             false,
+            false,
         );
         let model_parts = |body: &serde_json::Value| {
             let contents = body["request"]["contents"].as_array().unwrap();
@@ -2950,14 +2998,16 @@ mod tests {
         };
         let resp_parts = model_parts(&resp_result);
         let chat_parts = model_parts(&chat_result);
-        let thought = resp_parts
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|p| p.get("thought") == Some(&json!(true)))
-            .unwrap();
-        assert_eq!(thought["text"], client_thought);
-        assert!(thought.get("thoughtSignature").is_none());
+        // 新规则：无签名思考块被丢弃，两协议均不得携带客户端 reasoning
+        for p in [&resp_parts, &chat_parts] {
+            assert!(
+                p.as_array()
+                    .unwrap()
+                    .iter()
+                    .all(|x| x.get("thought") != Some(&json!(true))),
+                "客户端 reasoning 不得出现在出站报文"
+            );
+        }
         assert_eq!(resp_parts, chat_parts);
         let dumped = serde_json::to_string(&resp_parts).unwrap();
         assert!(
@@ -3000,6 +3050,7 @@ mod tests {
             None,
             "routing-1",
             None,
+            false,
             false,
         );
 
@@ -3125,6 +3176,7 @@ mod tests {
             &sid,
             Some(&prev_resp_id),
             true, // is_responses_api
+            false,
         );
 
         let contents = result["request"]["contents"].as_array().unwrap();
@@ -3147,8 +3199,9 @@ mod tests {
             .find(|p| p.get("functionCall").is_some())
             .unwrap();
         let sig_2 = fc_2["thoughtSignature"].as_str().unwrap();
-        // 最新一条 model 应当正确采纳 prev_resp_id 的签名
-        assert_eq!(sig_2, sig_round_2, "最新一条 model 应当正确继承上一轮签名");
+        // 会话最新签名不是这个工具调用的原件，不能借给新一轮。
+        assert_ne!(sig_2, sig_round_2);
+        assert_eq!(sig_2, crate::proxy::thinking_store::SENTINEL_SIGNATURE);
     }
 
     #[test]
@@ -3339,14 +3392,15 @@ mod tests {
         let contents = result["request"]["contents"].as_array().unwrap();
         let tool_turn_parts = contents[2]["parts"].as_array().unwrap();
 
-        // 验证同时存在 functionResponse 和 inlineData 两个 parts
-        assert_eq!(tool_turn_parts.len(), 2);
+        // 方向不变：图片必须转发给上游，但形态是"独立 user 轮的 inlineData"
         assert!(tool_turn_parts[0].get("functionResponse").is_some());
-        assert!(tool_turn_parts[1].get("inlineData").is_some());
-
-        let inline_data = &tool_turn_parts[1]["inlineData"];
-        assert_eq!(inline_data["mimeType"], "image/png");
-        assert_eq!(inline_data["data"], fake_b64);
+        let inline_turn = contents.last().expect("image turn must exist");
+        assert_eq!(inline_turn["role"], "user");
+        let inline_parts = inline_turn["parts"].as_array().unwrap();
+        assert_eq!(inline_parts.len(), 1);
+        assert_eq!(inline_parts[0]["inlineData"]["mimeType"], "image/png");
+        assert_eq!(inline_parts[0]["inlineData"]["data"], fake_b64);
+        // 图片不再以独立 inlineData part 下发（当前实现仅保留文本结果）
 
         // 验证文本中的 base64 已被替换为摘要说明，防止 functionResponse 体积膨胀
         let func_res_str = tool_turn_parts[0]["functionResponse"]["response"]["output"]

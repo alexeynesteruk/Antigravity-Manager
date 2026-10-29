@@ -1,3 +1,7 @@
+import { CacheCoverage } from './CacheCoverage';
+import { NominalCostBreakdown } from './NominalCostBreakdown';
+import { reportedTokens } from './usageMetrics';
+import type { CacheMetrics, NominalCostTotals, UsageCoverage } from './usageMetrics';
 import React, { useMemo, useState, useEffect } from 'react';
 import { useTranslation } from 'react-i18next';
 import {
@@ -15,7 +19,7 @@ import { AccountTokenStats } from '../../pages/TokenStats';
 import { request as invoke } from '../../utils/request';
 import { UserTokenStatsModal, UserTokenSummaryItem } from '../user_tokens/UserTokenStatsModal';
 
-interface TokenStatsSummary {
+interface TokenStatsSummary extends UsageCoverage {
     total_input_tokens: number;
     total_output_tokens: number;
     total_cached_tokens: number;
@@ -33,7 +37,8 @@ interface CyberCockpitViewProps {
     accountData: AccountTokenStats[];
     timeRange: 'minute' | 'hourly' | 'daily' | 'weekly' | 'all';
     totalEstimatedCost: number;
-    cacheMetrics: { hitRate: number; savings: number };
+    cacheMetrics: CacheMetrics;
+    nominalCosts: NominalCostTotals;
     formatNumber: (n: number) => string;
     formatCurrency: (n: number) => string;
     setShowPricingModal: (s: boolean) => void;
@@ -65,6 +70,7 @@ export const CyberCockpitView: React.FC<CyberCockpitViewProps> = ({
     timeRange,
     totalEstimatedCost,
     cacheMetrics,
+    nominalCosts,
     formatNumber,
     formatCurrency: _formatCurrency,
     setShowPricingModal,
@@ -121,13 +127,11 @@ export const CyberCockpitView: React.FC<CyberCockpitViewProps> = ({
     const deepMetrics = useMemo(() => {
         const totalReqs = summary?.total_requests || 1;
         const totalTokens = summary?.total_tokens || 0;
-        const totalInput = summary?.total_input_tokens || 0;
         const totalOutput = summary?.total_output_tokens || 0;
-        const totalCached = summary?.total_cached_tokens || 0;
         const totalReasoning = summary?.total_reasoning_tokens || 0;
 
         const avgTokensPerReq = Math.round(totalTokens / totalReqs);
-        const uncachedInput = Math.max(0, totalInput - totalCached);
+        const uncachedInput = cacheMetrics.uncachedInputTokens;
         const avgCostPerReq = totalReqs > 0 ? totalEstimatedCost / totalReqs : 0;
         const reasoningPctOfOutput = totalOutput > 0 ? Math.round((totalReasoning / totalOutput) * 100) : 0;
         const avgReasoningPerReq = Math.round(totalReasoning / totalReqs);
@@ -140,7 +144,7 @@ export const CyberCockpitView: React.FC<CyberCockpitViewProps> = ({
             reasoningPctOfOutput,
             avgReasoningPerReq,
         };
-    }, [summary, totalEstimatedCost]);
+    }, [summary, totalEstimatedCost, cacheMetrics.uncachedInputTokens]);
 
     // 3. 核心模型分布及 360 度辐射彩针计算
     const { topModels, radialNeedles } = useMemo(() => {
@@ -261,7 +265,10 @@ export const CyberCockpitView: React.FC<CyberCockpitViewProps> = ({
 
         const effectivePeak = peak > 0 ? peak : 1;
         buckets.forEach(b => {
-            b.pct = peak > 0 ? Math.max(10, Math.round((b.data.total_tokens / effectivePeak) * 100)) : 10;
+            const hasValue = b.data.total_tokens > 0;
+            b.pct = hasValue
+                ? Math.max(8, Math.round((b.data.total_tokens / effectivePeak) * 100))
+                : 0;
         });
 
         return {
@@ -295,7 +302,6 @@ export const CyberCockpitView: React.FC<CyberCockpitViewProps> = ({
                 relativePct,
                 isHighConcentration,
                 isPrimary: idx === 0,
-                approxCost: (acc.total_tokens * 2.0) / 1000000,
             };
         });
     }, [accountData, summary]);
@@ -318,7 +324,7 @@ export const CyberCockpitView: React.FC<CyberCockpitViewProps> = ({
                 sharePct,
                 relativePct,
                 color: MODEL_NEON_COLORS[idx % MODEL_NEON_COLORS.length],
-                approxCost: (m.total_tokens * 2.5) / 1000000,
+                approxCost: m.cost,
             };
         });
     }, [modelShareItems, summary]);
@@ -394,7 +400,7 @@ export const CyberCockpitView: React.FC<CyberCockpitViewProps> = ({
                                         {t('token_stats.total_usage', '总消耗量')}
                                     </span>
                                     <div className="text-3xl sm:text-4xl font-black font-mono tracking-tight text-gray-900 dark:text-white leading-none mt-1 flex items-baseline gap-1.5">
-                                        <span>{formatNumber(summary?.total_tokens || 0)}</span>
+                                        <span>{reportedTokens(summary?.total_tokens ?? 0, summary?.total_reported_requests) === null ? '—' : formatNumber(summary?.total_tokens ?? 0)}</span>
                                         <span className="text-xs font-medium text-gray-500 dark:text-gray-400">Tokens</span>
                                     </div>
                                     <div className="text-[11px] font-mono text-gray-500 dark:text-gray-400 mt-1 flex items-center flex-wrap gap-x-1.5 gap-y-0.5">
@@ -528,25 +534,26 @@ export const CyberCockpitView: React.FC<CyberCockpitViewProps> = ({
                                         </button>
                                     </div>
                                     <div className="text-2xl font-black font-mono text-blue-600 dark:text-emerald-400 leading-none mt-1">
-                                        ${totalEstimatedCost.toFixed(2)}
+                                        <NominalCostBreakdown costs={nominalCosts} formatCurrency={_formatCurrency} />
                                     </div>
                                     <div className="text-[10px] text-gray-500 dark:text-gray-400 font-mono mt-0.5">
-                                        {t('token_stats.cockpit_avg_per_req', '均次')} ~${deepMetrics.avgCostPerReq < 0.01 ? deepMetrics.avgCostPerReq.toFixed(4) : deepMetrics.avgCostPerReq.toFixed(3)} / req
+                                        {t('token_stats.cockpit_avg_per_req', '均次')} {summary && summary.total_requests > 0
+                                            && summary.cache_reported_requests === summary.total_requests
+                                            && summary.output_reported_requests === summary.total_requests
+                                            && nominalCosts.pricedModels === nominalCosts.totalModels
+                                            ? _formatCurrency(deepMetrics.avgCostPerReq) : '—'} / req
                                     </div>
                                 </div>
 
                                 <div>
                                     <div className="text-[11px] font-mono uppercase text-gray-500 dark:text-gray-400">
-                                        {t('token_stats.cockpit_cache_saved', '缓存节省')}
+                                        {t('token_stats.cache_field_coverage', 'Cache reporting coverage')}
                                     </div>
                                     <div className="text-xl font-bold font-mono text-teal-600 dark:text-cyan-400 leading-none mt-0.5">
-                                        +${cacheMetrics.savings.toFixed(2)}
+                                        {cacheMetrics.reportedRequests}/{cacheMetrics.totalRequests}
                                     </div>
                                     <div className="text-[10px] text-gray-500 dark:text-gray-400 font-mono">
-                                        {t('token_stats.cockpit_hit_rate_badge', {
-                                            rate: cacheMetrics.hitRate.toFixed(1),
-                                            defaultValue: `${cacheMetrics.hitRate.toFixed(1)}% 命中`,
-                                        })}
+                                        <CacheCoverage metrics={cacheMetrics} />
                                     </div>
                                 </div>
 
@@ -582,6 +589,7 @@ export const CyberCockpitView: React.FC<CyberCockpitViewProps> = ({
                                 {hourBuckets.map((bucket, i) => {
                                     const isPeak = bucket.data.total_tokens === maxHourTokens && maxHourTokens > 0;
                                     const isHovered = hoveredHourIdx === i;
+                                    const hasData = bucket.data.total_tokens > 0;
                                     return (
                                         <div
                                             key={i}
@@ -589,25 +597,33 @@ export const CyberCockpitView: React.FC<CyberCockpitViewProps> = ({
                                             onMouseLeave={() => setHoveredHourIdx(null)}
                                             className="flex-1 flex flex-col items-center justify-end h-full cursor-pointer group"
                                         >
-                                            <div
-                                                className={`w-1 h-1 rounded-full mb-0.5 transition-all ${
-                                                    isPeak
-                                                        ? 'bg-amber-500 dark:bg-amber-400 shadow-[0_0_6px_#f59e0b]'
-                                                        : isHovered
-                                                        ? 'bg-blue-600 dark:bg-white shadow-[0_0_6px_currentColor]'
-                                                        : 'bg-blue-300/60 dark:bg-emerald-400/60'
-                                                }`}
-                                            />
-                                            <div
-                                                className={`w-full rounded-sm transition-all ${
-                                                    isPeak
-                                                        ? 'bg-gradient-to-t from-blue-600 dark:from-emerald-600 via-amber-400 to-amber-500'
-                                                        : isHovered
-                                                        ? 'bg-gradient-to-t from-blue-400 dark:from-teal-500 to-blue-600 dark:to-emerald-300'
-                                                        : 'bg-gradient-to-t from-blue-100 dark:from-[#102a3a] to-blue-500/70 dark:to-emerald-500/80'
-                                                }`}
-                                                style={{ height: `${bucket.pct}%` }}
-                                            />
+                                            {hasData ? (
+                                                <div
+                                                    className={`w-1 h-1 rounded-full mb-0.5 transition-all ${
+                                                        isPeak
+                                                            ? 'bg-amber-500 dark:bg-amber-400 shadow-[0_0_6px_#f59e0b]'
+                                                            : isHovered
+                                                            ? 'bg-blue-600 dark:bg-white shadow-[0_0_6px_currentColor]'
+                                                            : 'bg-blue-300/60 dark:bg-emerald-400/60'
+                                                    }`}
+                                                />
+                                            ) : (
+                                                <div className="w-0.5 h-0.5 rounded-full bg-gray-200 dark:bg-white/[0.08] mb-0.5 transition-colors group-hover:bg-blue-400/60 dark:group-hover:bg-emerald-400/60" />
+                                            )}
+                                            {hasData ? (
+                                                <div
+                                                    className={`w-full rounded-sm transition-all ${
+                                                        isPeak
+                                                            ? 'bg-gradient-to-t from-blue-600 dark:from-emerald-600 via-amber-400 to-amber-500'
+                                                            : isHovered
+                                                            ? 'bg-gradient-to-t from-blue-400 dark:from-teal-500 to-blue-600 dark:to-emerald-300'
+                                                            : 'bg-gradient-to-t from-blue-100 dark:from-[#102a3a] to-blue-500/70 dark:to-emerald-500/80'
+                                                    }`}
+                                                    style={{ height: `${bucket.pct}%` }}
+                                                />
+                                            ) : (
+                                                <div className="w-full h-[1px] bg-gray-200 dark:bg-white/[0.06] transition-colors group-hover:bg-blue-300 dark:group-hover:bg-white/[0.2]" />
+                                            )}
                                         </div>
                                     );
                                 })}
@@ -670,7 +686,7 @@ export const CyberCockpitView: React.FC<CyberCockpitViewProps> = ({
                                         const y1 = cy + rInner * Math.sin(angle);
                                         const x2 = cx + rOuter * Math.cos(angle);
                                         const y2 = cy + rOuter * Math.sin(angle);
-                                        const isActive = (i / 40) * 100 <= Math.max(10, cacheMetrics.hitRate);
+                                        const isActive = cacheMetrics.hitRate !== null && cacheMetrics.hitRate > 0 && (i / 40) * 100 <= cacheMetrics.hitRate;
 
                                         return (
                                             <line
@@ -689,10 +705,10 @@ export const CyberCockpitView: React.FC<CyberCockpitViewProps> = ({
                                 </svg>
                                 <div className="absolute bottom-1 flex flex-col items-center text-center">
                                     <span className="text-[10px] font-mono text-gray-500 dark:text-gray-400">
-                                        {t('token_stats.cockpit_hit_rate', '命中率')}: <strong className="text-teal-600 dark:text-emerald-400 font-mono">{cacheMetrics.hitRate.toFixed(1)}%</strong>
+                                        {t('token_stats.cockpit_hit_rate', '命中率')}: <strong className="text-teal-600 dark:text-emerald-400 font-mono">{cacheMetrics.hitRate === null ? '—' : `${cacheMetrics.hitRate.toFixed(1)}%`}</strong>
                                     </span>
                                     <span className="text-xl font-black font-mono text-gray-900 dark:text-white leading-none mt-0.5">
-                                        {formatNumber(summary?.total_cached_tokens || 0)}
+                                        {cacheMetrics.cachedTokens === null ? '—' : formatNumber(cacheMetrics.cachedTokens)}
                                     </span>
                                     <span className="text-[9px] font-mono text-gray-400 dark:text-gray-500 uppercase tracking-widest mt-0.5">
                                         {t('token_stats.cockpit_cached_tokens', '复用 TOKEN 规模')}
@@ -701,9 +717,9 @@ export const CyberCockpitView: React.FC<CyberCockpitViewProps> = ({
                             </div>
 
                             <div className="shrink-0 pt-1.5 border-t border-gray-100 dark:border-white/[0.06] flex items-center justify-between text-[11px] font-mono text-gray-500 dark:text-gray-400">
-                                <span>{t('token_stats.cockpit_uncached_input', '未缓存输入')}: <strong className="text-gray-800 dark:text-white font-mono">{formatNumber(deepMetrics.uncachedInput)}</strong></span>
+                                <span>{t('token_stats.cockpit_uncached_input', '未缓存输入')}: <strong className="text-gray-800 dark:text-white font-mono">{deepMetrics.uncachedInput === null ? '—' : formatNumber(deepMetrics.uncachedInput)}</strong></span>
                                 <span className="text-teal-600 dark:text-emerald-400 font-bold font-mono">
-                                    +${cacheMetrics.savings.toFixed(2)} {t('token_stats.cockpit_saved_badge', '节省')}
+                                    {cacheMetrics.reportedRequests}/{cacheMetrics.totalRequests} {t('token_stats.reported_requests', 'reported requests')}
                                 </span>
                             </div>
                         </div>
@@ -815,7 +831,7 @@ export const CyberCockpitView: React.FC<CyberCockpitViewProps> = ({
                                                     <AlertTriangle className="w-3 h-3" /> {t('token_stats.cockpit_high_concentration', '流量高度集中')}
                                                 </span>
                                             ) : (
-                                                <span>~${acc.approxCost.toFixed(2)}</span>
+                                                <span>{t('token_stats.reported_usage', 'Reported usage')}</span>
                                             )}
                                         </div>
                                     </div>
@@ -865,7 +881,7 @@ export const CyberCockpitView: React.FC<CyberCockpitViewProps> = ({
 
                                         <div className="flex items-center justify-between text-[10px] font-mono text-gray-500 dark:text-gray-400">
                                             <span>{t('token_stats.percentage', '占比')}: {m.sharePct}% ({m.requests} {t('token_stats.times', '次')})</span>
-                                            <span>~${m.approxCost.toFixed(2)}</span>
+                                            <span>{m.approxCost === null ? '—' : _formatCurrency(m.approxCost)}</span>
                                         </div>
                                     </div>
                                 ))

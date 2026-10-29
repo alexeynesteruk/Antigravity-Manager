@@ -1,9 +1,9 @@
 mod commands;
 pub mod constants;
 pub mod error;
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", test))]
 pub mod linux_display_guard;
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", test))]
 mod linux_graphics;
 mod models;
 mod modules;
@@ -142,11 +142,16 @@ fn nvidia_proprietary_loaded() -> bool {
 
 #[cfg(target_os = "linux")]
 fn configure_linux_graphics() {
+    // 确保 GLib 在未设置 G_MESSAGES_DEBUG 时不过滤底层 Gdk/Gtk 的 debug 日志
+    if std::env::var("G_MESSAGES_DEBUG").is_err() {
+        std::env::set_var("G_MESSAGES_DEBUG", "Gdk,Gtk");
+    }
+
     linux_display_guard::init_display_guard();
 
     use linux_graphics::{
-        desktop_is_gnome, desktop_is_kde, desktop_is_wlroots_family, should_disable_webkit_dmabuf,
-        should_force_x11_backend,
+        desktop_is_gnome, desktop_is_kde, desktop_is_wlroots_family, is_remote_virtual_desktop,
+        should_disable_webkit_dmabuf, should_enable_software_compositing, should_force_x11_backend,
     };
 
     let is_wayland = is_wayland_session();
@@ -194,6 +199,29 @@ fn configure_linux_graphics() {
         std::env::set_var("WEBKIT_DISABLE_DMABUF_RENDERER", "1");
         info!(
             "WEBKIT_DISABLE_DMABUF_RENDERER=1 (WebKit DMA-BUF workaround on this Wayland setup). Set it yourself to override."
+        );
+    }
+
+    // [Fix #3752] 针对 xrdp / VNC 等远程虚拟桌面会话，自动启用 WebKitGTK 软件安全合成与渲染
+    // 根除客户端断开时由于显存缓冲区交换失败引发的 XIO Error / Broken pipe 崩溃，普通本地桌面不受影响
+    let has_xrdp_env = std::env::var("XRDP_SESSION").is_ok()
+        || std::env::var("XRDP_SOCKET_PATH").is_ok()
+        || std::env::var("XRDP_PULSE_SINK_SOCKET").is_ok();
+    let has_vnc_env = std::env::var("VNCDESKTOP").is_ok() || std::env::var("VNC_PORT").is_ok();
+    let force_software = env_flag_enabled("ANTIGRAVITY_FORCE_SOFTWARE_RENDER");
+    let force_hardware = env_flag_enabled("ANTIGRAVITY_FORCE_HARDWARE_RENDER");
+    let is_remote_desktop =
+        is_remote_virtual_desktop(has_xrdp_env, has_vnc_env, force_software, force_hardware);
+
+    let compositing_already_disabled = std::env::var("WEBKIT_DISABLE_COMPOSITING_MODE").is_ok();
+    if should_enable_software_compositing(compositing_already_disabled, is_remote_desktop) {
+        std::env::set_var("WEBKIT_DISABLE_COMPOSITING_MODE", "1");
+        std::env::set_var("WEBKIT_DISABLE_DMABUF_RENDERER", "1");
+        if std::env::var("LIBGL_ALWAYS_SOFTWARE").is_err() {
+            std::env::set_var("LIBGL_ALWAYS_SOFTWARE", "1");
+        }
+        info!(
+            "Remote virtual desktop session detected (xrdp/VNC). Enabling safe software compositing to prevent XIO crashes on disconnect."
         );
     }
 }
@@ -290,6 +318,10 @@ fn greet(name: &str) -> String {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // Record main thread ID on Linux for display disconnection guard
+    #[cfg(target_os = "linux")]
+    linux_display_guard::record_main_thread_id();
+
     // Disable Windows background throttling/EcoQoS
     #[cfg(target_os = "windows")]
     windows_api::disable_efficiency_mode();
@@ -534,19 +566,17 @@ pub fn run() {
             modules::log_bridge::init_log_bridge(app.handle().clone());
 
             // 为主窗口显式设置应用图标（强制触发 Win32 WM_SETICON，防止透明/覆盖标题栏窗口在任务栏丢失图标）
+            #[cfg(not(target_os = "macos"))]
             if let Some(window) = app.get_webview_window("main") {
-                #[cfg(not(target_os = "macos"))]
-                {
-                    let icon_bytes: &[u8] = include_bytes!("../icons/icon.png");
-                    if let Ok(img) = image::load_from_memory(icon_bytes) {
-                        let rgba = img.to_rgba8();
-                        let (width, height) = rgba.dimensions();
-                        let _ = window.set_icon(tauri::image::Image::new_owned(
-                            rgba.into_raw(),
-                            width,
-                            height,
-                        ));
-                    }
+                let icon_bytes: &[u8] = include_bytes!("../icons/icon.png");
+                if let Ok(img) = image::load_from_memory(icon_bytes) {
+                    let rgba = img.to_rgba8();
+                    let (width, height) = rgba.dimensions();
+                    let _ = window.set_icon(tauri::image::Image::new_owned(
+                        rgba.into_raw(),
+                        width,
+                        height,
+                    ));
                 }
             }
 
@@ -664,6 +694,7 @@ pub fn run() {
                         } => {},
                     }
                     tracing::info!("[Linux Display Guard] Received termination signal in background mode, shutting down cleanly.");
+                    linux_display_guard::mark_user_initiated_exit();
                     std::process::exit(0);
                 });
             }
@@ -671,34 +702,58 @@ pub fn run() {
             Ok(())
         })
         .on_window_event(|window, event| {
-            if let tauri::WindowEvent::CloseRequested { api, .. } = event {
-                let tray_enabled = window
-                    .app_handle()
-                    .try_state::<AppRuntimeFlags>()
-                    .map(|flags| flags.tray_enabled)
-                    .unwrap_or(true);
-
-                if tray_enabled {
-                    api.prevent_close();
-
-                    let is_lightweight = modules::load_app_config()
-                        .map(|c| c.lightweight_mode)
-                        .unwrap_or(false);
-
-                    if is_lightweight {
-                        let _ = modules::lightweight::enter_lightweight_mode(window.app_handle());
-                    } else {
-                        let _ = window.hide();
+            match event {
+                tauri::WindowEvent::Focused(focused) => {
+                    if window.label() == "main" && *focused {
                         #[cfg(target_os = "macos")]
                         {
-                            use tauri::Manager;
-                            window
+                            let _ = window
                                 .app_handle()
-                                .set_activation_policy(tauri::ActivationPolicy::Accessory)
-                                .unwrap_or(());
+                                .set_activation_policy(tauri::ActivationPolicy::Regular);
+                        }
+                    } else if !focused && window.label() == "mini" {
+                        modules::tray::record_blur();
+                        if !modules::tray::is_mini_view_pinned() && modules::tray::is_mini_view_active() {
+                            modules::tray::hide_mini_window(window.app_handle());
                         }
                     }
                 }
+                tauri::WindowEvent::CloseRequested { api, .. } => {
+                    if window.label() == "mini" {
+                        api.prevent_close();
+                        modules::tray::hide_mini_window(window.app_handle());
+                        return;
+                    }
+
+                    let tray_enabled = window
+                        .app_handle()
+                        .try_state::<AppRuntimeFlags>()
+                        .map(|flags| flags.tray_enabled)
+                        .unwrap_or(true);
+
+                    if tray_enabled {
+                        api.prevent_close();
+
+                        let is_lightweight = modules::load_app_config()
+                            .map(|c| c.lightweight_mode)
+                            .unwrap_or(false);
+
+                        if is_lightweight {
+                            let _ = modules::lightweight::enter_lightweight_mode(window.app_handle());
+                        } else {
+                            let _ = window.hide();
+                            #[cfg(target_os = "macos")]
+                            {
+                                use tauri::Manager;
+                                window
+                                    .app_handle()
+                                    .set_activation_policy(tauri::ActivationPolicy::Accessory)
+                                    .unwrap_or(());
+                            }
+                        }
+                    }
+                }
+                _ => {}
             }
         })
         .invoke_handler(tauri::generate_handler![
@@ -706,8 +761,10 @@ pub fn run() {
             // Account management commands
             commands::list_accounts,
             commands::add_account,
+            commands::batch_import_accounts,
             commands::delete_account,
             commands::delete_accounts,
+            commands::release_account_qos_jail,
             commands::reorder_accounts,
             commands::switch_account,
             commands::export_accounts,
@@ -756,6 +813,14 @@ pub fn run() {
             commands::set_data_dir,
             commands::migrate_data_dir,
             commands::show_main_window,
+            commands::switch_to_main_window,
+            commands::show_mini_view,
+            commands::hide_mini_view,
+            commands::exit_app,
+            commands::set_mini_view_pinned,
+            commands::is_mini_view_pinned,
+            commands::set_mini_view_active,
+            commands::update_tray_for_account,
             commands::set_window_theme,
             commands::get_antigravity_path,
             commands::get_antigravity_cli_path,
@@ -787,6 +852,8 @@ pub fn run() {
             commands::proxy::set_proxy_capture_health_logs,
             commands::proxy::clear_proxy_logs,
             commands::proxy::clear_thinking_store,
+            commands::proxy::get_signature_cache_stats,
+            commands::proxy::clear_signature_cache,
             commands::proxy::get_thinking_store_count,
             commands::proxy::get_proxy_db_disk_size,
             commands::proxy::test_model_connectivity,
@@ -817,6 +884,7 @@ pub fn run() {
             commands::warm_up_account,
             commands::update_account_label,
             commands::update_account_priority,
+            commands::update_account_max_concurrency,
             // HTTP API settings commands
             commands::get_http_api_settings,
             commands::save_http_api_settings,
@@ -935,6 +1003,9 @@ pub fn run() {
                 // Handle app exit - cleanup background tasks and release ports
                 tauri::RunEvent::Exit => {
                     tracing::info!("Application exiting, cleaning up background tasks and releasing ports...");
+                    // 尽力把签名缓存队列刷入 SQLite，避免直接退出丢失最近写入。
+                    crate::proxy::SignatureCache::global()
+                        .flush_persist(std::time::Duration::from_secs(2));
                     if let Some(state) =
                         app_handle.try_state::<crate::commands::proxy::ProxyServiceState>()
                     {

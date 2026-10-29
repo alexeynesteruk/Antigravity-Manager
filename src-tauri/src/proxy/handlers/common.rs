@@ -125,7 +125,10 @@ pub struct FailureStatusTracker {
 impl FailureStatusTracker {
     pub fn record_upstream_error(&mut self, error: &str) {
         let error = error.to_ascii_lowercase();
-        let status = if error.contains("timeout") || error.contains("timed out") {
+        let status = if error.contains("timeout")
+            || error.contains("timed out")
+            || crate::proxy::upstream::client::is_first_byte_stage_failure(&error)
+        {
             StatusCode::GATEWAY_TIMEOUT
         } else {
             StatusCode::BAD_GATEWAY
@@ -163,15 +166,18 @@ pub fn calculate_max_retry_attempts(pool_size: usize) -> usize {
     }
 }
 
-/// 单次客户端请求在网关内部允许消耗的最大全局时间预算（秒，默认 240s）
-/// Claude Code 客户端原生设置了 300 秒（5分钟）的首包超时看门狗 (firstWindowMs = 300_000)。
-/// 网关内部在尝试跨账号轮换时，总耗时必须严格控制在 240 秒以内，确保在看门狗触发前向客户端返回
-/// 结构化规范化错误（504 Gateway Timeout 或 429/503），避免客户端弹出未响应警告框。
-pub const MAX_GATEWAY_REQUEST_BUDGET_SECS: u64 = 240;
+/// 全局请求预算已下沉到 Pipeline（`proxy::pipeline::budget`），四大协议适配器统一生效。
+///
+/// 这里仅保留兼容导出，避免既有引用点一次性大改；新代码请直接用
+/// `crate::proxy::pipeline::budget::gateway_request_budget_secs()`。
+pub use crate::proxy::pipeline::budget::{
+    gateway_request_budget_secs,
+    DEFAULT_GATEWAY_REQUEST_BUDGET_SECS as MAX_GATEWAY_REQUEST_BUDGET_SECS,
+};
 
 /// [Issue #3634, #3693] 统一自适应计算流预读（Peek）阶段的超时时间。
 /// - Compaction 摘要请求：大 Prompt 处理，默认 180s；
-/// - 图像生成请求：图像生成耗时较长，默认 60s；
+/// - 图像生成请求：图像生成耗时较长（特别是 4K 高分辨率渲染），默认 90s；
 /// - 思考/深度推理模型请求：思考阶段 TTFT 较长，底线 60s（大上下文 90s/120s）；
 /// - 正常会话请求：根据估算 Token 数量动态自适应，避免大上下文 Prompt 预热（TTFT）超过 30s 被过早误杀导致全池轮换雪崩；
 ///   * > 100k tokens: 120s
@@ -195,7 +201,7 @@ pub fn calculate_adaptive_peek_timeout_full(
     if is_compaction {
         180
     } else if is_image_gen {
-        60
+        90
     } else if is_thinking {
         // [Issue #3693] 深度思考模型预热耗时长，设置 60s 宽限底线，防止过早误杀
         match estimated_tokens {
@@ -324,7 +330,12 @@ pub fn determine_retry_strategy_adaptive(
             // 包含明确的账号额度/周期枯竭字样（如 exceeded your current quota / insufficient_quota / weekly quota / credits 等）
             // 注意：Google 标准通用 429 的 "resource has been exhausted (e.g. check quota)" 属于无明确延迟的通用流控/TPM拒绝，
             // 严禁归入硬配额，否则将导致全池快速轮换遍历并引发全池 30 秒级联锁定 (#3506)。
-            let is_hard_quota_exhausted = parsed_delay.is_none()
+            // 但若明确包含 multi-day/跨小时超长重置延迟 (如 quotaResetDelay: 68h / retryDelay > 30min)，则明确属于周期硬配额耗尽。
+            let is_long_delay = parsed_delay
+                .as_ref()
+                .map(|d| d.actual_wait_ms() > 1800_000)
+                .unwrap_or(false);
+            let is_hard_quota_exhausted = (parsed_delay.is_none() || is_long_delay)
                 && (lower.contains("exceeded your current quota")
                     || lower.contains("insufficient_quota")
                     || lower.contains("credits")
@@ -333,8 +344,20 @@ pub fn determine_retry_strategy_adaptive(
                     || lower.contains("daily quota")
                     || lower.contains("per day")
                     || lower.contains("individual quota")
+                    || lower.contains("quotaresetdelay")
                     || (lower.contains("quota_exhausted")
-                        && !lower.contains("resource has been exhausted")));
+                        && (!lower.contains("resource has been exhausted")
+                            || lower.contains("quotaresetdelay"))));
+
+            // 多账号环境下，账号级硬配额枯竭在第一轮立即切换下一个账号（50ms 闪电切号，避免 CPU 空转并快速恢复响应）
+            if is_hard_quota_exhausted && attempt < pool_size {
+                tracing::info!(
+                    "[Retry] Account hard quota exhausted detected on attempt {}/{}; fast rotating to next account in pool (50ms)",
+                    attempt + 1,
+                    pool_size
+                );
+                return RetryStrategy::FixedDelay(Duration::from_millis(50));
+            }
 
             // 请求级 429 防早退与极速失败保护 (无明确重置时间且非账号硬配额耗尽)：
             // 在多账号池中，第一轮 (attempt < pool_size) 允许全池每一个可用健康账号均获得 1 次 150ms 执行机会，
@@ -449,6 +472,32 @@ pub fn determine_retry_strategy_adaptive(
         // 其他错误：不重试
         _ => RetryStrategy::NoRetry,
     }
+}
+
+/// 上报并评估首包 TTFT 耗时到 QoS 守卫
+///
+/// 传入的 `input_tokens` 只是 handler 侧的估值；若 Pipeline 已在**转出报文**上
+/// 估过 token（四条协议口径统一），优先采用后者，避免各协议分桶标准不一致。
+pub fn report_qos_ttft(
+    token_manager: &crate::proxy::token_manager::TokenManager,
+    account_id: &str,
+    session_id: Option<&str>,
+    ttft_ms: f64,
+    is_deep_thinking: bool,
+    input_tokens: Option<u32>,
+) {
+    let tier = token_manager
+        .get_account_tier(account_id)
+        .unwrap_or_else(|| "PRO".to_string());
+    let unified_tokens = crate::proxy::pipeline::budget::estimated_tokens().or(input_tokens);
+    token_manager.record_qos_ttft(
+        account_id,
+        session_id,
+        &tier,
+        ttft_ms,
+        is_deep_thinking,
+        unified_tokens,
+    );
 }
 
 #[cfg(test)]
@@ -574,7 +623,65 @@ pub async fn apply_retry_strategy(
     }
 }
 
+/// 入站模型闸门（协议无关）。
+///
+/// - 缺失 / 不存在的 model-id → 404 `model not exist`
+/// - 整池无配额 → 502 `no quota accounts`
+///
+/// 拒绝时：响应头带上 `X-Account-Email` 哨兵文案（日志账号列直接展示），
+/// 并把英文排障说明写入 `upstream_recorder`，使「转出报文」面板可展开查看。
+pub async fn enforce_model_gate(
+    state: &AppState,
+    requested_model: Option<&str>,
+    protocol: &str,
+    upstream_recorder: Option<&crate::proxy::monitor::UpstreamRequestBodyHolder>,
+) -> Result<String, Response> {
+    let decision = crate::proxy::common::model_gate::gate_inbound_model(
+        requested_model,
+        &state.custom_mapping,
+        &state.token_manager,
+    )
+    .await;
+
+    let Some((status, reason)) = decision.rejection() else {
+        return Ok(decision.allowed_model().unwrap_or_default().to_string());
+    };
+
+    let requested = requested_model.unwrap_or("").trim().to_string();
+    tracing::warn!(
+        "[ModelGate] Blocked inbound model '{}' ({}): HTTP {} - {}",
+        requested,
+        protocol,
+        status.as_u16(),
+        reason
+    );
+
+    // 把英文详细原因写入「转出报文」面板（原本这里会是空的“无中转报文”）
+    if let Some(holder) = upstream_recorder {
+        let explanation =
+            crate::proxy::common::model_gate::blocked_explanation(reason, &requested, protocol);
+        holder
+            .set(serde_json::to_string_pretty(&explanation).unwrap_or_else(|_| reason.to_string()));
+    }
+
+    let body = build_dual_track_error(protocol, status.as_u16(), &requested, reason);
+    Err((
+        status,
+        [
+            ("X-Account-Email", reason),
+            ("X-Mapped-Model", requested.as_str()),
+            ("X-Gateway-Error", reason),
+        ],
+        Json(body),
+    )
+        .into_response())
+}
+
 /// 判断是否应该轮换账号
+///
+/// [MODEL GATE] 网关自答（404 `model not exist` / 502 `no quota accounts`）永远不会到达这里：
+/// `enforce_model_gate` 在选号之前就返回，且 `UpstreamClassification::classify` 优先把它们
+/// 归为 `InternalGatewayMessage`（既不锁号也不解绑粘性会话）。此注释用于防止后续重构破防。
 pub fn should_rotate_account(status_code: u16, strategy: Option<&RetryStrategy>) -> bool {
     // [NEW] 如果识别为 Grace Retry，则显式要求不轮换账号
     if let Some(RetryStrategy::GraceRetry(_)) = strategy {
@@ -839,6 +946,9 @@ pub fn build_dual_track_error(
     model: &str,
     error_text: &str,
 ) -> serde_json::Value {
+    // [Fixes #3763] 剔除内部链路控制标记，避免大体积上传终态标记泄漏到客户端报文
+    let sanitized_error_text = crate::proxy::upstream::client::strip_internal_markers(error_text);
+    let error_text = sanitized_error_text.as_str();
     let lower = error_text.to_lowercase();
     let is_internal_limited = lower.contains("all accounts limited")
         || lower.contains("no accounts available")
@@ -855,7 +965,11 @@ pub fn build_dual_track_error(
         || lower.contains("timeout")
         || lower.contains("error trying to connect")
         || lower.contains("dns error")
-        || lower.contains("all endpoints failed");
+        || lower.contains("all endpoints failed")
+        // [Fixes #3763] 分阶段上传诊断归入网络类故障，保留真实阶段语义
+        || lower.contains("upload stalled")
+        || lower.contains("upload budget exhausted")
+        || lower.contains("upstream send failed");
 
     let is_not_found = is_model_not_found_error(status_code, error_text);
 
@@ -1061,8 +1175,8 @@ mod retry_after_tests {
             180
         );
 
-        // 2. 图像生成请求给予 60s
-        assert_eq!(calculate_adaptive_peek_timeout(false, true, None), 60);
+        // 2. 图像生成请求给予 90s
+        assert_eq!(calculate_adaptive_peek_timeout(false, true, None), 90);
 
         // 3. 正常会话根据 token 规模自适应阶梯分配
         assert_eq!(
@@ -1343,6 +1457,66 @@ mod retry_after_tests {
             "invalid_grant: refresh token revoked"
         ));
         assert!(!is_transient_token_error("No available account with quota"));
+    }
+
+    #[test]
+    fn test_failure_status_tracker_prevents_429_leak_on_timeout() {
+        use reqwest::StatusCode;
+
+        // 场景 1：首轮遭遇 429，后续轮换遭遇 504 超时或网络异常
+        let mut tracker = FailureStatusTracker::default();
+        tracker.record(StatusCode::TOO_MANY_REQUESTS);
+        tracker.record(StatusCode::GATEWAY_TIMEOUT);
+        // 必须返回 504，绝不能残留 429 导致客户端指数退避 1 分钟冷冻
+        assert_eq!(tracker.final_status(), StatusCode::GATEWAY_TIMEOUT);
+
+        // 场景 2：所有账号全量 429
+        let mut all_429_tracker = FailureStatusTracker::default();
+        all_429_tracker.record(StatusCode::TOO_MANY_REQUESTS);
+        all_429_tracker.record(StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(
+            all_429_tracker.final_status(),
+            StatusCode::TOO_MANY_REQUESTS
+        );
+    }
+
+    #[test]
+    fn test_determine_retry_strategy_adaptive_google_multi_day_quota_exhaustion() {
+        use reqwest::StatusCode;
+        use std::time::Duration;
+
+        let google_exhausted_body = r#"{
+            "error": {
+                "code": 429,
+                "message": "Resource has been exhausted (e.g. check quota).",
+                "status": "RESOURCE_EXHAUSTED",
+                "details": [
+                    {
+                        "@type": "type.googleapis.com/google.rpc.ErrorInfo",
+                        "reason": "QUOTA_EXHAUSTED",
+                        "domain": "googleapis.com",
+                        "metadata": {
+                            "quotaResetDelay": "68h25m14.683204506s",
+                            "service": "cloudcode-pa.googleapis.com"
+                        }
+                    },
+                    {
+                        "@type": "type.googleapis.com/google.rpc.RetryInfo",
+                        "retryDelay": "246314.683204506s"
+                    }
+                ]
+            }
+        }"#;
+
+        // 多账号环境下，明确标记为硬配额枯竭，立即切换下一账号 (50ms)
+        let strategy =
+            determine_retry_strategy_adaptive(429, google_exhausted_body, None, false, true, 0, 5);
+        match strategy {
+            RetryStrategy::FixedDelay(d) => {
+                assert_eq!(d, Duration::from_millis(50));
+            }
+            other => panic!("Expected FixedDelay(50ms), got {:?}", other),
+        }
     }
 }
 

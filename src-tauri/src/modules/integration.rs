@@ -84,7 +84,51 @@ fn apply_account_credentials(
 ) -> Result<(), String> {
     let mut use_keyring = false;
 
-    if !is_ide {
+    // 硬防护（issue #3762）：目标一旦确认为 IDE，坚决走 SQLite state.vscdb 注入。
+    // IDE（VS Code OSS 架构）的 2.6.0+ 版本号会被误判为「经典版 >= 2.0.0」而走系统 Keyring，
+    // 导致 IDE 启动后读不到凭据并提示重新登录。Keyring 仅供原生经典版 Standalone 使用。
+    // 显式的 classic 选择优先：只有未显式指定经典版时，才允许按可执行文件路径提升为 IDE。
+    let is_target_ide = is_ide
+        || effective_target == Some("ide")
+        || (effective_target != Some("classic")
+            && active_exe_path
+                .map(process::is_antigravity_ide_path)
+                .unwrap_or(false));
+
+    if is_target_ide {
+        // IDE 2.6 uses SQLite for the UI and native agy credentials for its hub.
+        // Commit the private fallback before touching processes; a missing OS
+        // keyring can then fall back to this verified file in headless sessions.
+        write_to_file_credentials(account, CredentialFiles::Ide)?;
+        if let Err(error) = write_to_system_keyring_for_target(account, CredentialFiles::Ide) {
+            crate::modules::logger::log_warn(&format!(
+                "IDE keyring unavailable; private file fallback is saved: {}",
+                error
+            ));
+        }
+        let db_path = db::get_db_path(Some("ide"))?;
+        db::inject_token(
+            &db_path,
+            &account.token.access_token,
+            &account.token.refresh_token,
+            account.token.expiry_timestamp,
+            &account.email,
+            account.token.is_gcp_tos,
+            account.token.project_id.as_deref(),
+            account.token.id_token.as_deref(),
+            account.token.oauth_client_key.as_deref(),
+            Some("ide"),
+        )?;
+        if let Some(ref profile) = account.device_profile {
+            if let Ok(storage) = device::get_storage_path(Some("ide")) {
+                device::write_profile(&storage, profile)?;
+            }
+            db::write_service_machine_id(&db_path, &profile.mac_machine_id)?;
+        }
+        return Ok(());
+    }
+
+    if !is_target_ide {
         // 经典原生版：自动探测版本号（优先使用预快照路径）
         match version::get_antigravity_version_with_path(
             effective_target,
@@ -128,6 +172,10 @@ fn apply_account_credentials(
                 }
             }
         }
+    } else {
+        crate::modules::logger::log_info(
+            "[Desktop] Target is Antigravity IDE (VS Code architecture); enforcing SQLite state.vscdb injection.",
+        );
     }
 
     if use_keyring {
@@ -303,6 +351,17 @@ impl SystemIntegration for DesktopIntegration {
         let mut hot_switch = false;
         let mut credentials_applied = false;
 
+        // Every running target must accept its credentials before process shutdown.
+        if is_ide && running {
+            apply_account_credentials(
+                account,
+                effective_target,
+                is_ide,
+                active_exe_path.as_deref(),
+            )?;
+            credentials_applied = true;
+        }
+
         // 仅原生经典版（!is_ide）且运行中时尝试热切号
         if !is_ide && running {
             apply_account_credentials(
@@ -447,6 +506,7 @@ pub(crate) fn write_to_system_keyring(account: &crate::models::Account) -> Resul
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum CredentialFiles {
     Gemini,
+    Ide,
     AntigravityCli,
 }
 
@@ -470,12 +530,16 @@ fn write_to_system_keyring_for_target(
         token_type: String,
         refresh_token: String,
         expiry: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        expires_in: Option<i64>,
     }
 
     #[derive(serde::Serialize)]
     struct KeyringPayload {
         token: KeyringTokenDetails,
         auth_method: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        id_token_email: Option<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
         id_token: Option<String>,
     }
@@ -486,8 +550,10 @@ fn write_to_system_keyring_for_target(
             token_type: "Bearer".to_string(),
             refresh_token: account.token.refresh_token.clone(),
             expiry: expiry_str,
+            expires_in: Some(account_remaining_lifetime(account)),
         },
         auth_method: "consumer".to_string(),
+        id_token_email: Some(account.email.clone()),
         id_token: account.token.id_token.clone(),
     })
     .map_err(|e| format!("Failed to serialize keyring JSON: {}", e))?;
@@ -729,7 +795,7 @@ fn write_to_system_keyring_for_target(
 
     // 同步写入 ~/.gemini/ 目录下的文件凭据，兼容 SSH 会话、容器环境和无 Keyring/D-Bus 场景
     if let Err(e) = write_to_file_credentials(account, target) {
-        if target == CredentialFiles::AntigravityCli {
+        if target != CredentialFiles::Gemini {
             return Err(e);
         }
         crate::modules::logger::log_warn(&format!("[Desktop] File credential sync warning: {}", e));
@@ -752,6 +818,20 @@ fn write_to_file_credentials(
     write_file_credentials_in_dir(account, &gemini_dir, target)
 }
 
+fn normalized_account_expiry(account: &Account) -> i64 {
+    if account.token.expiry_timestamp > 10_000_000_000 {
+        account.token.expiry_timestamp / 1000
+    } else {
+        account.token.expiry_timestamp
+    }
+}
+
+fn account_remaining_lifetime(account: &Account) -> i64 {
+    normalized_account_expiry(account)
+        .saturating_sub(chrono::Utc::now().timestamp())
+        .max(0)
+}
+
 fn write_file_credentials_in_dir(
     account: &crate::models::Account,
     gemini_dir: &std::path::Path,
@@ -767,64 +847,35 @@ fn write_file_credentials_in_dir(
         }
     }
 
-    // 1. 同步写入 Antigravity CLI (agy) 原生文件凭据: ~/.gemini/antigravity-cli/antigravity-oauth-token
-    // 兼容 SSH 会话、tmux、Docker 容器以及无 D-Bus 桌面环境
-    if target == CredentialFiles::AntigravityCli {
-        let agy_cli_dir = gemini_dir.join("antigravity-cli");
-        if !agy_cli_dir.exists() {
-            if let Err(e) = std::fs::create_dir_all(&agy_cli_dir) {
-                crate::modules::logger::log_warn(&format!(
-                    "[Desktop] Failed to create antigravity-cli directory: {}",
-                    e
-                ));
+    if target != CredentialFiles::Gemini {
+        let path = match target {
+            CredentialFiles::AntigravityCli => {
+                let cli_dir = gemini_dir.join("antigravity-cli");
+                fs::create_dir_all(&cli_dir)
+                    .map_err(|e| format!("Failed to create CLI credential directory: {}", e))?;
+                cli_dir.join("antigravity-oauth-token")
             }
-        }
-
-        let expiry_secs = if account.token.expiry_timestamp > 10_000_000_000 {
-            account.token.expiry_timestamp / 1000
-        } else {
-            account.token.expiry_timestamp
+            CredentialFiles::Ide => gemini_dir.join("jetski-standalone-oauth-token"),
+            CredentialFiles::Gemini => unreachable!(),
         };
-        let expiry_datetime =
-            chrono::DateTime::from_timestamp(expiry_secs, 0).unwrap_or_else(|| chrono::Utc::now());
-        let expiry_str = expiry_datetime.to_rfc3339_opts(chrono::SecondsFormat::Micros, true);
-
-        #[derive(serde::Serialize)]
-        struct AgyTokenDetails {
-            access_token: String,
-            token_type: String,
-            refresh_token: String,
-            expiry: String,
-        }
-
-        #[derive(serde::Serialize)]
-        struct AgyOAuthTokenFile {
-            token: AgyTokenDetails,
-            auth_method: String,
-            #[serde(skip_serializing_if = "Option::is_none")]
-            id_token: Option<String>,
-        }
-
-        let agy_token = AgyOAuthTokenFile {
-            token: AgyTokenDetails {
-                access_token: account.token.access_token.clone(),
-                token_type: "Bearer".to_string(),
-                refresh_token: account.token.refresh_token.clone(),
-                expiry: expiry_str,
+        let expiry_secs = normalized_account_expiry(account);
+        let expiry = chrono::DateTime::from_timestamp(expiry_secs, 0)
+            .ok_or("Invalid credential expiry timestamp")?
+            .to_rfc3339_opts(chrono::SecondsFormat::Micros, true);
+        let payload = serde_json::json!({
+            "token": {
+                "access_token": account.token.access_token,
+                "token_type": "Bearer",
+                "refresh_token": account.token.refresh_token,
+                "expiry": expiry,
+                "expires_in": account_remaining_lifetime(account),
             },
-            auth_method: "consumer".to_string(),
-            id_token: account.token.id_token.clone(),
-        };
-
-        let agy_token_path = agy_cli_dir.join("antigravity-oauth-token");
-        let agy_json_str = serde_json::to_string_pretty(&agy_token)
-            .map_err(|e| format!("Failed to serialize Antigravity CLI credentials: {}", e))?;
-        crate::utils::fs::write_private_atomic(&agy_token_path, agy_json_str.as_bytes())
-            .map_err(|e| format!("Failed to write Antigravity CLI credentials: {}", e))?;
-        crate::modules::logger::log_info(&format!(
-                "[Desktop] Successfully synced file-based credentials to ~/.gemini/antigravity-cli/antigravity-oauth-token for: {}",
-                account.email
-            ));
+            "auth_method": "consumer",
+            "id_token_email": account.email,
+            "id_token": account.token.id_token,
+        });
+        let bytes = serde_json::to_vec_pretty(&payload).map_err(|e| e.to_string())?;
+        crate::utils::fs::write_private_atomic(&path, &bytes)?;
         return Ok(());
     }
 
@@ -903,10 +954,7 @@ fn read_from_file_credentials() -> Result<crate::modules::migration::ImportedOAu
         dirs::home_dir().ok_or_else(|| "Failed to resolve user home directory".to_string())?;
 
     // 1. 优先尝试从 Antigravity CLI (agy) 原生文件凭据读取
-    let agy_token_path = home
-        .join(".gemini")
-        .join("antigravity-cli")
-        .join("antigravity-oauth-token");
+    let agy_token_path = home.join(".gemini").join("jetski-standalone-oauth-token");
     if agy_token_path.exists() {
         if let Ok(content) = fs::read_to_string(&agy_token_path) {
             if let Ok(state) = parse_keyring_payload(&content) {
@@ -1234,7 +1282,7 @@ impl SystemIntegration for CliIntegration {
         let ide_exe = process::get_antigravity_executable_path(Some("ide"));
         let ide_exe_str = ide_exe.as_ref().map(|p| p.to_string_lossy().to_string());
 
-        let (_is_ide, effective_target) = resolve_effective_target(
+        let (is_ide, effective_target) = resolve_effective_target(
             target_ide,
             classic_running,
             ide_running,
@@ -1242,6 +1290,9 @@ impl SystemIntegration for CliIntegration {
             ide_exe_str.as_deref(),
         );
 
+        if is_ide {
+            return apply_account_credentials(account, effective_target, true, ide_exe.as_deref());
+        }
         let _ = write_to_system_keyring(account);
         if let Ok(db_path) = db::get_db_path(effective_target) {
             if db_path.exists() {
@@ -1387,6 +1438,17 @@ mod tests {
         let cli: serde_json::Value =
             serde_json::from_slice(&std::fs::read(&cli_file).unwrap()).unwrap();
         assert_eq!(cli["token"]["refresh_token"], "refresh");
+        let cli_before = std::fs::read(&cli_file).unwrap();
+        write_file_credentials_in_dir(&account, dir.path(), CredentialFiles::Ide).unwrap();
+        assert_eq!(std::fs::read(&cli_file).unwrap(), cli_before);
+        assert_eq!(std::fs::read(&gemini_file).unwrap(), gemini_before);
+        let ide: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(dir.path().join("jetski-standalone-oauth-token")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(ide["id_token_email"], account.email);
+        let lifetime = ide["token"]["expires_in"].as_i64().unwrap();
+        assert!((3590..=3600).contains(&lifetime));
     }
 
     #[test]
@@ -1526,5 +1588,31 @@ mod tests {
         let (is_ide, effective) = resolve_effective_target(None, false, false, false, None);
         assert!(!is_ide);
         assert_eq!(effective, None);
+    }
+
+    #[test]
+    fn test_resolve_effective_target_detects_windows_ide_260_install_path() {
+        // [FIX #3762] Windows 2.6.0 IDE 安装在 AppData\Local\Programs\Antigravity IDE，
+        // 可执行文件名仍为 Antigravity.exe，必须靠安装目录的 IDE 命名推导为 IDE 目标。
+        let (is_ide, effective) = resolve_effective_target(
+            None,
+            false,
+            false,
+            false,
+            Some(r"C:\Users\user\AppData\Local\Programs\Antigravity IDE\Antigravity.exe"),
+        );
+        assert!(is_ide);
+        assert_eq!(effective, Some("ide"));
+
+        // 经典版同路径不得被推导为 IDE
+        let (is_ide_classic, effective_classic) = resolve_effective_target(
+            None,
+            false,
+            false,
+            false,
+            Some(r"C:\Users\user\AppData\Local\Programs\Antigravity\Antigravity.exe"),
+        );
+        assert!(!is_ide_classic);
+        assert_eq!(effective_classic, None);
     }
 }

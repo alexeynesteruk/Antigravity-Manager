@@ -66,11 +66,11 @@ pub fn derive_session_scoped(account_id: &str, fingerprint: &str, generation: u6
     derive_session_id(&format!("{}|{}|{}", account_id, fingerprint, generation))
 }
 
-/// 上游 `sessionId` 跟思维库的 `store_key` 走。账号粘性是另一把键。
-pub fn apply_upstream_session(inner: &mut serde_json::Value, account_id: &str, store_key: &str) {
-    let generation = current_bump(account_id, store_key);
+/// Upstream identity follows affinity; private thinking storage keeps its own key.
+pub fn apply_upstream_session(inner: &mut serde_json::Value, account_id: &str, upstream_key: &str) {
+    let generation = current_bump(account_id, upstream_key);
     inner["sessionId"] =
-        serde_json::json!(derive_session_scoped(account_id, store_key, generation));
+        serde_json::json!(derive_session_scoped(account_id, upstream_key, generation));
 }
 
 #[cfg(test)]

@@ -228,6 +228,9 @@ where
                                     } else {
                                         &mut json
                                     };
+                                    if let Some(usage) = inner.get("usageMetadata") {
+                                        crate::proxy::monitor::record_upstream_usage(usage);
+                                    }
                                     let mut chunk_has_finish = false;
                                     let mut chunk_has_parts = false;
 
@@ -337,7 +340,7 @@ where
                         "[{}] [Stream-AutoHeal] ✓ Continuation request succeeded (HTTP 200), piping healed stream directly into client connection...",
                         ctx.trace_id
                     );
-                    let mut stream2 = call_success.response.bytes_stream();
+                    let mut stream2 = crate::proxy::debug_logger::wrap_stream_with_upstream_usage_diagnostics(Box::pin(call_success.response.bytes_stream()));
                     let mut stream2_saw_output = false;
                     let mut s2_buffer = BytesMut::new();
 

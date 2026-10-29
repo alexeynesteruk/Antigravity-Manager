@@ -155,7 +155,7 @@ impl AccountService {
         modules::oauth_server::submit_oauth_code(code, state).await
     }
 
-    async fn process_oauth_token(
+    pub(crate) async fn process_oauth_token(
         &self,
         token_res: modules::oauth::TokenResponse,
     ) -> Result<Account, String> {

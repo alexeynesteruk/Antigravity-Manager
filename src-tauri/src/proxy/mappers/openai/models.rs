@@ -358,9 +358,12 @@ pub struct Choice {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OpenAIUsage {
-    pub prompt_tokens: u32,
-    pub completion_tokens: u32,
-    pub total_tokens: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prompt_tokens: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub completion_tokens: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub total_tokens: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub prompt_tokens_details: Option<PromptTokensDetails>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -390,17 +393,42 @@ pub struct CompletionTokensDetails {
 }
 
 impl OpenAIUsage {
+    pub fn merge(&mut self, reported: Self) {
+        self.prompt_tokens = reported.prompt_tokens.or(self.prompt_tokens);
+        self.completion_tokens = reported.completion_tokens.or(self.completion_tokens);
+        self.prompt_tokens_details = reported
+            .prompt_tokens_details
+            .or(self.prompt_tokens_details.take());
+        self.completion_tokens_details = reported
+            .completion_tokens_details
+            .or(self.completion_tokens_details.take());
+        self.input_tokens_by_modality = reported
+            .input_tokens_by_modality
+            .or(self.input_tokens_by_modality.take());
+        self.raw_output_tokens = reported.raw_output_tokens.or(self.raw_output_tokens);
+        self.total_thought_tokens = reported.total_thought_tokens.or(self.total_thought_tokens);
+        self.total_tool_use_tokens = reported
+            .total_tool_use_tokens
+            .or(self.total_tool_use_tokens);
+        self.gemini_total_tokens = reported.gemini_total_tokens.or(self.gemini_total_tokens);
+        if let Some(raw_output) = self.raw_output_tokens {
+            self.completion_tokens = Some(
+                self.total_thought_tokens
+                    .map_or(raw_output, |thoughts| raw_output.saturating_add(thoughts)),
+            );
+        }
+        self.total_tokens = self.gemini_total_tokens;
+    }
+
     pub fn to_responses_usage_value(&self) -> Value {
         let cached_tokens = self
             .prompt_tokens_details
             .as_ref()
-            .and_then(|details| details.cached_tokens)
-            .unwrap_or(0);
+            .and_then(|details| details.cached_tokens);
         let reasoning_tokens = self
             .completion_tokens_details
             .as_ref()
-            .and_then(|details| details.reasoning_tokens)
-            .unwrap_or(0);
+            .and_then(|details| details.reasoning_tokens);
 
         json!({
             "input_tokens": self.prompt_tokens,
@@ -422,29 +450,19 @@ impl From<&crate::proxy::pipeline::CanonicalUsage> for OpenAIUsage {
             prompt_tokens: c.total_input_tokens,
             completion_tokens: c.output_tokens,
             total_tokens: c.total_tokens,
-            prompt_tokens_details: if c.cached_tokens > 0 {
-                Some(PromptTokensDetails {
-                    cached_tokens: Some(c.cached_tokens),
-                })
-            } else {
-                None
-            },
-            completion_tokens_details: if c.reasoning_tokens > 0 {
-                Some(CompletionTokensDetails {
-                    reasoning_tokens: Some(c.reasoning_tokens),
-                })
-            } else {
-                None
-            },
+            prompt_tokens_details: c.cached_tokens.map(|cached| PromptTokensDetails {
+                cached_tokens: Some(cached),
+            }),
+            completion_tokens_details: c.reasoning_tokens.map(|reasoning| {
+                CompletionTokensDetails {
+                    reasoning_tokens: Some(reasoning),
+                }
+            }),
             input_tokens_by_modality: None,
-            raw_output_tokens: Some(c.output_tokens),
-            total_thought_tokens: if c.reasoning_tokens > 0 {
-                Some(c.reasoning_tokens)
-            } else {
-                None
-            },
+            raw_output_tokens: None,
+            total_thought_tokens: c.reasoning_tokens,
             total_tool_use_tokens: None,
-            gemini_total_tokens: Some(c.total_tokens),
+            gemini_total_tokens: c.total_tokens,
         }
     }
 }

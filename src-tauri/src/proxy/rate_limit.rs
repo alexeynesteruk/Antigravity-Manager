@@ -452,8 +452,10 @@ impl RateLimitTracker {
         parser_mode: RetryParserMode,
     ) -> Option<RateLimitInfo> {
         // 关键防御：网关内部自产生的排队/无可用账号错误，绝对禁止解析为上游限流，杜绝自噬死循环
+        // 同时无条件豁免网关自答哨兵（model not exist / no quota accounts）：它们不从属于任何账号。
         let lower_body = body.to_lowercase();
-        if lower_body.contains("all accounts limited")
+        if crate::proxy::common::model_gate::is_gateway_self_answer(body)
+            || lower_body.contains("all accounts limited")
             || lower_body.contains("no accounts available")
             || lower_body.contains("all accounts failed")
             || lower_body.contains("token pool is empty")

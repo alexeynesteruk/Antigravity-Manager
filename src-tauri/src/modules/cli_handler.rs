@@ -27,12 +27,24 @@ pub async fn try_handle_cli(args: &[String]) -> Result<bool, String> {
             handle_switch_command(&args[2..]).await?;
             Ok(true)
         }
+        "import" | "im" => {
+            handle_import_command(&args[2..]).await?;
+            Ok(true)
+        }
+        "export" | "ex" => {
+            handle_export_command(&args[2..]).await?;
+            Ok(true)
+        }
         "list" | "ls" | "accounts" => {
             handle_list_command().await?;
             Ok(true)
         }
         "current" | "whoami" => {
             handle_current_command().await?;
+            Ok(true)
+        }
+        "sync" => {
+            handle_sync_command(&args[2..]).await?;
             Ok(true)
         }
         "help" => {
@@ -49,19 +61,28 @@ fn print_cli_help() {
         Usage: antigravity-tools <command> [options]\n\n\
         Commands:\n  \
           switch [account]   Switch current account (supports email, index, name, or auto round-robin)\n  \
+          import <file>      High-performance batch import accounts from JSON (with auto-backup)\n  \
+          export [file]      Fast export all accounts to JSON (default: accounts_export.json)\n  \
           list, ls           List all accounts with active status and quota\n  \
           current, whoami    Show currently active accounts across clients (IDE / agy CLI)\n  \
+          sync [app]         One-click sync proxy URL and API key to Agent tools (dsh, claude, codex, etc.)\n  \
           help               Show this help message\n\n\
         Flags:\n  \
           --headless         Run as a background headless proxy daemon (no GUI / Wayland display required)\n\n\
         Options for `switch`:\n  \
           --target <target>  Target client: 'agy' (default), 'ide', or 'classic'\n  \
           -c, --continue     Automatically resume agy conversation via `agy --continue` after switch\n\n\
+        Options for `sync`:\n  \
+          [app]              Target Agent tool: 'dsh' / 'deepseek-harness' (default), 'claude', 'codex', 'gemini', 'opencode', 'jeikcode', 'grok', or 'all'\n  \
+          --model <model>    Default model to sync (default: gemini-3.8-flash-high)\n\n\
         Examples:\n  \
           antigravity-tools switch                     # Auto round-robin to next normal account\n  \
           antigravity-tools switch 1                   # Switch to account #1\n  \
           antigravity-tools switch work@gmail.com      # Switch by email or prefix\n  \
           antigravity-tools switch 2 --continue        # Switch to #2 and resume conversation\n  \
+          antigravity-tools sync dsh                   # Sync to DeepSeek Harness (Web GUI & CLI)\n  \
+          antigravity-tools sync dsh --model gemini-3.8-flash\n  \
+          antigravity-tools sync all                   # Sync to all detected Agent tools\n  \
           antigravity-tools --headless                 # Start headless proxy server (systemd friendly)\n"
     );
 }
@@ -192,9 +213,8 @@ fn truncate_str(s: &str, max_len: usize) -> String {
     }
 }
 
-async fn try_switch_via_local_api(account_id: &str, target_ide: &str) -> bool {
-    // 读取本地配置中的端口与密钥
-    let (port, api_key) = if let Ok(data_dir) = account::get_data_dir() {
+fn read_proxy_port_and_key() -> (u16, Option<String>) {
+    if let Ok(data_dir) = account::get_data_dir() {
         let cfg_path = data_dir.join("gui_config.json");
         if let Ok(content) = std::fs::read_to_string(cfg_path) {
             if let Ok(val) = serde_json::from_str::<serde_json::Value>(&content) {
@@ -208,16 +228,152 @@ async fn try_switch_via_local_api(account_id: &str, target_ide: &str) -> bool {
                     .and_then(|p| p.get("api_key"))
                     .and_then(|v| v.as_str())
                     .map(|s| s.to_string());
-                (p, k)
-            } else {
-                (8045, None)
+                return (p, k);
             }
-        } else {
-            (8045, None)
         }
-    } else {
-        (8045, None)
-    };
+    }
+    (8045, None)
+}
+
+/// 一键同步 Agent 工具配置命令（CLI 与 Headless 环境）
+async fn handle_sync_command(args: &[String]) -> Result<(), String> {
+    let mut target_app = "dsh".to_string();
+    let mut model: Option<String> = None;
+
+    let mut i = 0;
+    while i < args.len() {
+        let arg = &args[i];
+        if arg == "--model" || arg == "-m" {
+            if i + 1 < args.len() {
+                model = Some(args[i + 1].clone());
+                i += 1;
+            }
+        } else if !arg.starts_with('-') {
+            target_app = arg.to_lowercase();
+        }
+        i += 1;
+    }
+
+    let (port, api_key_opt) = read_proxy_port_and_key();
+    let api_key = api_key_opt.unwrap_or_default();
+    let proxy_url = format!("http://127.0.0.1:{}", port);
+
+    println!(
+        "\x1b[34m[Antigravity CLI]\x1b[0m 正在一键同步 Agent 工具配置 (目标: \x1b[1m{}\x1b[0m)...",
+        target_app
+    );
+
+    use crate::proxy::cli_sync::{sync_config, CliApp};
+
+    let target_model = model.unwrap_or_else(|| "gemini-3.8-flash-high".to_string());
+
+    match target_app.as_str() {
+        "dsh" | "deepseek" | "deepseek-harness" | "deepseek_harness" => {
+            sync_config(
+                &CliApp::DeepSeekHarness,
+                &proxy_url,
+                &api_key,
+                Some(&target_model),
+            )?;
+            println!("\x1b[32m✔ 成功同步配置到 DeepSeek Harness!\x1b[0m");
+            println!("  • 适配模式: \x1b[36mWeb GUI (dsh web) & CLI (dsh)\x1b[0m");
+            println!("  • 接口地址 (Base URL): \x1b[36m{}/v1\x1b[0m", proxy_url);
+            println!("  • 默认模型: \x1b[36m{}\x1b[0m", target_model);
+            println!("  • 配置文件:");
+            println!("    - ~/.dsh/profiles/desktop/cordis.patch.yml (CLI & Desktop)");
+            println!("    - ~/.dsh/profiles/web/cordis.patch.yml (Web GUI)");
+            println!("    - ~/.dsh/.credentials.yaml");
+        }
+        "claude" | "claude-code" | "claudecode" => {
+            sync_config(&CliApp::Claude, &proxy_url, &api_key, Some(&target_model))?;
+            println!(
+                "\x1b[32m✔ 成功同步配置到 Claude Code!\x1b[0m (模型: {})",
+                target_model
+            );
+        }
+        "codex" => {
+            let codex_url = format!("{}/v1", proxy_url);
+            sync_config(&CliApp::Codex, &codex_url, &api_key, Some(&target_model))?;
+            println!(
+                "\x1b[32m✔ 成功同步配置到 Codex AI!\x1b[0m (模型: {})",
+                target_model
+            );
+        }
+        "gemini" | "agy" => {
+            sync_config(&CliApp::Gemini, &proxy_url, &api_key, Some(&target_model))?;
+            println!(
+                "\x1b[32m✔ 成功同步配置到 Antigravity CLI (agy)!\x1b[0m (模型: {})",
+                target_model
+            );
+        }
+        "opencode" => {
+            let opencode_url = format!("{}/v1", proxy_url);
+            sync_config(
+                &CliApp::OpenCode,
+                &opencode_url,
+                &api_key,
+                Some(&target_model),
+            )?;
+            println!("\x1b[32m✔ 成功同步配置到 OpenCode!\x1b[0m");
+        }
+        "jeikcode" => {
+            let jeik_url = format!("{}/v1", proxy_url);
+            sync_config(&CliApp::JeikCode, &jeik_url, &api_key, Some(&target_model))?;
+            println!(
+                "\x1b[32m✔ 成功同步配置到 JeikCode!\x1b[0m (模型: {})",
+                target_model
+            );
+        }
+        "grok" | "grokbuild" => {
+            let grok_url = format!("{}/v1", proxy_url);
+            sync_config(&CliApp::GrokBuild, &grok_url, &api_key, Some(&target_model))?;
+            println!(
+                "\x1b[32m✔ 成功同步配置到 Grok Build!\x1b[0m (模型: {})",
+                target_model
+            );
+        }
+        "all" => {
+            let apps = [
+                (
+                    CliApp::DeepSeekHarness,
+                    "DeepSeek Harness (Web GUI & CLI)",
+                    true,
+                ),
+                (CliApp::Claude, "Claude Code", false),
+                (CliApp::Codex, "Codex AI", true),
+                (CliApp::Gemini, "Antigravity CLI (agy)", false),
+                (CliApp::OpenCode, "OpenCode", true),
+                (CliApp::JeikCode, "JeikCode", true),
+                (CliApp::GrokBuild, "Grok Build", true),
+            ];
+            for (app, name, needs_v1) in apps {
+                let url = if needs_v1 {
+                    format!("{}/v1", proxy_url)
+                } else {
+                    proxy_url.clone()
+                };
+                if let Err(e) = sync_config(&app, &url, &api_key, Some(&target_model)) {
+                    eprintln!("  \x1b[31m✘\x1b[0m 同步 {} 失败: {}", name, e);
+                } else {
+                    println!("  \x1b[32m✔\x1b[0m 已同步 {}", name);
+                }
+            }
+            println!("\x1b[32m🎉 全部 Agent 工具配置同步完成!\x1b[0m");
+        }
+        other => {
+            return Err(format!(
+                "未知的 Agent 工具: '{}'。支持的工具: dsh, claude, codex, gemini, opencode, jeikcode, grok, all",
+                other
+            ));
+        }
+    }
+
+    Ok(())
+}
+
+async fn try_switch_via_local_api(account_id: &str, target_ide: &str) -> bool {
+    // 读取本地配置中的端口与密钥
+    let (port, api_key) = read_proxy_port_and_key();
 
     let client = match reqwest::Client::builder()
         .timeout(std::time::Duration::from_millis(1500))
@@ -274,6 +430,89 @@ fn find_agy_executable() -> String {
         }
     }
     "agy".to_string()
+}
+
+/// [NEW #3726] CLI 批量高性能导入命令
+async fn handle_import_command(args: &[String]) -> Result<(), String> {
+    if args.is_empty() {
+        return Err("用法: antigravity-tools import <file.json>".to_string());
+    }
+
+    let file_path = std::path::PathBuf::from(&args[0]);
+    if !file_path.exists() {
+        return Err(format!("文件不存在: {:?}", file_path));
+    }
+
+    let content =
+        std::fs::read_to_string(&file_path).map_err(|e| format!("读取导入文件失败: {}", e))?;
+
+    // 自动为源文件创建 <filename>-backup 备份文件，确保失败随时可重新导入
+    let backup_path = format!("{}-backup", file_path.to_string_lossy());
+    if let Err(e) = std::fs::write(&backup_path, &content) {
+        eprintln!("\x1b[33m[Warning]\x1b[0m 无法创建源文件备份: {}", e);
+    } else {
+        println!(
+            "\x1b[32m✔\x1b[0m 已自动备份源文件至: \x1b[1m{}\x1b[0m",
+            backup_path
+        );
+    }
+
+    let entries = account::parse_import_entries_from_str(&content);
+    if entries.is_empty() {
+        return Err("未从文件中解析出有效的 refresh_token 凭据".to_string());
+    }
+
+    println!(
+        "\x1b[34m[Antigravity CLI]\x1b[0m 发现 {} 个有效账号凭据，正在以流式并发 (6路) 导入...",
+        entries.len()
+    );
+
+    let start = std::time::Instant::now();
+    let result = account::batch_import_accounts_logic(None, entries).await?;
+    let duration = start.elapsed();
+
+    println!(
+        "\x1b[32m🎉 批量导入完成!\x1b[0m 成功: \x1b[32m{}\x1b[0m | 失败: \x1b[31m{}\x1b[0m | 耗时: {:.2}s",
+        result.success,
+        result.failed,
+        duration.as_secs_f64()
+    );
+
+    if !result.errors.is_empty() {
+        eprintln!("\n\x1b[33m部分失败明细:\x1b[0m");
+        for (i, err) in result.errors.iter().take(5).enumerate() {
+            eprintln!("  {}. {}", i + 1, err);
+        }
+        if result.errors.len() > 5 {
+            eprintln!("  ... 其余 {} 条错误已忽略", result.errors.len() - 5);
+        }
+    }
+
+    Ok(())
+}
+
+/// [NEW #3726] CLI 极速导出所有账号命令
+async fn handle_export_command(args: &[String]) -> Result<(), String> {
+    let out_path = if !args.is_empty() {
+        std::path::PathBuf::from(&args[0])
+    } else {
+        std::path::PathBuf::from("antigravity_accounts_export.json")
+    };
+
+    println!("\x1b[34m[Antigravity CLI]\x1b[0m 正在极速导出所有账号...");
+    let response = account::export_accounts_by_ids(&[])?;
+    let content = serde_json::to_string_pretty(&response.accounts)
+        .map_err(|e| format!("序列化失败: {}", e))?;
+
+    std::fs::write(&out_path, content.as_bytes())
+        .map_err(|e| format!("写入导出文件失败: {}", e))?;
+
+    println!(
+        "\x1b[32m✔ 成功导出 {} 个账号至: \x1b[1m{:?}\x1b[0m",
+        response.accounts.len(),
+        out_path
+    );
+    Ok(())
 }
 
 #[cfg(test)]

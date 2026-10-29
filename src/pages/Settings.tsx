@@ -22,6 +22,7 @@ import { emit } from '@tauri-apps/api/event';
 import DebugConsole from '../components/debug/DebugConsole';
 import ProxyPoolSettings from '../components/settings/ProxyPoolSettings';
 import { motion } from 'framer-motion';
+import { ZOOM_LEVELS, getStoredZoom, applyZoom } from '../utils/zoom';
 
 function normalizeDataDirDisplay(path: string): string {
     const trimmed = path.trim();
@@ -45,7 +46,7 @@ function Settings() {
     const { config, loadConfig, saveConfig, updateLanguage, updateTheme } = useConfigStore();
     const { enable, disable, isEnabled } = useDebugConsole();
     const [activeTab, setActiveTab] = useState<'general' | 'account' | 'proxy' | 'advanced' | 'debug' | 'about'>('general');
-    const [appVersion, setAppVersion] = useState<string>('4.9.9-beta.4');
+    const [appVersion, setAppVersion] = useState<string>('5.0.1-beta.8');
     const [formData, setFormData] = useState<AppConfig>({
         language: 'zh',
         theme: 'system',
@@ -138,6 +139,22 @@ function Settings() {
     const [isBrewConfirmOpen, setIsBrewConfirmOpen] = useState(false);
     const [isBrewSuccessOpen, setIsBrewSuccessOpen] = useState(false);
     const [isUpdateConfirmOpen, setIsUpdateConfirmOpen] = useState(false);
+
+    // UI Zoom state
+    const [uiZoom, setUiZoom] = useState<number>(() => getStoredZoom());
+
+    useEffect(() => {
+        const handleZoomChange = (e: Event) => {
+            const customEvent = e as CustomEvent<number>;
+            if (customEvent.detail) {
+                setUiZoom(customEvent.detail);
+            }
+        };
+        window.addEventListener('app-ui-zoom-change', handleZoomChange);
+        return () => {
+            window.removeEventListener('app-ui-zoom-change', handleZoomChange);
+        };
+    }, []);
 
     // Official Hub fingerprint state
     const [hubFingerprint, setHubFingerprint] = useState<HubFingerprint | null>(null);
@@ -365,6 +382,7 @@ function Settings() {
                     proxy: {
                         ...formData.proxy,
                         debug_logging: {
+                            ...formData.proxy?.debug_logging,
                             enabled: formData.proxy?.debug_logging?.enabled ?? false,
                             output_dir: selected,
                         },
@@ -653,6 +671,35 @@ function Settings() {
                                 </select>
                             </div>
 
+                            {/* 界面与字体缩放 */}
+                            <div>
+                                <div className="flex justify-between items-center mb-2">
+                                    <label className="block text-sm font-medium text-gray-900 dark:text-base-content">
+                                        {t('settings.general.ui_zoom', '界面与字体缩放')}
+                                    </label>
+                                    <span className="text-xs text-gray-500 dark:text-gray-400">
+                                        Cmd / Ctrl + / - / 0
+                                    </span>
+                                </div>
+                                <select
+                                    className="w-full px-4 py-4 border border-gray-200 dark:border-base-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent text-gray-900 dark:text-base-content bg-gray-50 dark:bg-base-200"
+                                    value={uiZoom}
+                                    onChange={(e) => {
+                                        // applyZoom dispatches 'app-ui-zoom-change', which syncs uiZoom
+                                        applyZoom(Number(e.target.value));
+                                    }}
+                                >
+                                    {ZOOM_LEVELS.map((level) => (
+                                        <option key={level} value={level}>
+                                            {level}%{level === 100 ? ` (${t('settings.general.ui_zoom_default', '默认')})` : ''}{level === 120 ? ` (${t('settings.general.ui_zoom_recommended', '推荐大屏')})` : ''}
+                                        </option>
+                                    ))}
+                                </select>
+                                <p className="mt-1 text-xs text-gray-500 dark:text-gray-400">
+                                    {t('settings.general.ui_zoom_desc', '调整软件整体界面和字体大小，支持随时使用快捷键 Cmd/Ctrl + / - / 0 快速缩放')}
+                                </p>
+                            </div>
+
                             {/* 开机自动启动 */}
                             <div>
                                 <div className="flex justify-between items-center mb-2">
@@ -733,7 +780,6 @@ function Settings() {
                                                     await invoke('save_update_settings', {
                                                         settings: {
                                                             auto_check: enabled,
-                                                            last_check_time: 0,
                                                             check_interval_hours: formData.update_check_interval ?? 24
                                                         }
                                                     });
@@ -764,7 +810,6 @@ function Settings() {
                                                     await invoke('save_update_settings', {
                                                         settings: {
                                                             auto_check: formData.auto_check_update ?? true,
-                                                            last_check_time: 0,
                                                             check_interval_hours: formData.update_check_interval ?? 24
                                                         }
                                                     });
@@ -798,6 +843,46 @@ function Settings() {
                                         />
                                         <div className="w-11 h-6 bg-gray-200 dark:bg-base-300 peer-focus:outline-none peer-focus:ring-4 peer-focus:ring-blue-300 dark:peer-focus:ring-blue-800 rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border-gray-300 after:border after:rounded-full after:h-5 after:w-5 after:transition-all peer-checked:bg-blue-500"></div>
                                     </label>
+                                </div>
+                            )}
+
+                            {/* 托盘左键单击操作 */}
+                            {isTauri() && (
+                                <div className="flex items-center justify-between p-4 bg-gray-50 dark:bg-base-200 rounded-lg border border-gray-100 dark:border-base-300">
+                                    <div className="pr-4">
+                                        <div className="font-medium text-gray-900 dark:text-base-content">
+                                            {t('settings.general.tray_click_action')}
+                                        </div>
+                                        <p className="text-sm text-gray-600 dark:text-gray-400 mt-1">
+                                            {t('settings.general.tray_click_action_desc')}
+                                        </p>
+                                    </div>
+                                    <div className="flex items-center bg-gray-200/80 dark:bg-base-300 p-1 rounded-lg shrink-0">
+                                        <button
+                                            type="button"
+                                            onClick={() => setFormData({ ...formData, tray_click_action: 'mini' })}
+                                            className={cn(
+                                                "px-3 py-1.5 text-xs font-medium rounded-md transition-all cursor-pointer select-none",
+                                                (formData.tray_click_action || 'mini') === 'mini'
+                                                    ? "bg-white dark:bg-base-100 text-blue-600 dark:text-blue-400 shadow-xs font-semibold"
+                                                    : "text-gray-600 dark:text-gray-400 hover:text-gray-900 dark:hover:text-white"
+                                            )}
+                                        >
+                                            {t('settings.general.tray_click_action_mini_short', 'Mini 悬浮窗')}
+                                        </button>
+                                        <button
+                                            type="button"
+                                            onClick={() => setFormData({ ...formData, tray_click_action: 'main' })}
+                                            className={cn(
+                                                "px-3 py-1.5 text-xs font-medium rounded-md transition-all cursor-pointer select-none",
+                                                formData.tray_click_action === 'main'
+                                                    ? "bg-white dark:bg-base-100 text-blue-600 dark:text-blue-400 shadow-xs font-semibold"
+                                                    : "text-gray-600 dark:text-gray-400 hover:text-gray-900 dark:hover:text-white"
+                                            )}
+                                        >
+                                            {t('settings.general.tray_click_action_main_short', '主控制台')}
+                                        </button>
+                                    </div>
                                 </div>
                             )}
 
@@ -1435,6 +1520,7 @@ function Settings() {
                                                         proxy: {
                                                             ...formData.proxy,
                                                             debug_logging: {
+                                                                ...formData.proxy?.debug_logging,
                                                                 enabled: e.target.checked,
                                                                 output_dir: formData.proxy?.debug_logging?.output_dir,
                                                             },
@@ -1446,6 +1532,11 @@ function Settings() {
                                         </div>
                                         {(formData.proxy?.debug_logging?.enabled ?? false) && (
                                             <>
+                                                <label className="flex items-center justify-between gap-4 p-3 rounded-lg bg-gray-50 dark:bg-base-200">
+                                                    <span className="text-sm">{t('settings.advanced.metadata_only')}</span>
+                                                    <input type="checkbox" className="toggle toggle-sm" checked={formData.proxy?.debug_logging?.metadata_only ?? false}
+                                                        onChange={e => setFormData({ ...formData, proxy: { ...formData.proxy, debug_logging: { ...formData.proxy.debug_logging, enabled: true, metadata_only: e.target.checked } } })} />
+                                                </label>
                                                 <div className="bg-amber-50 dark:bg-amber-900/20 border border-amber-200 dark:border-amber-700/30 rounded-lg p-3">
                                                     <p className="text-sm text-amber-700 dark:text-amber-400">
                                                         {t('settings.advanced.debug_logs_desc')}
@@ -1466,6 +1557,7 @@ function Settings() {
                                                                 proxy: {
                                                                     ...formData.proxy,
                                                                     debug_logging: {
+                                                                        ...formData.proxy?.debug_logging,
                                                                         enabled: formData.proxy?.debug_logging?.enabled ?? false,
                                                                         output_dir: e.target.value || undefined,
                                                                     },
@@ -1776,9 +1868,6 @@ function Settings() {
                                                     try {
                                                         await invoke('save_update_settings', {
                                                             settings: {
-                                                                auto_check: formData.auto_check_update ?? true,
-                                                                last_check_time: 0,
-                                                                check_interval_hours: formData.update_check_interval ?? 24,
                                                                 update_channel: 'stable',
                                                             }
                                                         });
@@ -1803,9 +1892,6 @@ function Settings() {
                                                     try {
                                                         await invoke('save_update_settings', {
                                                             settings: {
-                                                                auto_check: formData.auto_check_update ?? true,
-                                                                last_check_time: 0,
-                                                                check_interval_hours: formData.update_check_interval ?? 24,
                                                                 update_channel: 'beta',
                                                             }
                                                         });

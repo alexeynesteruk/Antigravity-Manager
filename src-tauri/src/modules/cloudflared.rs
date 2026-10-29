@@ -1,10 +1,13 @@
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::process::Stdio;
-use std::sync::Arc;
+use std::sync::{
+    atomic::{AtomicUsize, Ordering},
+    Arc, OnceLock,
+};
 use tokio::io::{AsyncBufReadExt, AsyncRead, BufReader};
 use tokio::process::{Child, Command};
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex, RwLock};
 use tracing::{debug, info};
 
 #[cfg(target_os = "windows")]
@@ -14,6 +17,36 @@ use std::os::windows::process::CommandExt;
 const CREATE_NO_WINDOW: u32 = 0x08000000;
 #[cfg(target_os = "windows")]
 const CREATE_NEW_PROCESS_GROUP: u32 = 0x00000200;
+
+static ACTIVE_TUNNELS: OnceLock<Arc<AtomicUsize>> = OnceLock::new();
+
+pub fn public_tunnel_active() -> bool {
+    ACTIVE_TUNNELS
+        .get()
+        .is_some_and(|active| active.load(Ordering::SeqCst) > 0)
+}
+
+/// Lives with the owned child: spawn failure, verified process death and stop
+/// release it exactly once. A failed kill keeps both the process and auth guard.
+struct TunnelActivity(Arc<AtomicUsize>);
+
+impl TunnelActivity {
+    fn new(counter: Arc<AtomicUsize>) -> Self {
+        counter.fetch_add(1, Ordering::SeqCst);
+        Self(counter)
+    }
+}
+
+impl Drop for TunnelActivity {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+struct ManagedTunnelProcess {
+    child: Child,
+    _activity: TunnelActivity,
+}
 
 /// Cloudflared隧道模式
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -43,6 +76,9 @@ pub struct CloudflaredConfig {
     /// 认证模式的Token
     #[serde(default)]
     pub token: Option<String>,
+    /// Display URL for a named tunnel. Routing remains configured in Cloudflare.
+    #[serde(default)]
+    pub custom_domain: Option<String>,
     /// 使用http2协议(更兼容)
     #[serde(default)]
     pub use_http2: bool,
@@ -55,9 +91,66 @@ impl Default for CloudflaredConfig {
             mode: TunnelMode::Quick,
             port: 8045,
             token: None,
+            custom_domain: None,
             use_http2: true, // 默认启用http2，更稳定
         }
     }
+}
+
+fn normalize_public_url(value: &str) -> Result<Option<String>, String> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Ok(None);
+    }
+    let candidate = if value.contains("://") {
+        value.to_string()
+    } else {
+        format!("https://{value}")
+    };
+    let url = url::Url::parse(&candidate).map_err(|_| "Invalid tunnel public URL".to_string())?;
+    if !matches!(url.scheme(), "http" | "https")
+        || url.host_str().is_none()
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.path() != "/"
+        || url.query().is_some()
+        || url.fragment().is_some()
+    {
+        return Err(
+            "Tunnel public URL must be an http(s) origin without credentials, path or query"
+                .to_string(),
+        );
+    }
+    Ok(Some(url.origin().ascii_serialization()))
+}
+
+impl CloudflaredConfig {
+    fn preferred_public_url(&self) -> Result<Option<String>, String> {
+        if self.mode != TunnelMode::Auth {
+            return Ok(None);
+        }
+        let value = std::env::var("ABV_CLOUDFLARED_DOMAIN")
+            .ok()
+            .or_else(|| self.custom_domain.clone());
+        value
+            .as_deref()
+            .map(normalize_public_url)
+            .unwrap_or(Ok(None))
+    }
+}
+
+fn validate_tunnel_auth(security: &crate::proxy::ProxySecurityConfig) -> Result<(), String> {
+    if matches!(
+        security.effective_auth_mode(),
+        crate::proxy::ProxyAuthMode::Off
+    ) || security.api_key.trim().is_empty()
+    {
+        return Err(
+            "Enable proxy authentication and configure an API key before opening a public tunnel"
+                .to_string(),
+        );
+    }
+    Ok(())
 }
 
 /// Cloudflared状态
@@ -84,11 +177,12 @@ impl Default for CloudflaredStatus {
 
 /// Cloudflared管理器状态
 pub struct CloudflaredManager {
-    process: Arc<RwLock<Option<Child>>>,
+    process: Arc<RwLock<Option<ManagedTunnelProcess>>>,
     status: Arc<RwLock<CloudflaredStatus>>,
     bin_path: PathBuf,
     /// 用于通知进程监控任务停止
     shutdown_tx: RwLock<Option<tokio::sync::oneshot::Sender<()>>>,
+    lifecycle: Mutex<()>,
 }
 
 impl CloudflaredManager {
@@ -114,6 +208,7 @@ impl CloudflaredManager {
             status: Arc::new(RwLock::new(CloudflaredStatus::default())),
             bin_path,
             shutdown_tx: RwLock::new(None),
+            lifecycle: Mutex::new(()),
         }
     }
 
@@ -236,6 +331,13 @@ impl CloudflaredManager {
 
     /// 启动隧道
     pub async fn start(&self, config: CloudflaredConfig) -> Result<CloudflaredStatus, String> {
+        let _lifecycle = self.lifecycle.lock().await;
+        // Validate before spawning or changing the existing process state.
+        let initial_url = config.preferred_public_url()?;
+        let app_config = crate::modules::config::load_app_config()?;
+        validate_tunnel_auth(&crate::proxy::ProxySecurityConfig::from_proxy_config(
+            &app_config.proxy,
+        ))?;
         // 检查是否已在运行
         {
             let proc = self.process.read().await;
@@ -310,28 +412,38 @@ impl CloudflaredManager {
         #[cfg(target_os = "windows")]
         cmd.creation_flags(CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP);
 
+        // Activate authentication before the child can open any public socket.
+        let activity = TunnelActivity::new(
+            ACTIVE_TUNNELS
+                .get_or_init(|| Arc::new(AtomicUsize::new(0)))
+                .clone(),
+        );
+        cmd.kill_on_drop(true);
         let mut child = cmd.spawn().map_err(|e| format!("Failed to spawn: {}", e))?;
 
         let stdout = child.stdout.take();
         let stderr = child.stderr.take();
 
-        let status_clone = self.status.clone();
-        if let Some(stdout) = stdout {
-            spawn_log_reader(stdout, status_clone.clone());
-        }
-
-        if let Some(stderr) = stderr {
-            spawn_log_reader(stderr, status_clone.clone());
-        }
-
-        *self.process.write().await = Some(child);
+        *self.process.write().await = Some(ManagedTunnelProcess {
+            child,
+            _activity: activity,
+        });
         self.update_status(|s| {
             s.installed = installed.clone();
             s.version = version.clone();
             s.running = true;
             s.error = None;
+            s.url = initial_url.clone();
         })
         .await;
+
+        let configured_url = initial_url.is_some();
+        if let Some(stdout) = stdout {
+            spawn_log_reader(stdout, self.status.clone(), configured_url);
+        }
+        if let Some(stderr) = stderr {
+            spawn_log_reader(stderr, self.status.clone(), configured_url);
+        }
 
         // 启动进程监控任务
         let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
@@ -350,8 +462,8 @@ impl CloudflaredManager {
                         tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
 
                         let mut proc_lock = process_ref.write().await;
-                        if let Some(ref mut child) = *proc_lock {
-                            match child.try_wait() {
+                        if let Some(ref mut process) = *proc_lock {
+                            match process.child.try_wait() {
                                 Ok(Some(exit_status)) => {
                                     // 进程已退出
                                     info!("[cloudflared] Process exited with status: {:?}", exit_status);
@@ -368,13 +480,11 @@ impl CloudflaredManager {
                                 }
                                 Err(e) => {
                                     info!("[cloudflared] Error checking process: {}", e);
-                                    *proc_lock = None;
                                     drop(proc_lock);
 
                                     let mut s = status_ref.write().await;
-                                    s.running = false;
                                     s.error = Some(format!("Error checking tunnel: {}", e));
-                                    break;
+                                    // Its exit is unverified: retain the child and auth guard.
                                 }
                             }
                         } else {
@@ -397,14 +507,28 @@ impl CloudflaredManager {
 
     /// 停止隧道
     pub async fn stop(&self) -> Result<CloudflaredStatus, String> {
+        let _lifecycle = self.lifecycle.lock().await;
+        let mut proc_lock = self.process.write().await;
+        if let Some(process) = proc_lock.as_mut() {
+            let stopped = matches!(process.child.try_wait(), Ok(Some(_)));
+            if !stopped {
+                tokio::time::timeout(std::time::Duration::from_secs(10), process.child.kill())
+                    .await
+                    .map_err(|_| {
+                        "Timed out stopping the tunnel; authentication remains enforced".to_string()
+                    })?
+                    .map_err(|error| {
+                        format!(
+                            "Failed to stop the tunnel; authentication remains enforced: {error}"
+                        )
+                    })?;
+            }
+            *proc_lock = None;
+            info!("[cloudflared] Tunnel stopped");
+        }
+        drop(proc_lock);
         if let Some(tx) = self.shutdown_tx.write().await.take() {
             let _ = tx.send(());
-        }
-
-        let mut proc_lock = self.process.write().await;
-        if let Some(mut child) = proc_lock.take() {
-            let _ = child.kill().await;
-            info!("[cloudflared] Tunnel stopped");
         }
 
         self.update_status(|s| {
@@ -438,7 +562,7 @@ fn get_download_url() -> Result<String, String> {
     ))
 }
 
-fn spawn_log_reader<R>(stream: R, status_ref: Arc<RwLock<CloudflaredStatus>>)
+fn spawn_log_reader<R>(stream: R, status_ref: Arc<RwLock<CloudflaredStatus>>, configured_url: bool)
 where
     R: AsyncRead + Unpin + Send + 'static,
 {
@@ -448,13 +572,19 @@ where
         while let Ok(Some(line)) = lines.next_line().await {
             // 恢复日志级别为 debug，避免污染生产环境日志
             debug!("[cloudflared output] {}", line);
-            if let Some(url) = extract_tunnel_url(&line) {
-                info!("[cloudflared] Tunnel URL: {}", url);
-                let mut s = status_ref.write().await;
-                s.url = Some(url);
-            }
+            update_public_url(&mut *status_ref.write().await, &line, configured_url);
         }
     });
+}
+
+fn update_public_url(status: &mut CloudflaredStatus, line: &str, configured_url: bool) {
+    if configured_url {
+        return;
+    }
+    if let Some(url) = extract_tunnel_url(line) {
+        info!("[cloudflared] Tunnel URL: {}", url);
+        status.url = Some(url);
+    }
 }
 
 /// 从日志行提取隧道URL
@@ -479,11 +609,92 @@ fn extract_tunnel_url(line: &str) -> Option<String> {
             if let Some(end) = after_key.find("\\\"") {
                 let hostname = &after_key[..end];
                 if !hostname.is_empty() {
-                    return Some(format!("https://{}", hostname));
+                    return normalize_public_url(hostname).ok().flatten();
                 }
             }
         }
     }
 
     None
+}
+
+#[cfg(test)]
+mod tunnel_url_tests {
+    use super::*;
+
+    #[test]
+    fn activity_guards_preserve_other_tunnels_and_release_failed_start_attempts() {
+        let counter = Arc::new(AtomicUsize::new(0));
+        let running = TunnelActivity::new(counter.clone());
+        {
+            // A failed spawn drops its local guard without affecting an older child.
+            let _failed_start = TunnelActivity::new(counter.clone());
+            assert_eq!(counter.load(Ordering::SeqCst), 2);
+        }
+        assert_eq!(counter.load(Ordering::SeqCst), 1);
+        drop(running);
+        assert_eq!(counter.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn custom_public_url_is_validated_as_an_origin() {
+        assert_eq!(
+            normalize_public_url(" api.example.com ")
+                .unwrap()
+                .as_deref(),
+            Some("https://api.example.com")
+        );
+        assert_eq!(
+            normalize_public_url("http://localhost:8045/")
+                .unwrap()
+                .as_deref(),
+            Some("http://localhost:8045")
+        );
+        assert!(normalize_public_url(" ").unwrap().is_none());
+        for value in [
+            "ftp://api.example.com",
+            "https://user:secret@api.example.com",
+            "https://api.example.com/path",
+            "https://api.example.com?key=secret",
+            "https://api.example.com#fragment",
+        ] {
+            assert!(normalize_public_url(value).is_err(), "{value}");
+        }
+    }
+
+    #[test]
+    fn configured_domain_wins_and_unconfigured_tunnels_keep_log_discovery() {
+        let line = r#"INF Updated to new configuration config="{\"ingress\":[{\"hostname\":\"other.example.com\"}]}""#;
+        let mut configured = CloudflaredStatus::default();
+        configured.url = normalize_public_url("wanted.example.com").unwrap();
+        update_public_url(&mut configured, line, true);
+        assert_eq!(
+            configured.url.as_deref(),
+            Some("https://wanted.example.com")
+        );
+        let mut fallback = CloudflaredStatus::default();
+        update_public_url(&mut fallback, line, false);
+        assert_eq!(fallback.url.as_deref(), Some("https://other.example.com"));
+        update_public_url(
+            &mut fallback,
+            "INF https://temporary.trycloudflare.com",
+            false,
+        );
+        assert_eq!(
+            fallback.url.as_deref(),
+            Some("https://temporary.trycloudflare.com")
+        );
+    }
+
+    #[test]
+    fn tunnels_require_effective_authentication_before_spawning() {
+        let mut security =
+            crate::proxy::ProxySecurityConfig::from_proxy_config(&Default::default());
+        assert!(validate_tunnel_auth(&security).is_err());
+        security.auth_mode = crate::proxy::ProxyAuthMode::Strict;
+        security.api_key = String::new();
+        assert!(validate_tunnel_auth(&security).is_err());
+        security.api_key = "private-proxy-key".into();
+        assert!(validate_tunnel_auth(&security).is_ok());
+    }
 }

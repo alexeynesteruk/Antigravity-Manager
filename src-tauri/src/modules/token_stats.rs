@@ -9,9 +9,15 @@ pub struct TokenStatsAggregated {
     pub total_input_tokens: u64,
     pub total_output_tokens: u64,
     pub total_cached_tokens: u64,
+    pub cache_reported_requests: u64,
+    pub cache_reported_input_tokens: u64,
+    pub cache_reported_tokens: u64,
     #[serde(default)]
     pub total_reasoning_tokens: u64,
     pub total_tokens: u64,
+    pub total_reported_requests: u64,
+    pub output_reported_requests: u64,
+    pub input_reported_requests: u64,
     pub request_count: u64,
 }
 
@@ -22,9 +28,15 @@ pub struct AccountTokenStats {
     pub total_input_tokens: u64,
     pub total_output_tokens: u64,
     pub total_cached_tokens: u64,
+    pub cache_reported_requests: u64,
+    pub cache_reported_input_tokens: u64,
+    pub cache_reported_tokens: u64,
     #[serde(default)]
     pub total_reasoning_tokens: u64,
     pub total_tokens: u64,
+    pub total_reported_requests: u64,
+    pub output_reported_requests: u64,
+    pub input_reported_requests: u64,
     pub request_count: u64,
 }
 
@@ -34,9 +46,15 @@ pub struct TokenStatsSummary {
     pub total_input_tokens: u64,
     pub total_output_tokens: u64,
     pub total_cached_tokens: u64,
+    pub cache_reported_requests: u64,
+    pub cache_reported_input_tokens: u64,
+    pub cache_reported_tokens: u64,
     #[serde(default)]
     pub total_reasoning_tokens: u64,
     pub total_tokens: u64,
+    pub total_reported_requests: u64,
+    pub output_reported_requests: u64,
+    pub input_reported_requests: u64,
     pub total_requests: u64,
     pub unique_accounts: u64,
 }
@@ -48,23 +66,29 @@ pub struct ModelTokenStats {
     pub total_input_tokens: u64,
     pub total_output_tokens: u64,
     pub total_cached_tokens: u64,
+    pub cache_reported_requests: u64,
+    pub cache_reported_input_tokens: u64,
+    pub cache_reported_tokens: u64,
     #[serde(default)]
     pub total_reasoning_tokens: u64,
     pub total_tokens: u64,
+    pub total_reported_requests: u64,
+    pub output_reported_requests: u64,
+    pub input_reported_requests: u64,
     pub request_count: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModelTrendPoint {
     pub period: String,
-    pub model_data: std::collections::HashMap<String, u64>,
+    pub model_data: std::collections::HashMap<String, Option<u64>>,
 }
 
 /// Account trend data point (for stacked area chart)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AccountTrendPoint {
     pub period: String,
-    pub account_data: std::collections::HashMap<String, u64>,
+    pub account_data: std::collections::HashMap<String, Option<u64>>,
 }
 
 pub(crate) fn get_db_path() -> Result<PathBuf, String> {
@@ -107,10 +131,10 @@ pub fn init_db() -> Result<(), String> {
             timestamp INTEGER NOT NULL,
             account_email TEXT NOT NULL,
             model TEXT NOT NULL,
-            input_tokens INTEGER NOT NULL DEFAULT 0,
-            output_tokens INTEGER NOT NULL DEFAULT 0,
-            cached_tokens INTEGER NOT NULL DEFAULT 0,
-            total_tokens INTEGER NOT NULL DEFAULT 0
+            input_tokens INTEGER,
+            output_tokens INTEGER,
+            cached_tokens INTEGER,
+            total_tokens INTEGER
         )",
         [],
     )
@@ -165,11 +189,7 @@ pub fn init_db() -> Result<(), String> {
         "token_usage",
         "cached_tokens INTEGER NOT NULL DEFAULT 0",
     )?;
-    add_column_if_missing(
-        &conn,
-        "token_usage",
-        "reasoning_tokens INTEGER NOT NULL DEFAULT 0",
-    )?;
+    add_column_if_missing(&conn, "token_usage", "reasoning_tokens INTEGER")?;
     add_column_if_missing(
         &conn,
         "token_stats_hourly",
@@ -181,6 +201,63 @@ pub fn init_db() -> Result<(), String> {
         "total_reasoning_tokens INTEGER NOT NULL DEFAULT 0",
     )?;
 
+    add_column_if_missing(
+        &conn,
+        "token_usage",
+        "cache_reported INTEGER NOT NULL DEFAULT 0",
+    )?;
+    // total_tokens 是历史 input + output 派生列；没有原件时不能当作实报总量。
+    add_column_if_missing(&conn, "token_usage", "reported_total_tokens INTEGER")?;
+    let input_not_null: bool = conn
+        .query_row(
+            "SELECT \"notnull\" FROM pragma_table_info('token_usage') WHERE name = 'input_tokens'",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|e| e.to_string())?;
+    if input_not_null {
+        conn.execute_batch(
+            "BEGIN;
+             ALTER TABLE token_usage RENAME TO token_usage_before_nullable;
+             CREATE TABLE token_usage (
+                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+                 timestamp INTEGER NOT NULL,
+                 account_email TEXT NOT NULL,
+                 model TEXT NOT NULL,
+                 input_tokens INTEGER,
+                 output_tokens INTEGER,
+                 cached_tokens INTEGER,
+                 reasoning_tokens INTEGER,
+                 total_tokens INTEGER,
+                 reported_total_tokens INTEGER,
+                 cache_reported INTEGER NOT NULL DEFAULT 0
+             );
+             INSERT INTO token_usage
+                 (id, timestamp, account_email, model, input_tokens, output_tokens, cached_tokens,
+                  reasoning_tokens, total_tokens, reported_total_tokens, cache_reported)
+             SELECT id, timestamp, account_email, model, NULLIF(input_tokens, 0), NULLIF(output_tokens, 0),
+                    CASE WHEN cache_reported = 0 AND cached_tokens = 0 THEN NULL ELSE cached_tokens END,
+                    NULLIF(reasoning_tokens, 0), total_tokens, reported_total_tokens, cache_reported
+             FROM token_usage_before_nullable;
+             DROP TABLE token_usage_before_nullable;
+             CREATE INDEX idx_token_timestamp ON token_usage (timestamp DESC);
+             CREATE INDEX idx_token_account ON token_usage (account_email);
+             CREATE INDEX idx_token_account_timestamp ON token_usage (account_email, timestamp DESC);
+             CREATE INDEX idx_token_model ON token_usage (model);
+             COMMIT;"
+        ).map_err(|e| e.to_string())?;
+    }
+    for column in [
+        "cache_reported_requests INTEGER NOT NULL DEFAULT 0",
+        "cache_reported_input_tokens INTEGER NOT NULL DEFAULT 0",
+        "cache_reported_tokens INTEGER NOT NULL DEFAULT 0",
+        "reported_total_tokens INTEGER NOT NULL DEFAULT 0",
+        "total_reported_requests INTEGER NOT NULL DEFAULT 0",
+        "output_reported_requests INTEGER NOT NULL DEFAULT 0",
+        "input_reported_requests INTEGER NOT NULL DEFAULT 0",
+    ] {
+        add_column_if_missing(&conn, "token_stats_hourly", column)?;
+    }
     Ok(())
 }
 
@@ -188,34 +265,47 @@ pub fn init_db() -> Result<(), String> {
 pub fn record_usage(
     account_email: &str,
     model: &str,
-    input_tokens: u32,
-    output_tokens: u32,
-    cached_tokens: u32,
-    reasoning_tokens: u32,
+    input_tokens: Option<u32>,
+    output_tokens: Option<u32>,
+    cached_tokens: Option<u32>,
+    reasoning_tokens: Option<u32>,
+    reported_total_tokens: Option<u32>,
 ) -> Result<(), String> {
     let conn = connect_db()?;
     let timestamp = chrono::Local::now().timestamp();
-    let total_tokens = input_tokens + output_tokens;
+    let cache_reported = u32::from(input_tokens.zip(cached_tokens).is_some());
+    let cache_reported_input = input_tokens.zip(cached_tokens).map(|(input, _)| input);
+    let cache_reported_tokens = input_tokens.zip(cached_tokens).map(|(_, cached)| cached);
+    let input_reported = u32::from(input_tokens.is_some());
+    let output_reported = u32::from(output_tokens.is_some());
+    let total_reported = u32::from(reported_total_tokens.is_some());
 
     // Insert into raw usage table
     conn.execute(
-        "INSERT INTO token_usage (timestamp, account_email, model, input_tokens, output_tokens, cached_tokens, reasoning_tokens, total_tokens)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-        params![timestamp, account_email, model, input_tokens, output_tokens, cached_tokens, reasoning_tokens, total_tokens],
+        "INSERT INTO token_usage (timestamp, account_email, model, input_tokens, output_tokens, cached_tokens, reasoning_tokens, total_tokens, cache_reported, reported_total_tokens)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?8)",
+        params![timestamp, account_email, model, input_tokens, output_tokens, cached_tokens, reasoning_tokens, reported_total_tokens, cache_reported],
     ).map_err(|e| e.to_string())?;
 
     let hour_bucket = chrono::Local::now().format("%Y-%m-%d %H:00").to_string();
     conn.execute(
-        "INSERT INTO token_stats_hourly (hour_bucket, account_email, total_input_tokens, total_output_tokens, total_cached_tokens, total_reasoning_tokens, total_tokens, request_count)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 1)
+        "INSERT INTO token_stats_hourly (hour_bucket, account_email, total_input_tokens, total_output_tokens, total_cached_tokens, total_reasoning_tokens, total_tokens, request_count, cache_reported_requests, cache_reported_input_tokens, cache_reported_tokens, reported_total_tokens, total_reported_requests, output_reported_requests, input_reported_requests)
+         VALUES (?1, ?2, COALESCE(?3, 0), COALESCE(?4, 0), COALESCE(?5, 0), COALESCE(?6, 0), COALESCE(?7, 0), 1, ?8, COALESCE(?9, 0), COALESCE(?10, 0), COALESCE(?7, 0), ?11, ?12, ?13)
          ON CONFLICT(hour_bucket, account_email) DO UPDATE SET
-            total_input_tokens = total_input_tokens + ?3,
-            total_output_tokens = total_output_tokens + ?4,
-            total_cached_tokens = total_cached_tokens + ?5,
-            total_reasoning_tokens = total_reasoning_tokens + ?6,
-            total_tokens = total_tokens + ?7,
-            request_count = request_count + 1",
-        params![hour_bucket, account_email, input_tokens, output_tokens, cached_tokens, reasoning_tokens, total_tokens],
+            total_input_tokens = total_input_tokens + COALESCE(?3, 0),
+            total_output_tokens = total_output_tokens + COALESCE(?4, 0),
+            total_cached_tokens = total_cached_tokens + COALESCE(?5, 0),
+            total_reasoning_tokens = total_reasoning_tokens + COALESCE(?6, 0),
+            total_tokens = total_tokens + COALESCE(?7, 0),
+            request_count = request_count + 1,
+            cache_reported_requests = cache_reported_requests + ?8,
+            cache_reported_input_tokens = cache_reported_input_tokens + COALESCE(?9, 0),
+            cache_reported_tokens = cache_reported_tokens + COALESCE(?10, 0),
+            reported_total_tokens = reported_total_tokens + COALESCE(?7, 0),
+            total_reported_requests = total_reported_requests + ?11,
+            output_reported_requests = output_reported_requests + ?12,
+            input_reported_requests = input_reported_requests + ?13",
+        params![hour_bucket, account_email, input_tokens, output_tokens, cached_tokens, reasoning_tokens, reported_total_tokens, cache_reported, cache_reported_input, cache_reported_tokens, total_reported, output_reported, input_reported],
     ).map_err(|e| e.to_string())?;
 
     Ok(())
@@ -297,14 +387,18 @@ pub fn get_minute_stats(
 
     let mut stmt = conn
         .prepare(
-            "SELECT strftime('%Y-%m-%d %H:%M', datetime(timestamp - (timestamp % ?2), 'unixepoch', 'localtime')) as minute_bucket, 
-                SUM(input_tokens) as input, 
-                SUM(output_tokens) as output,
-                SUM(cached_tokens) as cached,
+            "SELECT strftime('%Y-%m-%d %H:%M', datetime(timestamp - (timestamp % ?2), 'unixepoch', 'localtime')) as minute_bucket,
+                COALESCE(SUM(input_tokens), 0) as input,
+                COALESCE(SUM(output_tokens), 0) as output,
+                COALESCE(SUM(cached_tokens), 0) as cached,
                 SUM(COALESCE(reasoning_tokens, 0)) as reasoning,
-                SUM(total_tokens) as total,
-                COUNT(*) as count
-         FROM token_usage 
+                COALESCE(SUM(reported_total_tokens), 0) as total,
+                COUNT(*) as count,
+                COALESCE(SUM(cache_reported), 0),
+                COALESCE(SUM(CASE WHEN cache_reported = 1 THEN input_tokens ELSE 0 END), 0),
+                COALESCE(SUM(CASE WHEN cache_reported = 1 THEN cached_tokens ELSE 0 END), 0),
+                COUNT(reported_total_tokens), COUNT(output_tokens), COUNT(input_tokens)
+         FROM token_usage
          WHERE timestamp >= ?1
          GROUP BY minute_bucket
          ORDER BY minute_bucket ASC",
@@ -318,6 +412,12 @@ pub fn get_minute_stats(
                 total_input_tokens: row.get(1)?,
                 total_output_tokens: row.get(2)?,
                 total_cached_tokens: row.get(3)?,
+                cache_reported_requests: row.get(7)?,
+                cache_reported_input_tokens: row.get(8)?,
+                cache_reported_tokens: row.get(9)?,
+                total_reported_requests: row.get(10)?,
+                output_reported_requests: row.get(11)?,
+                input_reported_requests: row.get(12)?,
                 total_reasoning_tokens: row.get(4)?,
                 total_tokens: row.get(5)?,
                 request_count: row.get(6)?,
@@ -344,14 +444,20 @@ pub fn get_hourly_stats(hours: i64) -> Result<Vec<TokenStatsAggregated>, String>
 
     let mut stmt = conn
         .prepare(
-            "SELECT hour_bucket, 
-                SUM(total_input_tokens) as input, 
+            "SELECT hour_bucket,
+                SUM(total_input_tokens) as input,
                 SUM(total_output_tokens) as output,
                 SUM(total_cached_tokens) as cached,
                 SUM(total_reasoning_tokens) as reasoning,
-                SUM(total_tokens) as total,
-                SUM(request_count) as count
-         FROM token_stats_hourly 
+                COALESCE(SUM(reported_total_tokens), 0) as total,
+                SUM(request_count) as count,
+                SUM(cache_reported_requests),
+                SUM(cache_reported_input_tokens),
+                SUM(cache_reported_tokens),
+                SUM(total_reported_requests),
+                SUM(output_reported_requests),
+                SUM(input_reported_requests)
+         FROM token_stats_hourly
          WHERE hour_bucket >= ?1
          GROUP BY hour_bucket
          ORDER BY hour_bucket ASC",
@@ -365,6 +471,12 @@ pub fn get_hourly_stats(hours: i64) -> Result<Vec<TokenStatsAggregated>, String>
                 total_input_tokens: row.get(1)?,
                 total_output_tokens: row.get(2)?,
                 total_cached_tokens: row.get(3)?,
+                cache_reported_requests: row.get(7)?,
+                cache_reported_input_tokens: row.get(8)?,
+                cache_reported_tokens: row.get(9)?,
+                total_reported_requests: row.get(10)?,
+                output_reported_requests: row.get(11)?,
+                input_reported_requests: row.get(12)?,
                 total_reasoning_tokens: row.get(4)?,
                 total_tokens: row.get(5)?,
                 request_count: row.get(6)?,
@@ -391,14 +503,20 @@ pub fn get_daily_stats(days: i64) -> Result<Vec<TokenStatsAggregated>, String> {
 
     let mut stmt = conn
         .prepare(
-            "SELECT substr(hour_bucket, 1, 10) as day_bucket, 
-                SUM(total_input_tokens) as input, 
+            "SELECT substr(hour_bucket, 1, 10) as day_bucket,
+                SUM(total_input_tokens) as input,
                 SUM(total_output_tokens) as output,
                 SUM(total_cached_tokens) as cached,
                 SUM(total_reasoning_tokens) as reasoning,
-                SUM(total_tokens) as total,
-                SUM(request_count) as count
-         FROM token_stats_hourly 
+                COALESCE(SUM(reported_total_tokens), 0) as total,
+                SUM(request_count) as count,
+                SUM(cache_reported_requests),
+                SUM(cache_reported_input_tokens),
+                SUM(cache_reported_tokens),
+                SUM(total_reported_requests),
+                SUM(output_reported_requests),
+                SUM(input_reported_requests)
+         FROM token_stats_hourly
          WHERE substr(hour_bucket, 1, 10) >= ?1
          GROUP BY day_bucket
          ORDER BY day_bucket ASC",
@@ -412,6 +530,12 @@ pub fn get_daily_stats(days: i64) -> Result<Vec<TokenStatsAggregated>, String> {
                 total_input_tokens: row.get(1)?,
                 total_output_tokens: row.get(2)?,
                 total_cached_tokens: row.get(3)?,
+                cache_reported_requests: row.get(7)?,
+                cache_reported_input_tokens: row.get(8)?,
+                cache_reported_tokens: row.get(9)?,
+                total_reported_requests: row.get(10)?,
+                output_reported_requests: row.get(11)?,
+                input_reported_requests: row.get(12)?,
                 total_reasoning_tokens: row.get(4)?,
                 total_tokens: row.get(5)?,
                 request_count: row.get(6)?,
@@ -439,13 +563,19 @@ pub fn get_weekly_stats(weeks: i64) -> Result<Vec<TokenStatsAggregated>, String>
     let mut stmt = conn
         .prepare(
             "SELECT strftime('%Y-W%W', datetime(timestamp, 'unixepoch', 'localtime')) as week_bucket,
-                SUM(input_tokens) as input, 
-                SUM(output_tokens) as output,
-                SUM(cached_tokens) as cached,
-                SUM(reasoning_tokens) as reasoning,
-                SUM(total_tokens) as total,
-                COUNT(*) as count
-         FROM token_usage 
+                COALESCE(SUM(input_tokens), 0) as input,
+                COALESCE(SUM(output_tokens), 0) as output,
+                COALESCE(SUM(cached_tokens), 0) as cached,
+                COALESCE(SUM(reasoning_tokens), 0) as reasoning,
+                COALESCE(SUM(reported_total_tokens), 0) as total,
+                COUNT(*) as count,
+                SUM(cache_reported),
+                SUM(CASE WHEN cache_reported = 1 THEN input_tokens ELSE 0 END),
+                SUM(CASE WHEN cache_reported = 1 THEN cached_tokens ELSE 0 END),
+                COUNT(reported_total_tokens),
+                COUNT(output_tokens),
+                COUNT(input_tokens)
+         FROM token_usage
          WHERE timestamp >= ?1
          GROUP BY week_bucket
          ORDER BY week_bucket ASC",
@@ -459,6 +589,12 @@ pub fn get_weekly_stats(weeks: i64) -> Result<Vec<TokenStatsAggregated>, String>
                 total_input_tokens: row.get(1)?,
                 total_output_tokens: row.get(2)?,
                 total_cached_tokens: row.get(3)?,
+                cache_reported_requests: row.get(7)?,
+                cache_reported_input_tokens: row.get(8)?,
+                cache_reported_tokens: row.get(9)?,
+                total_reported_requests: row.get(10)?,
+                output_reported_requests: row.get(11)?,
+                input_reported_requests: row.get(12)?,
                 total_reasoning_tokens: row.get(4)?,
                 total_tokens: row.get(5)?,
                 request_count: row.get(6)?,
@@ -486,13 +622,19 @@ pub fn get_account_stats(hours: i64) -> Result<Vec<AccountTokenStats>, String> {
     let mut stmt = conn
         .prepare(
             "SELECT account_email,
-                SUM(total_input_tokens) as input, 
+                SUM(total_input_tokens) as input,
                 SUM(total_output_tokens) as output,
                 SUM(total_cached_tokens) as cached,
                 SUM(total_reasoning_tokens) as reasoning,
-                SUM(total_tokens) as total,
-                SUM(request_count) as count
-         FROM token_stats_hourly 
+                COALESCE(SUM(reported_total_tokens), 0) as total,
+                SUM(request_count) as count,
+                SUM(cache_reported_requests),
+                SUM(cache_reported_input_tokens),
+                SUM(cache_reported_tokens),
+                SUM(total_reported_requests),
+                SUM(output_reported_requests),
+                SUM(input_reported_requests)
+         FROM token_stats_hourly
          WHERE hour_bucket >= ?1
          GROUP BY account_email
          ORDER BY total DESC",
@@ -509,6 +651,12 @@ pub fn get_account_stats(hours: i64) -> Result<Vec<AccountTokenStats>, String> {
                 total_reasoning_tokens: row.get(4)?,
                 total_tokens: row.get(5)?,
                 request_count: row.get(6)?,
+                cache_reported_requests: row.get(7)?,
+                cache_reported_input_tokens: row.get(8)?,
+                cache_reported_tokens: row.get(9)?,
+                total_reported_requests: row.get(10)?,
+                output_reported_requests: row.get(11)?,
+                input_reported_requests: row.get(12)?,
             })
         })
         .map_err(|e| e.to_string())?;
@@ -530,22 +678,34 @@ pub fn get_summary_stats(hours: i64) -> Result<TokenStatsSummary, String> {
         cutoff.format("%Y-%m-%d %H:00").to_string()
     };
 
-    let (total_input, total_output, total_cached, total_reasoning, total, requests): (
-        u64,
-        u64,
-        u64,
-        u64,
-        u64,
-        u64,
-    ) = conn
+    let (
+        total_input,
+        total_output,
+        total_cached,
+        total_reasoning,
+        total,
+        requests,
+        cache_requests,
+        cache_input,
+        cache_tokens,
+        total_reported_requests,
+        output_reported_requests,
+        input_reported_requests,
+    ): (u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64) = conn
         .query_row(
             "SELECT COALESCE(SUM(total_input_tokens), 0),
                 COALESCE(SUM(total_output_tokens), 0),
                 COALESCE(SUM(total_cached_tokens), 0),
                 COALESCE(SUM(total_reasoning_tokens), 0),
-                COALESCE(SUM(total_tokens), 0),
-                COALESCE(SUM(request_count), 0)
-         FROM token_stats_hourly 
+                COALESCE(SUM(reported_total_tokens), 0),
+                COALESCE(SUM(request_count), 0),
+                COALESCE(SUM(cache_reported_requests), 0),
+                COALESCE(SUM(cache_reported_input_tokens), 0),
+                COALESCE(SUM(cache_reported_tokens), 0),
+                COALESCE(SUM(total_reported_requests), 0),
+                COALESCE(SUM(output_reported_requests), 0),
+                COALESCE(SUM(input_reported_requests), 0)
+         FROM token_stats_hourly
          WHERE hour_bucket >= ?1",
             [&cutoff_bucket],
             |row| {
@@ -556,6 +716,12 @@ pub fn get_summary_stats(hours: i64) -> Result<TokenStatsSummary, String> {
                     row.get(3)?,
                     row.get(4)?,
                     row.get(5)?,
+                    row.get(6)?,
+                    row.get(7)?,
+                    row.get(8)?,
+                    row.get(9)?,
+                    row.get(10)?,
+                    row.get(11)?,
                 ))
             },
         )
@@ -573,8 +739,14 @@ pub fn get_summary_stats(hours: i64) -> Result<TokenStatsSummary, String> {
         total_input_tokens: total_input,
         total_output_tokens: total_output,
         total_cached_tokens: total_cached,
+        cache_reported_requests: cache_requests,
+        cache_reported_input_tokens: cache_input,
+        cache_reported_tokens: cache_tokens,
         total_reasoning_tokens: total_reasoning,
         total_tokens: total,
+        total_reported_requests,
+        output_reported_requests,
+        input_reported_requests,
         total_requests: requests,
         unique_accounts,
     })
@@ -591,12 +763,18 @@ pub fn get_model_stats(hours: i64) -> Result<Vec<ModelTokenStats>, String> {
     let mut stmt = conn
         .prepare(
             "SELECT model,
-                SUM(input_tokens) as input,
-                SUM(output_tokens) as output,
-                SUM(cached_tokens) as cached,
-                SUM(reasoning_tokens) as reasoning,
-                SUM(total_tokens) as total,
-                COUNT(*) as count
+                COALESCE(SUM(input_tokens), 0) as input,
+                COALESCE(SUM(output_tokens), 0) as output,
+                COALESCE(SUM(cached_tokens), 0) as cached,
+                COALESCE(SUM(reasoning_tokens), 0) as reasoning,
+                COALESCE(SUM(reported_total_tokens), 0) as total,
+                COUNT(*) as count,
+                SUM(cache_reported),
+                SUM(CASE WHEN cache_reported = 1 THEN input_tokens ELSE 0 END),
+                SUM(CASE WHEN cache_reported = 1 THEN cached_tokens ELSE 0 END),
+                COUNT(reported_total_tokens),
+                COUNT(output_tokens),
+                COUNT(input_tokens)
          FROM token_usage
          WHERE timestamp >= ?1
          GROUP BY model
@@ -611,6 +789,12 @@ pub fn get_model_stats(hours: i64) -> Result<Vec<ModelTokenStats>, String> {
                 total_input_tokens: row.get(1)?,
                 total_output_tokens: row.get(2)?,
                 total_cached_tokens: row.get(3)?,
+                cache_reported_requests: row.get(7)?,
+                cache_reported_input_tokens: row.get(8)?,
+                cache_reported_tokens: row.get(9)?,
+                total_reported_requests: row.get(10)?,
+                output_reported_requests: row.get(11)?,
+                input_reported_requests: row.get(12)?,
                 total_reasoning_tokens: row.get(4)?,
                 total_tokens: row.get(5)?,
                 request_count: row.get(6)?,
@@ -641,7 +825,7 @@ pub fn get_model_trend_minute(
         .prepare(
             "SELECT strftime('%Y-%m-%d %H:%M', datetime(timestamp - (timestamp % ?2), 'unixepoch', 'localtime')) as minute_bucket,
                 model,
-                SUM(total_tokens) as total
+                SUM(reported_total_tokens) as total
          FROM token_usage
          WHERE timestamp >= ?1
          GROUP BY minute_bucket, model
@@ -649,15 +833,17 @@ pub fn get_model_trend_minute(
         )
         .map_err(|e| e.to_string())?;
 
-    let mut trend_map: std::collections::BTreeMap<String, std::collections::HashMap<String, u64>> =
-        std::collections::BTreeMap::new();
+    let mut trend_map: std::collections::BTreeMap<
+        String,
+        std::collections::HashMap<String, Option<u64>>,
+    > = std::collections::BTreeMap::new();
 
     let rows = stmt
         .query_map(params![cutoff, step_secs], |row| {
             Ok((
                 row.get::<_, String>(0)?,
                 row.get::<_, String>(1)?,
-                row.get::<_, u64>(2)?,
+                row.get::<_, Option<u64>>(2)?,
             ))
         })
         .map_err(|e| e.to_string())?;
@@ -685,7 +871,7 @@ pub fn get_model_trend_hourly(hours: i64) -> Result<Vec<ModelTrendPoint>, String
         .prepare(
             "SELECT strftime('%Y-%m-%d %H:00', datetime(timestamp, 'unixepoch', 'localtime')) as hour_bucket,
                 model,
-                SUM(total_tokens) as total
+                SUM(reported_total_tokens) as total
          FROM token_usage
          WHERE timestamp >= ?1
          GROUP BY hour_bucket, model
@@ -693,15 +879,17 @@ pub fn get_model_trend_hourly(hours: i64) -> Result<Vec<ModelTrendPoint>, String
         )
         .map_err(|e| e.to_string())?;
 
-    let mut trend_map: std::collections::BTreeMap<String, std::collections::HashMap<String, u64>> =
-        std::collections::BTreeMap::new();
+    let mut trend_map: std::collections::BTreeMap<
+        String,
+        std::collections::HashMap<String, Option<u64>>,
+    > = std::collections::BTreeMap::new();
 
     let rows = stmt
         .query_map([cutoff], |row| {
             Ok((
                 row.get::<_, String>(0)?,
                 row.get::<_, String>(1)?,
-                row.get::<_, u64>(2)?,
+                row.get::<_, Option<u64>>(2)?,
             ))
         })
         .map_err(|e| e.to_string())?;
@@ -729,7 +917,7 @@ pub fn get_model_trend_daily(days: i64) -> Result<Vec<ModelTrendPoint>, String> 
         .prepare(
             "SELECT strftime('%Y-%m-%d', datetime(timestamp, 'unixepoch', 'localtime')) as day_bucket,
                 model,
-                SUM(total_tokens) as total
+                SUM(reported_total_tokens) as total
          FROM token_usage
          WHERE timestamp >= ?1
          GROUP BY day_bucket, model
@@ -737,15 +925,17 @@ pub fn get_model_trend_daily(days: i64) -> Result<Vec<ModelTrendPoint>, String> 
         )
         .map_err(|e| e.to_string())?;
 
-    let mut trend_map: std::collections::BTreeMap<String, std::collections::HashMap<String, u64>> =
-        std::collections::BTreeMap::new();
+    let mut trend_map: std::collections::BTreeMap<
+        String,
+        std::collections::HashMap<String, Option<u64>>,
+    > = std::collections::BTreeMap::new();
 
     let rows = stmt
         .query_map([cutoff], |row| {
             Ok((
                 row.get::<_, String>(0)?,
                 row.get::<_, String>(1)?,
-                row.get::<_, u64>(2)?,
+                row.get::<_, Option<u64>>(2)?,
             ))
         })
         .map_err(|e| e.to_string())?;
@@ -777,7 +967,7 @@ pub fn get_account_trend_minute(
         .prepare(
             "SELECT strftime('%Y-%m-%d %H:%M', datetime(timestamp - (timestamp % ?2), 'unixepoch', 'localtime')) as minute_bucket,
                 account_email,
-                SUM(total_tokens) as total
+                SUM(reported_total_tokens) as total
          FROM token_usage
          WHERE timestamp >= ?1
          GROUP BY minute_bucket, account_email
@@ -785,15 +975,17 @@ pub fn get_account_trend_minute(
         )
         .map_err(|e| e.to_string())?;
 
-    let mut trend_map: std::collections::BTreeMap<String, std::collections::HashMap<String, u64>> =
-        std::collections::BTreeMap::new();
+    let mut trend_map: std::collections::BTreeMap<
+        String,
+        std::collections::HashMap<String, Option<u64>>,
+    > = std::collections::BTreeMap::new();
 
     let rows = stmt
         .query_map(params![cutoff, step_secs], |row| {
             Ok((
                 row.get::<_, String>(0)?,
                 row.get::<_, String>(1)?,
-                row.get::<_, u64>(2)?,
+                row.get::<_, Option<u64>>(2)?,
             ))
         })
         .map_err(|e| e.to_string())?;
@@ -824,7 +1016,7 @@ pub fn get_account_trend_hourly(hours: i64) -> Result<Vec<AccountTrendPoint>, St
         .prepare(
             "SELECT strftime('%Y-%m-%d %H:00', datetime(timestamp, 'unixepoch', 'localtime')) as hour_bucket,
                 account_email,
-                SUM(total_tokens) as total
+                SUM(reported_total_tokens) as total
          FROM token_usage
          WHERE timestamp >= ?1
          GROUP BY hour_bucket, account_email
@@ -832,15 +1024,17 @@ pub fn get_account_trend_hourly(hours: i64) -> Result<Vec<AccountTrendPoint>, St
         )
         .map_err(|e| e.to_string())?;
 
-    let mut trend_map: std::collections::BTreeMap<String, std::collections::HashMap<String, u64>> =
-        std::collections::BTreeMap::new();
+    let mut trend_map: std::collections::BTreeMap<
+        String,
+        std::collections::HashMap<String, Option<u64>>,
+    > = std::collections::BTreeMap::new();
 
     let rows = stmt
         .query_map([cutoff], |row| {
             Ok((
                 row.get::<_, String>(0)?,
                 row.get::<_, String>(1)?,
-                row.get::<_, u64>(2)?,
+                row.get::<_, Option<u64>>(2)?,
             ))
         })
         .map_err(|e| e.to_string())?;
@@ -871,7 +1065,7 @@ pub fn get_account_trend_daily(days: i64) -> Result<Vec<AccountTrendPoint>, Stri
         .prepare(
             "SELECT strftime('%Y-%m-%d', datetime(timestamp, 'unixepoch', 'localtime')) as day_bucket,
                 account_email,
-                SUM(total_tokens) as total
+                SUM(reported_total_tokens) as total
          FROM token_usage
          WHERE timestamp >= ?1
          GROUP BY day_bucket, account_email
@@ -879,15 +1073,17 @@ pub fn get_account_trend_daily(days: i64) -> Result<Vec<AccountTrendPoint>, Stri
         )
         .map_err(|e| e.to_string())?;
 
-    let mut trend_map: std::collections::BTreeMap<String, std::collections::HashMap<String, u64>> =
-        std::collections::BTreeMap::new();
+    let mut trend_map: std::collections::BTreeMap<
+        String,
+        std::collections::HashMap<String, Option<u64>>,
+    > = std::collections::BTreeMap::new();
 
     let rows = stmt
         .query_map([cutoff], |row| {
             Ok((
                 row.get::<_, String>(0)?,
                 row.get::<_, String>(1)?,
-                row.get::<_, u64>(2)?,
+                row.get::<_, Option<u64>>(2)?,
             ))
         })
         .map_err(|e| e.to_string())?;
@@ -908,6 +1104,100 @@ pub fn get_account_trend_daily(days: i64) -> Result<Vec<AccountTrendPoint>, Stri
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn legacy_database_upgrade_keeps_derived_totals_separate_and_new_nulls_readable() {
+        let _data = crate::proxy::monitor::prompt_log_tests::TestDataDir::new();
+        let conn = connect_db().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE token_usage (id INTEGER PRIMARY KEY AUTOINCREMENT, timestamp INTEGER NOT NULL,
+                 account_email TEXT NOT NULL, model TEXT NOT NULL, input_tokens INTEGER NOT NULL DEFAULT 0,
+                 output_tokens INTEGER NOT NULL DEFAULT 0, cached_tokens INTEGER NOT NULL DEFAULT 0,
+                 reasoning_tokens INTEGER NOT NULL DEFAULT 0, total_tokens INTEGER NOT NULL DEFAULT 0);
+             INSERT INTO token_usage VALUES (1, 1, 'legacy@test', 'gemini', 100, 20, 80, 3, 120);
+             INSERT INTO token_usage VALUES (2, 1, 'legacy@test', 'gemini', 0, 0, 0, 0, 0);
+             CREATE TABLE token_stats_hourly (hour_bucket TEXT NOT NULL, account_email TEXT NOT NULL,
+                 total_input_tokens INTEGER NOT NULL DEFAULT 0, total_output_tokens INTEGER NOT NULL DEFAULT 0,
+                 total_cached_tokens INTEGER NOT NULL DEFAULT 0, total_reasoning_tokens INTEGER NOT NULL DEFAULT 0,
+                 total_tokens INTEGER NOT NULL DEFAULT 0, request_count INTEGER NOT NULL DEFAULT 0,
+                 PRIMARY KEY (hour_bucket, account_email));
+             INSERT INTO token_stats_hourly VALUES (strftime('%Y-%m-%d %H:00', 'now', 'localtime'), 'legacy@test', 100, 20, 80, 3, 120, 2);"
+        ).unwrap();
+        drop(conn);
+        init_db().unwrap();
+        let conn = connect_db().unwrap();
+        let old: (u32, Option<u32>, u32) = conn.query_row("SELECT total_tokens, reported_total_tokens, cache_reported FROM token_usage WHERE id = 1", [], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?))).unwrap();
+        assert_eq!(old, (120, None, 0));
+        let unknown: (Option<u32>, Option<u32>, Option<u32>, Option<u32>, Option<u32>) = conn.query_row("SELECT input_tokens, output_tokens, cached_tokens, reasoning_tokens, reported_total_tokens FROM token_usage WHERE id = 2", [], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?))).unwrap();
+        assert_eq!(unknown, (None, None, None, None, None));
+        drop(conn);
+        record_usage(
+            "legacy@test",
+            "gemini",
+            Some(0),
+            Some(0),
+            Some(0),
+            Some(0),
+            Some(0),
+        )
+        .unwrap();
+        record_usage(
+            "legacy@test",
+            "gemini",
+            Some(100),
+            None,
+            Some(80),
+            None,
+            None,
+        )
+        .unwrap();
+        init_db().unwrap();
+        let model = get_model_stats(0).unwrap().remove(0);
+        assert_eq!(model.request_count, 4);
+        assert_eq!(model.total_tokens, 0);
+        assert_eq!(model.total_reported_requests, 1);
+        assert_eq!(model.output_reported_requests, 2);
+        assert_eq!(model.cache_reported_requests, 2);
+        assert_eq!(model.cache_reported_input_tokens, 100);
+        assert_eq!(model.cache_reported_tokens, 80);
+        let conn = connect_db().unwrap();
+        let explicit: (Option<u32>, Option<u32>, Option<u32>, Option<u32>) = conn.query_row("SELECT input_tokens, output_tokens, cached_tokens, reported_total_tokens FROM token_usage WHERE id = 3", [], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))).unwrap();
+        assert_eq!(explicit, (Some(0), Some(0), Some(0), Some(0)));
+        let legacy_hourly: u64 = conn
+            .query_row("SELECT total_tokens FROM token_stats_hourly", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(legacy_hourly, 120);
+        let summary = get_summary_stats(0).unwrap();
+        assert_eq!(summary.total_requests, 4);
+        assert_eq!(summary.total_tokens, 0);
+        assert_eq!(summary.total_reported_requests, 1);
+        for trend in [
+            get_model_trend_hourly(0).unwrap(),
+            get_model_trend_daily(0).unwrap(),
+        ] {
+            let totals: Vec<_> = trend
+                .iter()
+                .flat_map(|point| point.model_data.values())
+                .copied()
+                .collect();
+            assert!(totals.contains(&None));
+            assert!(totals.contains(&Some(0)));
+        }
+        for trend in [
+            get_account_trend_hourly(0).unwrap(),
+            get_account_trend_daily(0).unwrap(),
+        ] {
+            let totals: Vec<_> = trend
+                .iter()
+                .flat_map(|point| point.account_data.values())
+                .copied()
+                .collect();
+            assert!(totals.contains(&None));
+            assert!(totals.contains(&Some(0)));
+        }
+    }
+
     use super::*;
 
     fn weekly_snapshot(observed: i64, reset: i64, fraction: f64) -> crate::models::QuotaData {
@@ -1056,8 +1346,34 @@ mod tests {
 
     #[test]
     fn test_record_and_query() {
-        // This would need a test database setup
-        // For now, just verify the module compiles
-        assert!(true);
+        let _data = crate::proxy::monitor::prompt_log_tests::TestDataDir::new();
+        init_db().unwrap();
+        for cached in [None, Some(0), Some(80)] {
+            record_usage(
+                "cache@test",
+                "gemini",
+                Some(100),
+                Some(2),
+                cached,
+                None,
+                None,
+            )
+            .unwrap();
+        }
+        let summary = get_summary_stats(0).unwrap();
+        assert_eq!(summary.total_requests, 3);
+        assert_eq!(summary.cache_reported_requests, 2);
+        assert_eq!(summary.cache_reported_input_tokens, 200);
+        assert_eq!(summary.cache_reported_tokens, 80);
+        let conn = connect_db().unwrap();
+        conn.execute("UPDATE token_usage SET cache_reported = 0", [])
+            .unwrap();
+        let model = get_model_stats(0).unwrap().remove(0);
+        assert_eq!(model.cache_reported_requests, 0);
+        assert_eq!(model.cache_reported_input_tokens, 0);
+        assert_eq!(model.cache_reported_tokens, 0);
+        // Old rows have no recoverable classification; their positive legacy total
+        // must not become a known-subset numerator with an unknown denominator.
+        assert_eq!(model.total_cached_tokens, 80);
     }
 }
