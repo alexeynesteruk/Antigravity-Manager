@@ -192,7 +192,7 @@ fn apply_account_credentials(
                     ));
                     let backup_path = db_path.with_extension("vscdb.backup");
                     let _ = fs::copy(&db_path, &backup_path);
-                    let _ = db::inject_token(
+                    db::inject_token(
                         &db_path,
                         &account.token.access_token,
                         &account.token.refresh_token,
@@ -203,7 +203,13 @@ fn apply_account_credentials(
                         account.token.id_token.as_deref(),
                         account.token.oauth_client_key.as_deref(),
                         effective_target,
-                    );
+                    )
+                    .map_err(|error| {
+                        format!(
+                            "Keyring write failed ({}); SQLite credential fallback also failed: {}",
+                            keyring_err, error
+                        )
+                    })?;
                     if let Some(ref profile) = account.device_profile {
                         let _ = db::write_service_machine_id(&db_path, &profile.mac_machine_id);
                     }
