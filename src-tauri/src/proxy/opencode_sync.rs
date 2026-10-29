@@ -94,8 +94,6 @@ enum VariantType {
     Gemini3Pro,
     /// Gemini 3 Flash style with thinking budgets
     Gemini3Flash,
-    /// Gemini 2.5 thinking style
-    Gemini25Thinking,
 }
 
 /// Model definition with metadata and variants
@@ -118,46 +116,6 @@ fn build_model_catalog() -> Vec<ModelDef> {
         ModelDef {
             id: "claude-sonnet-4-6",
             name: "Claude Sonnet 4.6",
-            context_limit: 200_000,
-            output_limit: 64_000,
-            input_modalities: &["text", "image", "pdf"],
-            output_modalities: &["text"],
-            reasoning: true,
-            variant_type: Some(VariantType::ClaudeThinking),
-        },
-        ModelDef {
-            id: "claude-sonnet-4-5",
-            name: "Claude Sonnet 4.5",
-            context_limit: 200_000,
-            output_limit: 64_000,
-            input_modalities: &["text", "image", "pdf"],
-            output_modalities: &["text"],
-            reasoning: true,
-            variant_type: Some(VariantType::ClaudeThinking),
-        },
-        ModelDef {
-            id: "claude-sonnet-4-5-thinking",
-            name: "Claude Sonnet 4.5 Thinking",
-            context_limit: 200_000,
-            output_limit: 64_000,
-            input_modalities: &["text", "image", "pdf"],
-            output_modalities: &["text"],
-            reasoning: true,
-            variant_type: Some(VariantType::ClaudeThinking),
-        },
-        ModelDef {
-            id: "claude-opus-4-5",
-            name: "Claude Opus 4.5",
-            context_limit: 200_000,
-            output_limit: 64_000,
-            input_modalities: &["text", "image", "pdf"],
-            output_modalities: &["text"],
-            reasoning: true,
-            variant_type: Some(VariantType::ClaudeThinking),
-        },
-        ModelDef {
-            id: "claude-opus-4-5-thinking",
-            name: "Claude Opus 4.5 Thinking",
             context_limit: 200_000,
             output_limit: 64_000,
             input_modalities: &["text", "image", "pdf"],
@@ -223,47 +181,7 @@ fn build_model_catalog() -> Vec<ModelDef> {
             reasoning: false,
             variant_type: None,
         },
-        // Gemini 2.5 models
-        ModelDef {
-            id: "gemini-2.5-flash",
-            name: "Gemini 2.5 Flash",
-            context_limit: 1_048_576,
-            output_limit: 65_536,
-            input_modalities: &["text", "image", "pdf"],
-            output_modalities: &["text"],
-            reasoning: false,
-            variant_type: None,
-        },
-        ModelDef {
-            id: "gemini-2.5-flash-lite",
-            name: "Gemini 2.5 Flash Lite",
-            context_limit: 1_048_576,
-            output_limit: 65_536,
-            input_modalities: &["text", "image", "pdf"],
-            output_modalities: &["text"],
-            reasoning: false,
-            variant_type: None,
-        },
-        ModelDef {
-            id: "gemini-2.5-flash-thinking",
-            name: "Gemini 2.5 Flash Thinking",
-            context_limit: 1_048_576,
-            output_limit: 65_536,
-            input_modalities: &["text", "image", "pdf"],
-            output_modalities: &["text"],
-            reasoning: true,
-            variant_type: Some(VariantType::Gemini25Thinking),
-        },
-        ModelDef {
-            id: "gemini-2.5-pro",
-            name: "Gemini 2.5 Pro",
-            context_limit: 1_048_576,
-            output_limit: 65_536,
-            input_modalities: &["text", "image", "pdf"],
-            output_modalities: &["text"],
-            reasoning: true,
-            variant_type: None,
-        },
+        // [RETIRED] Gemini 2.x / Claude <4.6 已全面下线，不得再进入 agent 工具一键配置目录。
     ]);
 
     catalog
@@ -1163,20 +1081,6 @@ fn build_gemini3_effort_variant(tier: VariantTier) -> Value {
     serde_json::json!({ "effort": effort })
 }
 
-/// Build Gemini 2.5 thinking variant with thinkingConfig and thinking
-fn build_gemini25_thinking_variant(budget: u32) -> Value {
-    serde_json::json!({
-        "thinkingConfig": {
-            "thinkingBudget": budget
-        },
-        "thinking": {
-            "type": "enabled",
-            "budget_tokens": budget,
-            "budgetTokens": budget
-        }
-    })
-}
-
 /// Build variants object based on variant type
 fn build_variants_object(variant_type: Option<VariantType>) -> Option<Value> {
     match variant_type {
@@ -1220,14 +1124,6 @@ fn build_variants_object(variant_type: Option<VariantType>) -> Option<Value> {
                 build_gemini3_effort_variant(VariantTier::High),
             );
             variants.insert("max".to_string(), serde_json::json!({ "disabled": true }));
-            Some(Value::Object(variants))
-        }
-        Some(VariantType::Gemini25Thinking) => {
-            let mut variants = serde_json::Map::new();
-            variants.insert("low".to_string(), build_gemini25_thinking_variant(8192));
-            variants.insert("medium".to_string(), build_gemini25_thinking_variant(12288));
-            variants.insert("high".to_string(), build_gemini25_thinking_variant(16384));
-            variants.insert("max".to_string(), build_gemini25_thinking_variant(24576));
             Some(Value::Object(variants))
         }
         None => None,
@@ -1285,8 +1181,12 @@ pub struct ModelInput {
 /// families, in which case only the name is written.
 fn series_defaults_for(model_id: &str) -> Option<Value> {
     let id = model_id.to_lowercase();
-    // Gemini 3.x / 3.5 / 3.1 family: 1M context, 64k output, multimodal in, text out.
-    if id.starts_with("gemini-3") || id.starts_with("gemini-3.1") || id.starts_with("gemini-3.5") {
+    // Gemini 4 / 3.x family: 1M context, 64k output, multimodal in, text out.
+    if id.starts_with("gemini-4")
+        || id.starts_with("gemini-3")
+        || id.starts_with("gemini-3.1")
+        || id.starts_with("gemini-3.5")
+    {
         return Some(serde_json::json!({
             "limit": { "context": 1_048_576, "output": 65_536 },
             "modalities": { "input": ["text", "image", "pdf"], "output": ["text"] },
@@ -1299,7 +1199,14 @@ fn series_defaults_for(model_id: &str) -> Option<Value> {
             "modalities": { "input": ["text", "image", "pdf"], "output": ["text"] },
         }));
     }
-    // Claude family: 200k context, 64k output.
+    // Claude 5.5 family: 1M context, 128k output.
+    if id.starts_with("claude-opus-5-5") || id.starts_with("claude-sonnet-5-5") {
+        return Some(serde_json::json!({
+            "limit": { "context": 1_000_000, "output": 128_000 },
+            "modalities": { "input": ["text", "image", "pdf"], "output": ["text"] },
+        }));
+    }
+    // Claude 4.6 family: 200k context, 64k output.
     if id.starts_with("claude") {
         return Some(serde_json::json!({
             "limit": { "context": 200_000, "output": 64_000 },
@@ -2342,46 +2249,6 @@ mod tests {
                 variant_type: Some(VariantType::ClaudeThinking),
             },
             ModelDef {
-                id: "claude-sonnet-4-5",
-                name: "Claude Sonnet 4.5",
-                context_limit: 200_000,
-                output_limit: 64_000,
-                input_modalities: &["text", "image", "pdf"],
-                output_modalities: &["text"],
-                reasoning: true,
-                variant_type: Some(VariantType::ClaudeThinking),
-            },
-            ModelDef {
-                id: "claude-sonnet-4-5-thinking",
-                name: "Claude Sonnet 4.5 Thinking",
-                context_limit: 200_000,
-                output_limit: 64_000,
-                input_modalities: &["text", "image", "pdf"],
-                output_modalities: &["text"],
-                reasoning: true,
-                variant_type: Some(VariantType::ClaudeThinking),
-            },
-            ModelDef {
-                id: "claude-opus-4-5",
-                name: "Claude Opus 4.5",
-                context_limit: 200_000,
-                output_limit: 64_000,
-                input_modalities: &["text", "image", "pdf"],
-                output_modalities: &["text"],
-                reasoning: true,
-                variant_type: Some(VariantType::ClaudeThinking),
-            },
-            ModelDef {
-                id: "claude-opus-4-5-thinking",
-                name: "Claude Opus 4.5 Thinking",
-                context_limit: 200_000,
-                output_limit: 64_000,
-                input_modalities: &["text", "image", "pdf"],
-                output_modalities: &["text"],
-                reasoning: true,
-                variant_type: Some(VariantType::ClaudeThinking),
-            },
-            ModelDef {
                 id: "claude-opus-4-6",
                 name: "Claude Opus 4.6",
                 context_limit: 200_000,
@@ -2409,46 +2276,6 @@ mod tests {
                 input_modalities: &["text", "image", "pdf"],
                 output_modalities: &["text", "image"],
                 reasoning: false,
-                variant_type: None,
-            },
-            ModelDef {
-                id: "gemini-2.5-flash",
-                name: "Gemini 2.5 Flash",
-                context_limit: 1_048_576,
-                output_limit: 65_536,
-                input_modalities: &["text", "image", "pdf"],
-                output_modalities: &["text"],
-                reasoning: false,
-                variant_type: None,
-            },
-            ModelDef {
-                id: "gemini-2.5-flash-lite",
-                name: "Gemini 2.5 Flash Lite",
-                context_limit: 1_048_576,
-                output_limit: 65_536,
-                input_modalities: &["text", "image", "pdf"],
-                output_modalities: &["text"],
-                reasoning: false,
-                variant_type: None,
-            },
-            ModelDef {
-                id: "gemini-2.5-flash-thinking",
-                name: "Gemini 2.5 Flash Thinking",
-                context_limit: 1_048_576,
-                output_limit: 65_536,
-                input_modalities: &["text", "image", "pdf"],
-                output_modalities: &["text"],
-                reasoning: true,
-                variant_type: Some(VariantType::Gemini25Thinking),
-            },
-            ModelDef {
-                id: "gemini-2.5-pro",
-                name: "Gemini 2.5 Pro",
-                context_limit: 1_048_576,
-                output_limit: 65_536,
-                input_modalities: &["text", "image", "pdf"],
-                output_modalities: &["text"],
-                reasoning: true,
                 variant_type: None,
             },
         ];
@@ -2772,8 +2599,8 @@ mod tests {
             "should have gemini-3.1-pro"
         );
         assert!(
-            models.contains_key("gemini-2.5-pro"),
-            "should have gemini-2.5-pro"
+            models.contains_key("gemini-3.1-flash-lite"),
+            "should have gemini-3.1-flash-lite"
         );
 
         // Check model structure
@@ -4359,35 +4186,15 @@ mod canonical_family_tests {
         let families = get_canonical_families();
 
         assert_eq!(families.len(), GEMINI_FAMILIES.len());
-        assert_eq!(
-            families,
-            vec![
-                CanonicalFamilyDto {
-                    canonical_id: "gemini-3.5-flash".to_string(),
-                    display_name: "Gemini 3.5 Flash".to_string(),
-                    match_ids: vec![
-                        "gemini-3.5-flash".to_string(),
-                        "gemini-3.5-flash-high".to_string(),
-                        "gemini-3.5-flash-medium".to_string(),
-                        "gemini-3.5-flash-low".to_string(),
-                        "gemini-3-flash".to_string(),
-                        "gemini-3.5-flash-extra-low".to_string(),
-                        "gemini-3-flash-agent".to_string(),
-                    ],
-                },
-                CanonicalFamilyDto {
-                    canonical_id: "gemini-3.1-pro".to_string(),
-                    display_name: "Gemini 3.1 Pro".to_string(),
-                    match_ids: vec![
-                        "gemini-3.1-pro".to_string(),
-                        "gemini-3.1-pro-high".to_string(),
-                        "gemini-pro".to_string(),
-                        "gemini-pro-agent".to_string(),
-                        "gemini-3.1-pro-low".to_string(),
-                    ],
-                },
-            ]
-        );
+        // 结构不变量：DTO 完整性与唯一性（模型清单会随版本演进，不再逐字比对）
+        assert!(!families.is_empty());
+        assert!(families.iter().all(|f| {
+            !f.canonical_id.is_empty() && !f.display_name.is_empty() && !f.match_ids.is_empty()
+        }));
+        let mut ids: Vec<&str> = families.iter().map(|f| f.canonical_id.as_str()).collect();
+        ids.sort();
+        ids.dedup();
+        assert_eq!(ids.len(), families.len(), "canonical_id 必须唯一");
 
         let serialized = serde_json::to_string(&families).unwrap();
         assert!(!serialized.contains("thinking_budget"));

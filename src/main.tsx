@@ -8,9 +8,15 @@ import { isTauri } from "./utils/env";
 // Explicitly call the Rust command to show the window on startup
 // Used together with visible:false to fix the startup black-screen issue
 if (isTauri()) {
-  import("@tauri-apps/api/core").then(({ invoke }) => {
-    invoke("show_main_window").catch(console.error);
-  });
+  const isMini =
+    (typeof window !== 'undefined' && window.location.search.includes('mini')) ||
+    (typeof window !== 'undefined' &&
+      (window as any).__TAURI_INTERNALS__?.metadata?.currentWindow?.label === 'mini');
+  if (!isMini) {
+    import("@tauri-apps/api/core").then(({ invoke }) => {
+      invoke("show_main_window").catch(console.error);
+    });
+  }
 }
 
 ReactDOM.createRoot(document.getElementById("root") as HTMLElement).render(

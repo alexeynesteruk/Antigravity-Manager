@@ -20,7 +20,9 @@ pub fn update_dynamic_forwarding_rules(old_model: String, new_model: String) {
 static CLAUDE_TO_GEMINI: Lazy<HashMap<&'static str, &'static str>> = Lazy::new(|| {
     let mut m = HashMap::new();
 
-    // ── Claude 别名/思考变体重定向 ──
+    // ── 官方支持模型的无后缀/变体归位（仅保留真实支持模型的后缀派生还原，全面下线过时硬编码兼容重定向）──
+    m.insert("gpt-oss-120b", "gpt-oss-120b-medium");
+    m.insert("internal-background-task", "gemini-3.1-flash-lite");
     m.insert("claude-sonnet-4-6-thinking", "claude-sonnet-4-6");
     m.insert("claude-opus-4-6", "claude-opus-4-6-thinking");
     // 历史老旧 Claude 模型重定向至基准版本
@@ -131,8 +133,9 @@ pub fn canonicalize_claude_client_model_id(input: &str) -> String {
             }
             out.push_str(&id[start..i]);
         } else {
-            out.push(bytes[i] as char);
-            i += 1;
+            let ch = id[i..].chars().next().expect("index is within model ID");
+            out.push(ch);
+            i += ch.len_utf8();
         }
     }
 
@@ -168,49 +171,41 @@ pub fn canonicalize_claude_client_model_id(input: &str) -> String {
     out
 }
 
-/// Claude 主版本低于当前服务端基准 4.6 时，按家族收到 4-6。
+/// Redirect older Claude versions without confusing date snapshots with versions.
 fn legacy_claude_family_target(id: &str) -> Option<&'static str> {
     if !id.contains("claude") {
         return None;
     }
-    let mut version: Option<f32> = None;
-    let tokens: Vec<&str> = id.split('-').collect();
-    for window in tokens.windows(2) {
-        if let (Ok(major), Ok(minor)) = (window[0].parse::<u32>(), window[1].parse::<u32>()) {
-            if minor < 100 {
-                version = Some(major as f32 + (minor as f32) / 10.0);
-            }
-        }
-    }
-    let below_baseline = version.is_some_and(|ver| ver < 4.6);
-    if !below_baseline {
+    let tokens: Vec<_> = id.split('-').collect();
+    let version = tokens
+        .windows(2)
+        .filter_map(|pair| {
+            let major = pair[0].parse::<u32>().ok()?;
+            let minor = pair[1].parse::<u32>().ok()?;
+            (major < 1000 && minor < 1000).then_some((major, minor))
+        })
+        .max()?;
+    if version >= (4, 6) {
         return None;
     }
-    let thinking = id.contains("thinking");
     if id.contains("opus") {
-        return Some("claude-opus-4-6-thinking");
+        Some("claude-opus-4-6-thinking")
+    } else if id.contains("sonnet") || id.contains("haiku") {
+        Some("claude-sonnet-4-6")
+    } else {
+        None
     }
-    if id.contains("sonnet") || id.contains("haiku") {
-        return Some("claude-sonnet-4-6");
-    }
-    None
 }
 
-/// Map Claude model names to Gemini model names
-///
-/// # 映射策略
-/// 1. **精确匹配**: 检查 CLAUDE_TO_GEMINI 映射表
-/// 2. **已知前缀透传**: gemini-* 和 *-thinking 模型直接透传
-/// 3. **[NEW] 直接透传**: 未知模型 ID 直接传递给 Google API (支持体验未发布模型)
 pub fn map_claude_model_to_gemini(input: &str) -> String {
     let canonical = canonicalize_claude_client_model_id(input);
 
-    // 0. [NEW] 优先匹配上游返回的动态模型转发表 (来自 fetchAvailableModels 下发的 model_forwarding_rules)
+    // 0. 优先匹配上游返回的动态模型转发表
     if let Some(mapped) = DYNAMIC_MODEL_FORWARDING_RULES.get(canonical.as_str()) {
         return mapped.value().clone();
     }
 
-    // 1. 精确匹配标准映射表
+    // 1. 精确匹配标准后缀派生还原表
     if let Some(mapped) = CLAUDE_TO_GEMINI.get(canonical.as_str()) {
         return mapped.to_string();
     }
@@ -250,19 +245,16 @@ pub fn map_claude_model_to_gemini(input: &str) -> String {
         return target.to_string();
     }
 
-    // 3. Known prefixes (gemini-, -thinking, veo-) pass-through
+    // 3. Preserve canonical protocol model IDs after client normalization.
     if canonical.starts_with("gemini-")
+        || canonical.starts_with("claude-")
         || canonical.contains("thinking")
         || canonical.starts_with("veo-")
     {
         return canonical;
     }
 
-    // 4. 直接透传未知模型 ID
-    if canonical.contains("claude") {
-        return canonical;
-    }
-    input.to_string()
+    input.trim().to_string()
 }
 
 /// 解析形如 "4.6", "4-6", "3.10", "3-10", "3" 的 (major, minor) 版本元组。
@@ -284,13 +276,14 @@ pub fn parse_version_tuple(s: &str) -> Option<(u32, u32)> {
             && (minor_token.starts_with("202") || minor_token.starts_with("201"))
         {
             0
-        } else {
-            let m = minor_token.parse::<u32>().ok()?;
+        } else if let Ok(m) = minor_token.parse::<u32>() {
             if m >= 1000 {
                 0
             } else {
                 m
             }
+        } else {
+            0
         }
     } else {
         0
@@ -298,11 +291,12 @@ pub fn parse_version_tuple(s: &str) -> Option<(u32, u32)> {
     Some((major, minor))
 }
 
-/// 核心基准线过滤器：严格遵循官方客户端当前展示的模型基准线
-/// 1. Gemini Flash 系列：基准线 3.5。版本 >= 3.5 保留；< 3.5 的除了 2.5 经典系列外全部淘汰。
-/// 2. Claude 系列：基准线 4.6。版本 >= 4.6 保留；4.6 以下全部淘汰。
-/// 3. GPT 系列：以官方最新公布为准 (gpt-oss-120b-medium)，淘汰 gpt-4o 等历史旧模型。
-/// 4. Pro 系列：以官方最新为准 (gemini-3.1-pro-high, gemini-3.1-pro-low, gemini-2.5-pro, gemini-3-pro-image)。
+/// 核心基准线过滤器：严格遵循官方客户端当前展示的旗舰模型基准线，全面下线非模型列表展示的过时/内部模型
+/// 1. Gemini 4+ 系列：如 gemini-4-argon 及 high/medium/low 变体保留。
+/// 2. Gemini Flash 系列：基准线 3.8（>= 3.8 保留，淘汰 2.5 / 3.0 / 3.5 / 3.6 / 3.7 等历史过渡版本）；保留官方专用轻量级 3.1-flash-lite 与 3.5-flash-lite。
+/// 3. Claude 系列：基准线 4.6（4.6 与 5.5+ 保留，4.6 以下、haiku、fable 等全部淘汰）。
+/// 4. GPT 系列：仅保留官方 gpt-oss-120b-medium 与派生裸模型 gpt-oss-120b，淘汰 gpt-4o 等历史旧模型。
+/// 5. Pro / Image 系列：保留 >= 3.1 Pro 与 3.1-flash-image / 3-pro-image，淘汰 2.5 Pro 及内部 agent / tab 预览模型。
 pub fn is_model_compliant_with_baseline(model: &str) -> bool {
     let lower = model.to_lowercase();
     let m = lower.trim();
@@ -312,7 +306,12 @@ pub fn is_model_compliant_with_baseline(model: &str) -> bool {
     }
 
     // 过滤内部任务与测试模型
-    if m.starts_with("chat_") || m.contains("internal") || m.contains("-exp") {
+    if m.starts_with("chat_")
+        || m.contains("internal")
+        || m.contains("-exp")
+        || m.contains("-disabled")
+        || m.ends_with("_disabled")
+    {
         return false;
     }
 
@@ -324,20 +323,25 @@ pub fn is_model_compliant_with_baseline(model: &str) -> bool {
         || m == "tab_jump_flash_lite_preview"
         || m == "gemini-3.1-flash-lite"
         || m == "gemini-3.5-flash-lite"
+        || m == "gemini-3.1-flash-image"
+        || m == "gemini-3-pro-image"
     {
         return true;
     }
 
-    // 1. Claude 系列：以 4.6 为基准线，4.6 以下全部淘汰
+    // 1. Claude 系列：以 4.6 为基准线（支持 4.6 与 5.5+），淘汰 4.6 以下、haiku、fable 及非法 thinking 后缀变体
     if m.contains("claude") {
-        // claude-sonnet 系列在官方权威结构体中即为包含思考能力的标准模型，不存在带有 -thinking 后缀的衍生版本
-        if m.starts_with("claude-sonnet-") && m.contains("thinking") {
+        if m.contains("haiku") || m.contains("fable") {
+            return false;
+        }
+        // claude-sonnet 系列与 Claude 5.x 分档模型不存在 -thinking 后缀变体
+        if (m.starts_with("claude-sonnet-") || m.contains("-5-5")) && m.contains("thinking") {
             return false;
         }
         if m.contains("4-6") || m.contains("4.6") {
             return true;
         }
-        // 兼容未来可能发布的 >= 4.6 版本 (如 4.7+, 5.x)
+        // 兼容 >= 4.6 版本 (如 4.7+, 5.5+)
         if let Some(pos) = m.find("claude") {
             let rest = &m[pos..];
             let tokens: Vec<&str> = rest.split(|c: char| c == '-' || c == '_').collect();
@@ -384,9 +388,9 @@ pub fn is_model_compliant_with_baseline(model: &str) -> bool {
         return false;
     }
 
-    // 2. GPT / OpenAI 系列：以官方为准 (gpt-oss-120b-medium)
+    // 2. GPT / OpenAI 系列：仅保留官方 gpt-oss-120b-medium 及其无后缀派生 gpt-oss-120b
     if m.contains("gpt") || m.contains("o1") || m.contains("o3") {
-        return m == "gpt-oss-120b-medium";
+        return m == "gpt-oss-120b-medium" || m == "gpt-oss-120b";
     }
 
     // 3. 图像模型保底
@@ -394,7 +398,7 @@ pub fn is_model_compliant_with_baseline(model: &str) -> bool {
         return m == "gemini-3.1-flash-image" || m == "gemini-3-pro-image";
     }
 
-    // 4. Gemini Pro 系列：以官方最新为准 (3.1 Pro)，淘汰 2.5 Pro 及以下历史旧模型
+    // 4. Gemini Pro 系列：以官方最新为准 (>= 3.1 Pro)，淘汰 2.5 Pro 及以下历史旧模型
     if m.contains("pro") {
         if m.contains("1.5")
             || m.contains("2.0")
@@ -408,7 +412,6 @@ pub fn is_model_compliant_with_baseline(model: &str) -> bool {
         if m.contains("3.1") {
             return true;
         }
-        // 未知更高版本 pro (如 3.10, 4.x)
         if let Some(pos) = m.find("gemini-") {
             let rest = &m[pos + 7..];
             if let Some(pro_pos) = rest.find("-pro") {
@@ -420,55 +423,58 @@ pub fn is_model_compliant_with_baseline(model: &str) -> bool {
         return false;
     }
 
-    // 5. Gemini Flash 系列：淘汰 2.5 全系列及已 503 的 3.5-flash-lite；放行 3.1-flash-lite 与 >= 3.5 版本
+    // 5. Gemini Flash 系列：全面升级至 >= 3.8 旗舰基准线，淘汰 2.5 / 3.0 / 3.5 / 3.6 / 3.7 等旧版推理 Flash
     if m.contains("flash") {
-        // 2.5 全系列已退役淘汰
-        if m.contains("2.5") || m.contains("2-5") {
+        if m.contains("2.5")
+            || m.contains("2-5")
+            || m.contains("3.5")
+            || m.contains("3-5")
+            || m.contains("3.6")
+            || m.contains("3-6")
+            || m.contains("3.7")
+            || m.contains("3-7")
+        {
             return false;
         }
 
-        // 3.1-flash-lite 与 3.5-flash-lite 特别放行
-        if m == "gemini-3.1-flash-lite" || m == "gemini-3.5-flash-lite" {
-            return true;
-        }
-
-        // 解析版本号 (使用语义元组比较，正确支持 3.10 > 3.5 等双位数次版本)
         if let Some(pos) = m.find("gemini-") {
             let rest = &m[pos + 7..];
             if let Some(flash_pos) = rest.find("-flash") {
                 let ver_str = &rest[..flash_pos];
                 if let Some(ver) = parse_version_tuple(ver_str) {
-                    return ver >= (3, 5);
+                    return ver >= (3, 8);
                 }
             }
         }
 
-        // 容错匹配特定已知 >= 3.5 版本
-        if m.contains("3.8")
-            || m.contains("3-8")
-            || m.contains("3.7")
-            || m.contains("3-7")
-            || m.contains("3.6")
-            || m.contains("3-6")
-            || m.contains("3.5")
-            || m.contains("3-5")
-        {
+        if m.contains("3.8") || m.contains("3-8") || m.contains("3.9") || m.contains("3-9") {
             return true;
         }
 
         return false;
     }
 
-    // 其他未知非 Google 系列（如用户自定义映射），予以放行
-    true
+    // 6. Gemini 4+ 新一代代号模型（如 gemini-4-argon 及 high/medium/low）
+    if m.starts_with("gemini-") {
+        let rest = &m["gemini-".len()..];
+        if let Some(ver) = parse_version_tuple(rest) {
+            return ver.0 >= 4;
+        }
+        return false;
+    }
+
+    false
 }
 
-/// 获取所有内置支持的标准公开模型列表 (动态从官方模型结构体目录获取，零硬编码)
+/// 获取所有内置支持的标准公开模型列表 (动态从官方模型结构体目录获取并严格过滤基准线)
 pub fn get_supported_models() -> Vec<String> {
     crate::models::OfficialModelCatalog::all_model_ids()
+        .into_iter()
+        .filter(|id| is_model_compliant_with_baseline(id))
+        .collect()
 }
 
-/// 动态获取所有可用模型列表 (包含内置与用户自定义与官方端点动态下发)
+/// 动态获取所有可用模型列表 (全账号池实际支持模型的并集 + 档位后缀自动派生无后缀裸模型 ID)
 pub async fn get_all_dynamic_models(
     custom_mapping: &tokio::sync::RwLock<std::collections::HashMap<String, String>>,
     token_manager: Option<&crate::proxy::token_manager::TokenManager>,
@@ -478,21 +484,25 @@ pub async fn get_all_dynamic_models(
     let mut model_ids = HashSet::new();
     let mut custom_keys = HashSet::new();
 
-    // 1. 获取所有账号从官方接口汇聚而来的动态模型 (Quota Models)
+    // 1. 获取所有账号从官方 fetchAvailableModels 接口汇聚而来的真实可用模型并集
     if let Some(tm) = token_manager {
         for dynamic_model in tm.get_all_collected_models() {
-            model_ids.insert(dynamic_model);
+            if is_model_compliant_with_baseline(&dynamic_model) {
+                model_ids.insert(dynamic_model);
+            }
         }
     }
 
-    // 如果未开启 only_raw_quota_models，则追加官方模型结构体目录与自定义映射模型
+    // 如果未开启 only_raw_quota_models：
+    // - 当账号池尚未加载任何模型（冷启动/无账号测试）时，使用官方权威目录基准模型兜底；
+    // - 追加用户显式配置的自定义映射模型 (Custom)。
     if !only_raw_quota_models {
-        // 2. 获取官方结构体目录中的全量模型 (零硬编码)
-        for m in get_supported_models() {
-            model_ids.insert(m);
+        if model_ids.is_empty() {
+            for m in get_supported_models() {
+                model_ids.insert(m);
+            }
         }
 
-        // 3. 获取所有自定义映射模型 (Custom)
         {
             let mapping = custom_mapping.read().await;
             for key in mapping.keys() {
@@ -503,11 +513,18 @@ pub async fn get_all_dynamic_models(
     }
 
     // 4. 动态档位后缀剥离与裸模型派生（纯通用数据驱动）：
-    // 若上游模型包含分档后缀（如 -high / -medium / -low / -extra-low 等），
-    // 自动剥离后缀并衍生对应的裸模型名，只要符合官方基准线，任何品牌家族均可自动派生。
+    // 若账号实际支持的模型包含分档或思考后缀（如 -high / -medium / -low / -extra-low / -tiered / -thinking），
+    // 自动剥离后缀并衍生对应的无后缀裸模型名（如 gemini-4-argon, gemini-3.8-flash, claude-opus-5-5, claude-sonnet-5-5, claude-opus-4-6, gpt-oss-120b）。
     let mut derived_bare_models = HashSet::new();
     for id in &model_ids {
-        for suffix in &["-tiered", "-high", "-medium", "-low", "-extra-low"] {
+        for suffix in &[
+            "-tiered",
+            "-high",
+            "-medium",
+            "-low",
+            "-extra-low",
+            "-thinking",
+        ] {
             if let Some(base) = id.strip_suffix(suffix) {
                 if !base.is_empty() && is_model_compliant_with_baseline(base) {
                     derived_bare_models.insert(base.to_string());
@@ -519,14 +536,69 @@ pub async fn get_all_dynamic_models(
         model_ids.insert(bare);
     }
 
+    // 4.5 生图尺寸变体归一（仅默认模式，且必须账号**真实配额 > 0**）：
+    // 部分账号只上报 `gemini-3.1-flash-image-4k` 这类尺寸变体；
+    // 只要该变体真实配额 > 0，就把基底生图模型也登记进列表，避免“有额度却看不到模型”。
+    // 零配额账号不会因此凭空出现（“默认列表不显示无配额模型”）。
+    if !only_raw_quota_models {
+        if let Some(tm) = token_manager {
+            for raw in tm.models_with_positive_quota() {
+                let base = strip_image_variant_suffix(&raw);
+                if base != raw.to_lowercase()
+                    && base.contains("image")
+                    && is_model_compliant_with_baseline(&base)
+                {
+                    model_ids.insert(base);
+                }
+            }
+        }
+    }
+
     // 5. 应用官方基准线过滤，彻底剔除已淘汰的旧版模型与内部虚拟 ID
-    // 自定义别名映射（custom_mapping）由用户显式指定，不受官方基准线过滤误杀
     let mut sorted_ids: Vec<_> = model_ids
         .into_iter()
         .filter(|id| custom_keys.contains(id) || is_model_compliant_with_baseline(id))
         .collect();
     sorted_ids.sort();
     sorted_ids
+}
+
+/// 生图模型族变体归一化：剔除尺寸/分辨率/预览后缀，得到基底生图模型 ID。
+///
+/// 例：`gemini-3-pro-image-preview` → `gemini-3-pro-image`；
+/// 　　`gemini-3.1-flash-image-4k-16x9` → `gemini-3.1-flash-image`。
+pub fn strip_image_variant_suffix(id: &str) -> String {
+    const SUFFIXES: &[&str] = &[
+        "-preview",
+        "-2k",
+        "-4k",
+        "-1k",
+        "-8k",
+        "-16x9",
+        "-9x16",
+        "-1x1",
+        "-3x4",
+        "-4x3",
+        "-high",
+        "-medium",
+        "-low",
+        "-extra-low",
+        "-tiered",
+    ];
+    let mut base = id.trim().to_lowercase();
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for suffix in SUFFIXES {
+            if let Some(stripped) = base.strip_suffix(suffix) {
+                if !stripped.is_empty() {
+                    base = stripped.to_string();
+                    changed = true;
+                }
+            }
+        }
+    }
+    base
 }
 
 /// 去除模型展示名称中的档位括号后缀 (如 "Gemini 3.1 Pro (Low)" -> "Gemini 3.1 Pro")
@@ -541,6 +613,7 @@ pub fn clean_tier_from_display_name(dn: &str) -> String {
         " (Low)",
         " (Extra Low)",
         " (Preview)",
+        " (Thinking)",
     ];
     let mut res = dn.to_string();
     for pat in &re_patterns {
@@ -553,7 +626,7 @@ pub fn clean_tier_from_display_name(dn: &str) -> String {
 ///
 /// 聚合逻辑：
 /// 1. 获取所有账号的 Quota 动态元数据 (TokenManager::get_all_model_metadata)
-/// 2. 剥离分档后缀（-high/-medium/-low/-tiered 等），自动让派生裸模型继承能力元数据
+/// 2. 剥离分档后缀（-high/-medium/-low/-tiered/-thinking 等），自动让派生裸模型继承能力元数据
 /// 3. 从官方权威模型目录（OfficialModelCatalog）补充/合并权威元数据
 /// 4. 自定义映射（custom_mapping）继承其目标模型的元数据
 pub async fn get_all_dynamic_models_metadata(
@@ -567,10 +640,26 @@ pub async fn get_all_dynamic_models_metadata(
         std::collections::HashMap::new()
     };
 
+    if !only_raw_quota_models && meta_map.is_empty() {
+        for m in get_supported_models() {
+            if let Some(official) = crate::models::OfficialModelCatalog::get(&m) {
+                let official_meta = crate::models::quota::ModelListingMeta::from(&official);
+                meta_map.entry(m).or_default().merge_from(&official_meta);
+            }
+        }
+    }
+
     // 动态档位后缀剥离与裸模型元数据派生继承
     let mut derived_metas = std::collections::HashMap::new();
     for (name, meta) in &meta_map {
-        for suffix in &["-tiered", "-high", "-medium", "-low", "-extra-low"] {
+        for suffix in &[
+            "-tiered",
+            "-high",
+            "-medium",
+            "-low",
+            "-extra-low",
+            "-thinking",
+        ] {
             if let Some(base) = name.strip_suffix(suffix) {
                 if !base.is_empty() && is_model_compliant_with_baseline(base) {
                     let mut m = meta.clone();
@@ -587,8 +676,9 @@ pub async fn get_all_dynamic_models_metadata(
     }
 
     if !only_raw_quota_models {
-        // 从官方权威目录补充缺失的元数据
-        for m in get_supported_models() {
+        // 对已存在的模型补充官方权威目录元数据
+        let existing_keys: Vec<String> = meta_map.keys().cloned().collect();
+        for m in existing_keys {
             if let Some(official) = crate::models::OfficialModelCatalog::get(&m) {
                 let official_meta = crate::models::quota::ModelListingMeta::from(&official);
                 meta_map.entry(m).or_default().merge_from(&official_meta);
@@ -605,6 +695,31 @@ pub async fn get_all_dynamic_models_metadata(
                 let official_meta = crate::models::quota::ModelListingMeta::from(&official);
                 meta_map.entry(alias.clone()).or_insert(official_meta);
             }
+        }
+    }
+
+    // 5. 应用思考预算配置与官方模型结构体参数覆盖：
+    // 用户前端配置自定义思考预算（或选择自适应 -1）优先覆盖；
+    // 默认模式下如实继承官方结构体的默认值（如官方自适应 -1 或标准预算），保持双轨完整支持。
+    let tb_config = crate::proxy::config::get_thinking_budget_config();
+    for (name, meta) in meta_map.iter_mut() {
+        if meta.supports_thinking.unwrap_or(true) {
+            let official_budget = crate::models::OfficialModelCatalog::get(name)
+                .and_then(|info| info.thinking_budget)
+                .map(|b| b as i32);
+
+            let configured_budget = if tb_config.control_source
+                == crate::proxy::config::ThinkingControlSource::Gateway
+            {
+                crate::proxy::model_specs::resolve_custom_budget(name, None, None, &tb_config, None)
+                    .map(|b| b as i32)
+            } else {
+                None
+            };
+
+            meta.thinking_budget = configured_budget
+                .or(official_budget)
+                .or(meta.thinking_budget);
         }
     }
 
@@ -914,6 +1029,11 @@ pub fn strip_tier_suffix(model: &str) -> String {
 pub fn normalize_to_standard_id(model_name: &str) -> Option<String> {
     let lower = model_name.to_lowercase();
 
+    // 排除被标记禁用的变体条目（如 gemini-4-argon-disabled）
+    if lower.contains("-disabled") || lower.ends_with("_disabled") {
+        return None;
+    }
+
     // 0. Gemini 4 Argon 系列（独立配额组与独立计费桶，所有档位变体如 high/medium/low/thinking 均归一化为基底 ID）
     if lower.contains("argon") {
         return Some("gemini-4-argon".to_string());
@@ -987,28 +1107,7 @@ mod tests {
     #[test]
     fn test_model_mapping() {
         assert_eq!(
-            map_claude_model_to_gemini("claude-3-5-sonnet-20241022"),
-            "claude-sonnet-4-6"
-        );
-        // [Redirect] Sonnet 4.5 -> Sonnet 4.6
-        assert_eq!(
-            map_claude_model_to_gemini("claude-sonnet-4-5"),
-            "claude-sonnet-4-6"
-        );
-        assert_eq!(
-            map_claude_model_to_gemini("claude-sonnet-4-5-thinking"),
-            "claude-sonnet-4-6"
-        );
-        assert_eq!(
-            map_claude_model_to_gemini("claude-opus-4"),
-            "claude-opus-4-6-thinking"
-        );
-        assert_eq!(
             map_claude_model_to_gemini("claude-opus-4.6"),
-            "claude-opus-4-6-thinking"
-        );
-        assert_eq!(
-            map_claude_model_to_gemini("claude-open-4.5"),
             "claude-opus-4-6-thinking"
         );
         assert_eq!(
@@ -1020,17 +1119,12 @@ mod tests {
             "claude-sonnet-4-6"
         );
         assert_eq!(
-            map_claude_model_to_gemini("claude-haiku-4.5"),
-            "claude-sonnet-4-6"
-        );
-        assert_eq!(
             map_claude_model_to_gemini("claude-opus-4-6-thinking"),
             "claude-opus-4-6-thinking"
         );
-        // Test gemini pass-through (should not be caught by "mini" rule)
         assert_eq!(
-            map_claude_model_to_gemini("gemini-2.5-flash-mini-test"),
-            "gemini-2.5-flash-mini-test"
+            map_claude_model_to_gemini("gpt-oss-120b"),
+            "gpt-oss-120b-medium"
         );
         assert_eq!(map_claude_model_to_gemini("unknown-model"), "unknown-model");
         // 旧 Pro 公开名必须落到上游可生成的真实 id。
@@ -1041,6 +1135,50 @@ mod tests {
         assert_eq!(
             map_claude_model_to_gemini("gemini-3-pro-low"),
             "gemini-3.1-pro-low"
+        );
+    }
+
+    #[test]
+    fn canonical_claude_ids_preserve_provider_normalization_and_custom_routes() {
+        for (input, expected) in [
+            ("anthropic/claude-sonnet-4.6", "claude-sonnet-4-6"),
+            ("models/claude-sonnet-4.6", "claude-sonnet-4-6"),
+            ("anthropic/claude-sonnet-6.10", "claude-sonnet-6-10"),
+            (
+                "anthropic/claude-sonnet-6.10-私有",
+                "claude-sonnet-6-10-私有",
+            ),
+        ] {
+            assert_eq!(map_claude_model_to_gemini(input), expected);
+        }
+        let custom = HashMap::from([(
+            "claude-sonnet-4-6".to_string(),
+            "private-sonnet-target".to_string(),
+        )]);
+        assert_eq!(
+            resolve_model_route("anthropic/claude-sonnet-4.6", &custom),
+            "private-sonnet-target"
+        );
+        assert_eq!(
+            map_claude_model_to_gemini("vendor/claude-sonnet-6.10-私有"),
+            "vendor/claude-sonnet-6.10-私有"
+        );
+    }
+
+    #[test]
+    fn legacy_flash_lite_alias_preserves_explicit_custom_routes() {
+        // The catalog's physical ID is 3.1; 3.5 is a display tag on retired 2.5.
+        assert_eq!(
+            resolve_model_route("gemini-3.5-flash-lite", &HashMap::new()),
+            "gemini-3.1-flash-lite"
+        );
+        let custom = HashMap::from([(
+            "gemini-3.5-flash-lite".to_string(),
+            "private-lite-target".to_string(),
+        )]);
+        assert_eq!(
+            resolve_model_route("gemini-3.5-flash-lite", &custom),
+            "private-lite-target"
         );
     }
 
@@ -1065,10 +1203,21 @@ mod tests {
         // 动态官方模型与自派生无后缀模型必须包含
         assert!(models_all.contains(&"claude-sonnet-4-6".to_string()));
         assert!(models_all.contains(&"claude-opus-4-6-thinking".to_string()));
+        assert!(models_all.contains(&"claude-opus-4-6".to_string()));
+        assert!(models_all.contains(&"claude-opus-5-5".to_string()));
+        assert!(models_all.contains(&"claude-opus-5-5-high".to_string()));
+        assert!(models_all.contains(&"claude-sonnet-5-5".to_string()));
+        assert!(models_all.contains(&"gemini-4-argon".to_string()));
+        assert!(models_all.contains(&"gemini-4-argon-high".to_string()));
         assert!(models_all.contains(&"gemini-3.8-flash".to_string()));
         assert!(models_all.contains(&"gemini-3.8-flash-high".to_string()));
-        // 非法硬编码模型 claude-sonnet-4-6-thinking 绝不泄露暴露
+        assert!(models_all.contains(&"gpt-oss-120b".to_string()));
+        assert!(models_all.contains(&"gpt-oss-120b-medium".to_string()));
+        // 非法硬编码或已淘汰模型绝不泄露暴露
         assert!(!models_all.contains(&"claude-sonnet-4-6-thinking".to_string()));
+        assert!(!models_all.contains(&"gemini-2.5-flash".to_string()));
+        assert!(!models_all.contains(&"gemini-3.7-flash-high".to_string()));
+        assert!(!models_all.contains(&"gemini-pro-agent".to_string()));
     }
 
     #[tokio::test]
@@ -1177,14 +1326,7 @@ mod tests {
             map_claude_model_to_gemini("internal-background-task"),
             "gemini-3.1-flash-lite"
         );
-        assert_eq!(
-            resolve_model_route("gemini-2.5-flash", &empty),
-            "gemini-3.6-flash-medium"
-        );
-        assert_eq!(
-            resolve_model_route("gemini-2.5-flash-lite", &empty),
-            "gemini-3.1-flash-lite"
-        );
+        let empty = HashMap::new();
         assert_eq!(
             resolve_model_route("gemini-3.1-flash-lite", &empty),
             "gemini-3.1-flash-lite"
@@ -1347,32 +1489,48 @@ mod tests {
 
     #[test]
     fn test_is_model_compliant_with_baseline() {
-        // Claude: >= 4.6 passes, < 4.6 rejected
+        // Claude: >= 4.6 passes (4.6 & 5.5), < 4.6 / haiku / fable rejected
         assert!(is_model_compliant_with_baseline("claude-sonnet-4-6"));
         assert!(is_model_compliant_with_baseline("claude-opus-4-6-thinking"));
-        assert!(is_model_compliant_with_baseline("claude-sonnet-4-7"));
+        assert!(is_model_compliant_with_baseline("claude-opus-4-6"));
+        assert!(is_model_compliant_with_baseline("claude-opus-5-5"));
+        assert!(is_model_compliant_with_baseline("claude-opus-5-5-high"));
+        assert!(is_model_compliant_with_baseline("claude-sonnet-5-5"));
+        assert!(is_model_compliant_with_baseline("claude-sonnet-5-5-medium"));
         assert!(!is_model_compliant_with_baseline(
             "claude-sonnet-4-6-thinking"
+        ));
+        assert!(!is_model_compliant_with_baseline(
+            "claude-opus-5-5-thinking"
         ));
         assert!(!is_model_compliant_with_baseline("claude-sonnet-4-5"));
         assert!(!is_model_compliant_with_baseline("claude-3-5-sonnet"));
         assert!(!is_model_compliant_with_baseline("claude-3-7-sonnet"));
         assert!(!is_model_compliant_with_baseline("claude-haiku-4-5"));
+        assert!(!is_model_compliant_with_baseline("claude-fable-5"));
 
-        // GPT: only gpt-oss-120b-medium passes
+        // GPT: gpt-oss-120b-medium & derived gpt-oss-120b pass
         assert!(is_model_compliant_with_baseline("gpt-oss-120b-medium"));
+        assert!(is_model_compliant_with_baseline("gpt-oss-120b"));
         assert!(!is_model_compliant_with_baseline("gpt-4o"));
         assert!(!is_model_compliant_with_baseline("gpt-4"));
         assert!(!is_model_compliant_with_baseline("gpt-3.5-turbo"));
 
-        // Gemini Flash: >= 3.5 passes, 3.1-flash-lite & 3.5-flash-lite pass, 2.5/1.5/2.0 rejected
+        // Gemini 4 Argon & Flash >= 3.8 pass, < 3.8 rejected (except 3.1/3.5-flash-lite)
+        assert!(is_model_compliant_with_baseline("gemini-4-argon"));
+        assert!(is_model_compliant_with_baseline("gemini-4-argon-high"));
+        assert!(!is_model_compliant_with_baseline("gemini-4-argon-disabled"));
+        assert!(!is_model_compliant_with_baseline(
+            "gemini-3.8-flash-disabled"
+        ));
         assert!(is_model_compliant_with_baseline("gemini-3.8-flash-high"));
-        assert!(is_model_compliant_with_baseline("gemini-3.7-flash-medium"));
-        assert!(is_model_compliant_with_baseline("gemini-3.6-flash-low"));
-        assert!(is_model_compliant_with_baseline("gemini-3.5-flash-low"));
+        assert!(is_model_compliant_with_baseline("gemini-3.8-flash"));
         assert!(is_model_compliant_with_baseline("gemini-3.10-flash-high"));
         assert!(is_model_compliant_with_baseline("gemini-3.1-flash-lite"));
         assert!(is_model_compliant_with_baseline("gemini-3.5-flash-lite"));
+        assert!(!is_model_compliant_with_baseline("gemini-3.7-flash-medium"));
+        assert!(!is_model_compliant_with_baseline("gemini-3.6-flash-low"));
+        assert!(!is_model_compliant_with_baseline("gemini-3.5-flash-low"));
         assert!(!is_model_compliant_with_baseline("gemini-2.5-flash"));
         assert!(!is_model_compliant_with_baseline("gemini-2.5-flash-lite"));
         assert!(!is_model_compliant_with_baseline(
@@ -1396,6 +1554,7 @@ mod tests {
         // Gemini Pro: 3.1 pass, 2.5/1.5/2.0/3.0 rejected
         assert!(is_model_compliant_with_baseline("gemini-3.1-pro-high"));
         assert!(is_model_compliant_with_baseline("gemini-3.1-pro-low"));
+        assert!(is_model_compliant_with_baseline("gemini-3.1-pro"));
         assert!(!is_model_compliant_with_baseline("gemini-2.5-pro"));
         assert!(!is_model_compliant_with_baseline("gemini-1.5-pro"));
         assert!(!is_model_compliant_with_baseline("gemini-2.0-pro"));
@@ -1409,10 +1568,6 @@ mod tests {
         // Internal / Deprecated models
         assert!(!is_model_compliant_with_baseline("chat_20706"));
         assert!(!is_model_compliant_with_baseline("chat_23310"));
-        assert!(!is_model_compliant_with_baseline("gemini-2.5-flash"));
-        assert!(!is_model_compliant_with_baseline("gemini-2.5-pro"));
-
-        // Official Agent & Preview & Derived Bare models (Kept)
         assert!(is_model_compliant_with_baseline(
             "tab_jump_flash_lite_preview"
         ));
@@ -1421,7 +1576,7 @@ mod tests {
         assert!(is_model_compliant_with_baseline("gemini-3-flash-agent"));
         assert!(is_model_compliant_with_baseline("gemini-3-flash"));
         assert!(is_model_compliant_with_baseline("gemini-3.1-pro"));
-        assert!(is_model_compliant_with_baseline("gemini-3.5-flash"));
+        assert!(!is_model_compliant_with_baseline("gemini-3.5-flash"));
     }
 
     #[test]
@@ -1438,8 +1593,6 @@ mod tests {
             "gemini-3.1-pro-high"
         );
 
-        // Pro has no medium upstream variant; the nearest high tier must also
-        // resolve to the physical agent ID, not the public high alias.
         for effort in ["medium", "xhigh", "max"] {
             assert_eq!(
                 resolve_model_route_with_effort("gemini-3.1-pro", &empty, Some(effort)),
@@ -1453,13 +1606,29 @@ mod tests {
             "gemini-3.1-pro-high"
         );
 
-        // 3. 衍生裸模型 gemini-3.5-flash 缺省 effort 遵循决策链 (取 low)
+        // 3. 衍生裸模型 claude-opus-5-5 / gemini-4-argon 缺省 effort 遵循决策链 (取 medium)
         assert_eq!(
-            resolve_model_route_with_effort("gemini-3.5-flash", &empty, None),
-            "gemini-3.5-flash-low"
+            resolve_model_route_with_effort("claude-opus-5-5", &empty, None),
+            "claude-opus-5-5-medium"
+        );
+        assert_eq!(
+            resolve_model_route_with_effort("claude-opus-5-5", &empty, Some("high")),
+            "claude-opus-5-5-high"
+        );
+        assert_eq!(
+            resolve_model_route_with_effort("gemini-4-argon", &empty, None),
+            "gemini-4-argon-medium"
+        );
+        assert_eq!(
+            resolve_model_route_with_effort("gemini-4-argon", &empty, Some("high")),
+            "gemini-4-argon-high"
+        );
+        assert_eq!(
+            resolve_model_route_with_effort("claude-opus-4-6", &empty, None),
+            "claude-opus-4-6-thinking"
         );
 
-        // 4. 显式档位与动态选择的档位使用相同的上游 ID
+        // 4. 显式档位保持不变
         assert_eq!(
             resolve_model_route_with_effort("gemini-3.1-pro-low", &empty, None),
             "gemini-3.1-pro-low"
@@ -1609,6 +1778,7 @@ mod tests {
             normalize_to_standard_id("gemini-4-argon"),
             Some("gemini-4-argon".to_string())
         );
+        assert_eq!(normalize_to_standard_id("gemini-4-argon-disabled"), None);
     }
 
     #[test]

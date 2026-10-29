@@ -35,11 +35,43 @@ fn extract_semver(raw: &str) -> Option<String> {
     None
 }
 
-/// 检测 Antigravity 版本（跨平台，支持预快照路径优先）
+use std::collections::HashMap;
+use std::sync::{LazyLock, Mutex};
+use std::time::{Duration, Instant};
+
+static VERSION_CACHE: LazyLock<Mutex<HashMap<String, (AntigravityVersion, Instant)>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+const CACHE_TTL: Duration = Duration::from_secs(60);
+
+#[allow(dead_code)]
+pub fn clear_version_cache() {
+    if let Ok(mut guard) = VERSION_CACHE.lock() {
+        guard.clear();
+    }
+}
+
+/// 检测 Antigravity 版本（跨平台，支持预快照路径优先与内存缓存）
 pub fn get_antigravity_version_with_path(
     target_ide: Option<&str>,
     preferred_path: Option<&std::path::Path>,
 ) -> Result<AntigravityVersion, String> {
+    let cache_key = format!(
+        "{}:{}",
+        target_ide.unwrap_or("default"),
+        preferred_path
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap_or_default()
+    );
+
+    if let Ok(guard) = VERSION_CACHE.lock() {
+        if let Some((ver, timestamp)) = guard.get(&cache_key) {
+            if timestamp.elapsed() < CACHE_TTL {
+                return Ok(ver.clone());
+            }
+        }
+    }
+
     // 1. 优先使用预捕获路径，若无则探查 Antigravity 可执行文件路径
     let exe_path = preferred_path
         .map(|p| p.to_path_buf())
@@ -47,20 +79,35 @@ pub fn get_antigravity_version_with_path(
         .ok_or("Unable to locate Antigravity executable")?;
 
     // 2. 根据平台读取版本信息
-    #[cfg(target_os = "macos")]
-    {
-        get_version_macos(&exe_path)
+    let res = {
+        #[cfg(target_os = "macos")]
+        {
+            get_version_macos(&exe_path)
+        }
+
+        #[cfg(target_os = "windows")]
+        {
+            get_version_windows(&exe_path)
+        }
+
+        #[cfg(target_os = "linux")]
+        {
+            get_version_linux(&exe_path)
+        }
+
+        #[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
+        {
+            Err("Unsupported operating system".to_string())
+        }
+    };
+
+    if let Ok(ref ver) = res {
+        if let Ok(mut guard) = VERSION_CACHE.lock() {
+            guard.insert(cache_key, (ver.clone(), Instant::now()));
+        }
     }
 
-    #[cfg(target_os = "windows")]
-    {
-        get_version_windows(&exe_path)
-    }
-
-    #[cfg(target_os = "linux")]
-    {
-        get_version_linux(&exe_path)
-    }
+    res
 }
 
 /// 检测 Antigravity 版本（跨平台）
@@ -474,5 +521,33 @@ mod tests {
     fn test_extract_semver_from_messy_output() {
         let raw = "1.107.0\n1504c8cc4b34dbfbb4a97ebe954b3da2b5634516\nx64";
         assert_eq!(extract_semver(raw), Some("1.107.0".to_string()));
+    }
+
+    #[test]
+    fn test_version_caching() {
+        clear_version_cache();
+        let cache_key = "test_target:test_path";
+        let ver = AntigravityVersion {
+            short_version: "2.5.0".to_string(),
+            bundle_version: "2.5.0".to_string(),
+        };
+
+        {
+            let mut guard = VERSION_CACHE.lock().unwrap();
+            guard.insert(cache_key.to_string(), (ver.clone(), Instant::now()));
+        }
+
+        {
+            let guard = VERSION_CACHE.lock().unwrap();
+            let cached = guard.get(cache_key);
+            assert!(cached.is_some());
+            assert_eq!(cached.unwrap().0.short_version, "2.5.0");
+        }
+
+        clear_version_cache();
+        {
+            let guard = VERSION_CACHE.lock().unwrap();
+            assert!(guard.get(cache_key).is_none());
+        }
     }
 }

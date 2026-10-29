@@ -39,8 +39,12 @@ import type { ModelShareItem } from '../components/token_stats/TopModelsShareCar
 import { AppleBentoView } from '../components/token_stats/AppleBentoView';
 import { CyberCockpitView } from '../components/token_stats/CyberCockpitView';
 import { PricingModal } from '../components/token_stats/PricingModal';
+import { CacheCoverage } from '../components/token_stats/CacheCoverage';
+import { NominalCostBreakdown } from '../components/token_stats/NominalCostBreakdown';
+import { cacheMetricsFor, nominalCostsFor, sumNominalCosts, sumKnownCost, reportedTokens } from '../components/token_stats/usageMetrics';
+import type { UsageCoverage } from '../components/token_stats/usageMetrics';
 
-export interface TokenStatsAggregated {
+export interface TokenStatsAggregated extends UsageCoverage {
     period: string;
     total_input_tokens: number;
     total_output_tokens: number;
@@ -48,10 +52,12 @@ export interface TokenStatsAggregated {
     total_reasoning_tokens?: number;
     total_tokens: number;
     request_count: number;
-    uncached_input_tokens?: number;
+    uncached_input_tokens?: number | null;
+    reported_cached_tokens?: number | null;
+    reported_output_tokens?: number | null;
 }
 
-export interface AccountTokenStats {
+export interface AccountTokenStats extends UsageCoverage {
     account_email: string;
     total_input_tokens: number;
     total_output_tokens: number;
@@ -61,7 +67,7 @@ export interface AccountTokenStats {
     request_count: number;
 }
 
-export interface ModelTokenStats {
+export interface ModelTokenStats extends UsageCoverage {
     model: string;
     total_input_tokens: number;
     total_output_tokens: number;
@@ -73,15 +79,15 @@ export interface ModelTokenStats {
 
 export interface ModelTrendPoint {
     period: string;
-    model_data: Record<string, number>;
+    model_data: Record<string, number | null>;
 }
 
 export interface AccountTrendPoint {
     period: string;
-    account_data: Record<string, number>;
+    account_data: Record<string, number | null>;
 }
 
-export interface TokenStatsSummary {
+export interface TokenStatsSummary extends UsageCoverage {
     total_input_tokens: number;
     total_output_tokens: number;
     total_cached_tokens: number;
@@ -335,7 +341,7 @@ const TokenStats: React.FC = () => {
     });
     const [showPricingModal, setShowPricingModal] = useState(false);
 
-    const getPricing = useCallback((modelName: string): ModelPricingRule => {
+    const getPricing = useCallback((modelName: string): ModelPricingRule | null => {
         let key = modelName.toLowerCase().trim();
         // 1. 直接精确命中
         if (pricing[key]) return pricing[key];
@@ -358,27 +364,26 @@ const TokenStats: React.FC = () => {
                 return rule;
             }
         }
-        return pricing['default'] || DEFAULT_PRICING['default'];
+        return null;
     }, [pricing]);
 
-    const calculateModelCost = useCallback((m: ModelTokenStats): number => {
-        const p = getPricing(m.model);
-        const uncachedInput = Math.max(0, m.total_input_tokens - (m.total_cached_tokens || 0));
-        const inputCost = (uncachedInput * p.input) / 1_000_000;
-        const cacheCost = ((m.total_cached_tokens || 0) * p.cached) / 1_000_000;
-        const outputCost = (m.total_output_tokens * p.output) / 1_000_000;
-        return inputCost + cacheCost + outputCost;
+    const calculateModelCost = useCallback((model: ModelTokenStats): number | null => {
+        return sumKnownCost(nominalCostsFor(model, getPricing(model.model)));
     }, [getPricing]);
 
-    const totalEstimatedCost = useMemo(() => {
-        return modelData.reduce((sum, m) => sum + calculateModelCost(m), 0);
-    }, [modelData, calculateModelCost]);
+    const nominalCosts = useMemo(() => sumNominalCosts(
+        modelData.map(model => nominalCostsFor(model, getPricing(model.model))),
+        modelData.filter(model => getPricing(model.model) !== null).length,
+    ), [modelData, getPricing]);
+
+    const totalEstimatedCost = (nominalCosts.input ?? 0) + (nominalCosts.output ?? 0);
 
     // 主力模型列表数据（带单项费用）
     const modelShareItems: ModelShareItem[] = useMemo(() => {
         return modelData.map(m => ({
             model: m.model,
             total_tokens: m.total_tokens,
+            total_reported_requests: m.total_reported_requests,
             request_count: m.request_count,
             total_input_tokens: m.total_input_tokens,
             total_output_tokens: m.total_output_tokens,
@@ -397,16 +402,7 @@ const TokenStats: React.FC = () => {
         }));
     }, [accountData]);
 
-    // 缓存命中率与节约成本估算
-    const cacheMetrics = useMemo(() => {
-        if (!summary || summary.total_tokens === 0) return { hitRate: 0, savings: 0 };
-        const totalInput = summary.total_input_tokens;
-        const cached = summary.total_cached_tokens;
-        const hitRate = totalInput > 0 ? (cached / totalInput) * 100 : 0;
-        // 估算节约：假设平均每 1M 缓存相比直接输入节省约 $1.50
-        const savings = (cached * 1.5) / 1_000_000;
-        return { hitRate, savings };
-    }, [summary]);
+    const cacheMetrics = useMemo(() => cacheMetricsFor(summary, summary?.total_requests ?? 0), [summary]);
 
     const fetchData = async () => {
         setLoading(true);
@@ -444,13 +440,13 @@ const TokenStats: React.FC = () => {
                     classicDataPromise = invoke<TokenStatsAggregated[]>('get_token_stats_weekly', { weeks: 12 });
 
                     // 按周合并聚合 modelTrend
-                    const weeklyModelMap = new Map<string, Record<string, number>>();
+                    const weeklyModelMap = new Map<string, Record<string, number | null>>();
                     for (const pt of rawDailyModelTrend) {
                         const wb = getSqliteWeekBucket(pt.period);
                         if (!weeklyModelMap.has(wb)) weeklyModelMap.set(wb, {});
                         const acc = weeklyModelMap.get(wb)!;
                         for (const [m, count] of Object.entries(pt.model_data)) {
-                            acc[m] = (acc[m] || 0) + count;
+                            acc[m] = count === null || acc[m] === null ? null : (acc[m] ?? 0) + count;
                         }
                     }
                     modelTrend = Array.from(weeklyModelMap.entries())
@@ -458,13 +454,13 @@ const TokenStats: React.FC = () => {
                         .map(([period, model_data]) => ({ period, model_data }));
 
                     // 按周合并聚合 accountTrend
-                    const weeklyAccountMap = new Map<string, Record<string, number>>();
+                    const weeklyAccountMap = new Map<string, Record<string, number | null>>();
                     for (const pt of rawDailyAccountTrend) {
                         const wb = getSqliteWeekBucket(pt.period);
                         if (!weeklyAccountMap.has(wb)) weeklyAccountMap.set(wb, {});
                         const acc = weeklyAccountMap.get(wb)!;
                         for (const [a, count] of Object.entries(pt.account_data)) {
-                            acc[a] = (acc[a] || 0) + count;
+                            acc[a] = count === null || acc[a] === null ? null : (acc[a] ?? 0) + count;
                         }
                     }
                     accountTrend = Array.from(weeklyAccountMap.entries())
@@ -487,7 +483,7 @@ const TokenStats: React.FC = () => {
             const modelTotals: Record<string, number> = {};
             modelTrend.forEach(p => {
                 Object.entries(p.model_data).forEach(([m, val]) => {
-                    modelTotals[m] = (modelTotals[m] || 0) + val;
+                    modelTotals[m] = (modelTotals[m] || 0) + (val ?? 0);
                 });
             });
             const sortedModels = Array.from(modelsSet).sort((a, b) => (modelTotals[b] || 0) - (modelTotals[a] || 0));
@@ -499,12 +495,12 @@ const TokenStats: React.FC = () => {
 
             const transformedTrend = modelTrend.map(point => {
                 const row: Record<string, any> = { period: point.period };
-                let otherSum = 0;
+                let otherSum: number | null = 0;
                 Object.entries(point.model_data).forEach(([model, val]) => {
                     if (top5Models.includes(model)) {
                         row[model] = val;
                     } else {
-                        otherSum += val;
+                        otherSum = otherSum === null || val === null ? null : otherSum + val;
                     }
                 });
                 if (hasOther) {
@@ -525,7 +521,7 @@ const TokenStats: React.FC = () => {
             const transformedAccountTrend = accountTrend.map(point => {
                 const row: Record<string, any> = { period: point.period };
                 accountList.forEach(acc => {
-                    row[acc] = point.account_data[acc] || 0;
+                    row[acc] = point.account_data[acc] ?? null;
                 });
                 return row;
             });
@@ -549,8 +545,10 @@ const TokenStats: React.FC = () => {
             setClassicChartData(
                 classicData.map(point => ({
                     ...point,
-                    total_cached_tokens: point.total_cached_tokens || 0,
-                    uncached_input_tokens: Math.max((point.total_input_tokens || 0) - (point.total_cached_tokens || 0), 0),
+                    total_cached_tokens: point.total_cached_tokens,
+                    uncached_input_tokens: cacheMetricsFor(point, point.request_count).uncachedInputTokens,
+                    reported_cached_tokens: reportedTokens(point.total_cached_tokens, point.cache_reported_requests),
+                    reported_output_tokens: reportedTokens(point.total_output_tokens, point.output_reported_requests),
                 }))
             );
 
@@ -589,24 +587,24 @@ const TokenStats: React.FC = () => {
     }, [timeRange, minuteSpan]);
 
     // 计算单个模型的有效单价 ($ / Token)
-    const getModelEffectiveRate = useCallback((modelName: string): number => {
+    const getModelEffectiveRate = useCallback((modelName: string): number | null => {
         const stats = modelData.find(m => m.model === modelName);
         if (stats && stats.total_tokens > 0) {
-            return calculateModelCost(stats) / stats.total_tokens;
+            const cost = calculateModelCost(stats);
+            return cost === null ? null : cost / stats.total_tokens;
         }
-        const p = getPricing(modelName);
-        return ((p.input + p.output) / 2) / 1_000_000;
+        return null;
     }, [modelData, calculateModelCost, getPricing]);
 
     // 计算“其他模型”的加权平均单价
-    const getOtherModelsEffectiveRate = useCallback((): number => {
+    const getOtherModelsEffectiveRate = useCallback((): number | null => {
         const otherStats = modelData.filter(m => !allModels.includes(m.model) || m.model === t('token_stats.other_models', 'Other Models'));
         const totalOtherTokens = otherStats.reduce((sum, m) => sum + m.total_tokens, 0);
-        const totalOtherCost = otherStats.reduce((sum, m) => sum + calculateModelCost(m), 0);
+        const totalOtherCost = otherStats.reduce((sum, m) => sum + (calculateModelCost(m) ?? 0), 0);
         if (totalOtherTokens > 0) {
             return totalOtherCost / totalOtherTokens;
         }
-        return (DEFAULT_PRICING['default'].input + DEFAULT_PRICING['default'].output) / 2 / 1_000_000;
+        return null;
     }, [modelData, allModels, calculateModelCost, t]);
 
     // 动态根据 metricType ('tokens' | 'cost') 转换模型趋势数据
@@ -617,9 +615,9 @@ const TokenStats: React.FC = () => {
         return modelTrendData.map(row => {
             const costRow: Record<string, any> = { period: row.period };
             allModels.forEach(modelKey => {
-                const tokenVal = row[modelKey] || 0;
+                const tokenVal = row[modelKey] ?? null;
                 const rate = modelKey === otherModelKey ? otherRate : getModelEffectiveRate(modelKey);
-                costRow[modelKey] = Number((tokenVal * rate).toFixed(4));
+                costRow[modelKey] = tokenVal === null || rate === null ? null : Number((tokenVal * rate).toFixed(4));
             });
             return costRow;
         });
@@ -630,12 +628,12 @@ const TokenStats: React.FC = () => {
         if (metricType === 'tokens') return accountTrendData;
         const avgTokenRate = summary && summary.total_tokens > 0
             ? totalEstimatedCost / summary.total_tokens
-            : 1.5 / 1_000_000;
+            : null;
         return accountTrendData.map(row => {
             const costRow: Record<string, any> = { period: row.period };
             allAccounts.forEach(acc => {
-                const tokenVal = row[acc] || 0;
-                costRow[acc] = Number((tokenVal * avgTokenRate).toFixed(4));
+                const tokenVal = row[acc] ?? null;
+                costRow[acc] = tokenVal === null || avgTokenRate === null ? null : Number((tokenVal * avgTokenRate).toFixed(4));
             });
             return costRow;
         });
@@ -684,7 +682,7 @@ const TokenStats: React.FC = () => {
                                     </span>
                                 </div>
                                 <span className="font-mono font-medium text-gray-800 dark:text-base-content">
-                                    {metricType === 'cost' ? formatCurrency(entry.value) : formatNumber(entry.value)}
+                                    {entry.value == null ? '—' : metricType === 'cost' ? formatCurrency(entry.value) : formatNumber(entry.value)}
                                 </span>
                             </div>
                         );
@@ -715,7 +713,7 @@ const TokenStats: React.FC = () => {
                                 </span>
                             </div>
                             <span className="font-mono font-medium text-gray-800 dark:text-white">
-                                {formatNumber(item.value)}
+                                {item.value == null ? '—' : formatNumber(item.value)}
                             </span>
                         </div>
                     ))}
@@ -948,6 +946,17 @@ const TokenStats: React.FC = () => {
                     </div>
                 </div>
 
+                <div className="flex flex-wrap items-start justify-between gap-3 text-xs text-gray-500 dark:text-gray-400">
+                    <div>
+                        <CacheCoverage metrics={cacheMetrics} />
+                        <span>{t('token_stats.reported_total_coverage', 'Total reported for {{known}}/{{total}} requests; missing fields remain unknown.', {
+                            known: summary?.total_reported_requests ?? 0, total: summary?.total_requests ?? 0,
+                        })}</span>
+                    </div>
+                    {dashboardMode === 'classic' && <NominalCostBreakdown costs={nominalCosts} formatCurrency={formatCurrency} />}
+                    {metricType === 'cost' && <span>{t('token_stats.nominal_trend_note', 'Cost trends use period-average prices and reported usage; estimates only.')}</span>}
+                </div>
+
                 {/* ==================== 0. 赛博大盘模式 (Cyber Cockpit View) ==================== */}
                 {dashboardMode === 'cockpit' && (
                     <div className="flex-1 min-h-0 overflow-hidden">
@@ -959,6 +968,7 @@ const TokenStats: React.FC = () => {
                             accountData={accountData}
                             timeRange={timeRange}
                             totalEstimatedCost={totalEstimatedCost}
+                            nominalCosts={nominalCosts}
                             cacheMetrics={cacheMetrics}
                             formatNumber={formatNumber}
                             formatCurrency={formatCurrency}
@@ -985,6 +995,7 @@ const TokenStats: React.FC = () => {
                         chartType={chartType}
                         timeRange={timeRange}
                         totalEstimatedCost={totalEstimatedCost}
+                            nominalCosts={nominalCosts}
                         cacheMetrics={cacheMetrics}
                         formatNumber={formatNumber}
                         formatCurrency={formatCurrency}
@@ -1011,7 +1022,7 @@ const TokenStats: React.FC = () => {
                                         <span>{t('token_stats.total_tokens', '总 Token')}</span>
                                     </div>
                                     <div className="text-2xl font-bold font-mono tracking-tight text-gray-900 dark:text-base-content">
-                                        {formatNumber(summary.total_tokens)}
+                                        {reportedTokens(summary.total_tokens, summary.total_reported_requests) === null ? '—' : formatNumber(summary.total_tokens)}
                                     </div>
                                 </div>
 
@@ -1024,7 +1035,7 @@ const TokenStats: React.FC = () => {
                                         <span>{t('token_stats.input_tokens', '输入 Token')}</span>
                                     </div>
                                     <div className="text-2xl font-bold font-mono tracking-tight text-blue-600 dark:text-blue-400">
-                                        {formatNumber(summary.total_input_tokens)}
+                                        {reportedTokens(summary.total_input_tokens, summary.input_reported_requests) === null ? '—' : formatNumber(summary.total_input_tokens)}
                                     </div>
                                 </div>
 
@@ -1037,7 +1048,7 @@ const TokenStats: React.FC = () => {
                                         <span>{t('token_stats.output_tokens', '输出 Token')}</span>
                                     </div>
                                     <div className="text-2xl font-bold font-mono tracking-tight text-purple-600 dark:text-purple-400">
-                                        {formatNumber(summary.total_output_tokens)}
+                                        {reportedTokens(summary.total_output_tokens, summary.output_reported_requests) === null ? '—' : formatNumber(summary.total_output_tokens)}
                                     </div>
                                 </div>
 
@@ -1050,7 +1061,7 @@ const TokenStats: React.FC = () => {
                                         <span>{t('token_stats.cached_token', '缓存命中')}</span>
                                     </div>
                                     <div className="text-2xl font-bold font-mono tracking-tight text-sky-600 dark:text-sky-400">
-                                        {formatNumber(summary.total_cached_tokens)}
+                                        {reportedTokens(summary.total_cached_tokens, summary.cache_reported_requests) === null ? '—' : formatNumber(summary.total_cached_tokens)}
                                     </div>
                                 </div>
 
@@ -1332,7 +1343,7 @@ const TokenStats: React.FC = () => {
                                                     allowEscapeViewBox={{ x: true, y: true }}
                                                 />
                                                 <Bar
-                                                    dataKey="total_cached_tokens"
+                                                    dataKey="reported_cached_tokens"
                                                     name={t('token_stats.cached_token', '缓存命中')}
                                                     stackId="input"
                                                     fill="#7dd3fc"
@@ -1348,7 +1359,7 @@ const TokenStats: React.FC = () => {
                                                     maxBarSize={36}
                                                 />
                                                 <Bar
-                                                    dataKey="total_output_tokens"
+                                                    dataKey="reported_output_tokens"
                                                     name={t('token_stats.output', '输出')}
                                                     fill="#a855f7"
                                                     radius={[3, 3, 0, 0]}
@@ -1416,7 +1427,7 @@ const TokenStats: React.FC = () => {
                                                 </span>
                                             </div>
                                             <span className="font-mono font-medium text-gray-800 dark:text-base-content">
-                                                {formatNumber(account.total_tokens)}
+                                                {reportedTokens(account.total_tokens, account.total_reported_requests) === null ? '—' : formatNumber(account.total_tokens)}
                                             </span>
                                         </div>
                                     ))}
@@ -1454,7 +1465,7 @@ const TokenStats: React.FC = () => {
                                 </thead>
                                 <tbody className="divide-y divide-gray-100 dark:divide-base-200">
                                     {modelData.map((model, index) => {
-                                        const percentage = summary && summary.total_tokens > 0 ? ((model.total_tokens / summary.total_tokens) * 100).toFixed(1) : '0';
+                                        const percentage = summary && summary.total_tokens > 0 && (model.total_reported_requests ?? 0) > 0 ? ((model.total_tokens / summary.total_tokens) * 100).toFixed(1) : null;
                                         const cost = calculateModelCost(model);
                                         return (
                                             <tr key={model.model} className="hover:bg-gray-50/70 dark:hover:bg-base-200/50 transition-colors">
@@ -1473,22 +1484,22 @@ const TokenStats: React.FC = () => {
                                                     {model.request_count.toLocaleString()}
                                                 </td>
                                                 <td className="py-2.5 px-3 text-right font-mono text-blue-600 dark:text-blue-400">
-                                                    {formatNumber(model.total_input_tokens)}
+                                                    {reportedTokens(model.total_input_tokens, model.input_reported_requests) === null ? '—' : formatNumber(model.total_input_tokens)}
                                                 </td>
                                                 <td className="py-2.5 px-3 text-right font-mono text-purple-600 dark:text-purple-400">
-                                                    {formatNumber(model.total_output_tokens)}
+                                                    {reportedTokens(model.total_output_tokens, model.output_reported_requests) === null ? '—' : formatNumber(model.total_output_tokens)}
                                                 </td>
                                                 <td className="py-2.5 px-3 text-right font-mono text-sky-600 dark:text-sky-400">
-                                                    {formatNumber(model.total_cached_tokens)}
+                                                    {reportedTokens(model.total_cached_tokens, model.cache_reported_requests) === null ? '—' : formatNumber(model.total_cached_tokens)}
                                                 </td>
                                                 <td className="py-2.5 px-3 text-right font-mono font-semibold text-gray-900 dark:text-base-content">
-                                                    {formatNumber(model.total_tokens)}
+                                                    {reportedTokens(model.total_tokens, model.total_reported_requests) === null ? '—' : formatNumber(model.total_tokens)}
                                                 </td>
                                                 <td className="py-2.5 px-3 text-right font-mono text-gray-500 dark:text-gray-400">
-                                                    {percentage}%
+                                                    {percentage === null ? '—' : `${percentage}%`}
                                                 </td>
                                                 <td className="py-2.5 px-3 text-right font-mono font-medium text-emerald-600 dark:text-emerald-400">
-                                                    ${cost.toFixed(2)}
+                                                    {cost === null ? '—' : formatCurrency(cost)}
                                                 </td>
                                             </tr>
                                         );
@@ -1529,16 +1540,16 @@ const TokenStats: React.FC = () => {
                                                 {account.request_count.toLocaleString()}
                                             </td>
                                             <td className="py-2.5 px-3 text-right font-mono text-blue-600 dark:text-blue-400">
-                                                {formatNumber(account.total_input_tokens)}
+                                                {reportedTokens(account.total_input_tokens, account.input_reported_requests) === null ? '—' : formatNumber(account.total_input_tokens)}
                                             </td>
                                             <td className="py-2.5 px-3 text-right font-mono text-purple-600 dark:text-purple-400">
-                                                {formatNumber(account.total_output_tokens)}
+                                                {reportedTokens(account.total_output_tokens, account.output_reported_requests) === null ? '—' : formatNumber(account.total_output_tokens)}
                                             </td>
                                             <td className="py-2.5 px-3 text-right font-mono text-sky-600 dark:text-sky-400">
-                                                {formatNumber(account.total_cached_tokens)}
+                                                {reportedTokens(account.total_cached_tokens, account.cache_reported_requests) === null ? '—' : formatNumber(account.total_cached_tokens)}
                                             </td>
                                             <td className="py-2.5 px-3 text-right font-mono font-semibold text-gray-900 dark:text-base-content">
-                                                {formatNumber(account.total_tokens)}
+                                                {reportedTokens(account.total_tokens, account.total_reported_requests) === null ? '—' : formatNumber(account.total_tokens)}
                                             </td>
                                         </tr>
                                     ))}

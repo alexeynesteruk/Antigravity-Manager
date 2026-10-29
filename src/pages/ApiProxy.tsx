@@ -26,7 +26,8 @@ import {
     Timer,
     Zap,
     Square,
-    ChevronDown
+    ChevronDown,
+    FlaskConical
 } from 'lucide-react';
 import { AppConfig, ProxyConfig, StickySessionConfig, ExperimentalConfig } from '../types/config';
 import HelpTooltip from '../components/common/HelpTooltip';
@@ -36,6 +37,8 @@ import { cn } from '../utils/cn';
 import { useProxyModels } from '../hooks/useProxyModels';
 import GroupedSelect, { SelectOption } from '../components/common/GroupedSelect';
 import { CliSyncCard } from '../components/proxy/CliSyncCard';
+import { RequestProbeModal } from '../components/proxy/RequestProbeModal';
+import type { ProbeResult } from '../utils/proxyProbe';
 import { listAccounts } from '../services/accountService';
 import { motion } from 'framer-motion';
 import CircuitBreaker from '../components/settings/CircuitBreaker';
@@ -43,8 +46,7 @@ import GlobalSystemPrompt from '../components/settings/GlobalSystemPrompt';
 import ImageThinkingMode from '../components/settings/ImageThinkingMode';
 import ThinkingBudget from '../components/settings/ThinkingBudget';
 import MultimodalSettings from '../components/settings/MultimodalSettings';
-import StreamTimeoutSettings from '../components/settings/StreamTimeoutSettings';
-import AgentSettings from '../components/settings/AgentSettings';
+import TimeoutSettings from '../components/settings/TimeoutSettings';import AgentSettings from '../components/settings/AgentSettings';
 import { CircuitBreakerConfig } from '../types/config';
 import { RequestDetailModal, ProxyRequestLog } from '../components/proxy/RequestDetailModal';
 
@@ -173,6 +175,7 @@ export default function ApiProxy() {
     const [copied, setCopied] = useState<string | null>(null);
     const [selectedProtocol, setSelectedProtocol] = useState<'openai' | 'anthropic' | 'gemini'>('openai');
     const [selectedModelId, setSelectedModelId] = useState('gemini-3.8-flash-tiered');
+    const [probeModel, setProbeModel] = useState<{ id: string; initialResult: ProbeResult | null } | null>(null);
     const [customMappingValue, setCustomMappingValue] = useState(''); // 自定义映射表单的选中值
     const [editingKey, setEditingKey] = useState<string | null>(null);
     const [editingValue, setEditingValue] = useState<string>('');
@@ -210,6 +213,7 @@ export default function ApiProxy() {
     const [cfLoading, setCfLoading] = useState(false);
     const [cfMode, setCfMode] = useState<'quick' | 'auth'>('quick');
     const [cfToken, setCfToken] = useState('');
+    const [cfCustomDomain, setCfCustomDomain] = useState('');
     const [cfUseHttp2, setCfUseHttp2] = useState(true); // 默认启用HTTP/2，更稳定
 
     // 生成自定义映射表单的选项 (从 models 动态生成，统一纯正 Model ID 风格)
@@ -431,6 +435,7 @@ export default function ApiProxy() {
                     mode: cfMode,
                     port: appConfig?.proxy.port || 8045,
                     token: cfMode === 'auth' ? cfToken : null,
+                    custom_domain: cfCustomDomain.trim() || null,
                     use_http2: cfUseHttp2,
                 };
                 const status = await invoke<typeof cfStatus>('cloudflared_start', { config });
@@ -446,6 +451,7 @@ export default function ApiProxy() {
                             enabled: true,
                             mode: cfMode,
                             token: cfToken,
+                            custom_domain: cfCustomDomain.trim() || null,
                             use_http2: cfUseHttp2,
                             port: appConfig.proxy.port || 8045
                         }
@@ -537,6 +543,7 @@ export default function ApiProxy() {
             if (config.cloudflared) {
                 setCfMode(config.cloudflared.mode || 'quick');
                 setCfToken(config.cloudflared.token || '');
+                setCfCustomDomain(config.cloudflared.custom_domain || '');
                 setCfUseHttp2(config.cloudflared.use_http2 !== false); // 默认开启 HTTP/2
             }
 
@@ -544,6 +551,7 @@ export default function ApiProxy() {
             if (config.cloudflared) {
                 setCfMode(config.cloudflared.mode || 'quick');
                 setCfToken(config.cloudflared.token || '');
+                setCfCustomDomain(config.cloudflared.custom_domain || '');
                 setCfUseHttp2(config.cloudflared.use_http2 !== false); // 默认 true
             }
         } catch (error) {
@@ -1128,6 +1136,10 @@ print(response.choices[0].message.content)`;
         return true;
     });
 
+    const getProbeBaseUrl = () => isTauri()
+        ? (status.running ? status.base_url : `http://127.0.0.1:${appConfig?.proxy.port || 8045}`)
+        : window.location.origin;
+
     const renderModelRouterSection = () => {
         if (!appConfig) return null;
         return (
@@ -1699,6 +1711,11 @@ print(response.choices[0].message.content)`;
                                                                 </div>
                                                             )}
                                                         </button>
+                                                        <button type="button" className="btn btn-xs btn-ghost h-6.5 min-h-0"
+                                                            title={t('proxy.probe.details')}
+                                                            onClick={(e) => { e.stopPropagation(); setProbeModel({ id: m.id, initialResult: null }); }}>
+                                                            <FlaskConical size={13} />
+                                                        </button>
                                                         <button
                                                             className="btn btn-xs h-6.5 min-h-0 px-2 rounded-md font-medium text-[11px] bg-gray-100 hover:bg-gray-200 dark:bg-base-200 dark:hover:bg-base-300 text-gray-700 dark:text-gray-300 border border-gray-200/70 dark:border-base-300 transition-all active:scale-95 shadow-2xs"
                                                             onClick={(e) => {
@@ -1820,7 +1837,7 @@ print(response.choices[0].message.content)`;
                 {!configLoading && !configError && appConfig && (
                     <div className="bg-white dark:bg-base-100 rounded-xl shadow-xs border border-gray-200/80 dark:border-base-200">
                         <div className="px-4 sm:px-5 py-2.5 border-b border-gray-100 dark:border-base-200 bg-gray-50/60 dark:bg-base-200/80 flex flex-wrap items-center justify-between gap-3">
-                            {/* 三个可选菜单栏：服务配置、CLI 一键配置、多协议支持 */}
+                            {/* 菜单栏：服务配置、模型配置、模型大全与协议、CLI 一键配置 */}
                             <div className="flex items-center gap-1.5 bg-gray-200/70 dark:bg-base-300/60 p-1 rounded-xl">
                                 <button
                                     type="button"
@@ -2310,15 +2327,17 @@ print(response.choices[0].message.content)`;
                         {/* TAB: 模型配置 (models) */}
                         {activeMenuTab === 'models' && (
                             <div className="p-4 space-y-4">
-                                {/* 流式超时设置 (Stream Timeout Settings) - 默认收起 */}
+                                {/* 超时设置 (全链路分阶段) - 默认收起 */}
                                 <CollapsibleCard
-                                    title={t('proxy.config.stream_timeout_settings.title', { defaultValue: '流式超时设置 (Stream Timeout Settings)' })}
+                                    title={t('proxy.config.timeout_settings.title', { defaultValue: '超时设置' })}
                                     icon={<Timer size={18} className="text-blue-500" />}
                                     defaultExpanded={false}
                                 >
-                                    <StreamTimeoutSettings
-                                        config={appConfig.proxy.stream_timeouts}
-                                        onChange={(timeoutConfig) => updateProxyConfig({ stream_timeouts: timeoutConfig })}
+                                    <TimeoutSettings
+                                        streamConfig={appConfig.proxy.stream_timeouts}
+                                        uploadConfig={appConfig.proxy.upload_timeouts}
+                                        onStreamChange={(timeoutConfig) => updateProxyConfig({ stream_timeouts: timeoutConfig })}
+                                        onUploadChange={(timeoutConfig) => updateProxyConfig({ upload_timeouts: timeoutConfig })}
                                         onSave={handleSaveProxySettings}
                                     />
                                 </CollapsibleCard>
@@ -2383,7 +2402,7 @@ print(response.choices[0].message.content)`;
                             </div>
                         )}
 
-                        {/* TAB 2: CLI 一键配置 (cli) */}
+                        {/* TAB 3: CLI 一键配置 (cli) */}
                         {activeMenuTab === 'cli' && (
                             <div className="p-4">
                                 <div className="bg-gray-50/60 dark:bg-base-200/50 rounded-xl p-3 border border-gray-200/60 dark:border-base-300">
@@ -2395,7 +2414,7 @@ print(response.choices[0].message.content)`;
                             </div>
                         )}
 
-                        {/* TAB 3: 多协议支持 (protocols) */}
+                        {/* TAB 4: 模型大全与协议 (protocols) */}
                         {activeMenuTab === 'protocols' && (
                             <div className="p-4 space-y-6">
                                 {renderMultiProtocolSection()}
@@ -2415,6 +2434,14 @@ print(response.choices[0].message.content)`;
                                 icon={<RefreshCw size={18} className="text-indigo-500" />}
                             >
                                 <div className="space-y-4">
+                                    <label className="flex items-center justify-between gap-4 rounded-xl bg-gray-50 dark:bg-base-200 p-3">
+                                        <span className="text-xs font-medium">{t('proxy.config.scheduling.account_concurrency')}
+                                            <span className="block text-[10px] text-gray-500 mt-1">{t('proxy.config.scheduling.account_concurrency_hint')}</span>
+                                        </span>
+                                        <input type="number" min={0} max={4294967295} step={1} className="input input-bordered input-sm w-24"
+                                            value={appConfig.proxy.account_max_concurrency ?? 0}
+                                            onChange={e => updateProxyConfig({ account_max_concurrency: Math.max(0, Math.min(4294967295, Math.trunc(Number(e.target.value) || 0))) })} />
+                                    </label>
                                     <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
                                         <div className="space-y-3">
                                             <div className="flex items-center justify-between">
@@ -2758,6 +2785,34 @@ print(response.choices[0].message.content)`;
                                                     </div>
                                                 )}
 
+                                                {cfMode === 'auth' && (
+                                                    <div className="space-y-2">
+                                                        <label htmlFor="cf-public-url" className="text-sm font-medium text-gray-700 dark:text-gray-300">
+                                                            {t('proxy.cloudflared.public_url', { defaultValue: 'Public URL (optional)' })}
+                                                        </label>
+                                                        <input
+                                                            id="cf-public-url"
+                                                            type="text"
+                                                            value={cfCustomDomain}
+                                                            onChange={(event) => setCfCustomDomain(event.target.value)}
+                                                            onBlur={() => {
+                                                                if (appConfig) {
+                                                                    saveConfig({
+                                                                        ...appConfig,
+                                                                        cloudflared: { ...appConfig.cloudflared, custom_domain: cfCustomDomain.trim() || null }
+                                                                    });
+                                                                }
+                                                            }}
+                                                            disabled={cfStatus.running}
+                                                            placeholder="https://api.example.com"
+                                                            className="w-full px-3 py-2 rounded-lg border border-gray-200 dark:border-gray-700 bg-white dark:bg-base-200 text-sm font-mono disabled:opacity-60"
+                                                        />
+                                                        <p className="text-[10px] text-gray-500 dark:text-gray-400">
+                                                            {t('proxy.cloudflared.public_url_hint', { defaultValue: 'Shows this address for the named tunnel. Configure its routing in Cloudflare; leave empty to detect the address from tunnel logs.' })}
+                                                        </p>
+                                                    </div>
+                                                )}
+
                                                 {/* HTTP2选项 */}
                                                 <div className="flex items-center justify-between p-3 bg-gray-50 dark:bg-base-200 rounded-lg">
                                                     <div className="space-y-0.5">
@@ -2942,6 +2997,11 @@ print(response.choices[0].message.content)`;
                         </div>
                     </div>
                 </ModalDialog>
+                {probeModel && appConfig && (
+                    <RequestProbeModal key={probeModel.id} model={probeModel.id}
+                        initialResult={probeModel.initialResult} baseUrl={getProbeBaseUrl()}
+                        apiKey={appConfig.proxy.api_key} onClose={() => setProbeModel(null)} />
+                )}
             </div>
         </motion.div>
     );

@@ -14,6 +14,8 @@ export interface ProxyConfig {
     custom_mapping?: Record<string, string>;
     request_timeout: number;
     enable_logging: boolean;
+    account_max_concurrency?: number;
+    security_monitor?: { trusted_proxies?: string[]; cors_allowed_origins?: string[]; blacklist: { enabled: boolean; block_message: string }; whitelist: { enabled: boolean; whitelist_priority: boolean } };
     capture_health_logs?: boolean;
     log_retention?: LogRetentionConfig;
     internal_error_log_retention?: InternalErrorLogRetentionConfig;
@@ -32,6 +34,17 @@ export interface ProxyConfig {
     proxy_pool?: ProxyPoolConfig;
     multimodal?: MultimodalConfig;
     stream_timeouts?: StreamTimeoutConfig;
+    upload_timeouts?: UploadTimeoutConfig;
+}
+
+export interface UploadTimeoutConfig {
+    connect_secs?: number;
+    min_upload_mbps?: number;
+    extra_wait_ratio?: number;
+    stall_secs?: number;
+    header_wait_secs?: number;
+    large_body_threshold_mb?: number;
+    large_body_endpoint_attempts?: number;
 }
 
 export interface StreamTimeoutConfig {
@@ -122,6 +135,7 @@ export interface GlobalSystemPromptConfig {
 
 export interface DebugLoggingConfig {
     enabled: boolean;
+    metadata_only?: boolean;
     output_dir?: string;
 }
 
@@ -201,6 +215,7 @@ export interface AppConfig {
     proxy: ProxyConfig;
     cloudflared: CloudflaredConfig; // [NEW] Cloudflared 配置
     lightweight_mode?: boolean; // [NEW] 轻量模式：关闭到托盘时释放 WebView
+    tray_click_action?: 'mini' | 'main'; // [NEW] 托盘左键点击行为：'mini' 为弹出悬浮窗，'main' 为直接打开主控制台
     suggestion_delete_thinking_store?: boolean; // [NEW] 建议删除历史思考块缓存开关
     thinking_cleanup_dismissed?: boolean; // [NEW] 用户是否已确认/忽略该建议
     dismissed_thinking_cleanup_version?: string; // [NEW] 用户已确认或忽略建议的目标版本号
@@ -213,6 +228,7 @@ export interface AppConfig {
 export type TunnelMode = 'quick' | 'auth';
 
 export interface CloudflaredConfig {
+    custom_domain?: string | null;
     enabled: boolean;
     mode: TunnelMode;
     port: number;

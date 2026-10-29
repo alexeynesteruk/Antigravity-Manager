@@ -1,7 +1,103 @@
 // Common utilities for request mapping across all protocols
 // Provides unified grounding/networking logic
 
+use once_cell::sync::Lazy;
+use parking_lot::RwLock;
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
+use std::collections::{HashMap, VecDeque};
+use std::time::{Duration, Instant};
+
+/// 有限容量的图片 SHA-256 指纹黑名单（带 FIFO O(1) 逐项淘汰，防止全量清空导致长会话雪崩）
+#[derive(Debug)]
+pub struct ImageBlacklist {
+    hashes: HashMap<String, Instant>,
+    order: VecDeque<String>,
+    capacity: usize,
+}
+
+impl ImageBlacklist {
+    pub fn new(capacity: usize) -> Self {
+        Self {
+            hashes: HashMap::new(),
+            order: VecDeque::new(),
+            capacity,
+        }
+    }
+
+    pub fn insert(&mut self, hash: String) {
+        while self
+            .order
+            .front()
+            .is_some_and(|oldest| !self.contains(oldest))
+        {
+            if let Some(oldest) = self.order.pop_front() {
+                self.hashes.remove(&oldest);
+            }
+        }
+        if self.capacity == 0 || self.contains(&hash) {
+            return;
+        }
+        if self.hashes.len() >= self.capacity {
+            if let Some(oldest) = self.order.pop_front() {
+                self.hashes.remove(&oldest);
+            }
+        }
+        self.hashes.insert(hash.clone(), Instant::now());
+        self.order.push_back(hash);
+    }
+
+    pub fn contains(&self, hash: &str) -> bool {
+        self.hashes
+            .get(hash)
+            .is_some_and(|recorded| recorded.elapsed() < Duration::from_secs(600))
+    }
+
+    pub fn len(&self) -> usize {
+        self.hashes.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.hashes.is_empty()
+    }
+
+    pub fn clear(&mut self) {
+        self.hashes.clear();
+        self.order.clear();
+    }
+}
+
+/// 全局已知损坏/无法被 Google 上游视觉解码器处理的图片 SHA-256 指纹黑名单
+static CORRUPTED_IMAGE_HASHES: Lazy<RwLock<ImageBlacklist>> =
+    Lazy::new(|| RwLock::new(ImageBlacklist::new(2000)));
+
+/// 计算 Base64 图片数据的指纹 (SHA-256)
+pub fn calculate_image_hash(b64_data: &str) -> String {
+    let clean = b64_data.trim();
+    let mut hasher = Sha256::new();
+    hasher.update(clean.as_bytes());
+    format!("{:x}", hasher.finalize())
+}
+
+/// 检查图片是否在已知损坏黑名单中
+pub fn is_corrupted_image(b64_data: &str) -> bool {
+    let hash = calculate_image_hash(b64_data);
+    let blacklist = CORRUPTED_IMAGE_HASHES.read();
+    blacklist.contains(&hash)
+}
+
+/// 将图片指纹记录到损坏黑名单中
+pub fn record_corrupted_image_hash(b64_data: &str) {
+    let hash = calculate_image_hash(b64_data);
+    let mut blacklist = CORRUPTED_IMAGE_HASHES.write();
+    blacklist.insert(hash);
+}
+
+/// 清空全局损坏图片黑名单（主要用于单元测试隔离与内存重置）
+pub fn clear_corrupted_image_hashes() {
+    let mut blacklist = CORRUPTED_IMAGE_HASHES.write();
+    blacklist.clear();
+}
 
 /// Request configuration after grounding resolution
 #[derive(Debug, Clone)]
@@ -1319,6 +1415,62 @@ mod tests {
         assert!(parts[3].get("inlineData").is_some());
         assert_eq!(parts[3]["inlineData"]["data"], valid_png_b64);
     }
+
+    #[test]
+    fn test_corrupted_image_recovery_preserves_healthy_media() {
+        use base64::Engine;
+        let png = base64::engine::general_purpose::STANDARD
+            .encode(include_bytes!("../../../icons/32x32.png"));
+        let good = json!({"inlineData":{"mimeType":"image/png","data":png}});
+        let pdf = json!({"inlineData":{"mimeType":"application/pdf","data":"JVBERi0xLjQK"}});
+        let audio = json!({"inlineData":{"mimeType":"audio/wav","data":"UklGRg=="}});
+        let mut payload = json!({"contents":[{"role":"user","parts":[good.clone(),pdf.clone(),audio.clone(),{"inline_data":{"mime_type":"image/png","data":"+A=="}}]}]});
+        assert_eq!(purge_corrupted_images_from_gemini_payload(&mut payload), 1);
+        assert_eq!(payload["contents"][0]["parts"][0], good);
+        assert_eq!(payload["contents"][0]["parts"][1], pdf);
+        assert_eq!(payload["contents"][0]["parts"][2], audio);
+        let before = payload.clone();
+        assert_eq!(purge_corrupted_images_from_gemini_payload(&mut payload), 0);
+        assert_eq!(
+            payload, before,
+            "ambiguous image errors must not discard healthy media"
+        );
+    }
+
+    #[test]
+    fn test_image_blacklist_fifo_eviction() {
+        let mut list = ImageBlacklist::new(3);
+        list.insert("hash_1".to_string());
+        list.insert("hash_2".to_string());
+        list.insert("hash_3".to_string());
+        assert_eq!(list.len(), 3);
+        assert!(list.contains("hash_1"));
+        assert!(list.contains("hash_2"));
+        assert!(list.contains("hash_3"));
+
+        // 插入第 4 个元素，验证按 FIFO 淘汰最旧的 hash_1 (Review 建议 #2)
+        list.insert("hash_4".to_string());
+        assert_eq!(list.len(), 3);
+        assert!(!list.contains("hash_1"), "最旧条目应被逐项淘汰");
+        assert!(list.contains("hash_2"));
+        assert!(list.contains("hash_3"));
+        assert!(list.contains("hash_4"));
+
+        // 插入重复条目不改变容量与顺序
+        list.insert("hash_2".to_string());
+        assert_eq!(list.len(), 3);
+    }
+
+    #[test]
+    fn invalid_image_fingerprints_expire_without_eviction_of_healthy_media() {
+        let mut list = ImageBlacklist::new(2);
+        list.insert("expired".into());
+        *list.hashes.get_mut("expired").unwrap() = Instant::now() - Duration::from_secs(601);
+        assert!(!list.contains("expired"));
+        list.insert("current".into());
+        assert_eq!(list.len(), 1);
+        assert!(list.contains("current"));
+    }
 }
 
 /// [FIX] Parse markdown base64 images from text and split into Gemini parts
@@ -1634,6 +1786,10 @@ pub fn validate_and_sanitize_inline_data(
 
     // Deep structural completeness & truncation defense for raster images:
     // Prevent truncated header-only fragments (like a 21-byte cut PNG) from penetrating upstream.
+    if final_mime.starts_with("image/") && is_corrupted_image(clean_b64) {
+        return None;
+    }
+
     if final_mime.starts_with("image/") {
         let len = decoded_bytes.len();
         match final_mime.as_str() {
@@ -1779,7 +1935,13 @@ pub fn sanitize_gemini_payload_inline_data(body: &mut Value) -> usize {
         }
     };
 
-    if let Some(contents) = body.get_mut("contents").and_then(Value::as_array_mut) {
+    let root = if body.get("request").is_some() {
+        body.get_mut("request").unwrap()
+    } else {
+        body
+    };
+
+    if let Some(contents) = root.get_mut("contents").and_then(Value::as_array_mut) {
         for content in contents.iter_mut() {
             if let Some(parts) = content.get_mut("parts").and_then(Value::as_array_mut) {
                 sanitize_parts(parts);
@@ -1787,16 +1949,85 @@ pub fn sanitize_gemini_payload_inline_data(body: &mut Value) -> usize {
         }
     }
 
-    if let Some(sys) = body
-        .get_mut("systemInstruction")
-        .and_then(Value::as_object_mut)
-    {
+    let sys_node = if root.get("systemInstruction").is_some() {
+        root.get_mut("systemInstruction")
+    } else {
+        root.get_mut("system_instruction")
+    };
+    if let Some(sys) = sys_node.and_then(Value::as_object_mut) {
         if let Some(parts) = sys.get_mut("parts").and_then(Value::as_array_mut) {
             sanitize_parts(parts);
         }
     }
 
     total_sanitized
+}
+
+/// Replace only inline images independently proven invalid by local validation.
+/// An ambiguous upstream image error leaves healthy images and non-image media
+/// intact; returning zero tells the caller to preserve the original error.
+pub fn purge_corrupted_images_from_gemini_payload(body: &mut Value) -> usize {
+    fn sanitize(parts: &mut [Value]) -> usize {
+        let mut removed = 0;
+        for part in parts {
+            let invalid_image = part
+                .get("inlineData")
+                .or_else(|| part.get("inline_data"))
+                .and_then(Value::as_object)
+                .is_some_and(|inline| {
+                    let mime = inline
+                        .get("mimeType")
+                        .or_else(|| inline.get("mime_type"))
+                        .and_then(Value::as_str);
+                    let data = inline
+                        .get("data")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default();
+                    // An upstream error does not identify a culprit. Only remove images
+                    // independently proven invalid; retain healthy images, PDFs and audio.
+                    mime.is_some_and(|m| m.starts_with("image/"))
+                        && validate_and_sanitize_inline_data(mime, data).is_none()
+                });
+            if invalid_image {
+                if let Some(data) = part
+                    .get("inlineData")
+                    .or_else(|| part.get("inline_data"))
+                    .and_then(|v| v.get("data"))
+                    .and_then(Value::as_str)
+                {
+                    // Record only locally proven invalid data, never an entire
+                    // request's images after an ambiguous upstream failure.
+                    record_corrupted_image_hash(data);
+                }
+                *part = json!({"text": "[Image: invalid or corrupted data omitted]"});
+                removed += 1;
+            }
+        }
+        removed
+    }
+    let root = if body.get("request").is_some() {
+        body.get_mut("request").unwrap()
+    } else {
+        body
+    };
+    let mut removed = 0;
+    if let Some(contents) = root.get_mut("contents").and_then(Value::as_array_mut) {
+        for turn in contents {
+            if let Some(parts) = turn.get_mut("parts").and_then(Value::as_array_mut) {
+                removed += sanitize(parts);
+            }
+        }
+    }
+    for key in ["systemInstruction", "system_instruction"] {
+        if let Some(parts) = root
+            .get_mut(key)
+            .and_then(|v| v.get_mut("parts"))
+            .and_then(Value::as_array_mut)
+        {
+            removed += sanitize(parts);
+        }
+    }
+    removed
 }
 
 /// Check if two model strings are compatible (same family)

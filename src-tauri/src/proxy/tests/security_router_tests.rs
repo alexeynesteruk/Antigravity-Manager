@@ -25,7 +25,7 @@ use tower::ServiceExt;
 use crate::proxy::{
     middleware::{
         auth::{admin_auth_middleware, auth_middleware},
-        cors::cors_layer,
+        cors::{cors_layer, origin_policy_middleware},
         internal::{
             internal_loopback_middleware, internal_request_credential,
             require_validated_internal_request, INTERNAL_REQUEST_CREDENTIAL_HEADER,
@@ -39,6 +39,7 @@ use crate::proxy::{
 const BODY_LIMIT: usize = 256;
 const PROXY_KEY: &str = "router-proxy-key";
 const ADMIN_PASSWORD: &str = "router-admin-password";
+const BROWSER_ORIGIN: &str = "https://example.test";
 
 #[derive(Clone, Default)]
 struct Observations {
@@ -67,8 +68,8 @@ async fn admin_control(State(observed): State<Observations>, headers: HeaderMap)
     StatusCode::NO_CONTENT
 }
 
-/// Mirrors server.rs: AI-only auth/decompression, strict admin authentication,
-/// then the shared service gate, CORS, private internal guard, and decoded-body limit extension.
+/// Mirrors server.rs: AI-only service/auth/decompression gates, strict admin
+/// authentication, then shared CORS, private internal guard and body-limit extension.
 fn router(running: bool, auth_mode: ProxyAuthMode, observed: Observations) -> Router {
     let security = Arc::new(RwLock::new(ProxySecurityConfig {
         auth_mode,
@@ -76,7 +77,10 @@ fn router(running: bool, auth_mode: ProxyAuthMode, observed: Observations) -> Ro
         admin_password: Some(ADMIN_PASSWORD.to_string()),
         allow_lan_access: true,
         port: 8045,
-        security_monitor: Default::default(),
+        security_monitor: crate::proxy::config::SecurityMonitorConfig {
+            cors_allowed_origins: vec![BROWSER_ORIGIN.to_string()],
+            ..Default::default()
+        },
     }));
     let ai = Router::new()
         .route("/internal/warmup", post(echo))
@@ -87,23 +91,28 @@ fn router(running: bool, auth_mode: ProxyAuthMode, observed: Observations) -> Ro
         .layer(middleware::from_fn_with_state(
             security.clone(),
             auth_middleware,
-        ));
+        ))
+        .layer(middleware::from_fn(move |request, next| {
+            service_status_middleware_with_running(running, request, next)
+        }));
     let admin = Router::new()
         .route("/settings", post(admin_control))
         .route("/health", get(|| async { StatusCode::NO_CONTENT }))
         .with_state(observed)
         .layer(middleware::from_fn_with_state(
-            security,
+            security.clone(),
             admin_auth_middleware,
         ));
     Router::new()
         .merge(ai)
         .nest("/api", admin)
         .route("/health", get(|| async { StatusCode::NO_CONTENT }))
-        .layer(middleware::from_fn(move |request, next| {
-            service_status_middleware_with_running(running, request, next)
-        }))
+        .route("/auth/callback", get(|| async { StatusCode::NO_CONTENT }))
         .layer(cors_layer())
+        .layer(middleware::from_fn_with_state(
+            security,
+            origin_policy_middleware,
+        ))
         .layer(middleware::from_fn(internal_loopback_middleware))
         .layer(DefaultBodyLimit::max(BODY_LIMIT))
 }
@@ -147,6 +156,72 @@ fn gzip(bytes: &[u8]) -> Vec<u8> {
     let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
     encoder.write_all(bytes).unwrap();
     encoder.finish().unwrap()
+}
+
+#[tokio::test]
+async fn paused_ai_service_keeps_static_ui_admin_and_callback_accessible() {
+    let assets = tempfile::tempdir().unwrap();
+    std::fs::create_dir(assets.path().join("assets")).unwrap();
+    std::fs::write(
+        assets.path().join("index.html"),
+        "<html>Account management</html>",
+    )
+    .unwrap();
+    std::fs::write(
+        assets.path().join("assets/app.js"),
+        "window.managementReady = true;",
+    )
+    .unwrap();
+    let observed = Observations::default();
+    let app = router(false, ProxyAuthMode::Strict, observed.clone()).fallback_service(
+        tower_http::services::ServeDir::new(assets.path()).fallback(
+            tower_http::services::ServeFile::new(assets.path().join("index.html")),
+        ),
+    );
+    for (path, content) in [
+        ("/", "<html>Account management</html>"),
+        ("/assets/app.js", "window.managementReady = true;"),
+    ] {
+        let request = Request::builder().uri(path).body(Body::empty()).unwrap();
+        let response = app.clone().oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK, "{path}");
+        let body = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .unwrap();
+        assert_eq!(body.as_ref(), content.as_bytes());
+    }
+    for path in ["/health", "/api/health", "/auth/callback"] {
+        let request = Request::builder().uri(path).body(Body::empty()).unwrap();
+        assert_eq!(
+            app.clone().oneshot(request).await.unwrap().status(),
+            StatusCode::NO_CONTENT,
+            "{path}"
+        );
+    }
+    let admin = request(
+        "/api/settings",
+        Some("127.0.0.1:1234"),
+        None,
+        Some(ADMIN_PASSWORD),
+        Body::empty(),
+    );
+    assert_eq!(
+        app.clone().oneshot(admin).await.unwrap().status(),
+        StatusCode::NO_CONTENT
+    );
+    let ai = request(
+        "/v1/messages",
+        Some("127.0.0.1:1234"),
+        None,
+        Some(PROXY_KEY),
+        unread_body(),
+    );
+    assert_eq!(
+        app.oneshot(ai).await.unwrap().status(),
+        StatusCode::SERVICE_UNAVAILABLE
+    );
+    assert_eq!(observed.monitored.load(Ordering::SeqCst), 0);
+    assert_eq!(observed.mutations.load(Ordering::SeqCst), 1);
 }
 
 #[tokio::test]
@@ -316,19 +391,36 @@ async fn normal_ai_routes_preserve_service_and_auth_policy_without_internal_cred
 
 #[tokio::test]
 async fn normal_preflight_and_health_remain_available_while_service_is_stopped() {
-    let app = router(false, ProxyAuthMode::Strict, Observations::default());
-    let mut preflight = request("/v1/messages", None, None, None, unread_body());
-    *preflight.method_mut() = Method::OPTIONS;
-    preflight
-        .headers_mut()
-        .insert(header::ORIGIN, "https://example.test".parse().unwrap());
-    preflight.headers_mut().insert(
-        header::ACCESS_CONTROL_REQUEST_METHOD,
-        "POST".parse().unwrap(),
-    );
-    let response = app.clone().oneshot(preflight).await.unwrap();
-    assert!(response.status().is_success());
-    assert_eq!(response.headers()[header::ACCESS_CONTROL_ALLOW_ORIGIN], "*");
+    let observed = Observations::default();
+    let app = router(false, ProxyAuthMode::Strict, observed.clone());
+    for (origin, expected) in [
+        (BROWSER_ORIGIN, StatusCode::OK),
+        ("https://untrusted.test", StatusCode::FORBIDDEN),
+    ] {
+        let mut preflight = request("/v1/messages", None, None, None, unread_body());
+        *preflight.method_mut() = Method::OPTIONS;
+        preflight
+            .headers_mut()
+            .insert(header::ORIGIN, origin.parse().unwrap());
+        preflight.headers_mut().insert(
+            header::ACCESS_CONTROL_REQUEST_METHOD,
+            "POST".parse().unwrap(),
+        );
+        let response = app.clone().oneshot(preflight).await.unwrap();
+        assert_eq!(response.status(), expected);
+        if expected == StatusCode::OK {
+            assert_eq!(
+                response.headers()[header::ACCESS_CONTROL_ALLOW_ORIGIN],
+                BROWSER_ORIGIN
+            );
+        } else {
+            assert!(!response
+                .headers()
+                .contains_key(header::ACCESS_CONTROL_ALLOW_ORIGIN));
+        }
+    }
+    assert_eq!(observed.monitored.load(Ordering::SeqCst), 0);
+    assert_eq!(observed.mutations.load(Ordering::SeqCst), 0);
     let health = Request::builder()
         .uri("/health")
         .body(Body::empty())

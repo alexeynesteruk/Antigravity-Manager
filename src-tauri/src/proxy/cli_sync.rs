@@ -223,6 +223,7 @@ pub enum CliApp {
     OpenCode,
     JeikCode,
     GrokBuild,
+    DeepSeekHarness,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
@@ -240,6 +241,7 @@ impl CliApp {
             CliApp::OpenCode => "opencode",
             CliApp::JeikCode => "jeikcode",
             CliApp::GrokBuild => "grok",
+            CliApp::DeepSeekHarness => "dsh",
         }
     }
 
@@ -347,6 +349,29 @@ impl CliApp {
                     path: grok_dir.join("config.toml"),
                 }]
             }
+            CliApp::DeepSeekHarness => {
+                let dsh_dir = home.join(".dsh");
+                vec![
+                    CliConfigFile {
+                        name: "profiles/desktop/cordis.patch.yml".to_string(),
+                        path: dsh_dir
+                            .join("profiles")
+                            .join("desktop")
+                            .join("cordis.patch.yml"),
+                    },
+                    CliConfigFile {
+                        name: "profiles/web/cordis.patch.yml".to_string(),
+                        path: dsh_dir
+                            .join("profiles")
+                            .join("web")
+                            .join("cordis.patch.yml"),
+                    },
+                    CliConfigFile {
+                        name: ".credentials.yaml".to_string(),
+                        path: dsh_dir.join(".credentials.yaml"),
+                    },
+                ]
+            }
         }
     }
 
@@ -358,6 +383,7 @@ impl CliApp {
             CliApp::OpenCode => "https://api.openai.com/v1",
             CliApp::JeikCode => "http://127.0.0.1:8046/v1",
             CliApp::GrokBuild => "https://api.x.ai/v1",
+            CliApp::DeepSeekHarness => "https://api.deepseek.com/v1",
         }
     }
 }
@@ -379,6 +405,7 @@ pub fn check_cli_installed(app: &CliApp) -> (bool, Option<String>) {
         CliApp::Gemini => vec!["agy_cli", "agy", "gemini"],
         CliApp::JeikCode => vec!["jeikcode", "atomcode"],
         CliApp::GrokBuild => vec!["grok", "grokbuild"],
+        CliApp::DeepSeekHarness => vec!["dsh", "deepseek-harness", "deepseek"],
         _ => vec![app.as_str()],
     };
 
@@ -507,6 +534,44 @@ pub fn check_cli_installed(app: &CliApp) -> (bool, Option<String>) {
                 || grokbuild_dir.exists()
             {
                 installed = true;
+            }
+        }
+    }
+
+    // 如果是 DeepSeek Harness 且常规检测未命中，尝试检测应用目录或 ~/.dsh 目录
+    if !installed && app == &CliApp::DeepSeekHarness {
+        #[cfg(target_os = "macos")]
+        {
+            let mac_dsh = PathBuf::from(
+                "/Applications/DeepSeek Harness.app/Contents/Resources/runtime/cli/bin/dsh",
+            );
+            if mac_dsh.exists() {
+                executable_path = mac_dsh;
+                installed = true;
+            } else if PathBuf::from("/Applications/DeepSeek Harness.app").exists() {
+                installed = true;
+            }
+        }
+        #[cfg(target_os = "windows")]
+        if let Some(home) = dirs::home_dir() {
+            let win_paths = vec![
+                home.join(".dsh").join("bin").join("dsh.cmd"),
+                home.join(".dsh").join("bin").join("dsh.exe"),
+            ];
+            for p in win_paths {
+                if is_safe_path(&p) {
+                    executable_path = p;
+                    installed = true;
+                    break;
+                }
+            }
+        }
+        if !installed {
+            if let Some(home) = dirs::home_dir() {
+                let dsh_dir = home.join(".dsh");
+                if dsh_dir.exists() {
+                    installed = true;
+                }
             }
         }
     }
@@ -793,6 +858,57 @@ pub fn get_sync_status(
                     }
                 }
             }
+            CliApp::DeepSeekHarness => {
+                if file.name.ends_with("cordis.patch.yml") {
+                    let normalized_proxy = proxy_url
+                        .trim_end_matches('/')
+                        .trim_end_matches("/v1")
+                        .trim_end_matches('/');
+
+                    let has_ag_provider = content.contains("provider: antigravity")
+                        || content.contains("antigravity:");
+
+                    let mut matched = false;
+                    let re_url =
+                        regex::Regex::new(r#"(?m)^\s*baseURL:\s*['"]?([^'"\s#]+)['"]?"#).ok();
+                    if let Some(re) = re_url {
+                        for cap in re.captures_iter(&content) {
+                            if let Some(m) = cap.get(1) {
+                                let found_url = m.as_str();
+                                let norm_found = found_url
+                                    .trim_end_matches('/')
+                                    .trim_end_matches("/v1")
+                                    .trim_end_matches('/');
+                                if norm_found == normalized_proxy {
+                                    current_base_url = Some(found_url.to_string());
+                                    matched = true;
+                                    break;
+                                } else if current_base_url.is_none() {
+                                    current_base_url = Some(found_url.to_string());
+                                }
+                            }
+                        }
+                    }
+
+                    if current_model.is_none() {
+                        let re_model = regex::Regex::new(
+                            r#"(?s)id:\s*agent-default-model[\s\S]*?config:[\s\S]*?model:\s*['"]?([a-zA-Z0-9_.-]+)['"]?"#,
+                        )
+                        .ok();
+                        if let Some(re) = re_model {
+                            if let Some(cap) = re.captures(&content) {
+                                if let Some(m) = cap.get(1) {
+                                    current_model = Some(m.as_str().to_string());
+                                }
+                            }
+                        }
+                    }
+
+                    if !matched || !has_ag_provider {
+                        all_synced = false;
+                    }
+                }
+            }
         }
     }
 
@@ -1000,26 +1116,19 @@ pub fn sync_config(
             fs::create_dir_all(parent).map_err(|e| format!("无法创建目录: {}", e))?;
         }
 
-        // [New Feature] 自动备份：如果文件存在且没有备份，创建 .antigravity.bak 备份
-        // 这样可以保留用户最初的配置，后续多次同步不会覆盖这个备份
+        let mut content = match fs::read_to_string(&file.path) {
+            Ok(content) => content,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
+            Err(error) => return Err(format!("Failed to read {}: {}", file.name, error)),
+        };
         if file.path.exists() {
             let backup_path = file
                 .path
                 .with_file_name(format!("{}.antigravity.bak", file.name));
             if !backup_path.exists() {
-                if let Err(e) = fs::copy(&file.path, &backup_path) {
-                    tracing::warn!("Failed to create backup for {}: {}", file.name, e);
-                } else {
-                    tracing::info!("Created backup for {}: {:?}", file.name, backup_path);
-                }
+                crate::utils::fs::write_private_atomic(&backup_path, content.as_bytes())?;
             }
         }
-
-        let mut content = if file.path.exists() {
-            fs::read_to_string(&file.path).unwrap_or_default()
-        } else {
-            String::new()
-        };
 
         match app {
             CliApp::Claude => {
@@ -1399,19 +1508,50 @@ pub fn sync_config(
                     content = doc.to_string();
                 }
             }
+            CliApp::DeepSeekHarness => {
+                if file.name.ends_with("cordis.patch.yml") {
+                    let target_model = match model {
+                        Some(m) if !m.is_empty() => m,
+                        _ => "gemini-3.8-flash-high",
+                    };
+                    let normalized_proxy_url = {
+                        let trimmed = proxy_url.trim().trim_end_matches('/');
+                        if trimmed.ends_with("/v1") {
+                            trimmed.to_string()
+                        } else {
+                            format!("{}/v1", trimmed)
+                        }
+                    };
+                    if !content.trim().is_empty()
+                        && content.trim() != "[]"
+                        && !content.lines().any(|line| line.starts_with("- id:"))
+                    {
+                        return Err(
+                            "Unsupported DSH patch layout; existing configuration was preserved"
+                                .to_string(),
+                        );
+                    }
+                    content = sync_dsh_cordis_patch_content(
+                        &content,
+                        &normalized_proxy_url,
+                        target_model,
+                    );
+                } else if file.name == ".credentials.yaml" {
+                    content = sync_dsh_credentials_content(&content, api_key)?;
+                }
+            }
         }
 
-        // 使用临时文件原子写入
-        let tmp_path = file.path.with_extension("tmp");
-        fs::write(&tmp_path, &content).map_err(|e| format!("写入临时文件失败: {}", e))?;
-        fs::rename(&tmp_path, &file.path).map_err(|e| format!("重命名配置文件失败: {}", e))?;
+        // Includes credentials: create owner-only unique temp files and use the
+        // cross-platform atomic replacement helper (including Windows overwrite).
+        crate::utils::fs::write_private_atomic(&file.path, content.as_bytes())?;
 
         #[cfg(unix)]
         if file.name.ends_with(".sh") {
             use std::os::unix::fs::PermissionsExt;
             if let Ok(metadata) = fs::metadata(&file.path) {
                 let mut perms = metadata.permissions();
-                perms.set_mode(0o755);
+                perms.set_mode(0o700);
                 let _ = fs::set_permissions(&file.path, perms);
             }
         }
@@ -1484,10 +1624,20 @@ pub async fn execute_cli_restore(app_type: CliApp) -> Result<(), String> {
                 .path
                 .with_file_name(format!("{}.antigravity.bak", file.name));
             if backup_path.exists() {
-                // 还原：覆盖原文件
-                if let Err(e) = fs::rename(&backup_path, &file.path) {
-                    return Err(format!("恢复备份失败 {}: {}", file.name, e));
+                // Replace an existing destination on Windows too. Preserve the
+                // backup until the complete private replacement has succeeded.
+                let backup = fs::read(&backup_path)
+                    .map_err(|e| format!("Failed to read backup {}: {}", file.name, e))?;
+                crate::utils::fs::write_private_atomic(&file.path, &backup)?;
+                #[cfg(unix)]
+                if file.name.ends_with(".sh") {
+                    use std::os::unix::fs::PermissionsExt;
+                    fs::set_permissions(&file.path, fs::Permissions::from_mode(0o700))
+                        .map_err(|e| format!("Failed to restore script permissions: {}", e))?;
                 }
+                fs::remove_file(&backup_path).map_err(|e| {
+                    format!("Restored configuration but could not remove backup: {}", e)
+                })?;
                 restored_count += 1;
             }
         }
@@ -1573,55 +1723,43 @@ pub struct CoreModel {
     pub context_window: i64,
 }
 
-/// 导出网关全量核心模型（仅剔除带 -日期数字 的后缀版本）
+/// 导出网关全量核心模型（仅保留官方最新支持的旗舰模型及后缀派生裸模型）
 pub fn get_core_gateway_models() -> &'static [CoreModel] {
     &[
-        // Claude 5 系列 (256k 上下文)
-        CoreModel {
-            id: "claude-fable-5",
-            context_window: 256_000,
-        },
-        CoreModel {
-            id: "claude-fable-5-thinking",
-            context_window: 256_000,
-        },
+        // Claude 5.5 系列 (1M 上下文)
         CoreModel {
             id: "claude-opus-5-5",
-            context_window: 256_000,
+            context_window: 1_000_000,
         },
         CoreModel {
-            id: "claude-opus-5-5-thinking",
-            context_window: 256_000,
+            id: "claude-opus-5-5-high",
+            context_window: 1_000_000,
+        },
+        CoreModel {
+            id: "claude-opus-5-5-medium",
+            context_window: 1_000_000,
+        },
+        CoreModel {
+            id: "claude-opus-5-5-low",
+            context_window: 1_000_000,
         },
         CoreModel {
             id: "claude-sonnet-5-5",
-            context_window: 256_000,
+            context_window: 1_000_000,
         },
         CoreModel {
-            id: "claude-sonnet-5-5-thinking",
-            context_window: 256_000,
+            id: "claude-sonnet-5-5-high",
+            context_window: 1_000_000,
         },
         CoreModel {
-            id: "claude-haiku-5-5",
-            context_window: 256_000,
+            id: "claude-sonnet-5-5-medium",
+            context_window: 1_000_000,
         },
         CoreModel {
-            id: "claude-haiku-5-5-thinking",
-            context_window: 256_000,
+            id: "claude-sonnet-5-5-low",
+            context_window: 1_000_000,
         },
-        // Claude 系列 (256k 上下文)
-        CoreModel {
-            id: "claude-sonnet-4-6",
-            context_window: 256_000,
-        },
-        CoreModel {
-            id: "claude-sonnet-4-5",
-            context_window: 256_000,
-        },
-        CoreModel {
-            id: "claude-sonnet-4-5-thinking",
-            context_window: 256_000,
-        },
+        // Claude 4.6 系列 (256k 上下文)
         CoreModel {
             id: "claude-opus-4-6",
             context_window: 256_000,
@@ -1631,143 +1769,48 @@ pub fn get_core_gateway_models() -> &'static [CoreModel] {
             context_window: 256_000,
         },
         CoreModel {
-            id: "claude-opus-4-5",
+            id: "claude-sonnet-4-6",
             context_window: 256_000,
         },
-        CoreModel {
-            id: "claude-opus-4-5-thinking",
-            context_window: 256_000,
-        },
-        CoreModel {
-            id: "claude-opus-4",
-            context_window: 256_000,
-        },
-        CoreModel {
-            id: "claude-3-7-sonnet",
-            context_window: 256_000,
-        },
-        CoreModel {
-            id: "claude-3-5-sonnet",
-            context_window: 256_000,
-        },
-        CoreModel {
-            id: "claude-haiku-4-5",
-            context_window: 256_000,
-        },
-        CoreModel {
-            id: "claude-haiku-4",
-            context_window: 256_000,
-        },
-        CoreModel {
-            id: "claude-3-5-haiku",
-            context_window: 256_000,
-        },
-        CoreModel {
-            id: "claude-3-haiku",
-            context_window: 256_000,
-        },
-        // Gemini 4 Argon 系列 (Google 旗舰优化推理模型)
+        // Gemini 4 Argon 系列 (Google 旗舰推理模型，1M 上下文)
         CoreModel {
             id: "gemini-4-argon",
-            context_window: 1_000_000,
+            context_window: 1_048_576,
         },
         CoreModel {
             id: "gemini-4-argon-high",
-            context_window: 1_000_000,
+            context_window: 1_048_576,
         },
         CoreModel {
             id: "gemini-4-argon-medium",
-            context_window: 1_000_000,
+            context_window: 1_048_576,
         },
         CoreModel {
             id: "gemini-4-argon-low",
-            context_window: 1_000_000,
+            context_window: 1_048_576,
         },
-        // Gemini 3.x 系列 (1M 上下文)
+        // Gemini 3.8 Flash 系列 (1M 上下文)
         CoreModel {
             id: "gemini-3.8-flash",
-            context_window: 1_000_000,
+            context_window: 1_048_576,
         },
         CoreModel {
             id: "gemini-3.8-flash-tiered",
-            context_window: 1_000_000,
+            context_window: 1_048_576,
         },
         CoreModel {
             id: "gemini-3.8-flash-high",
-            context_window: 1_000_000,
+            context_window: 1_048_576,
         },
         CoreModel {
             id: "gemini-3.8-flash-medium",
-            context_window: 1_000_000,
+            context_window: 1_048_576,
         },
         CoreModel {
             id: "gemini-3.8-flash-low",
-            context_window: 1_000_000,
+            context_window: 1_048_576,
         },
-        CoreModel {
-            id: "gemini-3.7-flash",
-            context_window: 1_000_000,
-        },
-        CoreModel {
-            id: "gemini-3.7-flash-tiered",
-            context_window: 1_000_000,
-        },
-        CoreModel {
-            id: "gemini-3.7-flash-high",
-            context_window: 1_000_000,
-        },
-        CoreModel {
-            id: "gemini-3.7-flash-medium",
-            context_window: 1_000_000,
-        },
-        CoreModel {
-            id: "gemini-3.7-flash-low",
-            context_window: 1_000_000,
-        },
-        CoreModel {
-            id: "gemini-3.6-flash",
-            context_window: 1_000_000,
-        },
-        CoreModel {
-            id: "gemini-3.6-flash-tiered",
-            context_window: 1_000_000,
-        },
-        CoreModel {
-            id: "gemini-3.6-flash-high",
-            context_window: 1_000_000,
-        },
-        CoreModel {
-            id: "gemini-3.6-flash-medium",
-            context_window: 1_000_000,
-        },
-        CoreModel {
-            id: "gemini-3.6-flash-low",
-            context_window: 1_000_000,
-        },
-        CoreModel {
-            id: "gemini-3.5-flash",
-            context_window: 1_000_000,
-        },
-        CoreModel {
-            id: "gemini-3.5-flash-high",
-            context_window: 1_000_000,
-        },
-        CoreModel {
-            id: "gemini-3.5-flash-medium",
-            context_window: 1_000_000,
-        },
-        CoreModel {
-            id: "gemini-3.5-flash-low",
-            context_window: 1_000_000,
-        },
-        CoreModel {
-            id: "gemini-3-flash",
-            context_window: 1_000_000,
-        },
-        CoreModel {
-            id: "gemini-3-flash-agent",
-            context_window: 1_000_000,
-        },
+        // Gemini 3.1 Pro & 专用模型
         CoreModel {
             id: "gemini-3.1-pro",
             context_window: 1_048_576,
@@ -1781,31 +1824,7 @@ pub fn get_core_gateway_models() -> &'static [CoreModel] {
             context_window: 1_048_576,
         },
         CoreModel {
-            id: "gemini-3.1-pro-preview",
-            context_window: 1_048_576,
-        },
-        CoreModel {
-            id: "gemini-3-pro",
-            context_window: 1_048_576,
-        },
-        CoreModel {
-            id: "gemini-3-pro-high",
-            context_window: 1_048_576,
-        },
-        CoreModel {
-            id: "gemini-3-pro-low",
-            context_window: 1_048_576,
-        },
-        CoreModel {
-            id: "gemini-3-pro-preview",
-            context_window: 1_048_576,
-        },
-        CoreModel {
-            id: "gemini-pro",
-            context_window: 1_048_576,
-        },
-        CoreModel {
-            id: "gemini-pro-agent",
+            id: "gemini-3.5-flash-lite",
             context_window: 1_048_576,
         },
         CoreModel {
@@ -1814,53 +1833,16 @@ pub fn get_core_gateway_models() -> &'static [CoreModel] {
         },
         CoreModel {
             id: "gemini-3.1-flash-image",
-            context_window: 1_048_576,
+            context_window: 65_536,
         },
+        // GPT-OSS 官方支持系列
         CoreModel {
-            id: "gemini-3-pro-image",
-            context_window: 1_048_576,
-        },
-        // Gemini 2.x 系列 (1M 上下文)
-        CoreModel {
-            id: "gemini-2.5-pro",
-            context_window: 1_048_576,
-        },
-        CoreModel {
-            id: "gemini-2.5-flash",
-            context_window: 1_048_576,
-        },
-        CoreModel {
-            id: "gemini-2.5-flash-lite",
-            context_window: 1_048_576,
-        },
-        CoreModel {
-            id: "gemini-2.5-flash-thinking",
-            context_window: 1_048_576,
-        },
-        CoreModel {
-            id: "gemini-2.0-flash",
-            context_window: 1_048_576,
-        },
-        CoreModel {
-            id: "gemini-2.0-flash-lite",
-            context_window: 1_048_576,
-        },
-        CoreModel {
-            id: "gemini-2.0-flash-exp",
-            context_window: 1_048_576,
-        },
-        CoreModel {
-            id: "gemini-2.0-flash-thinking-exp",
-            context_window: 1_048_576,
-        },
-        // 其他高频模型
-        CoreModel {
-            id: "grok-4.6",
-            context_window: 500_000,
+            id: "gpt-oss-120b",
+            context_window: 131_072,
         },
         CoreModel {
             id: "gpt-oss-120b-medium",
-            context_window: 128_000,
+            context_window: 131_072,
         },
     ]
 }
@@ -2024,6 +2006,325 @@ pub fn sync_jeikcode_toml_content(
     Ok(doc.to_string())
 }
 
+/// 同步 DeepSeek Harness 的 .credentials.yaml 密钥文件
+fn sync_dsh_credentials_content(content: &str, api_key: &str) -> Result<String, String> {
+    use yaml_rt::{JsonPointer, SemanticKind, YamlDoc, YamlFragment};
+    let source = if content.trim().is_empty() {
+        "version: 1\nrefs: {}\n"
+    } else {
+        content
+    };
+    let mut document = YamlDoc::parse(source)
+        .map_err(|_| "DSH credentials are not valid YAML; existing file preserved".to_string())?;
+    let root = document
+        .document_root(0)
+        .map_err(|e| e.to_string())?
+        .ok_or("DSH credentials must be a mapping")?;
+    if !matches!(
+        document.semantic_kind(root),
+        Some(SemanticKind::Mapping { .. })
+    ) {
+        return Err("DSH credentials must be a mapping".to_string());
+    }
+    let refs = JsonPointer::parse("/refs").map_err(|e| e.to_string())?;
+    if let Ok(node) = document.resolve_pointer(0, &refs) {
+        if !matches!(
+            document.semantic_kind(node),
+            Some(SemanticKind::Mapping { .. })
+        ) {
+            return Err(
+                "DSH credential refs must be a mapping; existing file preserved".to_string(),
+            );
+        }
+    } else {
+        document
+            .add_at(
+                0,
+                &refs,
+                &YamlFragment::parse("{}").map_err(|e| e.to_string())?,
+            )
+            .map_err(|e| e.to_string())?;
+        document.commit_edits().map_err(|e| e.to_string())?;
+    }
+    let key = JsonPointer::parse("/refs/ANTIGRAVITY_API_KEY").map_err(|e| e.to_string())?;
+    let encoded = serde_json::to_string(api_key).map_err(|e| e.to_string())?;
+    let value = YamlFragment::parse(&encoded).map_err(|e| e.to_string())?;
+    if document.resolve_pointer(0, &key).is_ok() {
+        document
+            .replace_at(0, &key, &value)
+            .map_err(|e| e.to_string())?;
+    } else {
+        document
+            .add_at(0, &key, &value)
+            .map_err(|e| e.to_string())?;
+    }
+    document.commit_edits().map_err(|e| e.to_string())?;
+    Ok(document.as_source().to_string())
+}
+
+fn dsh_yaml_scalar(value: &str) -> String {
+    if !value.is_empty()
+        && value
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || "_./:@+-".contains(c))
+    {
+        value.to_string()
+    } else {
+        serde_json::to_string(value).expect("String serialization is infallible")
+    }
+}
+
+fn build_dsh_models_yaml(selected_model: &str) -> String {
+    let core_models = get_core_gateway_models();
+    let mut out = String::new();
+
+    if !core_models.iter().any(|m| m.id == selected_model) {
+        out.push_str(&format!(
+            "          - id: {}\n            name: {}\n            contextWindow: 1048576\n            input:\n              - text\n              - image\n            maxTokens: 128000\n",
+            dsh_yaml_scalar(selected_model), dsh_yaml_scalar(selected_model)
+        ));
+    }
+
+    for m in core_models {
+        out.push_str(&format!(
+            "          - id: {}\n            name: {}\n            contextWindow: {}\n            input:\n              - text\n              - image\n            maxTokens: 128000\n",
+            m.id, m.id, m.context_window
+        ));
+        let has_reasoning = m.id.contains("high")
+            || m.id.contains("thinking")
+            || m.id.contains("medium")
+            || m.id.contains("low")
+            || m.id.starts_with("gemini");
+        if has_reasoning {
+            out.push_str("            reasoningEfforts:\n              off: null\n              low: low\n              medium: medium\n              high: high\n");
+        }
+    }
+    out
+}
+
+fn build_dsh_provider_block(proxy_url: &str, selected_model: &str) -> String {
+    let models_yaml = build_dsh_models_yaml(selected_model);
+    format!(
+        "      antigravity:\n        displayName: antigravity\n        apiKeyEnv: ANTIGRAVITY_API_KEY\n        api: openai-completions\n        baseURL: {}\n        models:\n{}",
+        dsh_yaml_scalar(proxy_url), models_yaml
+    )
+}
+
+struct DshPatchEntry {
+    id: String,
+    lines: Vec<String>,
+}
+
+fn parse_dsh_patch_entries(content: &str) -> (Vec<String>, Vec<DshPatchEntry>) {
+    let mut header = Vec::new();
+    let mut entries = Vec::new();
+    let mut current_id: Option<String> = None;
+    let mut current_lines: Vec<String> = Vec::new();
+    let mut in_header = true;
+
+    for line in content.lines() {
+        let trimmed = line.trim_start();
+        if line.starts_with("- id:") {
+            in_header = false;
+            if let Some(id) = current_id.take() {
+                entries.push(DshPatchEntry {
+                    id,
+                    lines: current_lines.clone(),
+                });
+                current_lines.clear();
+            }
+            let id_val = trimmed["- id:".len()..]
+                .trim()
+                .trim_matches(|c| c == '\'' || c == '"');
+            current_id = Some(id_val.to_string());
+        }
+
+        if in_header {
+            header.push(line.to_string());
+        } else {
+            current_lines.push(line.to_string());
+        }
+    }
+
+    if let Some(id) = current_id {
+        entries.push(DshPatchEntry {
+            id,
+            lines: current_lines,
+        });
+    }
+
+    (header, entries)
+}
+
+/// 同步 DeepSeek Harness 的 cordis.patch.yml 配置（同时适用于 Desktop/CLI 与 Web GUI Profile）
+fn sync_dsh_cordis_patch_content(content: &str, proxy_url: &str, selected_model: &str) -> String {
+    let default_model_block = format!(
+        "- id: agent-default-model\n  name: \"@deepseek-ai/dsh-agent-default-model\"\n  config:\n    provider: antigravity\n    model: {}\n",
+        dsh_yaml_scalar(selected_model)
+    );
+    let provider_block = build_dsh_provider_block(proxy_url, selected_model);
+
+    let trimmed = content.trim();
+    if trimmed.is_empty() || trimmed == "[]" || !trimmed.contains("- id:") {
+        let comment = "# Your patch layer for this dsh profile, applied after every bundle layer:\n# a top-level YAML array of loader patch entries (id-targeted config\n# overrides, disables, and insert lists; `!!js` expressions allowed).\n";
+        return format!(
+            "{}{}- id: llm-pi-ai\n  name: \"@deepseek-ai/dsh-llm-pi-ai\"\n  config:\n    providers:\n{}\n",
+            comment, default_model_block, provider_block
+        );
+    }
+
+    let (header, mut entries) = parse_dsh_patch_entries(content);
+
+    // 1. 更新或插入 agent-default-model
+    if let Some(entry) = entries.iter_mut().find(|e| e.id == "agent-default-model") {
+        let mut new_lines = Vec::new();
+        let mut has_config = false;
+        let mut has_provider = false;
+        let mut has_model = false;
+
+        for line in &entry.lines {
+            let t = line.trim();
+            if t.starts_with("config:") {
+                has_config = true;
+                new_lines.push(line.clone());
+            } else if t.starts_with("provider:") {
+                has_provider = true;
+                let indent = line.len() - line.trim_start().len();
+                new_lines.push(format!(
+                    "{:indent$}provider: antigravity",
+                    "",
+                    indent = indent
+                ));
+            } else if t.starts_with("model:") {
+                has_model = true;
+                let indent = line.len() - line.trim_start().len();
+                new_lines.push(format!(
+                    "{:indent$}model: {}",
+                    "",
+                    dsh_yaml_scalar(selected_model),
+                    indent = indent
+                ));
+            } else {
+                new_lines.push(line.clone());
+            }
+        }
+
+        if !has_config {
+            new_lines.push("  config:".to_string());
+        }
+        if !has_provider {
+            new_lines.push("    provider: antigravity".to_string());
+        }
+        if !has_model {
+            new_lines.push(format!("    model: {}", dsh_yaml_scalar(selected_model)));
+        }
+
+        entry.lines = new_lines;
+    } else {
+        entries.insert(
+            0,
+            DshPatchEntry {
+                id: "agent-default-model".to_string(),
+                lines: default_model_block.lines().map(|s| s.to_string()).collect(),
+            },
+        );
+    }
+
+    // 2. 更新或插入 llm-pi-ai
+    if let Some(entry) = entries.iter_mut().find(|e| e.id == "llm-pi-ai") {
+        let mut new_lines = Vec::new();
+        let mut in_providers = false;
+        let mut in_antigravity = false;
+        let mut provider_replaced = false;
+        let mut has_providers_header = false;
+
+        let provider_block_lines: Vec<String> =
+            provider_block.lines().map(|s| s.to_string()).collect();
+
+        for line in &entry.lines {
+            let trimmed = line.trim_start();
+            let indent = line.len() - trimmed.len();
+
+            if trimmed.starts_with("providers:") {
+                in_providers = true;
+                has_providers_header = true;
+                new_lines.push(line.clone());
+                continue;
+            }
+
+            if in_providers {
+                if indent == 6 && trimmed.ends_with(':') {
+                    if trimmed.starts_with("antigravity:") {
+                        in_antigravity = true;
+                        if !provider_replaced {
+                            new_lines.extend(provider_block_lines.clone());
+                            provider_replaced = true;
+                        }
+                        continue;
+                    } else {
+                        in_antigravity = false;
+                    }
+                } else if indent < 6 && !trimmed.is_empty() {
+                    in_providers = false;
+                    in_antigravity = false;
+                }
+
+                if in_antigravity {
+                    continue;
+                }
+            }
+
+            new_lines.push(line.clone());
+        }
+
+        if !has_providers_header {
+            if !new_lines.iter().any(|l| l.trim().starts_with("config:")) {
+                new_lines.push("  config:".to_string());
+            }
+            new_lines.push("    providers:".to_string());
+            new_lines.extend(provider_block_lines);
+        } else if !provider_replaced {
+            let mut final_lines = Vec::new();
+            for l in new_lines {
+                let is_prov = l.trim().starts_with("providers:");
+                final_lines.push(l);
+                if is_prov {
+                    final_lines.extend(provider_block_lines.clone());
+                }
+            }
+            new_lines = final_lines;
+        }
+
+        entry.lines = new_lines;
+    } else {
+        let new_llm_block = format!(
+            "- id: llm-pi-ai\n  name: \"@deepseek-ai/dsh-llm-pi-ai\"\n  config:\n    providers:\n{}\n",
+            provider_block
+        );
+        entries.push(DshPatchEntry {
+            id: "llm-pi-ai".to_string(),
+            lines: new_llm_block.lines().map(|s| s.to_string()).collect(),
+        });
+    }
+
+    // 3. 组装输出
+    let mut out = String::new();
+    if !header.is_empty() {
+        for l in header {
+            out.push_str(&l);
+            out.push('\n');
+        }
+    }
+    for e in entries {
+        for l in e.lines {
+            out.push_str(&l);
+            out.push('\n');
+        }
+    }
+
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2088,16 +2389,17 @@ model = "deepseek-chat"
 
         // 验证核心模型已添加
         let models = doc.get("models").unwrap().as_table().unwrap();
-        assert!(models.contains_key("claude-fable-5"));
         assert!(models.contains_key("claude-opus-5-5"));
+        assert!(models.contains_key("claude-opus-5-5-high"));
         assert!(models.contains_key("claude-sonnet-5-5"));
-        assert!(models.contains_key("claude-haiku-5-5"));
+        assert!(models.contains_key("claude-sonnet-5-5-high"));
         assert!(models.contains_key("claude-sonnet-4-6"));
         assert!(models.contains_key("claude-opus-4-6"));
+        assert!(models.contains_key("gemini-4-argon"));
+        assert!(models.contains_key("gemini-4-argon-high"));
         assert!(models.contains_key("gemini-3.8-flash"));
         assert!(models.contains_key("gemini-3.8-flash-tiered"));
         assert!(models.contains_key("gemini-3.8-flash-high"));
-        assert!(models.contains_key("gemini-3.7-flash"));
         assert!(models.contains_key("gemini-3.1-pro"));
 
         // 验证旧关联模型已被清除，且保留其他账号模型
@@ -2112,7 +2414,7 @@ model = "deepseek-chat"
         );
         assert_eq!(
             m.get("context_window").unwrap().as_integer().unwrap(),
-            1_000_000
+            1_048_576
         );
         assert_eq!(m.get("reasoning_model").unwrap().as_bool().unwrap(), true);
         assert_eq!(
@@ -2148,5 +2450,120 @@ model = "deepseek-chat"
             doc.get("default_model").unwrap().as_str().unwrap(),
             "gemini-3.8-flash-high"
         );
+    }
+
+    #[test]
+    fn test_sync_dsh_credentials_content() {
+        let empty = "";
+        let res1 = sync_dsh_credentials_content(empty, "sk-test1").unwrap();
+        assert!(res1.contains("ANTIGRAVITY_API_KEY:"));
+
+        let existing = r#"version: 1
+records:
+  browser-session:
+    kind: grant
+refs:
+  {
+    KIMI_KEY: sk-kimi,
+    ANTIGRAVITY_API_KEY: sk-old
+  }
+"#;
+        let res2 = sync_dsh_credentials_content(existing, "sk-new").unwrap();
+        assert!(res2.contains("sk-new"), "新 key 必须写入: {res2}");
+        assert!(res2.contains("sk-kimi"), "其他 key 必须保留: {res2}");
+    }
+
+    #[test]
+    fn test_sync_dsh_cordis_patch_content() {
+        let empty = "[]";
+        let res1 = sync_dsh_cordis_patch_content(
+            empty,
+            "http://127.0.0.1:8045/v1",
+            "gemini-3.8-flash-high",
+        );
+        assert!(res1.contains("provider: antigravity"));
+        assert!(res1.contains("model: gemini-3.8-flash-high"));
+        assert!(res1.contains("baseURL: http://127.0.0.1:8045/v1"));
+        assert!(res1.contains("apiKeyEnv: ANTIGRAVITY_API_KEY"));
+
+        let existing = r#"- id: ui-settings
+  config:
+    enabled: true
+- id: agent-default-model
+  config:
+    provider: deepseek-official
+    model: deepseek-chat
+- id: llm-pi-ai
+  config:
+    providers:
+      kimi-k3:
+        displayName: kimi-k3
+        baseURL: https://hubway.cc
+"#;
+        let res2 = sync_dsh_cordis_patch_content(
+            existing,
+            "http://127.0.0.1:8045/v1",
+            "claude-sonnet-4-6",
+        );
+        assert!(res2.contains("provider: antigravity"));
+        assert!(res2.contains("model: claude-sonnet-4-6"));
+        assert!(res2.contains("baseURL: http://127.0.0.1:8045/v1"));
+        assert!(res2.contains("kimi-k3:"));
+        assert!(res2.contains("ui-settings"));
+
+        // 二次同步覆盖（更新模型与代理端口）
+        let res3 =
+            sync_dsh_cordis_patch_content(&res2, "http://127.0.0.1:9000/v1", "gpt-oss-120b-medium");
+        assert!(res3.contains("model: gpt-oss-120b-medium"));
+        assert!(res3.contains("baseURL: http://127.0.0.1:9000/v1"));
+        assert!(!res3.contains("baseURL: http://127.0.0.1:8045/v1"));
+        assert!(res3.contains("kimi-k3:"));
+    }
+}
+
+#[cfg(test)]
+mod dsh_safety_tests {
+    use super::*;
+
+    #[test]
+    fn credentials_update_only_the_ref_and_keep_api_key_as_one_scalar() {
+        let source = "version: 1\nrecords:\n  keep:\n    ANTIGRAVITY_API_KEY: unrelated-record\nrefs:\n  OTHER_KEY: keep-me\n  ANTIGRAVITY_API_KEY: old\n";
+        let key = "key: # \\\"\nrefs:\n  INJECTED: no";
+        let output = sync_dsh_credentials_content(source, key).unwrap();
+        assert!(output.contains("unrelated-record"));
+        assert!(output.contains("OTHER_KEY: keep-me"));
+        let doc = yaml_rt::YamlDoc::parse(&output).unwrap();
+        let pointer = yaml_rt::JsonPointer::parse("/refs/ANTIGRAVITY_API_KEY").unwrap();
+        let node = doc.resolve_pointer(0, &pointer).unwrap();
+        assert_eq!(doc.scalar_value(node).unwrap().as_ref(), key);
+    }
+
+    #[test]
+    fn malformed_credential_refs_are_rejected_instead_of_replaced() {
+        assert!(
+            sync_dsh_credentials_content("version: 1\nrefs: keep-this-scalar\n", "new").is_err()
+        );
+        assert!(sync_dsh_credentials_content("- keep-this-list\n", "new").is_err());
+    }
+
+    #[test]
+    fn repeated_sync_does_not_treat_nested_model_ids_as_patch_entries() {
+        let first = sync_dsh_cordis_patch_content(
+            "[]",
+            "http://localhost:8045/v1",
+            "gemini-3.8-flash-high",
+        );
+        let (_, entries) = parse_dsh_patch_entries(&first);
+        assert_eq!(entries.len(), 2);
+        let second =
+            sync_dsh_cordis_patch_content(&first, "http://localhost:9000/v1", "claude-sonnet-4-6");
+        let (_, entries) = parse_dsh_patch_entries(&second);
+        assert_eq!(entries.len(), 2);
+        assert_eq!(
+            second.matches("          - id:").count(),
+            first.matches("          - id:").count()
+        );
+        assert!(second.contains("baseURL: http://localhost:9000/v1"));
+        assert!(!second.contains("baseURL: http://localhost:8045/v1"));
     }
 }

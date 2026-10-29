@@ -15,6 +15,8 @@ interface IpWhitelistConfig {
 }
 
 interface SecurityMonitorConfig {
+    trusted_proxies?: string[];
+    cors_allowed_origins?: string[];
     blacklist: IpBlacklistConfig;
     whitelist: IpWhitelistConfig;
 }
@@ -46,7 +48,7 @@ export const SecurityConfig: React.FC = () => {
         if (!config) return;
         setSaving(true);
         try {
-            await invoke('update_security_config', { config });
+            await invoke('update_security_config', { config: { ...config, trusted_proxies: (config.trusted_proxies ?? []).map(s => s.trim()).filter(Boolean), cors_allowed_origins: (config.cors_allowed_origins ?? []).map(s => s.trim()).filter(Boolean) } });
             showToast(t('security.config.save_success'), 'success');
         } catch (e) {
             console.error('Failed to save security config', e);
@@ -76,6 +78,28 @@ export const SecurityConfig: React.FC = () => {
                     {saving ? <span className="loading loading-spinner loading-xs"></span> : <Save size={18} />}
                     {saving ? t('security.config.saving') : t('security.config.save')}
                 </button>
+            </div>
+
+            <div className="card bg-base-100 border border-gray-200 dark:border-base-300 shadow-sm">
+                <div className="card-body gap-4">
+                    <h3 className="card-title">{t('security.config.request_boundaries')}</h3>
+                    <label className="flex flex-col gap-2">
+                        <span className="font-medium text-sm">{t('security.config.trusted_proxies')}</span>
+                        <textarea className="textarea textarea-bordered border-gray-200 dark:border-base-300 font-mono text-sm w-full" rows={3}
+                            value={(config.trusted_proxies ?? []).join('\n')}
+                            onChange={e => setConfig({ ...config, trusted_proxies: e.target.value.split(/\r?\n/) })}
+                            placeholder="127.0.0.1/32" />
+                        <span className="text-xs text-gray-500">{t('security.config.trusted_proxies_hint')}</span>
+                    </label>
+                    <label className="flex flex-col gap-2">
+                        <span className="font-medium text-sm">{t('security.config.allowed_origins')}</span>
+                        <textarea className="textarea textarea-bordered border-gray-200 dark:border-base-300 font-mono text-sm w-full" rows={3}
+                            value={(config.cors_allowed_origins ?? []).join('\n')}
+                            onChange={e => setConfig({ ...config, cors_allowed_origins: e.target.value.split(/\r?\n/) })}
+                            placeholder="https://client.example.com" />
+                        <span className="text-xs text-gray-500">{t('security.config.allowed_origins_hint')}</span>
+                    </label>
+                </div>
             </div>
 
             {/* Blacklist Settings */}

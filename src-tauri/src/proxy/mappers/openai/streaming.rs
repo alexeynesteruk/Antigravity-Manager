@@ -37,19 +37,40 @@ pub fn store_thought_signature(sig: &str, session_id: &str, message_count: usize
 /// Supports both legacy v1internal format and new Interactions API format.
 ///
 /// Key semantic difference:
-/// - Old format: candidatesTokenCount = all output tokens (text + thinking + tool)
-/// - New format: total_output_tokens = text + tool output only; thought tokens are separate (total_thought_tokens)
+/// - Gemini candidatesTokenCount and Interactions total_output_tokens exclude thought tokens.
+/// - OpenAI completion_tokens already includes reasoning tokens.
 ///
 /// For Codex, we must sum them back together as `completion_tokens`.
-fn extract_usage_metadata(u: &Value) -> Option<super::models::OpenAIUsage> {
+fn extract_usage_metadata(u: &Value) -> super::models::OpenAIUsage {
     let canonical = crate::proxy::pipeline::CanonicalUsage::from_gemini(u);
     let mut usage = super::models::OpenAIUsage::from(&canonical);
+    usage.raw_output_tokens = u
+        .get("total_output_tokens")
+        .and_then(Value::as_u64)
+        .or_else(|| u.get("candidatesTokenCount").and_then(Value::as_u64))
+        .or_else(|| u.get("candidates_token_count").and_then(Value::as_u64))
+        .map(|v| v as u32);
+    usage.gemini_total_tokens = u
+        .get("total_tokens")
+        .and_then(Value::as_u64)
+        .or_else(|| u.get("totalTokenCount").and_then(Value::as_u64))
+        .map(|v| v as u32);
     usage.input_tokens_by_modality = u.get("input_tokens_by_modality").cloned();
     usage.total_tool_use_tokens = u
         .get("total_tool_use_tokens")
         .and_then(|v| v.as_u64())
         .map(|v| v as u32);
-    Some(usage)
+    usage
+}
+
+fn capture_usage_metadata(current: &mut Option<super::models::OpenAIUsage>, raw: &Value) {
+    crate::proxy::monitor::record_upstream_usage(raw);
+    let reported = extract_usage_metadata(raw);
+    if let Some(previous) = current.as_mut() {
+        previous.merge(reported);
+    } else {
+        *current = Some(reported);
+    }
 }
 
 #[allow(dead_code)]
@@ -113,7 +134,7 @@ impl ProtocolStreamHandler for OpenAIChatStreamHandler {
                 json
             };
             if let Some(u) = actual_data.get("usageMetadata") {
-                self.final_usage = extract_usage_metadata(u);
+                capture_usage_metadata(&mut self.final_usage, u);
             }
 
             if let Some(candidates) = actual_data.get("candidates").and_then(|c| c.as_array()) {
@@ -576,7 +597,7 @@ where
                                         if json_part == "[DONE]" { continue; }
                                         if let Ok(mut json) = serde_json::from_str::<Value>(json_part) {
                                             let actual_data = if let Some(inner) = json.get_mut("response").map(|v| v.take()) { inner } else { json };
-                                            if let Some(u) = actual_data.get("usageMetadata") { final_usage = extract_usage_metadata(u); }
+                                            if let Some(u) = actual_data.get("usageMetadata") { capture_usage_metadata(&mut final_usage, u); }
 
                                             let mut content_out = String::new();
                                             if let Some(candidates) = actual_data.get("candidates").and_then(|c| c.as_array()) {
@@ -877,7 +898,7 @@ where
                                         let actual_data = if let Some(inner) = json.get_mut("response").map(|v| v.take()) { inner } else { json };
 
                                         if let Some(u) = actual_data.get("usageMetadata") {
-                                            final_usage = extract_usage_metadata(u);
+                                            capture_usage_metadata(&mut final_usage, u);
                                         }
 
                                         if let Some(candidates) = actual_data.get("candidates").and_then(|c| c.as_array()) {
@@ -1484,21 +1505,6 @@ where
         if let Some(resp_obj) = completed_ev.get_mut("response").and_then(|r| r.as_object_mut()) {
             if let Some(ref usage) = final_usage {
                 resp_obj.insert("usage".to_string(), usage.to_responses_usage_value());
-            } else {
-                resp_obj.insert(
-                    "usage".to_string(),
-                    json!({
-                        "input_tokens": 0,
-                        "input_tokens_details": {
-                            "cached_tokens": 0
-                        },
-                        "output_tokens": 0,
-                        "output_tokens_details": {
-                            "reasoning_tokens": 0
-                        },
-                        "total_tokens": 0
-                    }),
-                );
             }
         }
 
@@ -1511,6 +1517,79 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn native_late_thoughts_are_added_once_and_openai_reasoning_is_already_in_completion() {
+        let mut native = None;
+        capture_usage_metadata(
+            &mut native,
+            &json!({"promptTokenCount":100,"candidatesTokenCount":20}),
+        );
+        capture_usage_metadata(
+            &mut native,
+            &json!({"thoughtsTokenCount":3,"totalTokenCount":123}),
+        );
+        let native = native.unwrap();
+        assert_eq!(native.completion_tokens, Some(23));
+        assert_eq!(native.total_tokens, Some(123));
+        let completion = extract_usage_metadata(
+            &json!({"prompt_tokens":100,"completion_tokens":23,"completion_tokens_details":{"reasoning_tokens":3},"total_tokens":123}),
+        );
+        assert_eq!(completion.completion_tokens, Some(23));
+        assert_eq!(completion.total_tokens, Some(123));
+        assert_eq!(
+            completion.to_responses_usage_value()["output_tokens_details"]["reasoning_tokens"],
+            3
+        );
+        let interactions = extract_usage_metadata(
+            &json!({"total_input_tokens":100,"total_output_tokens":20,"total_thought_tokens":3,"total_tool_use_tokens":7,"total_tokens":130}),
+        );
+        assert_eq!(interactions.completion_tokens, Some(23));
+        assert_eq!(interactions.total_tokens, Some(130));
+    }
+
+    #[test]
+    fn partial_native_usage_retains_known_components_and_real_total() {
+        let mut usage = None;
+        capture_usage_metadata(
+            &mut usage,
+            &json!({"promptTokenCount":100,"cachedContentTokenCount":80}),
+        );
+        capture_usage_metadata(&mut usage, &json!({"candidatesTokenCount":2}));
+        let mapped = usage.as_ref().unwrap();
+        assert_eq!(mapped.prompt_tokens, Some(100));
+        assert_eq!(mapped.completion_tokens, Some(2));
+        assert_eq!(mapped.total_tokens, None);
+        capture_usage_metadata(
+            &mut usage,
+            &json!({"totalTokenCount":123,"cachedContentTokenCount":0}),
+        );
+        capture_usage_metadata(
+            &mut usage,
+            &json!({"promptTokenCount":null,"candidatesTokenCount":0}),
+        );
+        let mapped = usage.unwrap();
+        assert_eq!(mapped.prompt_tokens, Some(100));
+        assert_eq!(mapped.completion_tokens, Some(0));
+        assert_eq!(mapped.total_tokens, Some(123));
+        assert_eq!(mapped.prompt_tokens_details.unwrap().cached_tokens, Some(0));
+    }
+
+    #[test]
+    fn separate_native_output_and_reasoning_reports_keep_their_sum() {
+        let mut usage = None;
+        capture_usage_metadata(
+            &mut usage,
+            &json!({"total_input_tokens":100,"total_thought_tokens":3,"total_tokens":123}),
+        );
+        capture_usage_metadata(&mut usage, &json!({"total_output_tokens":20}));
+        let mapped = usage.unwrap();
+        assert_eq!(mapped.completion_tokens, Some(23));
+        assert_eq!(mapped.total_tokens, Some(123));
+        assert_eq!(
+            mapped.to_responses_usage_value()["output_tokens_details"]["reasoning_tokens"],
+            3
+        );
+    }
     use futures::stream;
     use serde_json::json;
 

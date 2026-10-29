@@ -26,6 +26,7 @@ interface AccountState {
     completeOAuthLogin: () => Promise<void>;
     cancelOAuthLogin: () => Promise<void>;
     importV1Accounts: () => Promise<void>;
+    batchImportAccounts: (entries: accountService.ImportAccountEntry[]) => Promise<accountService.BatchImportResult>;
     importFromDb: () => Promise<void>;
     importFromCustomDb: (path: string) => Promise<void>;
     syncAccountFromDb: () => Promise<void>;
@@ -35,6 +36,13 @@ interface AccountState {
     updateAccountLabel: (accountId: string, label: string) => Promise<void>;
     updateAccountPriority: (accountId: string, priority: number) => Promise<void>;
 }
+
+// Remove snapshots from older builds that may contain OAuth credentials.
+try {
+    for (const key of ['antigravity_accounts_cache', 'antigravity_current_account_cache', 'antigravity_active_clients_cache']) {
+        localStorage.removeItem(key);
+    }
+} catch { /* Storage can be unavailable in embedded or private contexts. */ }
 
 export const useAccountStore = create<AccountState>((set, get) => ({
     accounts: [],
@@ -254,6 +262,19 @@ export const useAccountStore = create<AccountState>((set, get) => ({
             await accountService.importV1Accounts();
             await get().fetchAccounts();
             set({ loading: false });
+        } catch (error) {
+            set({ error: String(error), loading: false });
+            throw error;
+        }
+    },
+
+    batchImportAccounts: async (entries: accountService.ImportAccountEntry[]) => {
+        set({ loading: true, error: null });
+        try {
+            const res = await accountService.batchImportAccounts(entries);
+            await get().fetchAccounts();
+            set({ loading: false });
+            return res;
         } catch (error) {
             set({ error: String(error), loading: false });
             throw error;

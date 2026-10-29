@@ -1,10 +1,13 @@
 use crate::modules::oauth;
 use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant};
 use tauri::Url;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::sync::mpsc;
 use tokio::sync::watch;
+
+const OAUTH_FLOW_TTL: Duration = Duration::from_secs(10 * 60);
 
 struct OAuthFlowState {
     auth_url: String,
@@ -12,6 +15,8 @@ struct OAuthFlowState {
     redirect_uri: String,
     state: String,
     client_key: String,
+    created_at: Instant,
+    code_claimed: bool,
     cancel_tx: watch::Sender<bool>,
     code_tx: mpsc::Sender<Result<String, String>>,
     code_rx: Option<mpsc::Receiver<Result<String, String>>>,
@@ -21,6 +26,63 @@ static OAUTH_FLOW_STATE: OnceLock<Mutex<Option<OAuthFlowState>>> = OnceLock::new
 
 fn get_oauth_flow_state() -> &'static Mutex<Option<OAuthFlowState>> {
     OAUTH_FLOW_STATE.get_or_init(|| Mutex::new(None))
+}
+
+impl OAuthFlowState {
+    fn claim_code(
+        &mut self,
+        nonce: Option<&str>,
+        redirect: Option<&str>,
+        require_nonce: bool,
+    ) -> Result<String, String> {
+        if self.created_at.elapsed() >= OAUTH_FLOW_TTL {
+            return Err("OAuth flow expired; start authorization again".to_string());
+        }
+        if self.code_claimed {
+            return Err("OAuth callback was already consumed".to_string());
+        }
+        if require_nonce && nonce.is_none_or(str::is_empty) {
+            return Err("OAuth state is required".to_string());
+        }
+        if nonce.is_some_and(|value| value != self.state) {
+            return Err("OAuth state mismatch".to_string());
+        }
+        if redirect.is_some_and(|value| value != self.redirect_uri) {
+            return Err("OAuth redirect does not match the pending flow".to_string());
+        }
+        self.code_claimed = true;
+        Ok(self.client_key.clone())
+    }
+}
+
+/// Atomically reserve the public callback before exchanging its code. The nonce
+/// selects a pending flow bound to its redirect and selected OAuth client.
+pub fn claim_pending_oauth_callback(nonce: Option<&str>, redirect: &str) -> Result<String, String> {
+    let mut pending = get_oauth_flow_state()
+        .lock()
+        .map_err(|_| "OAuth state lock corrupted".to_string())?;
+    pending
+        .as_mut()
+        .ok_or_else(|| "No active OAuth flow found".to_string())?
+        .claim_code(nonce, Some(redirect), true)
+}
+
+fn claim_listener_callback(nonce: Option<&str>) -> bool {
+    get_oauth_flow_state()
+        .lock()
+        .ok()
+        .and_then(|mut pending| pending.as_mut()?.claim_code(nonce, None, true).ok())
+        .is_some()
+}
+
+pub fn finish_pending_oauth_callback(nonce: &str) {
+    if let Ok(mut pending) = get_oauth_flow_state().lock() {
+        if pending.as_ref().is_some_and(|flow| flow.state == nonce) {
+            if let Some(flow) = pending.take() {
+                let _ = flow.cancel_tx.send(true);
+            }
+        }
+    }
 }
 
 fn oauth_success_html() -> &'static str {
@@ -62,7 +124,7 @@ async fn ensure_oauth_flow_prepared(
     // Return URL if flow already exists and is still "fresh" (receiver hasn't been taken)
     if let Ok(mut state) = get_oauth_flow_state().lock() {
         if let Some(s) = state.as_mut() {
-            if s.code_rx.is_some() {
+            if s.code_rx.is_some() && s.created_at.elapsed() < OAUTH_FLOW_TTL {
                 return Ok(s.auth_url.clone());
             } else {
                 // Flow is already "in progress" (rx taken), but user requested a NEW one.
@@ -156,13 +218,18 @@ async fn ensure_oauth_flow_prepared(
         let app_handle = app_handle_for_tasks.clone();
         tokio::spawn(async move {
             if let Ok((mut stream, _)) = tokio::select! {
-                res = l4.accept() => res.map_err(|e| format!("failed_to_accept_connection: {}", e)),
+                res = tokio::time::timeout(OAUTH_FLOW_TTL, l4.accept()) => res.map_err(|_| "OAuth flow expired".to_string()).and_then(|result| result.map_err(|e| format!("failed_to_accept_connection: {}", e))),
                 _ = rx.changed() => Err("OAuth cancelled".to_string()),
             } {
                 // Reuse the existing parsing/response code by constructing a temporary listener task
                 // that sends into the shared mpsc channel.
                 let mut buffer = [0u8; 4096];
-                let bytes_read = stream.read(&mut buffer).await.unwrap_or(0);
+                let bytes_read =
+                    tokio::time::timeout(Duration::from_secs(10), stream.read(&mut buffer))
+                        .await
+                        .ok()
+                        .and_then(Result::ok)
+                        .unwrap_or(0);
                 let request = String::from_utf8_lossy(&buffer[..bytes_read]);
 
                 // [FIX #931/850/778] More robust parsing and detailed logging
@@ -200,24 +267,14 @@ async fn ensure_oauth_flow_prepared(
                 };
 
                 if code.is_none() && bytes_read > 0 {
-                    crate::modules::logger::log_error(&format!(
-                        "OAuth callback failed to parse code. Raw request (first 512 bytes): {}",
-                        &request.chars().take(512).collect::<String>()
-                    ));
+                    crate::modules::logger::log_error(
+                        "OAuth callback did not contain an authorization code",
+                    );
                 }
 
-                // Verify state
-                let state_valid = {
-                    if let Ok(lock) = get_oauth_flow_state().lock() {
-                        if let Some(s) = lock.as_ref() {
-                            received_state.as_ref() == Some(&s.state)
-                        } else {
-                            false
-                        }
-                    } else {
-                        false
-                    }
-                };
+                // A valid nonce can be claimed by exactly one listener/manual callback.
+                let state_valid =
+                    code.is_some() && claim_listener_callback(received_state.as_deref());
 
                 let (result, response_html) = match (code, state_valid) {
                     (Some(code), true) => {
@@ -256,11 +313,16 @@ async fn ensure_oauth_flow_prepared(
         let app_handle = app_handle_for_tasks;
         tokio::spawn(async move {
             if let Ok((mut stream, _)) = tokio::select! {
-                res = l6.accept() => res.map_err(|e| format!("failed_to_accept_connection: {}", e)),
+                res = tokio::time::timeout(OAUTH_FLOW_TTL, l6.accept()) => res.map_err(|_| "OAuth flow expired".to_string()).and_then(|result| result.map_err(|e| format!("failed_to_accept_connection: {}", e))),
                 _ = rx.changed() => Err("OAuth cancelled".to_string()),
             } {
                 let mut buffer = [0u8; 4096];
-                let bytes_read = stream.read(&mut buffer).await.unwrap_or(0);
+                let bytes_read =
+                    tokio::time::timeout(Duration::from_secs(10), stream.read(&mut buffer))
+                        .await
+                        .ok()
+                        .and_then(Result::ok)
+                        .unwrap_or(0);
                 let request = String::from_utf8_lossy(&buffer[..bytes_read]);
 
                 let query_params = request
@@ -294,24 +356,14 @@ async fn ensure_oauth_flow_prepared(
                 };
 
                 if code.is_none() && bytes_read > 0 {
-                    crate::modules::logger::log_error(&format!(
-                        "OAuth callback failed to parse code (IPv6). Raw request: {}",
-                        &request.chars().take(512).collect::<String>()
-                    ));
+                    crate::modules::logger::log_error(
+                        "IPv6 OAuth callback did not contain an authorization code",
+                    );
                 }
 
-                // Verify state
-                let state_valid = {
-                    if let Ok(lock) = get_oauth_flow_state().lock() {
-                        if let Some(s) = lock.as_ref() {
-                            received_state.as_ref() == Some(&s.state)
-                        } else {
-                            false
-                        }
-                    } else {
-                        false
-                    }
-                };
+                // A valid nonce can be claimed by exactly one listener/manual callback.
+                let state_valid =
+                    code.is_some() && claim_listener_callback(received_state.as_deref());
 
                 let (result, response_html) = match (code, state_valid) {
                     (Some(code), true) => {
@@ -351,6 +403,8 @@ async fn ensure_oauth_flow_prepared(
             redirect_uri,
             state: state_str,
             client_key: resolved_client_key,
+            created_at: Instant::now(),
+            code_claimed: false,
             cancel_tx,
             code_tx,
             code_rx: Some(code_rx),
@@ -401,7 +455,7 @@ pub async fn start_oauth_flow(
     }
 
     // Take code_rx to wait for it
-    let (mut code_rx, redirect_uri, client_key) = {
+    let (mut code_rx, redirect_uri, client_key, flow_nonce) = {
         let mut lock = get_oauth_flow_state()
             .lock()
             .map_err(|_| "OAuth state lock corrupted".to_string())?;
@@ -412,22 +466,26 @@ pub async fn start_oauth_flow(
             .code_rx
             .take()
             .ok_or_else(|| "OAuth authorization already in progress".to_string())?;
-        (rx, state.redirect_uri.clone(), state.client_key.clone())
+        (
+            rx,
+            state.redirect_uri.clone(),
+            state.client_key.clone(),
+            state.state.clone(),
+        )
     };
 
     // Wait for code (if user has already authorized, this returns immediately)
     // For mpsc, we use recv()
-    let code = match code_rx.recv().await {
-        Some(Ok(code)) => code,
-        Some(Err(e)) => return Err(e),
-        None => return Err("OAuth flow channel closed unexpectedly".to_string()),
-    };
+    let received = tokio::time::timeout(OAUTH_FLOW_TTL, code_rx.recv()).await;
+    finish_pending_oauth_callback(&flow_nonce);
+    let code =
+        match received.map_err(|_| "OAuth flow expired; start authorization again".to_string())? {
+            Some(Ok(code)) => code,
+            Some(Err(e)) => return Err(e),
+            None => return Err("OAuth flow channel closed unexpectedly".to_string()),
+        };
 
     // Clean up flow state (release cancel_tx, etc.)
-    if let Ok(mut lock) = get_oauth_flow_state().lock() {
-        *lock = None;
-    }
-
     oauth::exchange_code_with_client(&code, &redirect_uri, Some(&client_key)).await
 }
 
@@ -441,7 +499,7 @@ pub async fn complete_oauth_flow(
     let _ = ensure_oauth_flow_prepared(app_handle, None).await?;
 
     // Take receiver to wait for code
-    let (mut code_rx, redirect_uri, client_key) = {
+    let (mut code_rx, redirect_uri, client_key, flow_nonce) = {
         let mut lock = get_oauth_flow_state()
             .lock()
             .map_err(|_| "OAuth state lock corrupted".to_string())?;
@@ -452,18 +510,22 @@ pub async fn complete_oauth_flow(
             .code_rx
             .take()
             .ok_or_else(|| "OAuth authorization already in progress".to_string())?;
-        (rx, state.redirect_uri.clone(), state.client_key.clone())
+        (
+            rx,
+            state.redirect_uri.clone(),
+            state.client_key.clone(),
+            state.state.clone(),
+        )
     };
 
-    let code = match code_rx.recv().await {
-        Some(Ok(code)) => code,
-        Some(Err(e)) => return Err(e),
-        None => return Err("OAuth flow channel closed unexpectedly".to_string()),
-    };
-
-    if let Ok(mut lock) = get_oauth_flow_state().lock() {
-        *lock = None;
-    }
+    let received = tokio::time::timeout(OAUTH_FLOW_TTL, code_rx.recv()).await;
+    finish_pending_oauth_callback(&flow_nonce);
+    let code =
+        match received.map_err(|_| "OAuth flow expired; start authorization again".to_string())? {
+            Some(Ok(code)) => code,
+            Some(Err(e)) => return Err(e),
+            None => return Err("OAuth flow channel closed unexpectedly".to_string()),
+        };
 
     oauth::exchange_code_with_client(&code, &redirect_uri, Some(&client_key)).await
 }
@@ -475,42 +537,51 @@ pub async fn submit_oauth_code(
     code_input: String,
     state_input: Option<String>,
 ) -> Result<(), String> {
-    let tx = {
-        let lock = get_oauth_flow_state().lock().map_err(|e| e.to_string())?;
-        if let Some(state) = lock.as_ref() {
-            // Verify state if provided
-            if let Some(provided_state) = state_input {
-                if provided_state != state.state {
-                    return Err("OAuth state mismatch (CSRF protection)".to_string());
-                }
+    // This entrypoint is authenticated IPC/admin traffic. Pasting a bare code is
+    // supported, while a pasted callback URL must carry its matching nonce.
+    let (code, nonce, redirect) =
+        if code_input.starts_with("http://") || code_input.starts_with("https://") {
+            let mut url =
+                Url::parse(&code_input).map_err(|_| "Invalid OAuth callback URL".to_string())?;
+            let code = url
+                .query_pairs()
+                .find(|(key, _)| key == "code")
+                .map(|(_, value)| value.into_owned())
+                .ok_or_else(|| "OAuth callback URL has no code".to_string())?;
+            let nonce = url
+                .query_pairs()
+                .find(|(key, _)| key == "state")
+                .map(|(_, value)| value.into_owned())
+                .ok_or_else(|| "OAuth callback URL has no state".to_string())?;
+            if state_input
+                .as_deref()
+                .is_some_and(|provided| provided != nonce)
+            {
+                return Err("OAuth state mismatch".to_string());
             }
-            state.code_tx.clone()
+            url.set_query(None);
+            url.set_fragment(None);
+            (code, Some(nonce), Some(url.to_string()))
         } else {
-            return Err("No active OAuth flow found".to_string());
-        }
+            (code_input, state_input, None)
+        };
+    if code.trim().is_empty() {
+        return Err("OAuth authorization code is empty".to_string());
+    }
+    let tx = {
+        let mut pending = get_oauth_flow_state()
+            .lock()
+            .map_err(|_| "OAuth state lock corrupted".to_string())?;
+        let flow = pending
+            .as_mut()
+            .ok_or_else(|| "No active OAuth flow found".to_string())?;
+        flow.claim_code(nonce.as_deref(), redirect.as_deref(), redirect.is_some())?;
+        flow.code_tx.clone()
     };
-
-    // Extract code if it's a URL
-    let code = if code_input.starts_with("http") {
-        if let Ok(url) = Url::parse(&code_input) {
-            url.query_pairs()
-                .find(|(k, _)| k == "code")
-                .map(|(_, v)| v.to_string())
-                .unwrap_or(code_input)
-        } else {
-            code_input
-        }
-    } else {
-        code_input
-    };
-
+    // The capacity-one channel is only claimed once; never wait indefinitely.
+    tx.try_send(Ok(code))
+        .map_err(|_| "OAuth flow receiver is unavailable; start authorization again".to_string())?;
     crate::modules::logger::log_info("Received manual OAuth code submission");
-
-    // Send to the channel
-    tx.send(Ok(code))
-        .await
-        .map_err(|_| "Failed to send code to OAuth flow (receiver dropped)".to_string())?;
-
     Ok(())
 }
 /// Manually prepare an OAuth flow without starting listeners.
@@ -519,9 +590,11 @@ pub fn prepare_oauth_flow_manually(
     redirect_uri: String,
     state_str: String,
     oauth_client_key: Option<String>,
-) -> Result<(String, mpsc::Receiver<Result<String, String>>), String> {
+) -> Result<(String, mpsc::Receiver<Result<String, String>>, String), String> {
     let (auth_url, resolved_client_key) =
         oauth::get_auth_url_with_client(&redirect_uri, &state_str, oauth_client_key.as_deref())?;
+
+    let client_key = resolved_client_key.clone();
 
     // Check if we can reuse existing state
     if let Ok(mut lock) = get_oauth_flow_state().lock() {
@@ -543,11 +616,96 @@ pub fn prepare_oauth_flow_manually(
             redirect_uri: redirect_uri.clone(),
             state: state_str,
             client_key: resolved_client_key,
+            created_at: Instant::now(),
+            code_claimed: false,
             cancel_tx,
             code_tx,
             code_rx: None, // We return it directly
         });
     }
 
-    Ok((auth_url, code_rx))
+    Ok((auth_url, code_rx, client_key))
+}
+
+#[cfg(test)]
+mod callback_security_tests {
+    use super::*;
+
+    fn pending() -> OAuthFlowState {
+        let (cancel_tx, _) = watch::channel(false);
+        let (code_tx, code_rx) = mpsc::channel(1);
+        OAuthFlowState {
+            auth_url: String::new(),
+            redirect_uri: "http://localhost:8045/auth/callback".into(),
+            state: "pending-nonce".into(),
+            client_key: "selected-client".into(),
+            created_at: Instant::now(),
+            code_claimed: false,
+            cancel_tx,
+            code_tx,
+            code_rx: Some(code_rx),
+        }
+    }
+
+    #[test]
+    fn public_callback_requires_matching_nonce_redirect_and_is_one_use() {
+        let mut flow = pending();
+        let redirect = flow.redirect_uri.clone();
+        assert!(flow.claim_code(None, Some(&redirect), true).is_err());
+        assert!(flow
+            .claim_code(Some("wrong"), Some(&redirect), true)
+            .is_err());
+        assert!(flow
+            .claim_code(
+                Some("pending-nonce"),
+                Some("https://other.example/callback"),
+                true
+            )
+            .is_err());
+        assert!(!flow.code_claimed);
+        assert_eq!(
+            flow.claim_code(Some("pending-nonce"), Some(&redirect), true)
+                .unwrap(),
+            "selected-client"
+        );
+        assert!(flow
+            .claim_code(Some("pending-nonce"), Some(&redirect), true)
+            .is_err());
+    }
+
+    #[test]
+    fn expired_flows_are_rejected_and_authenticated_bare_code_remains_supported() {
+        let mut expired = pending();
+        expired.created_at = Instant::now() - OAUTH_FLOW_TTL;
+        assert!(expired
+            .claim_code(Some("pending-nonce"), None, true)
+            .is_err());
+        let mut manual = pending();
+        assert_eq!(
+            manual.claim_code(None, None, false).unwrap(),
+            "selected-client"
+        );
+        assert!(manual.claim_code(None, None, false).is_err());
+    }
+
+    #[test]
+    fn concurrent_callbacks_cannot_claim_the_same_flow() {
+        let flow = std::sync::Arc::new(Mutex::new(pending()));
+        let threads: Vec<_> = (0..8)
+            .map(|_| {
+                let flow = flow.clone();
+                std::thread::spawn(move || {
+                    flow.lock()
+                        .unwrap()
+                        .claim_code(Some("pending-nonce"), None, true)
+                        .is_ok()
+                })
+            })
+            .collect();
+        let winners = threads
+            .into_iter()
+            .map(|thread| usize::from(thread.join().unwrap()))
+            .sum::<usize>();
+        assert_eq!(winners, 1);
+    }
 }

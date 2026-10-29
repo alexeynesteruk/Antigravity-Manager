@@ -109,7 +109,15 @@ where
 
                     // 1. Capture Usage
                     if let Some(usage) = actual_data.get("usageMetadata") {
-                        usage_metadata = Some(usage.clone());
+                        crate::proxy::monitor::record_upstream_usage(usage);
+                        if let (Some(current), Some(reported)) = (
+                            usage_metadata.as_mut().and_then(Value::as_object_mut),
+                            usage.as_object(),
+                        ) {
+                            current.extend(reported.clone());
+                        } else {
+                            usage_metadata = Some(usage.clone());
+                        }
                     }
 
                     // 2. Capture Content & Signature

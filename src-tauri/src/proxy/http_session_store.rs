@@ -309,6 +309,49 @@ pub async fn save_session_delta(
     );
 }
 
+fn tenant_response_key(tenant: &str, response_id: &str) -> String {
+    format!("{tenant}\u{1f}{response_id}")
+}
+
+pub async fn save_session_for_tenant(tenant: &str, response_id: String, entry: HttpSessionEntry) {
+    store()
+        .lock()
+        .await
+        .insert(tenant_response_key(tenant, &response_id), entry);
+}
+
+pub async fn get_session_with_parent_for_tenant(
+    tenant: &str,
+    response_id: &str,
+) -> Option<(HttpSessionEntry, SessionParent)> {
+    store()
+        .lock()
+        .await
+        .get(&tenant_response_key(tenant, response_id))
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn save_session_delta_for_tenant(
+    tenant: &str,
+    response_id: String,
+    parent: Option<SessionParent>,
+    input_delta: Vec<Value>,
+    response_output: Vec<Value>,
+    instructions: String,
+    model: String,
+    routing_session_id: String,
+) {
+    store().lock().await.insert_delta(
+        tenant_response_key(tenant, &response_id),
+        parent,
+        input_delta,
+        response_output,
+        instructions,
+        model,
+        Some(routing_session_id),
+    );
+}
+
 pub struct PreparedSessionInput {
     pub merged: Vec<Value>,
     pub delta: Vec<Value>,
@@ -841,5 +884,35 @@ mod tests {
         let prepared = prepare_session_input(history, new_input, &HashMap::new());
         // Should not duplicate to 4 items
         assert_eq!(prepared.merged.len(), 2);
+    }
+}
+
+#[cfg(test)]
+mod tenant_history_tests {
+    use super::*;
+    #[test]
+    fn another_tenant_cannot_restore_a_known_response_id() {
+        let mut store = HttpSessionStore::new();
+        let response = "resp-known";
+        store.insert(
+            tenant_response_key("owner-a", response),
+            HttpSessionEntry {
+                input_items: vec![serde_json::json!({"role":"user","content":"private"})],
+                instructions: String::new(),
+                model: "gemini".into(),
+                last_accessed: Instant::now(),
+            },
+        );
+        assert!(store
+            .get(&tenant_response_key("owner-b", response))
+            .is_none());
+        assert_eq!(
+            store
+                .get(&tenant_response_key("owner-a", response))
+                .unwrap()
+                .0
+                .input_items[0]["content"],
+            "private"
+        );
     }
 }

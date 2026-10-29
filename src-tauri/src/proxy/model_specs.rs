@@ -749,14 +749,11 @@ pub fn resolve_custom_budget(
             }
         } else {
             // 针对未指定档位后缀的 Claude 思考模型（如 claude-sonnet-4-6、claude-opus-4-6-thinking）：
-            // claude_budget=0 表示"未显式配置，使用官方模型结构体默认值"（对标 flash_high=-1 语义）。
-            // 返回 None 时，configure_inbound_thinking 会 fallback 到 official_info.thinking_budget（官方默认 1024）。
+            // 填 > 0 则精确覆盖；<= 0 则回退至官方模型结构体默认值 (如 1024)
             if tb_config.claude_budget > 0 {
                 Some(tb_config.claude_budget as i64)
-            } else if tb_config.claude_budget < 0 {
-                None // claude_budget < 0 → 上游自适应
             } else {
-                None // claude_budget = 0 → 使用官方模型结构体默认值
+                None
             }
         }
     } else if is_pro {

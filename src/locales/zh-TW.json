@@ -63,7 +63,8 @@
     "selected": "已選擇",
     "claude_series": "Claude 系列",
     "maximize": "最大化",
-    "app_name": "Antigravity Tools"
+    "app_name": "Antigravity Tools",
+    "copy_to_clipboard": "複製到剪貼板"
   },
   "nav": {
     "dashboard": "儀表板",
@@ -207,7 +208,11 @@
     "no_client_account": "該應用當前暫無登錄或綁定的帳號",
     "go_switch_account": "前往切換帳號",
     "switch_best_to_target": "一鍵切換最佳帳號到 {{target}}",
-    "switch_this_to_target": "一鍵將此帳號切換到 {{target}}"
+    "switch_this_to_target": "一鍵將此帳號切換到 {{target}}",
+    "account_pool": "帳號池",
+    "view_mode_title_5h": "5小時滾動視窗檢視",
+    "view_mode_title_weekly": "7天週配額檢視",
+    "view_mode_title_weighted": "綜合加權檢視"
   },
   "accounts": {
     "account": "帳號",
@@ -449,7 +454,25 @@
     "quota_group_claude": "Claude & GPT 模型",
     "weekly_constrained_tooltip": "受到週配額短板壓制",
     "weekly_tokens": "本週期 Token",
-    "weekly_tokens_tooltip": "本實例在此配額週期記錄的 Token 用量（輸入 + 輸出）"
+    "weekly_tokens_tooltip": "本實例在此配額週期記錄的 Token 用量（輸入 + 輸出）",
+    "qos": {
+      "suspicious": "疑似被限速",
+      "suspicious_hint": "上游首包延遲出現異常卡頓，已開啟只出不進保護並暫緩新會話分流",
+      "jailed": "限速小黑屋中",
+      "jailed_hint": "已觸發上游靜默降速熔斷並強制解綁會話，正在階梯冷卻中，後台探針將自動測速自愈",
+      "probing": "解限探測中",
+      "probing_hint": "正在向該帳號發起純淨測速探針，檢測上游服務質量是否已滿血恢復",
+      "half_open": "觀察緩刑中",
+      "half_open_hint": "探針通過，正在進行生產流量單路試探，連續穩定通過後將徹底恢復健康",
+      "release_btn": "解除",
+      "release_tooltip": "點擊立即手動移除小黑屋限制，恢復帳號正常調度",
+      "release_success": "已成功解除該帳號的小黑屋限制，恢復正常調度"
+    },
+    "remaining_quota": "剩餘配額: {{percentage}}%",
+    "reset_in": "重設: {{time}}",
+    "supported_official_models": "支援官方模型 ({{count}}個):",
+    "switch_next_short": "切下一個",
+    "weekly_exhausted_tooltip": "週配額已耗盡，已觸發自動保護"
   },
   "settings": {
     "save": "儲存設定",
@@ -468,6 +491,10 @@
       "theme_light": "淺色",
       "theme_dark": "深色",
       "theme_system": "跟隨系統",
+      "ui_zoom": "介面與字型縮放",
+      "ui_zoom_desc": "調整軟體整體介面和字型大小，支援隨時使用快捷鍵 Cmd/Ctrl + / - / 0 快速縮放",
+      "ui_zoom_default": "預設",
+      "ui_zoom_recommended": "推薦大螢幕",
       "auto_launch": "開機自動啟動",
       "auto_launch_enabled": "啟用",
       "auto_launch_disabled": "停用",
@@ -486,7 +513,13 @@
       "lightweight_mode": "輕量模式 (釋放記憶體)",
       "lightweight_mode_desc": "退出或最小化到系統匣時銷毀前端渲染行程，常駐記憶體可降至約 35MB。重新開啟主視窗時需要數毫秒重建。",
       "lightweight_mode_enabled": "已啟用輕量模式",
-      "lightweight_mode_disabled": "已停用輕量模式"
+      "lightweight_mode_disabled": "已停用輕量模式",
+      "tray_click_action": "托盤左鍵單擊操作",
+      "tray_click_action_desc": "選擇按一下系統托盤/功能表列圖示時的預設回應動作",
+      "tray_click_action_mini": "彈出 Mini 懸浮監控視窗 (推薦)",
+      "tray_click_action_main": "直接打開主控制台介面",
+      "tray_click_action_mini_short": "Mini 懸浮窗",
+      "tray_click_action_main_short": "主控制台"
     },
     "account": {
       "title": "帳號設定",
@@ -773,7 +806,8 @@
       "placeholder": "輸入全局系統提示詞...\n例如：你是一位資深的全棧開發工程師，擅長 React 和 Rust。請使用繁體中文回复。",
       "char_count": "{{count}} 字符",
       "long_prompt_warning": "提示詞較長（超過 2000 字符），可能會佔用較多的上下文窗口空間。"
-    }
+    },
+    "lightweight_mode_desc": "開啟後退出或最小化到托盤將徹底釋放 WebView 記憶體"
   },
   "tray": {
     "current": "當前",
@@ -786,7 +820,10 @@
     "no_account": "無帳號",
     "unknown_quota": "未知 (點選重新整理)",
     "forbidden": "帳號被封禁",
-    "lightweight_mode": "輕量模式 (退出時釋放記憶體)"
+    "lightweight_mode": "輕量模式 (退出時釋放記憶體)",
+    "open_console": "開啟主控制台",
+    "pin_desc": "固定在桌面（點擊常駐桌面，不隨失焦收起）",
+    "unpin_desc": "已固定常駐（點擊取消固定，失焦自動收起）"
   },
   "proxy": {
     "title": "API 反向代理服務",
@@ -1084,6 +1121,18 @@
         "default_600_tag": "預設 600",
         "max_memory_turns_desc": "控制單一工作階段在記憶體 (RAM) 中常駐保留的歷史思考區塊輪次。單輪思考區塊預估記憶體消耗約為 1.5 KB ~ 2.5 KB（600 輪約佔用 1.2 MB / 工作階段）。",
         "turns_unit": "輪",
+        "signature_cache_title": "工具簽名快取（自動）",
+        "signature_cache_clear_btn": "清除簽名快取",
+        "signature_cache_desc": "依本機 CPU / 記憶體自動選擇快取檔位；SQLite 僅作冷層，批次寫入與壓縮清理均在背景完成。",
+        "clear_signature_confirm": "確定清除工具簽名快取嗎？不會影響請求日誌與思考區塊。",
+        "clear_signature_success": "已清除簽名快取 ({{count}} 條 L1 記錄)",
+        "clear_signature_error": "清除簽名快取失敗: {{error}}",
+        "signature_cache_hit_rate": "命中率",
+        "signature_cache_thinking": "思考區塊",
+        "signature_cache_thinking_value": "{{turns}} 輪 / {{sessions}} 會話",
+        "signature_cache_dropped": "丟棄",
+        "signature_cache_pending": "待刪除",
+        "signature_cache_machine": "本機 {{mb}} MB / {{cores}} 核。",
         "window_guide_title": "滑動窗口淘汰機制與各並發規模選型建議",
         "window_guide_desc": "超長工作階段超過此設定輪次時，採用先進先出（FIFO）滑動窗口自動淘汰最舊思考區塊。被淘汰輪次絕不降級為破壞快取的佔位符，而是由本機 SQLite 專屬索引在奈秒級精準穿透回撈，保證 Prompt Cache 100% 位元組級嚴格對齊且絕不 OOM。",
         "tooltip_32768": "32,768 Tokens：適合複雜編程與深度架構任務",
@@ -1132,14 +1181,14 @@
         "clear_error": "清空思考區塊失敗: {{error}}",
         "gemini_soft_budget_note": "⚠️ 思考預算特性說明：Google Gemini 上游將 thinkingBudget 視為啟發式偏好（Soft Target）。面對超長 Prompt、複雜程式碼推演或 Agent 任務時，上游推理引擎會自動深入展開思考鏈，可能突破所設數值；設定為 0 則徹底關閉思考。"
       },
-      "stream_timeout_settings": {
-        "title": "串流逾時設定 (Stream Timeout Settings)"
+      "timeout_settings": {
+        "title": "逾時設定"
       },
       "thinking_settings": {
-        "title": "思考設定 (Thinking Settings)"
+        "title": "思考設定"
       },
       "prompt_multimodal": {
-        "title": "全域提示詞與多模態設定 (Prompt & Multimodal)"
+        "title": "全域提示詞與多模態設定"
       },
       "log_retention_title": "請求日誌保留",
       "log_retention_body_hours": "請求主體保留小時數",
@@ -1203,10 +1252,10 @@
         }
       },
       "multimodal_settings": {
-        "title": "多模態交互設定 (Multimodal Settings)"
+        "title": "多模態交互設定"
       },
       "agent_settings": {
-        "title": "特定 Agent 設定 (Specific Agent Settings)"
+        "title": "特定 Agent 設定"
       },
       "hub": {
         "title": "官方 Hub 客戶端指紋",
@@ -1225,17 +1274,54 @@
     "stream_timeouts": {
       "banner_title": "三階段串流梯度逾時與保活機制",
       "banner_desc": "針對深度思考模型、超大上下文 Prefill、長歷史壓縮摘要及大檔案程式碼寫入場景，透過三階段獨立計時與全程底層心跳保活（: ping），徹底杜絕中間閘道切斷、過渡斷崖誤殺與客戶端重試死循環。",
-      "ttft_title": "首字回應寬限 (TTFT)",
+      "ttft_title": "首字回應寬限",
       "default_badge": "預設: 180s",
       "ttft_desc": "涵蓋上游冷啟動排隊、超大提示詞 Prefill 與長歷史壓縮摘要任務的最大容忍時間。期間每 3 秒下發心跳保活。",
       "transition_title": "狀態切換寬限 (全新輪迴)",
       "transition_desc": "思考完畢至首個內文或工具調用出字的過渡期。思考結束時自適應重置計時器，為大檔案寫入等裝配留出充分時間。",
-      "sliding_title": "推流滑動逾時 (Streaming)",
+      "sliding_title": "推流滑動逾時",
       "default_badge_sliding": "預設: 120s",
       "sliding_desc": "持續吐字過程中相鄰 Token 的最大允許靜默間隔。若中途意外斷流超過此時長，自動優雅截斷收尾並保全已產生的程式碼。",
       "toast_reset": "已恢復逾時設定預設值",
       "btn_reset": "恢復預設值",
       "btn_save": "儲存逾時設定"
+    },
+    "upload_timeouts": {
+      "adaptive_title": "上傳逾時：自動依頻寬判定",
+      "min_speed_title": "上傳頻寬 (Mbps)",
+      "min_speed_desc": "VPN使用者通常高下行、低上行、建議填1-5Mbps。",
+      "extra_wait_title": "額外等待係數",
+      "extra_wait_desc": "此參數影響上傳最大等待時間。",
+      "formula_title": "最大等待時間 = 請求內容大小 ÷ 上傳頻寬 × (1 + 額外等待係數)",
+      "stall_title": "停滯逾時 (秒)",
+      "stall_desc": "上傳時因網路錯誤持續卡死的逾時時間；若最大等待時間更短，則自動取最大等待時間。",
+      "header_wait_title": "首回應標頭逾時 (秒)",
+      "header_wait_desc": "0 = 使用內建值：首選端點 30 秒 / 備用端點 25 秒；填非 0 時只作為下限往上抬。",
+      "large_body_desc": "超過閾值的檔案預設只送一次，避免反覆重傳佔滿上行。",
+      "large_body_threshold_title": "大檔案閾值 (MB)",
+      "endpoint_attempts_title": "最多嘗試次數",
+      "toast_reset": "已恢復逾時預設值",
+      "btn_reset": "恢復預設值",
+      "btn_save": "儲存逾時設定"
+    },
+    "timeouts": {
+      "banner_title": "逾時設定",
+      "banner_desc": "一次請求的完整逾時鏈路：建立連線 → 上傳 → 首回應標頭 → 首字/連續輸出。",
+      "section_connect": "① 端點建立連線 （自動故障切換端點）",
+      "connect_label": "連線逾時 (秒)",
+      "connect_desc": "和端點的TCP連線建立逾時時間，通常速度極快。",
+      "connect_restart": "改完需重新啟動代理服務。",
+      "section_upload": "② 上傳（送出請求內容）",
+      "section_large_body": "大檔案重試",
+      "section_header": "③ 首回應標頭（自動故障切換端點）",
+      "header_primary_title": "首選端點：",
+      "header_primary_items": "常規：TTFT　圖片：TTFT+45　影片：TTFT+60　輔助：TTFT−30",
+      "header_fallback_title": "備選端點：",
+      "header_fallback_items": "同類增量減半（負增量不減半）",
+      "first_byte_effective": "目前生效（基準上限 {{cap}}s）：常規 {{text}}s　圖片 {{image}}s　影片 {{video}}s　輔助 {{aux}}s",
+      "section_stream": "③ 首字與連續輸出",
+      "stream_desc": "首回應標頭與首個輸出 token 已合併為統一首字延遲：未收到 200 前可切換端點；收到 200 後僅安全收尾，不再切換。",
+      "auto_summary": "例：最大等待時間= 47MB ÷ 2Mbps ×1.4 ≈ {{big}} 秒；"
     },
     "example": {
       "title": "使用示例",
@@ -1385,7 +1471,7 @@
       "title": "使用示例"
     },
     "multi_protocol": {
-      "title": "多協定支援 (Multi-Protocol Support)",
+      "title": "模型大全與協定",
       "subtitle": "快速同步 API 地址與金鑰到本地 AI 工具",
       "description": "反代服務支援 OpenAI、Anthropic 和 Gemini 協定，滿足不同工具的整合需求",
       "openai_label": "OpenAI 協定",
@@ -1394,7 +1480,7 @@
       "anthropic_tools": "Claude Code CLI",
       "gemini_label": "Gemini 協定",
       "gemini_tools": "Google AI SDK, LangChain",
-      "quick_integration": "快速整合 (Quick Integration)",
+      "quick_integration": "快速整合",
       "click_tip": "👆 點擊模型以更新程式碼範例",
       "copy_base": "複製 Base"
     },
@@ -1438,7 +1524,8 @@
       },
       "model_select": "Select Model",
       "apps": {
-        "gemini": "Antigravity CLI (agy)"
+        "gemini": "Antigravity CLI (agy)",
+        "deepseek_harness": "DeepSeek Harness"
       }
     },
     "hermes_sync": {
@@ -1686,6 +1773,35 @@
         "patch_feature_title": "8k 深度封存微創等長補丁",
         "patch_feature_desc": "保留最新 8k 活躍訊息上下文，超出歷史 100% 濃縮封存，壓縮率突破 60%+。系統將自動建立 .bak 安全備份，支援隨時一鍵還原。"
       }
+    },
+    "probe": {
+      "title": "請求探針",
+      "protocol": "協定",
+      "body": "請求主體（JSON，可編輯）",
+      "template": "範本",
+      "send": "傳送",
+      "stop": "停止",
+      "ttft": "首字延遲",
+      "total": "總耗時",
+      "account": "帳號",
+      "mapped_model": "映射",
+      "response": "回應",
+      "invalid_json": "JSON 無效，未傳送請求",
+      "test_all": "全部測試",
+      "tested": "已測試 {{done}}/{{total}}",
+      "status": "狀態",
+      "status_ok": "正常",
+      "status_fail": "失敗",
+      "status_limited": "限流或配額耗盡（模型可用）",
+      "status_skipped": "已略過（圖像模型不參與測試）",
+      "filter_all": "全部",
+      "check": "檢測",
+      "verdict_ok": "可用",
+      "verdict_fail": "不可用",
+      "verdict_limited": "觸發限流",
+      "served_by": "請求 {{requested}} → 實際回應 {{served}}",
+      "details": "點擊查看請求詳情",
+      "headers": "回應標頭"
     }
   },
   "monitor": {
@@ -1742,7 +1858,7 @@
       "out_tokens_title": "輸出 Token",
       "ttft_prefix": "首字:",
       "total_duration_title": "總耗時",
-      "ttft_title": "首字延遲 (TTFT)"
+      "ttft_title": "首字延遲"
     },
     "details": {
       "title": "請求詳情",

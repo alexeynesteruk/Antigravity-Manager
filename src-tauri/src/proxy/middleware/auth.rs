@@ -1,10 +1,6 @@
 // API Key 认证中间件
 use axum::{
-    extract::Request,
-    extract::State,
-    http::{header, StatusCode},
-    middleware::Next,
-    response::Response,
+    extract::Request, extract::State, http::StatusCode, middleware::Next, response::Response,
 };
 use std::borrow::Cow;
 use std::sync::Arc;
@@ -18,52 +14,32 @@ use crate::proxy::{ProxyAuthMode, ProxySecurityConfig};
 /// 2. x-api-key header
 /// 3. x-goog-api-key header (Google Gemini / Google Cloud)
 /// 4. URL query 参数 ?key=... (Google Gemini 官方 REST 协议规范)
-fn extract_api_key<B>(request: &Request<B>, allow_query: bool) -> Option<Cow<'_, str>> {
-    // 1. Authorization header
-    if let Some(auth_val) = request
-        .headers()
-        .get(header::AUTHORIZATION)
-        .and_then(|h| h.to_str().ok())
-    {
-        let trimmed = auth_val.trim();
-        let token = if let Some(stripped) = trimmed.strip_prefix("Bearer ") {
-            stripped.trim()
-        } else if let Some(stripped) = trimmed.strip_prefix("bearer ") {
-            stripped.trim()
-        } else if trimmed.eq_ignore_ascii_case("bearer") {
-            ""
-        } else {
-            trimmed
+pub(crate) fn extract_header_api_key(headers: &axum::http::HeaderMap) -> Option<&str> {
+    for name in ["authorization", "x-api-key", "x-goog-api-key"] {
+        let Some(value) = headers.get(name).and_then(|value| value.to_str().ok()) else {
+            continue;
         };
-        if !token.is_empty() {
-            return Some(Cow::Borrowed(token));
+        let value = value.trim();
+        let value = if name == "authorization" {
+            match value.split_once(' ') {
+                Some((scheme, token)) if scheme.eq_ignore_ascii_case("bearer") => token.trim(),
+                _ if value.eq_ignore_ascii_case("bearer") => "",
+                _ => value,
+            }
+        } else {
+            value
+        };
+        if !value.is_empty() {
+            return Some(value);
         }
     }
+    None
+}
 
-    // 2. x-api-key header
-    if let Some(val) = request
-        .headers()
-        .get("x-api-key")
-        .and_then(|h| h.to_str().ok())
-    {
-        let trimmed = val.trim();
-        if !trimmed.is_empty() {
-            return Some(Cow::Borrowed(trimmed));
-        }
+fn extract_api_key<B>(request: &Request<B>, allow_query: bool) -> Option<Cow<'_, str>> {
+    if let Some(key) = extract_header_api_key(request.headers()) {
+        return Some(Cow::Borrowed(key));
     }
-
-    // 3. x-goog-api-key header
-    if let Some(val) = request
-        .headers()
-        .get("x-goog-api-key")
-        .and_then(|h| h.to_str().ok())
-    {
-        let trimmed = val.trim();
-        if !trimmed.is_empty() {
-            return Some(Cow::Borrowed(trimmed));
-        }
-    }
-
     if !allow_query {
         return None;
     }
@@ -552,5 +528,147 @@ mod tests {
             ));
         let resp = app.clone().oneshot(req_spoofed).await.unwrap();
         assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[test]
+    fn test_extract_api_key_sources() {
+        // 1. Authorization: Bearer
+        let req = Request::builder()
+            .header("Authorization", "Bearer sk-bearer-token")
+            .body(())
+            .unwrap();
+        assert_eq!(
+            extract_api_key(&req, true).as_deref(),
+            Some("sk-bearer-token")
+        );
+
+        // 2. Authorization: bearer (小写)
+        let req = Request::builder()
+            .header("Authorization", "bearer sk-lowercase-token")
+            .body(())
+            .unwrap();
+        assert_eq!(
+            extract_api_key(&req, true).as_deref(),
+            Some("sk-lowercase-token")
+        );
+
+        // 3. Authorization: raw token (无 Bearer 前缀)
+        let req = Request::builder()
+            .header("Authorization", "sk-raw-token")
+            .body(())
+            .unwrap();
+        assert_eq!(extract_api_key(&req, true).as_deref(), Some("sk-raw-token"));
+
+        // 4. x-api-key header
+        let req = Request::builder()
+            .header("x-api-key", "sk-x-api-key")
+            .body(())
+            .unwrap();
+        assert_eq!(extract_api_key(&req, true).as_deref(), Some("sk-x-api-key"));
+
+        // 5. x-goog-api-key header (Google Gemini)
+        let req = Request::builder()
+            .header("x-goog-api-key", "AIzaSyGeminiHeaderKey")
+            .body(())
+            .unwrap();
+        assert_eq!(
+            extract_api_key(&req, true).as_deref(),
+            Some("AIzaSyGeminiHeaderKey")
+        );
+
+        // 6. URL query: ?key=... (Google Gemini REST 协议)
+        let req = Request::builder()
+            .uri("/v1beta/models?key=AIzaSyGeminiQueryKey")
+            .body(())
+            .unwrap();
+        assert_eq!(
+            extract_api_key(&req, true).as_deref(),
+            Some("AIzaSyGeminiQueryKey")
+        );
+
+        // 7. URL query: 混合其它参数 ?alt=sse&key=...&other=1
+        let req = Request::builder()
+            .uri("/v1beta/models/gemini-2.5-flash:generateContent?alt=sse&key=AIzaSyMixedQuery&stream=true")
+            .body(())
+            .unwrap();
+        assert_eq!(
+            extract_api_key(&req, true).as_deref(),
+            Some("AIzaSyMixedQuery")
+        );
+
+        // 8. 优先级：Header 优先于 Query
+        let req = Request::builder()
+            .header("x-goog-api-key", "header-key")
+            .uri("/v1beta/models?key=query-key")
+            .body(())
+            .unwrap();
+        assert_eq!(extract_api_key(&req, true).as_deref(), Some("header-key"));
+
+        // 9. 空值/空白处理
+        let req = Request::builder()
+            .uri("/v1beta/models?key=%20%20")
+            .body(())
+            .unwrap();
+        assert_eq!(extract_api_key(&req, true), None);
+
+        let req = Request::builder()
+            .uri("/v1beta/models?key=")
+            .body(())
+            .unwrap();
+        assert_eq!(extract_api_key(&req, true), None);
+
+        let req = Request::builder()
+            .header("Authorization", "Bearer   ")
+            .body(())
+            .unwrap();
+        assert_eq!(extract_api_key(&req, true), None);
+    }
+
+    #[tokio::test]
+    async fn test_auth_middleware_with_gemini_query_key() {
+        use axum::routing::get;
+        use tower::ServiceExt;
+
+        let _ = crate::modules::user_token_db::init_db();
+
+        let security = Arc::new(RwLock::new(ProxySecurityConfig {
+            auth_mode: ProxyAuthMode::Strict,
+            api_key: "valid-gemini-key".to_string(),
+            admin_password: None,
+            allow_lan_access: true,
+            port: 8045,
+            security_monitor: crate::proxy::config::SecurityMonitorConfig::default(),
+        }));
+
+        let app = axum::Router::new()
+            .route("/v1beta/models", get(|| async { StatusCode::OK }))
+            .layer(axum::middleware::from_fn_with_state(
+                security.clone(),
+                auth_middleware,
+            ));
+
+        // 1. 通过 URL query 携带正确的 API Key 访问 Gemini 接口 -> 200 OK
+        let req_valid = Request::builder()
+            .uri("/v1beta/models?key=valid-gemini-key")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let resp = app.clone().oneshot(req_valid).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // 2. 通过 URL query 携带错误的 API Key（未通过主 API Key，进入 UserToken 校验失败） -> 403 Forbidden
+        let req_invalid = Request::builder()
+            .uri("/v1beta/models?key=wrong-key")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let resp = app.clone().oneshot(req_invalid).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+
+        // 3. 不带任何 Key 访问 -> 401 Unauthorized
+        let req_none = Request::builder()
+            .uri("/v1beta/models")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let resp = app.clone().oneshot(req_none).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
     }
 }

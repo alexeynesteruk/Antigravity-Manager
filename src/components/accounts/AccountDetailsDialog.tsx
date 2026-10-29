@@ -5,6 +5,8 @@ import { Account, getAccountTier, getTierLabel } from '../../types/account';
 import { formatDate, formatTimeRemaining } from '../../utils/format';
 import { useTranslation } from 'react-i18next';
 import { MODEL_CONFIG, sortModels } from '../../config/modelConfig';
+import { request as invoke } from '../../utils/request';
+import { useAccountStore } from '../../stores/useAccountStore';
 import { showToast } from '../common/ToastContainer';
 
 interface AccountDetailsDialogProps {
@@ -18,63 +20,37 @@ export default function AccountDetailsDialog({ account, onClose, onUpdatePriorit
     const [activeTab, setActiveTab] = useState<'basic' | 'detailed'>('basic');
     const [priorityInput, setPriorityInput] = useState('50');
     const [savingPriority, setSavingPriority] = useState(false);
-
-    const tier = useMemo(() => account ? getAccountTier(account) : 'free', [account]);
-    const isProOrUltra = tier === 'pro' || tier === 'ultra';
+    const [concurrency, setConcurrency] = useState('');
+    const [savingConcurrency, setSavingConcurrency] = useState(false);
+    useEffect(() => { setConcurrency(account?.max_concurrency == null ? '' : String(account.max_concurrency)); }, [account?.id, account?.max_concurrency]);
 
     const displayGroups = useMemo(() => {
-        let groups = account?.quota?.quota_groups || [];
-        const hasArgonGroup = groups.some(g =>
-            (g.display_name || '').toLowerCase().includes('argon')
-            || (g.buckets || []).some(b => (b.bucket_id || '').toLowerCase().includes('argon'))
-        );
-        if (isProOrUltra && !hasArgonGroup) {
-            const geminiGroup = groups.find(g => (g.display_name || '').toLowerCase().includes('gemini'));
-            const geminiWeeklyBucket = geminiGroup?.buckets?.find(b =>
-                (b.window || '').toLowerCase().includes('week') || (b.bucket_id || '').toLowerCase().includes('week')
-            );
-            groups = [
-                ...groups,
-                {
-                    display_name: 'Gemini 4 Argon',
-                    description: 'Models within this group: Gemini 4 Argon',
-                    buckets: [
-                        {
-                            bucket_id: 'argon-weekly',
-                            window: 'weekly',
-                            remaining_fraction: 1.0,
-                            reset_time: geminiWeeklyBucket?.reset_time || new Date(Date.now() + 6 * 24 * 3600 * 1000 + 20 * 3600 * 1000).toISOString(),
-                            display_name: 'Gemini 4 Argon Weekly Limit'
-                        }
-                    ]
-                }
-            ];
-        }
-        return groups;
-    }, [account?.quota?.quota_groups, isProOrUltra]);
+        return account?.quota?.quota_groups || [];
+    }, [account?.quota?.quota_groups]);
 
     const displayModels = useMemo(() => {
-        let models = account?.quota?.models || [];
-        const hasArgonModel = models.some(m => m.name.toLowerCase().includes('argon'));
-        if (isProOrUltra && !hasArgonModel) {
-            const geminiModel = models.find(m => m.name.toLowerCase().startsWith('gemini'));
-            models = [
-                ...models,
-                {
-                    name: 'gemini-4-argon',
-                    display_name: 'Gemini 4 Argon',
-                    percentage: 100,
-                    reset_time: geminiModel?.reset_time || '',
-                    supports_images: true,
-                    supports_thinking: true,
-                    recommended: true,
-                    max_tokens: 1048576,
-                    max_output_tokens: 65536,
-                }
-            ];
-        }
-        return models;
-    }, [account?.quota?.models, isProOrUltra]);
+        const models = account?.quota?.models || [];
+        return models.filter(m => {
+            const name = (m.name || '').trim().toLowerCase();
+            if (
+                name.startsWith('chat_') ||
+                name.startsWith('tab_') ||
+                name.includes('internal') ||
+                name.includes('-exp') ||
+                name.endsWith('-agent') ||
+                name === 'gemini-3-flash' ||
+                name.includes('2.5') ||
+                name.includes('2-5') ||
+                name.includes('3.5-flash-low') ||
+                name.includes('3.5-flash-extra-low') ||
+                name.includes('3.6-flash') ||
+                name.includes('3.7-flash')
+            ) {
+                return false;
+            }
+            return true;
+        });
+    }, [account?.quota?.models]);
 
     useEffect(() => {
         setPriorityInput(String(account?.priority ?? 50));
@@ -156,6 +132,22 @@ export default function AccountDetailsDialog({ account, onClose, onUpdatePriorit
 
                 {/* Content */}
                 <div className="p-6 max-h-[68vh] overflow-y-auto space-y-6">
+                    <div className="p-4 rounded-xl border border-gray-100 dark:border-base-200 flex flex-col sm:flex-row justify-between gap-3">
+                        <div><div className="text-sm font-semibold">{t('accounts.concurrency')}</div>
+                            <p className="text-xs text-gray-500 mt-1">{t('accounts.concurrency_hint')}</p></div>
+                        <div className="flex gap-2 items-center">
+                            <input type="number" min={0} max={4294967295} step={1} className="input input-bordered input-sm w-28"
+                                placeholder={t('accounts.inherit_concurrency')} value={concurrency} onChange={e => setConcurrency(e.target.value)} disabled={savingConcurrency} />
+                            <button className="btn btn-primary btn-sm" disabled={savingConcurrency} onClick={async () => {
+                                const value = concurrency.trim() === '' ? null : Number(concurrency);
+                                if (value !== null && (!Number.isInteger(value) || value < 0 || value > 4294967295)) return;
+                                setSavingConcurrency(true);
+                                try { await invoke('update_account_max_concurrency', { accountId: account.id, maxConcurrency: value });
+                                    await useAccountStore.getState().fetchAccounts(); showToast(t('common.saved'), 'success');
+                                } catch (e) { showToast(String(e), 'error'); } finally { setSavingConcurrency(false); }
+                            }}>{t('common.save')}</button>
+                        </div>
+                    </div>
                     {/* 优先级设置 */}
                     <div className="p-4 rounded-xl border border-gray-100 dark:border-base-200 bg-gray-50/50 dark:bg-base-200/40 flex flex-col sm:flex-row sm:items-center justify-between gap-3">
                         <div>
@@ -267,13 +259,16 @@ export default function AccountDetailsDialog({ account, onClose, onUpdatePriorit
                                                                 {label}
                                                             </span>
                                                         </div>
-                                                        {model.thinking_budget !== undefined && (
-                                                            <div className="mt-1 flex items-center gap-1">
+                                                        <div className="mt-1 flex flex-wrap items-center gap-1">
+                                                            <span className="text-[10px] text-blue-600 dark:text-blue-400 font-mono bg-blue-50 dark:bg-blue-950/40 px-1.5 py-0.5 rounded border border-blue-200/50 dark:border-blue-800/40">
+                                                                {model.name}
+                                                            </span>
+                                                            {model.thinking_budget !== undefined && (
                                                                 <span className="text-[10px] text-gray-500 dark:text-gray-400 font-mono bg-gray-100 dark:bg-base-200 px-1.5 py-0.5 rounded border border-gray-200/50 dark:border-base-300">
                                                                     {t('accounts.details.thinking_budget', '思考预算')}: <span className="font-bold text-gray-700 dark:text-gray-300">{model.thinking_budget}</span>
                                                                 </span>
-                                                            </div>
-                                                        )}
+                                                            )}
+                                                        </div>
                                                     </div>
                                                     <span className={`text-[11px] font-mono font-bold px-2 py-0.5 rounded-md shrink-0 ${badgeColor}`}>
                                                         {model.percentage}%

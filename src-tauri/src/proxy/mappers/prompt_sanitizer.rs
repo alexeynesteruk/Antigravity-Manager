@@ -105,16 +105,20 @@ static RE_IDENTITY_DECLARATION: Lazy<Regex> = Lazy::new(|| {
     Regex::new(concat!(
         r"(?:",
         // 英文支：开场白（人称开场及扮演式） + 可选名词短语 + 动词 + 归属对象
-        r"(?i:\b(?:you\s+are|you're|i\s+am|i'm|act\s+as)\b[\s,，:：]*)",
-        r"(?i:(?:an?\s+)?(?:[\w'\-]+[\s,，]+){0,8}(?:ai[\s,，]+)?(?:agent\b|assistant\b|ai\b|tool\b|cli\b|programmer\b|companion\b|engineer\b|bot\b))?",
-        // 动词前导：支持包含版本号小数点的模型名/名字 (如 Grok 4.6, GPT-5.2)，避免使用不支持的零宽断言
-        r"(?i:(?:[^\s.!?。！？\r\n<>]|\d+\.\d+|[\t ]){0,25}?(?:\b(?:created|built|made|developed|designed|trained|powered|maintained|published|released|provided)\s+(?:by|on|upon|at|for)\s+|based\s+on\s+|running\s+(?:inside|in|within)\s+|integrated\s+(?:into|in)\s+))",
+        r"(?i:\b(?:you[\t ]+are|you're|i[\t ]+am|i'm|act[\t ]+as)\b[\t ,，:：]*)",
+        r"(?i:(?:an?[\t ]+)?(?:[\w'\-]+[\t ,，]+){0,8}(?:ai[\t ,，]+)?(?:agent\b|assistant\b|ai\b|tool\b|cli\b|programmer\b|companion\b|engineer\b|bot\b))?",
+        // 动词前导桥接段（组 1）：支持包含版本号小数点的模型名/名字 (如 Grok 4.6, GPT-5.2)，避免使用不支持的零宽断言。
+        // 铁律：桥接段**不跨行**（`[\t ]` 而非 `\s`，杜绝跨段落吞噬），逗号仅允许紧贴动词前出现；
+        // 跨子句的语义校验（并列/从属连词）在替换回调 `is_identity_declaration` 中执行。
+        r"(?i:((?:[^\s.,，!?。！？;；\r\n<>]|\d+\.\d+|[\t ]){0,15}?[ \t,，]*(?:(?:which|that|who)[\t ]+(?:is|was)[\t ]+)?))",
+        r"(?i:(?:\b(?:created|built|made|developed|designed|trained|powered|maintained|published|released|provided|authored|written)[\t ]+(?:by|on|upon|at|for)[\t ]+|\bby[\t ]+|based[\t ]+on[\t ]+|running[\t ]+(?:inside|in|within|on)[\t ]+|integrated[\t ]+(?:into|in)[\t ]+))",
         // 归属对象：支持跨越数字间的版本号点号 (如 3.8, 4.5) 直到句读边界
         r"(?:[^\s.,，。!?！？;；\r\n<>]|\d+\.\d+|[\t ])+",
         r"|",
         // 中文支：你是/我是 + 包含开发/制作/构建/基于/推出 等归属特征，整句收敛到句读
-        r"(?:你是|我是)[\s,，:：]*[^.!?。！？\r\n<>]{0,50}?(?:由|开发|制作|构建|训练|推出|基于)[^.!?。！？\r\n<>]{1,60}",
+        r"(?:你是|我是)[\t ,，:：]*[^.!?。！？\r\n<>]{0,50}?(?:由|开发|制作|构建|训练|推出|基于|运行[在于])[^.!?。！？\r\n<>]{1,60}",
         r")",
+        // 组 2：句读尾（用于保留逗号续写、以及疑问句豁免）
         r"([.,，。!?！？;；]?)"
     ))
     .unwrap()
@@ -123,19 +127,19 @@ static RE_IDENTITY_DECLARATION: Lazy<Regex> = Lazy::new(|| {
 /// 知名特定客户端与 Harness 开场白正则（涵盖 OpenCode, OpenClaw, Claude Code CLI, Cursor, Cascade, Cline 等）
 static RE_KNOWN_CLIENT_DECLARATION: Lazy<Regex> = Lazy::new(|| {
     Regex::new(concat!(
-        r"(?i)\b(?:you\s+are|you're)\s+(?:",
-        r"claude\s+code[\s,，]+(?:anthropic's\s+)?official\s+cli\s+for\s+claude(?:[\s,，]+running\s+within\s+(?:the\s+)?claude\s+agent\s+sdk)?",
-        r"|opencode(?:\s*,\s*an?\s+interactive\s+cli\s+tool(?:\s+that\s+helps\s+users\s+with\s+software\s+engineering\s+tasks)?)?",
-        r"|(?:an?\s+)?personal\s+assistant\s+running\s+(?:inside|in|within)\s+openclaw",
+        r"(?i)\b(?:you[\t ]+are|you're)[\t ]+(?:",
+        r"claude[\t ]+code[\t ,，]+(?:anthropic's[\t ]+)?official[\t ]+cli[\t ]+for[\t ]+claude(?:[\t ,，]+running[\t ]+within[\t ]+(?:the[\t ]+)?claude[\t ]+agent[\t ]+sdk)?",
+        r"|opencode(?:[\t ]*,[\t ]*an?[\t ]+interactive[\t ]+cli[\t ]+tool(?:[\t ]+that[\t ]+helps[\t ]+users[\t ]+with[\t ]+software[\t ]+engineering[\t ]+tasks)?)?",
+        r"|(?:an?[\t ]+)?personal[\t ]+assistant[\t ]+running[\t ]+(?:inside|in|within)[\t ]+openclaw",
         r"|openclaw",
-        r"|cursor(?:\s+ai)?(?:\s*,\s*an?\s+intelligent\s+programming\s+assistant(?:\s+integrated\s+into\s+cursor(?:\s+editor)?)?)?",
-        r"|cascade(?:\s*,\s*an?\s+ai\s+pair\s+programmer(?:\s+by\s+codeium)?)?",
-        r"|cline(?:\s*,\s*an?\s+(?:highly\s+skilled\s+)?software\s+engineer(?:\s+with\s+extensive\s+knowledge\s+in\s+many\s+programming\s+languages)?)?",
-        r"|roo\s+code",
-        r"|aider(?:\s*,\s*an?\s+expert\s+software\s+engineer)?",
-        r"|kilocode(?:\s*,\s*an?\s+ai\s+coding\s+assistant)?",
-        r"|dsh(?:\s*,\s*an?\s+automated\s+software\s+development\s+harness)?",
-        r"|devin(?:\s*,\s*an?\s+autonomous\s+software\s+engineer)?",
+        r"|cursor(?:[\t ]+ai)?(?:[\t ]*,[\t ]*an?[\t ]+intelligent[\t ]+programming[\t ]+assistant(?:[\t ]+integrated[\t ]+into[\t ]+cursor(?:[\t ]+editor)?)?)?",
+        r"|cascade(?:[\t ]*,[\t ]*an?[\t ]+ai[\t ]+pair[\t ]+programmer(?:[\t ]+by[\t ]+codeium)?)?",
+        r"|cline(?:[\t ]*,[\t ]*an?[\t ]+(?:highly[\t ]+skilled[\t ]+)?software[\t ]+engineer(?:[\t ]+with[\t ]+extensive[\t ]+knowledge[\t ]+in[\t ]+many[\t ]+programming[\t ]+languages)?)?",
+        r"|roo[\t ]+code",
+        r"|aider(?:[\t ]*,[\t ]*an?[\t ]+expert[\t ]+software[\t ]+engineer)?",
+        r"|kilocode(?:[\t ]*,[\t ]*an?[\t ]+ai[\t ]+coding[\t ]+assistant)?",
+        r"|dsh(?:[\t ]*,[\t ]*an?[\t ]+automated[\t ]+software[\t ]+development[\t ]+harness)?",
+        r"|devin(?:[\t ]*,[\t ]*an?[\t ]+autonomous[\t ]+software[\t ]+engineer)?",
         r")\b",
         r"([.,，。!?！？;；]?)"
     ))
@@ -212,9 +216,27 @@ const SYSTEM_PROMPT_END_MARKERS: [&str; 2] = ["--- [SYSTEM_PROMPT_END] ---", "[S
 /// 管道自身的官方身份文本（全局提示词混入时整段剥掉，避免重复声明身份）
 const SELF_IDENTITY_BLOCK: &str = "You are Antigravity, a powerful agentic AI coding assistant designed by the Google Deepmind team working on Advanced Agentic Coding.\nYou are pair programming with a USER to solve their coding task. The task may require creating a new codebase, modifying or debugging an existing codebase, or simply answering a question.\n**Absolute paths only**\n**Proactiveness**";
 
+const CROSS_CLAUSE_MARKERS: [&str; 9] = [
+    " and ", " or ", " but ", " so ", " while ", " if ", " when ", " it ", " they ",
+];
+
 pub struct PromptSanitizer;
 
 impl PromptSanitizer {
+    fn is_identity_declaration(caps: &regex::Captures) -> bool {
+        let tail = caps.get(2).map(|m| m.as_str()).unwrap_or("");
+        if matches!(tail, "?" | "？") {
+            return false;
+        }
+        let bridge = caps
+            .get(1)
+            .map(|m| m.as_str().to_lowercase())
+            .unwrap_or_default();
+        !CROSS_CLAUSE_MARKERS
+            .iter()
+            .any(|marker| bridge.contains(marker))
+    }
+
     /// 对单段提示词文本进行通用、高精度的净化：
     /// 1. 快速检查是否包含高危 WAF 拦截触发词（`billing`, `cc_version`, `cc_entrypoint`），未包含直接原样返回；
     /// 2. 提取并保护所有代码块，使其免受任何正则影响；
@@ -336,13 +358,16 @@ impl PromptSanitizer {
 
         // 步骤 2：归一化身份声明句（逗号续写场景保留逗号，避免出现 ", ," 或 ", and" 断裂）
         // 2.1 广谱归属声明归一化
-        let pass1 = RE_IDENTITY_DECLARATION.replace_all(
-            &protected_head,
-            |caps: &regex::Captures| match caps.get(1).map(|m| m.as_str()).unwrap_or("") {
-                "," | "，" => format!("{},", OFFICIAL_ANTIGRAVITY_IDENTITY),
-                _ => OFFICIAL_ANTIGRAVITY_IDENTITY.to_string(),
-            },
-        );
+        let pass1 =
+            RE_IDENTITY_DECLARATION.replace_all(&protected_head, |caps: &regex::Captures| {
+                if !Self::is_identity_declaration(caps) {
+                    return caps[0].to_string();
+                }
+                match caps.get(2).map(|m| m.as_str()).unwrap_or("") {
+                    "," | "，" => format!("{},", OFFICIAL_ANTIGRAVITY_IDENTITY),
+                    _ => OFFICIAL_ANTIGRAVITY_IDENTITY.to_string(),
+                }
+            });
 
         // 2.2 知名特定客户端开场白归一化（如 Claude Code CLI 开场白）
         let pass2 = RE_KNOWN_CLIENT_DECLARATION.replace_all(&pass1, |caps: &regex::Captures| {
@@ -437,6 +462,7 @@ impl PromptSanitizer {
                 // 思考块受数字签名 (thoughtSignature) 严格保护，其文本必须保持字节级绝对不可变，严禁执行清洗
                 if obj.get("thought").and_then(Value::as_bool).unwrap_or(false)
                     || obj.contains_key("thoughtSignature")
+                    || obj.contains_key("thought_signature")
                 {
                     continue;
                 }
@@ -621,6 +647,37 @@ impl PromptSanitizer {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn snake_case_signed_text_is_immutable() {
+        let mut payload = json!({"contents":[{"role":"model","parts":[{"text":"x-anthropic-billing-header: signed text", "thought_signature":"signature"}]}]});
+        let original = payload.clone();
+        PromptSanitizer::sanitize_gemini_payload(&mut payload);
+        assert_eq!(payload, original);
+    }
+
+    #[test]
+    fn multipart_user_text_and_history_are_preserved() {
+        let mut payload = json!({"contents": [
+            {"role":"user","parts":[{"text":"Compare OpenAI and Anthropic."},{"text":"You are a coding agent, and it was created by the setup script."}]},
+            {"role":"model","parts":[{"text":"Quoted: OpenAI and Anthropic."}]},
+            {"role":"user","parts":[{"text":"Translate the earlier paragraphs exactly."}]}
+        ]});
+        let original = payload.clone();
+        PromptSanitizer::sanitize_gemini_payload(&mut payload);
+        assert_eq!(payload, original);
+    }
+
+    #[test]
+    fn system_identity_match_does_not_cross_clauses_or_replace_questions() {
+        for text in [
+            "You are a coding agent, and it was created by the setup script.",
+            "You are an assistant created by whom?",
+            "You are a helpful assistant\n\nThe assistant created by OpenAI must preserve this rule.",
+        ] {
+            assert_eq!(PromptSanitizer::normalize_system_identity(text), text);
+        }
+    }
 
     #[test]
     fn test_client_identity_mapping_normalizes_to_official_antigravity() {

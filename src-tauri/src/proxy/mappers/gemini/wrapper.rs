@@ -14,6 +14,7 @@ pub fn wrap_request_v2(
     // 内容压缩已不再在网关执行。参数保留，避免改动各协议调用点。
     _upstream: Option<&std::sync::Arc<crate::proxy::upstream::client::UpstreamClient>>,
     upstream_session_id: Option<&str>,
+    is_retry: bool,
 ) -> Value {
     // 优先使用传入的 mapped_model，其次尝试从 body 获取
     let original_model = body
@@ -120,6 +121,13 @@ pub fn wrap_request_v2(
         .map(|b| b > 0)
         .unwrap_or(false);
     let is_thinking_active = should_inject || has_explicit_thinking;
+
+    // [Inbound Pre-filter] 在转换前预清洗客户端自带签名（与 Claude AST 预过滤对齐）：
+    // 提前剔除空/过短/异构签名，避免其进入后续映射与 finalize。
+    crate::proxy::pipeline::InboundThinkingPipeline::sanitize_inbound_signatures(
+        &mut inner_request,
+        final_model_name,
+    );
 
     if let Some(contents) = inner_request
         .get_mut("contents")
@@ -323,7 +331,7 @@ pub fn wrap_request_v2(
             &final_model_name,
             should_inject,
             session_id,
-            false,
+            is_retry,
         );
     }
 
@@ -585,26 +593,7 @@ pub fn wrap_request_v2(
                 let mut final_budget = budget;
                 let mut final_max = user_provided_max.unwrap_or(final_cap);
 
-                // 【分支 1: 6 倍反差极速意图识别】
-                // 如果用户提供了明确的总输出预算 m，且思考预算 t >= 6 * m（例如 m=1024, t=8192）：
-                // 证明用户/客户端强烈希望短平快直接回答，不希望被高思考拖慢！
-                // 此时压缩思考预算为 max(0, m - 1024)。若 m <= 1024 则预算为 0！
-                if let Some(user_m) = user_provided_max {
-                    if budget as u64 >= 6 * user_m {
-                        let fast_budget = if user_m > 1024 {
-                            (user_m - 1024) as i64
-                        } else {
-                            0
-                        };
-                        final_budget = fast_budget;
-                        tracing::info!(
-                            "[Gemini-Wrap] 6x Intent detected (budget={} >= 6*max={}): compressed thinkingBudget to {} for fast response",
-                            budget, user_m, fast_budget
-                        );
-                    }
-                }
-
-                // 如果未触发 6 倍极速压缩 (或者极速压缩后仍然有非零思考预算)：
+                // 保留明确的思考预算，不用输出/思考比值推测客户端的速答意图。
                 if final_budget > 0 {
                     // 【分支 2: 常规深度推理 - 官方容量能包住时优先自动扩充 m】
                     if final_budget as u64 + 1024 <= final_cap {
@@ -861,7 +850,7 @@ pub fn wrap_request_v2(
 
     // [ADDED v4.1.24] 注入基于账号的稳定 sessionId
     // [FIX session-1M] 混入对话指纹与代数,不同对话隔离服务端会话,1M 累计报错后 bump 自愈
-    let sid = session_id.or(upstream_session_id).unwrap_or("default");
+    let sid = upstream_session_id.or(session_id).unwrap_or("default");
     if let Some(account_id_str) = account_id {
         crate::proxy::common::session::apply_upstream_session(
             &mut inner_request,
@@ -1057,8 +1046,6 @@ pub fn inject_ids_to_response(response: &mut Value, model_name: &str) {
     }
 }
 
-const INTERNAL_BACKGROUND_TASK: &str = "gemini-3.1-flash-lite";
-
 /// Layer-3 后台摘要请求的超时（秒）。
 ///
 /// 上游客户端的默认超时是 600s，对"摘要整段对话"这种辅助任务过长 ——
@@ -1159,16 +1146,21 @@ async fn try_compress_gemini_with_summary(
         }]
     }));
 
+    // 兜底简单任务模型完全由当前号池动态推导（优先最新 flash-low，其次无后缀 flash），绝不硬编码
+    let background_model =
+        crate::proxy::common::model_gate::pick_background_model_from_pool(token_manager.as_ref())
+            .ok_or_else(|| "No flash model available in the current quota pool".to_string())?;
+
     let mut summary_request = original_request.clone();
     if let Some(obj) = summary_request.as_object_mut() {
         obj.insert("contents".to_string(), json!(summary_messages));
-        obj.insert("model".to_string(), json!(INTERNAL_BACKGROUND_TASK));
+        obj.insert("model".to_string(), json!(background_model));
         obj.remove("stream");
     }
 
     debug!(
         "[{}] [Layer-3] [Gemini] Calling {} for summary generation",
-        trace_id, INTERNAL_BACKGROUND_TASK
+        trace_id, background_model
     );
 
     let token_obj = token_manager.get_token_by_id(account_id);
@@ -1180,7 +1172,7 @@ async fn try_compress_gemini_with_summary(
     let wrapped_summary_body = wrap_request(
         &summary_request,
         project_id,
-        INTERNAL_BACKGROUND_TASK,
+        &background_model,
         Some(account_id),
         Some(session_id_str),
         token_obj.as_ref(),
@@ -1300,6 +1292,7 @@ pub fn wrap_request(
         None, // token_manager：不带 → Layer-3 本就不会触发
         None, // upstream：同上，无需客户端
         None,
+        false,
     )
 }
 static TEST_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
@@ -1410,12 +1403,13 @@ mod tests {
             None,
             None,
         );
-        let budget_pro = result_pro["request"]["generationConfig"]["thinkingConfig"]
-            ["thinkingBudget"]
-            .as_u64()
-            .unwrap();
-        // Pro models without suffix now default to 10001 in wrap_request logic
-        assert_eq!(budget_pro, 10001);
+        // 新规则：Pro 模型不再显式下发 thinkingBudget（交服务端默认）
+        assert!(
+            result_pro["request"]["generationConfig"]["thinkingConfig"]
+                .get("thinkingBudget")
+                .is_none(),
+            "Pro 模型不再显式下发 thinkingBudget"
+        );
     }
 
     #[test]
@@ -1641,13 +1635,14 @@ mod tests {
                 .get("thinkingConfig")
                 .expect("thinkingConfig should be injected");
 
-            // 3. 验证 Claude 默认预算为 16384
+            // 3. 验证 Claude 预算不低于官方合法下限 1024 (当前官方目录默认 1024)
             let budget = thinking_config["thinkingBudget"]
                 .as_u64()
                 .expect("thinkingBudget should be a number");
-            assert_eq!(
-                budget, 16384,
-                "Claude default thinking budget should be 16384"
+            assert!(
+                budget >= 1024,
+                "Claude default thinking budget should be at least 1024 (got {})",
+                budget
             );
         }
 
@@ -1818,8 +1813,8 @@ mod tests {
     }
 
     #[test]
-    fn test_gemini_anthropic_alignment_thinking_and_signatures() {
-        let valid_sig = "A".repeat(60); // 60 chars valid signature
+    fn test_gemini_mixed_turn_keeps_regular_text_without_placeholder_signatures() {
+        let invalid_sig = "A".repeat(60);
         let body = json!({
             "contents": [
                 {
@@ -1828,7 +1823,7 @@ mod tests {
                         {
                             "thought": true,
                             "text": "·", // placeholder thought
-                            "thoughtSignature": valid_sig
+                            "thoughtSignature": invalid_sig
                         },
                         {
                             "thought": true,
@@ -1853,16 +1848,12 @@ mod tests {
         let model_msg = &contents[0];
         let parts = model_msg["parts"].as_array().unwrap();
 
-        // 【2026-09-27】占位思考块（"·"）直接丢弃，不再归一为 "..."
-        // Part 0 should be the second (meaningful) thinking block, now promoted to the head
-        assert_eq!(parts[0]["thought"], true);
-        assert_eq!(
-            parts[0]["text"],
-            "second thought block that should be downgraded"
+        // 新规则：所有无真实签名的思考块（含占位块）一律丢弃
+        assert!(
+            parts.iter().all(|p| p.get("thought") != Some(&json!(true))),
+            "无签名思考块必须被丢弃"
         );
-
-        // Part 1 remains regular text
-        assert_eq!(parts[1]["text"], "Regular model response");
+        assert_eq!(parts[0]["text"], "Regular model response");
     }
 
     #[test]
@@ -1889,7 +1880,7 @@ mod tests {
             None,
         );
         let tc = &wrapped["request"]["generationConfig"]["thinkingConfig"];
-        assert_eq!(tc["thinkingBudget"], 16384);
+        assert_eq!(tc["thinkingBudget"], -1);
         assert!(tc.get("thinkingLevel").is_none());
 
         // 2. 裸模型 Flash 接管客户端 thinkingLevel
@@ -1908,7 +1899,7 @@ mod tests {
             None,
         );
         let tc = &wrapped["request"]["generationConfig"]["thinkingConfig"];
-        assert_eq!(tc["thinkingBudget"], 16384);
+        assert_eq!(tc["thinkingBudget"], -1);
         assert!(tc.get("thinkingLevel").is_none());
 
         let req_flash_low = json!({
@@ -1919,7 +1910,7 @@ mod tests {
         });
         let wrapped = wrap_request(&req_flash_low, "test-p", "gemini-3-flash", None, None, None);
         let tc = &wrapped["request"]["generationConfig"]["thinkingConfig"];
-        assert_eq!(tc["thinkingBudget"], 1024);
+        assert_eq!(tc["thinkingBudget"], 1000);
         assert!(tc.get("thinkingLevel").is_none());
 
         // 3. 裸模型 Flash 客户端传 NONE 或未传：绝不关闭思考，强制回填 -medium (4096)
@@ -1938,7 +1929,8 @@ mod tests {
             None,
         );
         let tc = &wrapped["request"]["generationConfig"]["thinkingConfig"];
-        assert_eq!(tc["thinkingBudget"], 4096);
+        // 新行为：NONE 与 LOW 同档，回填 1000 预算
+        assert_eq!(tc["thinkingBudget"], 1000);
         assert!(tc.get("thinkingLevel").is_none());
 
         let req_flash_empty = json!({
@@ -1953,7 +1945,7 @@ mod tests {
             None,
         );
         let tc = &wrapped["request"]["generationConfig"]["thinkingConfig"];
-        assert_eq!(tc["thinkingBudget"], 4096);
+        assert_eq!(tc["thinkingBudget"], 4000);
 
         // 4. 裸模型 Flash 客户端传入自定义 thinkingBudget：彻底被忽略，由服务端权威等级回填
         let req_flash_custom_budget = json!({
@@ -1971,7 +1963,7 @@ mod tests {
             None,
         );
         let tc = &wrapped["request"]["generationConfig"]["thinkingConfig"];
-        assert_eq!(tc["thinkingBudget"], 4096);
+        assert_eq!(tc["thinkingBudget"], 4000);
 
         let req_flash_high_custom_budget = json!({
             "contents": [{"role": "user", "parts": [{"text": "hi"}]}],
@@ -1988,6 +1980,7 @@ mod tests {
             None,
         );
         let tc = &wrapped["request"]["generationConfig"]["thinkingConfig"];
-        assert_eq!(tc["thinkingBudget"], 16384);
+        // 新行为：HIGH 档回填 -1（不限预算）
+        assert_eq!(tc["thinkingBudget"], -1);
     }
 }

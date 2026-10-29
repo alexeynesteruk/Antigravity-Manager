@@ -11,6 +11,8 @@ pub enum UpstreamClassification {
     InternalGatewayMessage,
     /// 思考签名失效或跨模型异构签名污染错误（400 Invalid signature in thinking block）
     ThoughtSignatureError,
+    /// 上游多模态图像解码或处理失败错误（400 Unable to process input image 等）
+    ImageProcessingError,
     /// 其他普通客户端错误
     OtherClientError(u16),
 }
@@ -19,6 +21,12 @@ impl UpstreamClassification {
     /// 统一分类器：协议无关，全局唯一真理
     pub fn classify(status: u16, body: &str, retry_after_header: Option<&str>) -> Self {
         let lower = body.to_lowercase();
+        // 0. 网关自答（model not exist / no quota accounts）最高优先级豁免：
+        //    它们不对应任何账号，绝不允许触发换号、粘性解绑或账号冷却。
+        if crate::proxy::common::model_gate::is_gateway_self_answer(body) {
+            return UpstreamClassification::InternalGatewayMessage;
+        }
+
         // 1. 优先排除网关自身内部错误（防自噬死循环）
         if lower.contains("all accounts limited")
             || lower.contains("no accounts available")
@@ -61,7 +69,12 @@ impl UpstreamClassification {
             return UpstreamClassification::ThoughtSignatureError;
         }
 
-        // 4. 判定真正的限流 (仅限 429 和 529)
+        // 4. 判定上游图像解码/处理失败 (400 Unable to process input image)
+        if Self::is_image_processing_error_str(status, body) {
+            return UpstreamClassification::ImageProcessingError;
+        }
+
+        // 5. 判定真正的限流 (仅限 429 和 529)
         if status == 429 || status == 529 {
             let delay = crate::proxy::upstream::retry::parse_retry_delay(body, retry_after_header)
                 .map(|ms| ms.saturating_add(999) / 1000);
@@ -101,9 +114,33 @@ impl UpstreamClassification {
         matches!(self, UpstreamClassification::ThoughtSignatureError)
     }
 
+    /// 该分类是否为上游图像解码/处理失败
+    pub fn is_image_processing_error(&self) -> bool {
+        matches!(self, UpstreamClassification::ImageProcessingError)
+    }
+
     /// 该分类是否为网关自身内部消息
     pub fn is_internal_gateway_message(&self) -> bool {
         matches!(self, UpstreamClassification::InternalGatewayMessage)
+    }
+
+    /// 判断是否为上游多模态图像解码或处理错误 (400 "Unable to process input image")
+    pub fn is_image_processing_error_str(status: u16, body: &str) -> bool {
+        if status != 400 {
+            return false;
+        }
+        let lower = body.to_lowercase();
+        lower.contains("unable to process input image")
+            || lower.contains("failed to process input image")
+            || lower.contains("cannot process input image")
+            || lower.contains("could not process image")
+            || lower.contains("error processing input image")
+            || lower.contains("invalid input image")
+            || lower.contains("unable to decode image")
+            || lower.contains("unsupported image format")
+            || lower.contains("image decoding failed")
+            || (lower.contains("process input image")
+                && lower.contains("developers.generativeai.google"))
     }
 
     /// 判断是否为上游服务过载（HTTP 503 / 529，或 500/504 等返回 "model is overloaded"）
@@ -187,5 +224,45 @@ mod tests {
             400,
             "Normal 400 bad request"
         ));
+    }
+
+    #[test]
+    fn test_image_processing_error_classification() {
+        let err_body = r#"API Error: 400 Unable to process input image. Please retry or report in https://developers.generativeai.google/guide/troubleshooting"#;
+        let classification = UpstreamClassification::classify(400, err_body, None);
+        assert_eq!(classification, UpstreamClassification::ImageProcessingError);
+        assert!(classification.is_image_processing_error());
+        assert!(!classification.should_lock_account());
+        assert!(!classification.abandons_sticky_account());
+
+        assert!(UpstreamClassification::is_image_processing_error_str(
+            400, err_body
+        ));
+        assert!(UpstreamClassification::is_image_processing_error_str(
+            400,
+            r#"{"error":{"message":"Failed to process input image due to decoding error"}}"#
+        ));
+        assert!(!UpstreamClassification::is_image_processing_error_str(
+            200, err_body
+        ));
+        assert!(!UpstreamClassification::is_image_processing_error_str(
+            400,
+            "Invalid signature in thinking block"
+        ));
+    }
+
+    #[test]
+    fn test_gateway_self_answer_never_penalizes_accounts() {
+        // 404 model not exist：网关代答，绝不能解绑粘性会话或打入冷却
+        let not_found = UpstreamClassification::classify(404, "model not exist", None);
+        assert_eq!(not_found, UpstreamClassification::InternalGatewayMessage);
+        assert!(!not_found.should_lock_account());
+        assert!(!not_found.abandons_sticky_account());
+
+        // 502 no quota accounts：即使文本包含 quota 关键词，也必须豁免
+        let no_quota = UpstreamClassification::classify(502, "no quota accounts", None);
+        assert_eq!(no_quota, UpstreamClassification::InternalGatewayMessage);
+        assert!(!no_quota.should_lock_account());
+        assert!(!no_quota.abandons_sticky_account());
     }
 }

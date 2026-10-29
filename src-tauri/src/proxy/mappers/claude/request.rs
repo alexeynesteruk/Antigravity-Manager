@@ -398,7 +398,7 @@ pub fn transform_claude_request_in_timed(
     is_retry: bool,
     account_id: Option<&str>,
     thinking_session_id: &str,
-    _upstream_session_id: &str,
+    upstream_session_id: &str,
     token: Option<&crate::proxy::token_manager::ProxyToken>, // [NEW] 支持动态规格
 ) -> Result<(Value, TransformTiming), String> {
     let mut timing = TransformTiming::default();
@@ -747,7 +747,7 @@ pub fn transform_claude_request_in_timed(
         crate::proxy::common::session::apply_upstream_session(
             &mut inner_request,
             account_id,
-            &session_id,
+            upstream_session_id,
         );
     }
 
@@ -1650,7 +1650,7 @@ fn build_google_contents(
         mapped_model,
         should_finalize_thinking,
         Some(session_id),
-        false,
+        is_retry,
     );
     timing.think_fill_micros = think_start.elapsed().as_micros() as u64;
 
@@ -2848,7 +2848,7 @@ mod tests {
         let _lock = crate::proxy::config::TEST_CONFIG_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        // Setup request for Gemini Pro (no -thinking suffix)
+        // The shared pipeline decides the server-authoritative budget.
         let req = ClaudeRequest {
             model: "gemini-3-pro-preview".to_string(),
             messages: vec![Message {
@@ -2886,11 +2886,21 @@ mod tests {
             "thinkingConfig should be preserved for gemini-3-pro"
         );
 
-        let budget = gen_config["thinkingConfig"]["thinkingBudget"]
-            .as_u64()
-            .unwrap();
-        // In Auto mode, client's budget is ignored and bare gemini-3-pro defaults to 10001
-        assert_eq!(budget, 10001);
+        // The shared pipeline decides the server-authoritative budget.
+        assert_eq!(gen_config["thinkingConfig"]["includeThoughts"], true);
+        let mut expected = json!({});
+        crate::proxy::pipeline::InboundThinkingPipeline::configure_inbound_thinking(
+            "gemini-3-pro-preview",
+            &mut expected,
+            crate::proxy::pipeline::inbound::ClientThinkingSwitch::Enabled,
+            None,
+            Some(16000),
+            None,
+        );
+        assert_eq!(
+            &gen_config["thinkingConfig"], &expected["thinkingConfig"],
+            "adapter must preserve shared pipeline thinking policy"
+        );
     }
 
     #[test]
@@ -3319,12 +3329,9 @@ mod tests {
             .as_array()
             .expect("Contents array");
         let assistant_parts = contents[1]["parts"].as_array().expect("Assistant parts");
-        assert_eq!(assistant_parts.len(), 2);
-        assert!(assistant_parts[0]["text"]
-            .as_str()
-            .unwrap_or("")
-            .contains("Considering the question deeply..."));
-        assert_eq!(assistant_parts[1]["text"], "Here is my answer");
+        // 新规则：无签名思考块出站前丢弃，仅保留正文
+        assert_eq!(assistant_parts.len(), 1);
+        assert_eq!(assistant_parts[0]["text"], "Here is my answer");
     }
 
     #[test]

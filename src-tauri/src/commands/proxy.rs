@@ -169,6 +169,7 @@ pub async fn internal_start_proxy_service(
 
     // 同步配置到运行中的 TokenManager
     token_manager.start_auto_cleanup().await;
+    token_manager.set_default_max_concurrency(config.account_max_concurrency);
     token_manager
         .update_sticky_config(config.scheduling.clone())
         .await;
@@ -311,6 +312,7 @@ pub async fn ensure_admin_server(
     crate::proxy::update_image_thinking_mode(config.image_thinking_mode.clone());
     crate::proxy::update_multimodal_config(config.multimodal.clone());
     crate::proxy::update_stream_timeout_config(config.stream_timeouts.clone());
+    crate::proxy::update_upload_timeout_config(config.upload_timeouts.clone());
     crate::proxy::config::update_global_audit_config(
         config.experimental.payload_storage_mode.clone(),
         config.experimental.log_retention_days,
@@ -476,6 +478,28 @@ pub async fn clear_thinking_store() -> Result<usize, String> {
     tokio::task::spawn_blocking(crate::modules::proxy_db::clear_all_thinking_data)
         .await
         .map_err(|e| format!("Spawn blocking failed: {}", e))?
+}
+
+/// 签名缓存统计：环境预设 + L1/L2 命中、队列丢弃、pending 删除数。
+#[tauri::command]
+pub fn get_signature_cache_stats() -> serde_json::Value {
+    serde_json::json!({
+        "profile": crate::proxy::cache_profile(),
+        "stats": crate::proxy::signature_cache::signature_cache_stats(),
+        "thinking": crate::proxy::thinking_store::thinking_store_stats(),
+    })
+}
+
+/// 仅清空签名缓存（L1 + 工具签名 SQLite），不触碰思考块与请求日志。
+#[tauri::command]
+pub async fn clear_signature_cache() -> Result<usize, String> {
+    tokio::task::spawn_blocking(|| {
+        let before = crate::proxy::signature_cache::signature_cache_stats().l1_entries;
+        crate::proxy::SignatureCache::global().clear();
+        before
+    })
+    .await
+    .map_err(|e| format!("Spawn blocking failed: {}", e))
 }
 
 /// 获取当前思考块存储的记录总数

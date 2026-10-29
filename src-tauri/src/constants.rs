@@ -224,7 +224,7 @@ pub const OFFICIAL_HUB_CL: &str = "1000335682";
 
 /// Returns the official Antigravity Hub User-Agent matching the upstream egress signature:
 /// format: "antigravity/hub/{OFFICIAL_HUB_VERSION} (aidev_client; os_type={os}; arch={arch}; cl={OFFICIAL_HUB_CL})"
-/// e.g.: "antigravity/hub/2.23.1 (aidev_client; os_type=darwin; arch=arm64; cl=998881661)"
+/// e.g.: "antigravity/hub/2.24.0 (aidev_client; os_type=darwin; arch=arm64; cl=1000335682)"
 pub fn build_official_upstream_user_agent() -> String {
     crate::modules::hub_version::get_current_hub_user_agent()
 }
@@ -359,6 +359,15 @@ mod tests {
             "KNOWN_STABLE_VERSION ({}) must be > 4.1.22; please sync with Cargo.toml",
             KNOWN_STABLE_VERSION
         );
+    }
+
+    #[test]
+    fn test_official_hub_version_baseline() {
+        assert!(
+            compare_semver(OFFICIAL_HUB_VERSION, "2.23.1") > std::cmp::Ordering::Equal,
+            "OFFICIAL_HUB_VERSION must be >= 2.24.0 to satisfy upstream Google Argon gate"
+        );
+        assert_eq!(OFFICIAL_HUB_CL, "1000335682");
     }
 
     #[test]

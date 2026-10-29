@@ -3,6 +3,7 @@ export interface Account {
     email: string;
     name?: string;
     priority?: number;
+    max_concurrency?: number | null;
     token: TokenData;
     device_profile?: DeviceProfile;
     device_history?: DeviceProfileVersion[];
@@ -15,7 +16,9 @@ export interface Account {
     proxy_disabled_at?: number;
     protected_models?: string[];
     live_limited_models?: Record<string, LiveLimitStatus>;
-    custom_label?: string;  // User-defined custom label
+    custom_label?: string;  // 用户自定义标签
+    qos_status?: 'suspicious' | 'jailed' | 'probing' | 'half_open' | null; // 运行时 QoS 状态
+    qos_reset_seconds?: number | null; // 运行时 QoS 冷却剩余秒数
     validation_blocked?: boolean;
     validation_blocked_until?: number;
     validation_blocked_reason?: string;
@@ -141,9 +144,88 @@ export function getAccountTier(account: { quota?: QuotaData | null }): 'ultra' |
 }
 
 /**
+ * 统一收敛判定：该账号是否具备 Gemini 4 Argon 授权能力
+ * 涵盖两种套餐的 Argon 权威判据：
+ * 1. Ultra 旗舰套餐 (Google AI Ultra / Helium)：
+ *    Ultra 订阅上游全量授权 Argon（纳入高阶特权共享池），即便 quota_groups 未拆分独立桶，也原生享有 Argon 完整权限；
+ * 2. Pro 套餐或灰度专属分组 (Google AI Pro)：
+ *    上游在真实 quota_groups 中显式下发了 Argon 专属配额组（如 gemini-argon-wtu-weekly），
+ *    或（无 groups 离线兜底时）models 列表中明确包含非禁用的 Argon 官方条目；
+ * 3. Free / 未授权套餐：
+ *    未分配专属分组且非 Ultra，坚决判定为 false（严格防呆隔离，杜绝虚假徽章与卡片）。
+ */
+export function hasAccountArgonCapability(account: { quota?: QuotaData | null }): boolean {
+    const tier = getAccountTier(account);
+    const groups = account.quota?.quota_groups || [];
+    const models = account.quota?.models || [];
+    return checkArgonEligibility(groups, models, tier);
+}
+
+/**
+ * 依据配额组、模型列表与订阅等级综合校验 Argon 准入资格
+ */
+export function checkArgonEligibility(
+    groups: QuotaGroup[] = [],
+    models: ModelQuota[] = [],
+    tier?: 'ultra' | 'pro' | 'free'
+): boolean {
+    // 判据 1: Ultra 旗舰套餐（原生全量支持 Argon，共享或内置高阶池）
+    if (tier === 'ultra') {
+        const hasExplicitDisabled = models.some(m => {
+            const n = (m?.name || '').toLowerCase();
+            return /argon/i.test(n) && (n.includes('-disabled') || n.endsWith('_disabled') || (m as any)?.disabled);
+        });
+        if (hasExplicitDisabled) return false;
+        return true;
+    }
+
+    // 判据 2: Pro 套餐或灰度授权（必须在真实 quota_groups 中分配了专属 Argon 分组/桶）
+    const hasArgonInGroups = (groups || []).some(group => {
+        const groupName = (group?.display_name || '').toLowerCase();
+        return /argon/i.test(groupName)
+            || (group?.buckets || []).some(b => /argon/i.test(`${b?.bucket_id || ''} ${b?.display_name || ''}`));
+    });
+
+    if (hasArgonInGroups) {
+        return true;
+    }
+
+    // 判据 3: 无 groups 数据时的离线/冷启动兜底（仅当服务端未返回任何 groups，且 models 明确包含非禁用 Argon 模型）
+    if (!groups || groups.length === 0) {
+        return models.some(m => {
+            const n = (m?.name || '').toLowerCase();
+            return /argon/i.test(n) && !n.includes('-disabled') && !n.endsWith('_disabled') && !(m as any)?.disabled;
+        });
+    }
+
+    // 其余情况（如 Free 账号但仅有普通 Gemini 组，无 Argon 专属组）：坚决判定为 false (Fixes #3745)
+    return false;
+}
+
+/**
  * 订阅等级的展示文案。所有徽标都应使用它，避免直接把后端的原始字符串
  * （如 "Antigravity Starter Quota"）渲染到界面上。
  */
 export function getTierLabel(tier: 'ultra' | 'pro' | 'free'): string {
     return tier.toUpperCase();
+}
+
+export interface ImportAccountEntry {
+    email?: string;
+    refresh_token: string;
+}
+
+export interface BatchImportProgress {
+    current: number;
+    total: number;
+    success: number;
+    failed: number;
+    current_email?: string;
+}
+
+export interface BatchImportResult {
+    total: number;
+    success: number;
+    failed: number;
+    errors: string[];
 }
