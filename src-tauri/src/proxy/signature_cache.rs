@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{
     sync_channel, Receiver, RecvTimeoutError, SyncSender, TryRecvError, TrySendError,
 };
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Mutex, OnceLock, RwLock};
 use std::time::{Duration, Instant, SystemTime};
 
 // Node.js proxy uses 2 hours TTL
@@ -227,9 +227,33 @@ fn flush_touch_batch(batch: &mut HashMap<String, (u64, i64)>) {
 fn mark_dirty_save(key: String, signature: String, seq: u64) {
     let slot = DIRTY_SAVES.get_or_init(|| Mutex::new(HashMap::new()));
     if let Ok(mut map) = slot.lock() {
-        if map.len() < DIRTY_SAVE_CAP || map.contains_key(&key) {
-            map.insert(key, (signature, seq));
+        insert_dirty_save(&mut map, key, signature, seq);
+    }
+}
+
+fn insert_dirty_save(
+    map: &mut HashMap<String, (String, u64)>,
+    key: String,
+    signature: String,
+    seq: u64,
+) {
+    let newer = map.get(&key).is_none_or(|(_, current)| seq >= *current);
+    if newer && (map.len() < DIRTY_SAVE_CAP || map.contains_key(&key)) {
+        map.insert(key, (signature, seq));
+    }
+}
+
+fn discard_superseded_dirty_save(key: &str, seq: u64) {
+    if let Some(slot) = DIRTY_SAVES.get() {
+        if let Ok(mut map) = slot.lock() {
+            discard_superseded_save(&mut map, key, seq);
         }
+    }
+}
+
+fn discard_superseded_save(map: &mut HashMap<String, (String, u64)>, key: &str, seq: u64) {
+    if map.get(key).is_some_and(|(_, current)| *current <= seq) {
+        map.remove(key);
     }
 }
 
@@ -375,6 +399,9 @@ fn run_tool_sig_persist_worker(
                     if !is_session_delete_pending_for_scoped_key(&key)
                         && SignatureCache::is_persist_entry_current(&key, seq)
                     {
+                        // A newer queued save supersedes an older overflow or
+                        // failed-write retry, even if this batch flushes first.
+                        discard_superseded_dirty_save(&key, seq);
                         let should_insert = batch
                             .get(&key)
                             .map(|(_, existing_seq)| seq >= *existing_seq)
@@ -485,6 +512,9 @@ impl<T> CacheEntry<T> {
 /// 2. Cross-model compatibility checks (preventing Claude signatures on Gemini models)
 /// 3. Session-based signature tracking (preventing cross-session pollution)
 pub struct SignatureCache {
+    // Order tool writes/enqueues and keep an L2 restore inside the same
+    // invalidation boundary. Ordinary lookups may run concurrently.
+    tool_update_lock: RwLock<()>,
     /// Layer 1: Scoped Tool Use ID -> Thinking Signature (with epoch-guarded negative cache)
     /// Key: "{store_key}\x1f{normalized_tool_use_id}"
     /// Value: Present(signature) or Missing { write_epoch }
@@ -597,6 +627,7 @@ impl SignatureCache {
 
     fn with_persist_mode(persist_mode: PersistMode) -> Self {
         Self {
+            tool_update_lock: RwLock::new(()),
             tool_signatures: DashMap::new(),
             thinking_families: Mutex::new(HashMap::new()),
             session_signatures: Mutex::new(HashMap::new()),
@@ -728,6 +759,10 @@ impl SignatureCache {
     }
 
     pub fn cache_tool_signature(&self, store_key: &str, tool_use_id: &str, signature: String) {
+        let _update = self
+            .tool_update_lock
+            .write()
+            .unwrap_or_else(|e| e.into_inner());
         let Some(signature) = crate::modules::proxy_db::normalize_and_heal_signature(&signature)
         else {
             return;
@@ -846,6 +881,10 @@ impl SignatureCache {
 
     /// Retrieve a signature for a tool_use_id inside one session store.
     pub fn get_tool_signature(&self, store_key: &str, tool_use_id: &str) -> Option<String> {
+        let _update = self
+            .tool_update_lock
+            .read()
+            .unwrap_or_else(|e| e.into_inner());
         let started = Instant::now();
         if self.persist_mode == PersistMode::Async && is_session_delete_pending_for_store(store_key)
         {
@@ -945,6 +984,10 @@ impl SignatureCache {
         store_key: &str,
         tool_ids: &[String],
     ) -> HashMap<String, String> {
+        let _update = self
+            .tool_update_lock
+            .read()
+            .unwrap_or_else(|e| e.into_inner());
         let mut result = HashMap::new();
         if tool_ids.is_empty() {
             return result;
@@ -1355,6 +1398,10 @@ impl SignatureCache {
     /// 删除指定会话的缓存签名（同步清理会话级签名、工具调用签名及底层 SQLite 持久化，保留会话推理文本）
     #[allow(dead_code)] // 预留给重试剥离、管理接口或调试使用
     pub fn delete_session_signature(&self, session_id: &str) {
+        let _update = self
+            .tool_update_lock
+            .write()
+            .unwrap_or_else(|e| e.into_inner());
         let session_id = session_id.trim();
         if session_id.is_empty() {
             return;
@@ -1434,6 +1481,10 @@ impl SignatureCache {
     /// Clear all caches (for testing or manual reset)
     #[allow(dead_code)] // Used in tests
     pub fn clear(&self) {
+        let _update = self
+            .tool_update_lock
+            .write()
+            .unwrap_or_else(|e| e.into_inner());
         let _ = Self::bump_global_persist_floor();
         self.tool_signatures.clear();
         if let Ok(mut cache) = self.thinking_families.lock() {
@@ -1946,6 +1997,27 @@ mod memory_budget_tests {
 #[cfg(test)]
 mod scoped_budget_regressions {
     use super::*;
+    #[test]
+    fn older_failed_save_never_overwrites_a_newer_retry() {
+        let mut dirty = HashMap::new();
+        let key = "session\u{1f}tool";
+        insert_dirty_save(&mut dirty, key.into(), "new".into(), 20);
+        insert_dirty_save(&mut dirty, key.into(), "old".into(), 10);
+        assert_eq!(dirty.get(key), Some(&("new".into(), 20)));
+        discard_superseded_save(&mut dirty, key, 10);
+        assert!(dirty.contains_key(key));
+        discard_superseded_save(&mut dirty, key, 20);
+        assert!(!dirty.contains_key(key));
+    }
+
+    #[test]
+    fn queued_newer_save_removes_an_older_overflow_retry() {
+        let mut dirty = HashMap::new();
+        let key = "session\u{1f}tool";
+        insert_dirty_save(&mut dirty, key.into(), "old".into(), 10);
+        discard_superseded_save(&mut dirty, key, 20);
+        assert!(!dirty.contains_key(key));
+    }
     #[test]
     fn tool_l1_byte_budget_survives_background_writer_refactor() {
         let cache = SignatureCache::with_persist_mode(PersistMode::MemoryOnly);
