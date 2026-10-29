@@ -110,10 +110,28 @@ impl QoSGuardian {
 
     /// 获取账号当前 QoS 状态（未记录则默认 Healthy）
     pub fn get_state(&self, account_id: &str) -> AccountQoSState {
-        self.states
+        let state = self
+            .states
             .get(account_id)
             .map(|r| r.value().clone())
-            .unwrap_or(AccountQoSState::Healthy)
+            .unwrap_or(AccountQoSState::Healthy);
+        if matches!(state, AccountQoSState::Suspicious { first_strike_at, .. }
+            if first_strike_at.elapsed() > Duration::from_secs(5 * 60))
+        {
+            // Idle suspicious accounts receive no new sessions, so expiry cannot
+            // depend on another completed request. Recheck under the write lock
+            // in case a concurrent observation has already jailed the account.
+            if let Some(mut current) = self.states.get_mut(account_id) {
+                if matches!(*current, AccountQoSState::Suspicious { first_strike_at, .. }
+                    if first_strike_at.elapsed() > Duration::from_secs(5 * 60))
+                {
+                    *current = AccountQoSState::Healthy;
+                }
+                return current.clone();
+            }
+            return AccountQoSState::Healthy;
+        }
+        state
     }
 
     /// 判断账号是否处于小黑屋或探针探测中（完全不可用于业务调度）
@@ -721,10 +739,20 @@ impl QoSGuardian {
             .collect();
 
         // 阶段 2：读锁已完全释放，逐个安全原子更新为 Probing 状态
+        self.mark_expired_jails_for_probing(candidates)
+    }
+
+    fn mark_expired_jails_for_probing(
+        &self,
+        candidates: Vec<(String, usize)>,
+    ) -> Vec<(String, usize)> {
         let mut expired = Vec::with_capacity(candidates.len());
         for (account_id, level) in candidates {
             if let Some(mut entry) = self.states.get_mut(&account_id) {
-                if let AccountQoSState::Jailed { .. } = *entry.value() {
+                if matches!(*entry.value(), AccountQoSState::Jailed {
+                    level: current_level, jailed_at, current_wait
+                } if current_level == level && jailed_at.elapsed() >= current_wait)
+                {
                     *entry.value_mut() = AccountQoSState::Probing {
                         level,
                         started_at: Instant::now(),
@@ -752,6 +780,67 @@ mod tests {
     use super::*;
     use std::collections::{HashMap, HashSet};
     use std::path::PathBuf;
+
+    #[test]
+    fn idle_suspicion_expires_before_scheduler_reuses_account() {
+        let guardian = QoSGuardian::new();
+        guardian.states.insert(
+            "idle".into(),
+            AccountQoSState::Suspicious {
+                first_strike_at: Instant::now() - Duration::from_secs(301),
+                strike_count: 1,
+                consecutive_healthy: 0,
+            },
+        );
+        assert!(!guardian.is_suspicious("idle"));
+        assert!(guardian.is_healthy("idle"));
+        guardian.states.insert(
+            "recent".into(),
+            AccountQoSState::Suspicious {
+                first_strike_at: Instant::now(),
+                strike_count: 1,
+                consecutive_healthy: 0,
+            },
+        );
+        assert!(guardian.is_suspicious("recent"));
+    }
+
+    #[test]
+    fn stale_jail_snapshot_cannot_skip_a_renewed_cooldown() {
+        let guardian = QoSGuardian::new();
+        // The scanner saw an expired level-0 jail before a concurrent failed
+        // probe renewed it. Neither the same level nor an escalated jail may
+        // use that stale scan result to bypass its new cooldown.
+        for level in [0, 1] {
+            guardian.states.insert(
+                "renewed".into(),
+                AccountQoSState::Jailed {
+                    level,
+                    jailed_at: Instant::now(),
+                    current_wait: Duration::from_secs(120),
+                },
+            );
+            assert!(guardian
+                .mark_expired_jails_for_probing(vec![("renewed".into(), 0)])
+                .is_empty());
+            assert!(
+                matches!(guardian.get_state("renewed"), AccountQoSState::Jailed { level: current, .. } if current == level)
+            );
+        }
+        guardian.states.insert(
+            "expired".into(),
+            AccountQoSState::Jailed {
+                level: 1,
+                jailed_at: Instant::now() - Duration::from_secs(121),
+                current_wait: Duration::from_secs(120),
+            },
+        );
+        assert_eq!(
+            guardian.take_expired_jails_for_probing(),
+            vec![("expired".into(), 1)]
+        );
+        assert!(guardian.take_expired_jails_for_probing().is_empty());
+    }
 
     fn create_test_token(account_id: &str, tier: &str) -> ProxyToken {
         ProxyToken {
