@@ -2426,13 +2426,7 @@ pub(crate) fn tenant_component(headers: &HeaderMap, tenant_id: Option<&str>) -> 
 }
 
 fn tenant_from_headers(headers: &HeaderMap) -> String {
-    let raw = headers
-        .get(axum::http::header::AUTHORIZATION)
-        .and_then(|h| h.to_str().ok())
-        .and_then(|s| s.strip_prefix("Bearer ").or(Some(s)))
-        .or_else(|| headers.get("x-api-key").and_then(|h| h.to_str().ok()))
-        .or_else(|| headers.get("x-goog-api-key").and_then(|h| h.to_str().ok()))
-        .unwrap_or("anon");
+    let raw = crate::proxy::middleware::auth::extract_header_api_key(headers).unwrap_or("anon");
     hash16(raw)
 }
 
@@ -3342,6 +3336,23 @@ pub fn fingerprint(visible: &str, tool_ids: &[String], tool_names: &[String]) ->
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tenant_headers_use_the_authenticated_credential_precedence() {
+        let mut headers = HeaderMap::new();
+        let anonymous = tenant_component(&headers, None);
+        for bearer in ["Bearer", "Bearer ", "bearer"] {
+            headers.insert("authorization", bearer.parse().unwrap());
+            assert_eq!(tenant_component(&headers, None), anonymous);
+        }
+        headers.insert("authorization", " ".parse().unwrap());
+        headers.insert("x-api-key", "first".parse().unwrap());
+        let first = tenant_component(&headers, None);
+        headers.insert("x-api-key", "second".parse().unwrap());
+        assert_ne!(tenant_component(&headers, None), first);
+        headers.insert("authorization", "bEaReR first".parse().unwrap());
+        assert_eq!(tenant_component(&headers, None), first);
+    }
 
     pub(super) fn rec(thought: &str, visible: &str, tool_id: Option<&str>) -> ThinkingRecord {
         let tool_ids = tool_id.map(|id| vec![id.to_string()]).unwrap_or_default();

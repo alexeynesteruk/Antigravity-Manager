@@ -269,6 +269,7 @@ pub(crate) struct UpstreamCapture {
     diagnostics: Option<(crate::proxy::config::DebugLoggingConfig, String)>,
     usage: Option<serde_json::Map<String, serde_json::Value>>,
     attempts: Option<Vec<crate::proxy::upstream::client::FallbackAttemptLog>>,
+    tool_call_tenant: Option<String>,
 }
 
 #[derive(Clone, Default)]
@@ -292,6 +293,16 @@ pub(crate) async fn scope_upstream_work<F: std::future::Future>(
 }
 
 impl UpstreamRequestBodyHolder {
+    pub(crate) fn set_tool_call_tenant(&self, tenant: Option<String>) {
+        if let Ok(mut capture) = self.0.lock() {
+            capture.tool_call_tenant = tenant;
+        }
+    }
+
+    pub(crate) fn tool_call_tenant(&self) -> Option<String> {
+        self.0.lock().ok()?.tool_call_tenant.clone()
+    }
+
     pub(crate) fn configure_diagnostics(
         &self,
         cfg: crate::proxy::config::DebugLoggingConfig,

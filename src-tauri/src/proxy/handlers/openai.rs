@@ -2118,6 +2118,12 @@ pub async fn handle_chat_completions(
             .as_ref()
             .map(|identity| identity.token_id.as_str()),
     );
+    configure_tool_call_tenant(
+        &headers,
+        user_identity
+            .as_ref()
+            .map(|identity| identity.token_id.as_str()),
+    );
     crate::proxy::pipeline::schema_limits::validate_request_tool_schemas(&body)
         .map_err(|error| (StatusCode::BAD_REQUEST, error))?;
 
@@ -3694,6 +3700,12 @@ pub async fn handle_completions(
         return (StatusCode::BAD_REQUEST, Json(json!({"error":{"type":"invalid_request_error","message":"input must be a string or an array"}}))).into_response();
     }
     let response_tenant = crate::proxy::thinking_store::tenant_component(
+        &headers,
+        user_identity
+            .as_ref()
+            .map(|identity| identity.token_id.as_str()),
+    );
+    configure_tool_call_tenant(
         &headers,
         user_identity
             .as_ref()
@@ -7328,20 +7340,42 @@ impl ToolCallCache {
 
 static WEBSOCKET_TOOL_CALL_CACHE: OnceLock<TokioRwLock<ToolCallCache>> = OnceLock::new();
 
+fn configure_tool_call_tenant(headers: &HeaderMap, token_id: Option<&str>) {
+    // Without a credential there is no tenant identity to share recovery across
+    // connections. Local WS history and explicit previous_response_id still work.
+    let has_credentials = token_id.is_some_and(|id| !id.trim().is_empty())
+        || crate::proxy::middleware::auth::extract_header_api_key(headers).is_some();
+    let tenant =
+        has_credentials.then(|| crate::proxy::thinking_store::tenant_component(headers, token_id));
+    let _ = crate::proxy::monitor::CURRENT_UPSTREAM_CAPTURE
+        .try_with(|capture| capture.set_tool_call_tenant(tenant));
+}
+
+fn scoped_tool_call_key(call_id: &str) -> Option<String> {
+    let tenant = crate::proxy::monitor::CURRENT_UPSTREAM_CAPTURE
+        .try_with(|capture| capture.tool_call_tenant())
+        .ok()??;
+    Some(format!("{tenant}:{call_id}"))
+}
+
 pub fn get_cached_tool_call(call_id: &str) -> Option<Value> {
+    let key = scoped_tool_call_key(call_id)?;
     WEBSOCKET_TOOL_CALL_CACHE
         .get()
-        .and_then(|cache| cache.try_read().ok().and_then(|guard| guard.get(call_id)))
+        .and_then(|cache| cache.try_read().ok().and_then(|guard| guard.get(&key)))
 }
 
 pub fn insert_cached_tool_call(call_id: String, item: Value) {
     if call_id.is_empty() {
         return;
     }
+    let Some(key) = scoped_tool_call_key(&call_id) else {
+        return;
+    };
     let cache =
         WEBSOCKET_TOOL_CALL_CACHE.get_or_init(|| TokioRwLock::new(ToolCallCache::default()));
     if let Ok(mut guard) = cache.try_write() {
-        guard.insert(call_id, item);
+        guard.insert(key, item);
     }
 }
 
@@ -7465,6 +7499,7 @@ async fn handle_websocket_turn(
     session_state: &mut WebsocketSessionState,
     payload: Value,
 ) {
+    configure_tool_call_tenant(headers, identity.map(|identity| identity.token_id.as_str()));
     let ws_trace_id = format!("ws_{}", chrono::Utc::now().timestamp_subsec_millis());
     let debug_cfg = state.debug_logging.read().await.clone();
     if debug_logger::is_payload_enabled(&debug_cfg) {
@@ -9104,6 +9139,64 @@ mod structured_response_tests {
 #[cfg(test)]
 mod tool_call_memory_tests {
     use super::*;
+    #[tokio::test]
+    async fn empty_bearer_does_not_enable_anonymous_tool_recovery() {
+        let capture = crate::proxy::monitor::UpstreamRequestBodyHolder::new();
+        crate::proxy::monitor::CURRENT_UPSTREAM_CAPTURE
+            .scope(capture, async {
+                let mut headers = HeaderMap::new();
+                for value in ["Bearer", "Bearer ", " "] {
+                    headers.insert("authorization", value.parse().unwrap());
+                    configure_tool_call_tenant(&headers, None);
+                    assert!(scoped_tool_call_key("anonymous").is_none());
+                }
+                headers.insert("x-api-key", "owner-a".parse().unwrap());
+                configure_tool_call_tenant(&headers, None);
+                let owner = scoped_tool_call_key("shared").unwrap();
+                headers.insert("x-api-key", "owner-b".parse().unwrap());
+                configure_tool_call_tenant(&headers, None);
+                assert_ne!(scoped_tool_call_key("shared").unwrap(), owner);
+            })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn tool_call_recovery_cannot_cross_tenants() {
+        let call_id = format!("tenant-test-{}", Uuid::new_v4());
+        let private_call = json!({"type":"function_call","call_id":call_id,"name":"read","arguments":"private arguments"});
+        let owner_capture = crate::proxy::monitor::UpstreamRequestBodyHolder::new();
+        crate::proxy::monitor::CURRENT_UPSTREAM_CAPTURE
+            .scope(owner_capture, async {
+                configure_tool_call_tenant(&HeaderMap::new(), Some("owner-a"));
+                insert_cached_tool_call(call_id.clone(), private_call.clone());
+                assert_eq!(get_cached_tool_call(&call_id), Some(private_call.clone()));
+            })
+            .await;
+        let other_capture = crate::proxy::monitor::UpstreamRequestBodyHolder::new();
+        crate::proxy::monitor::CURRENT_UPSTREAM_CAPTURE.scope(other_capture, async {
+            configure_tool_call_tenant(&HeaderMap::new(), Some("owner-b"));
+            assert!(get_cached_tool_call(&call_id).is_none());
+            let output = json!({"type":"function_call_output","call_id":call_id,"output":"attempted replay"});
+            let prepared = crate::proxy::http_session_store::prepare_session_input(
+                Vec::new(), vec![output.clone()], &HashMap::new(),
+            );
+            assert_eq!(prepared.merged, vec![output]);
+            insert_cached_tool_call(call_id.clone(), json!({"name":"other"}));
+        }).await;
+        assert!(get_cached_tool_call(&call_id).is_none());
+        let owner_capture = crate::proxy::monitor::UpstreamRequestBodyHolder::new();
+        crate::proxy::monitor::CURRENT_UPSTREAM_CAPTURE
+            .scope(owner_capture, async {
+                configure_tool_call_tenant(&HeaderMap::new(), Some("owner-a"));
+                assert_eq!(get_cached_tool_call(&call_id), Some(private_call));
+                configure_tool_call_tenant(&HeaderMap::new(), None);
+                assert!(get_cached_tool_call(&call_id).is_none());
+                insert_cached_tool_call(call_id.clone(), json!({"name":"anonymous"}));
+                assert!(get_cached_tool_call(&call_id).is_none());
+            })
+            .await;
+    }
+
     #[test]
     fn tool_call_payloads_and_idle_retention_are_bounded() {
         let mut cache = ToolCallCache::default();

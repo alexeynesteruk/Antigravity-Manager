@@ -381,30 +381,44 @@ pub fn prepare_session_input_with_storage(
         )
     });
     let exact_replay = !history.is_empty() && new_input.starts_with(&history);
+    // Ignore only transport metadata. Tool arguments, outputs, call IDs and
+    // reasoning fields are all part of an item's meaning, even without content.
+    let items_semantically_equal = |a: &Value, b: &Value| -> bool {
+        match (a.as_object(), b.as_object()) {
+            (Some(a), Some(b)) => {
+                let meaningful = |key: &&String| !matches!(key.as_str(), "id" | "status");
+                a.keys().filter(meaningful).count() == b.keys().filter(meaningful).count()
+                    && a.iter()
+                        .filter(|(key, _)| meaningful(key))
+                        .all(|(key, value)| b.get(key) == Some(value))
+            }
+            _ => a == b,
+        }
+    };
+
+    // A truncated replay must be a leading, unchanged suffix of saved history.
+    // Finding an arbitrary repeated ID could discard changed payloads or new
+    // items that preceded it in this request.
     let replayed_through = if reset_parent || exact_replay {
         None
     } else {
-        let history_ids: std::collections::HashSet<&str> = history
-            .iter()
-            .filter_map(|item| item.get("id").and_then(Value::as_str))
-            .filter(|id| !id.is_empty())
-            .collect();
-        new_input.iter().rposition(|item| {
-            item.get("id")
-                .and_then(Value::as_str)
-                .is_some_and(|id| history_ids.contains(id))
+        (0..history.len()).find_map(|start| {
+            let suffix = &history[start..];
+            if suffix.len() > new_input.len() {
+                return None;
+            }
+            suffix
+                .iter()
+                .zip(&new_input)
+                .all(|(old, new)| {
+                    old.get("id")
+                        .and_then(Value::as_str)
+                        .filter(|id| !id.is_empty())
+                        .is_some_and(|id| new.get("id").and_then(Value::as_str) == Some(id))
+                        && items_semantically_equal(old, new)
+                })
+                .then_some(suffix.len() - 1)
         })
-    };
-
-    // Helper: check if two input items are semantically equivalent (ignoring volatile fields like id)
-    let items_semantically_equal = |a: &Value, b: &Value| -> bool {
-        let role_a = a.get("role").and_then(Value::as_str);
-        let role_b = b.get("role").and_then(Value::as_str);
-        let type_a = a.get("type").and_then(Value::as_str);
-        let type_b = b.get("type").and_then(Value::as_str);
-        let content_a = a.get("content").or_else(|| a.get("text"));
-        let content_b = b.get("content").or_else(|| b.get("text"));
-        role_a == role_b && type_a == type_b && content_a == content_b
     };
 
     // Semantic prefix match: check if new_input starts with history semantically
@@ -415,50 +429,18 @@ pub fn prepare_session_input_with_storage(
             .zip(new_input.iter())
             .all(|(h, n)| items_semantically_equal(h, n));
 
-    // Semantic suffix find: find last item of history in new_input
-    let semantic_suffix_idx = if !history.is_empty()
-        && !reset_parent
-        && !exact_replay
-        && replayed_through.is_none()
-        && !semantic_prefix_match
-    {
-        let last_h = &history[history.len() - 1];
+    let delta_source = if reset_parent || history.is_empty() {
         new_input
-            .iter()
-            .rposition(|n| items_semantically_equal(last_h, n))
-    } else {
-        None
-    };
-
-    let (delta_source, use_new_input_as_merged) = if reset_parent || history.is_empty() {
-        (new_input.clone(), false)
     } else if exact_replay {
-        (new_input[history.len()..].to_vec(), false)
+        new_input[history.len()..].to_vec()
     } else if semantic_prefix_match {
-        (new_input[history.len()..].to_vec(), false)
+        new_input[history.len()..].to_vec()
     } else if let Some(index) = replayed_through {
-        (new_input[index + 1..].to_vec(), false)
-    } else if let Some(index) = semantic_suffix_idx {
-        (new_input[index + 1..].to_vec(), false)
-    } else if new_input.len() >= history.len() {
-        // [FIX #3382] Fallback protection:
-        // When the client sends full conversation history but formatting/IDs differed
-        // such that no boundary was identified, appending all of new_input to history
-        // would double the history (2x, 4x, ...). Instead, treat new_input as the authoritative
-        // current history, extracting the last element as delta.
-        tracing::warn!(
-            "[Session] Match failed but new_input (len: {}) >= history (len: {}). Preventing history duplication.",
-            new_input.len(),
-            history.len()
-        );
-        let delta_slice = if new_input.is_empty() {
-            Vec::new()
-        } else {
-            vec![new_input.last().unwrap().clone()]
-        };
-        (delta_slice, true)
+        new_input[index + 1..].to_vec()
     } else {
-        (new_input.clone(), false)
+        // previous_response_id supplies prior context; unmatched input is a
+        // delta regardless of its length. Repeated text alone is not replay proof.
+        new_input
     };
 
     let delta = merge_history_with_new_input(Vec::new(), &[], delta_source, tool_call_cache);
@@ -469,8 +451,6 @@ pub fn prepare_session_input_with_storage(
     };
     let merged = if reset_parent || history.is_empty() {
         delta
-    } else if use_new_input_as_merged {
-        merge_history_with_new_input(Vec::new(), &[], new_input, tool_call_cache)
     } else {
         merge_history_with_new_input(history, &[], delta, tool_call_cache)
     };
@@ -870,20 +850,109 @@ mod tests {
     }
 
     #[test]
-    fn prepare_session_input_fallback_avoids_duplication_when_unmatched() {
+    fn unmatched_multi_item_delta_keeps_prior_history_across_turns() {
         let history = vec![
             json!({"role": "user", "type": "message", "content": "msg 1"}),
             json!({"role": "assistant", "type": "message", "content": "msg 2"}),
         ];
-        // Client sends 2 different messages (length >= history)
+        // Multiple new input items are legal even when longer than prior history.
         let new_input = vec![
             json!({"role": "user", "type": "message", "content": "different 1"}),
             json!({"role": "assistant", "type": "message", "content": "different 2"}),
         ];
 
-        let prepared = prepare_session_input(history, new_input, &HashMap::new());
-        // Should not duplicate to 4 items
+        let mut expected = history.clone();
+        expected.extend(new_input.clone());
+        let prepared = prepare_session_input(history.clone(), new_input.clone(), &HashMap::new());
+        assert_eq!(prepared.merged, expected);
+        assert_eq!(prepared.delta, new_input);
+        assert!(!prepared.reset_parent);
+
+        let mut store = HttpSessionStore::new();
+        let mut root = entry("root");
+        root.input_items = history;
+        store.insert("root".into(), root);
+        let (_, parent) = store.get("root").unwrap();
+        store.insert_delta(
+            "next".into(),
+            Some(parent),
+            prepared.delta,
+            Vec::new(),
+            String::new(),
+            String::new(),
+            None,
+        );
+        assert_eq!(store.get("next").unwrap().0.input_items, expected);
+    }
+
+    #[test]
+    fn semantic_replay_compares_all_tool_and_reasoning_payloads() {
+        for (old, new) in [
+            (
+                json!({"type":"function_call","call_id":"a","name":"read","arguments":"{}"}),
+                json!({"type":"function_call","call_id":"b","name":"write","arguments":"{\"x\":1}"}),
+            ),
+            (
+                json!({"type":"function_call_output","call_id":"a","output":"first"}),
+                json!({"type":"function_call_output","call_id":"b","output":"second"}),
+            ),
+            (
+                json!({"type":"custom_tool_call","call_id":"a","name":"shell","input":"pwd"}),
+                json!({"type":"custom_tool_call","call_id":"b","name":"shell","input":"ls"}),
+            ),
+            (
+                json!({"type":"reasoning","summary":[{"text":"first"}]}),
+                json!({"type":"reasoning","summary":[{"text":"second"}]}),
+            ),
+        ] {
+            let prepared =
+                prepare_session_input(vec![old.clone()], vec![new.clone()], &HashMap::new());
+            assert_eq!(prepared.delta, vec![new.clone()]);
+            assert_eq!(prepared.merged, vec![old, new]);
+        }
+        let history = vec![
+            json!({"id":"old-id","status":"completed","type":"function_call","call_id":"a","name":"read","arguments":"{}"}),
+        ];
+        let replay = vec![
+            json!({"id":"new-id","type":"function_call","call_id":"a","name":"read","arguments":"{}"}),
+            json!({"type":"function_call_output","call_id":"a","output":"file"}),
+        ];
+        let prepared = prepare_session_input(history, replay.clone(), &HashMap::new());
+        assert_eq!(prepared.delta, vec![replay[1].clone()]);
         assert_eq!(prepared.merged.len(), 2);
+    }
+
+    #[test]
+    fn replay_ids_cannot_hide_changed_or_preceding_items() {
+        let old = json!({"id":"out-1","type":"function_call_output","call_id":"a","output":"old"});
+        let changed =
+            json!({"id":"out-1","type":"function_call_output","call_id":"a","output":"corrected"});
+        let prepared =
+            prepare_session_input(vec![old.clone()], vec![changed.clone()], &HashMap::new());
+        assert_eq!(prepared.delta, vec![changed.clone()]);
+        assert_eq!(prepared.merged, vec![changed.clone()]);
+        let input = vec![
+            json!({"id":"new-1","role":"user","content":"new input"}),
+            old.clone(),
+        ];
+        let prepared = prepare_session_input(vec![old.clone()], input.clone(), &HashMap::new());
+        assert_eq!(prepared.delta, input);
+        let next = json!({"role":"user","content":"next"});
+        let prepared =
+            prepare_session_input(vec![old.clone()], vec![old, next.clone()], &HashMap::new());
+        assert_eq!(prepared.delta, vec![next]);
+    }
+
+    #[test]
+    fn repeated_message_is_not_a_partial_replay_boundary() {
+        let history = vec![
+            json!({"role":"user","content":"say yes"}),
+            json!({"role":"assistant","content":"yes"}),
+        ];
+        let input = vec![json!({"role":"assistant","content":"yes"})];
+        let prepared = prepare_session_input(history.clone(), input.clone(), &HashMap::new());
+        assert_eq!(prepared.delta, input);
+        assert_eq!(prepared.merged.len(), history.len() + 1);
     }
 }
 
