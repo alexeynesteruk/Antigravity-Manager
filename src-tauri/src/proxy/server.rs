@@ -5230,7 +5230,10 @@ mod image_scheduler_tests {
             account.max_concurrency = limit;
             let payload =
                 serde_json::to_value(super::to_account_response(&account, &None)).unwrap();
-            assert_eq!(payload.get("max_concurrency"), Some(&serde_json::json!(limit)));
+            assert_eq!(
+                payload.get("max_concurrency"),
+                Some(&serde_json::json!(limit))
+            );
             assert!(payload.get("token").is_none());
             let serialized = payload.to_string();
             assert!(!serialized.contains("private-access"));

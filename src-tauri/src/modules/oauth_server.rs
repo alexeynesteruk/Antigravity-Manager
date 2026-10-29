@@ -187,9 +187,8 @@ async fn serve_oauth_listener(
             _ = cancel_rx.changed() => return,
             result = tokio::time::timeout_at(read_deadline, read) => result.ok().flatten(),
         };
-        let callback = callback.filter(|(nonce, _)| {
-            claim_listener_callback(nonce, &listener_nonce, &redirect_uri)
-        });
+        let callback = callback
+            .filter(|(nonce, _)| claim_listener_callback(nonce, &listener_nonce, &redirect_uri));
         let accepted = callback.is_some();
         let response = if matches!(callback, Some((_, Ok(_)))) {
             oauth_success_html()
@@ -695,12 +694,14 @@ mod callback_security_tests {
                 code_rx.try_recv(),
                 Err(mpsc::error::TryRecvError::Empty)
             ));
-            assert!(!get_oauth_flow_state()
-                .lock()
-                .unwrap()
-                .as_ref()
-                .unwrap()
-                .code_claimed);
+            assert!(
+                !get_oauth_flow_state()
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .unwrap()
+                    .code_claimed
+            );
         }
 
         let response = callback_request(
@@ -732,9 +733,15 @@ mod callback_security_tests {
             let request = format!("GET {target} HTTP/1.1\r\nHost: {address}\r\n\r\n");
             if fragmented {
                 let split = request.find("state=").unwrap() + 3;
-                stream.write_all(&request.as_bytes()[..split]).await.unwrap();
+                stream
+                    .write_all(&request.as_bytes()[..split])
+                    .await
+                    .unwrap();
                 tokio::task::yield_now().await;
-                stream.write_all(&request.as_bytes()[split..]).await.unwrap();
+                stream
+                    .write_all(&request.as_bytes()[split..])
+                    .await
+                    .unwrap();
             } else {
                 stream.write_all(request.as_bytes()).await.unwrap();
             }
@@ -759,12 +766,14 @@ mod callback_security_tests {
             "old-listener-nonce",
             &redirect,
         ));
-        assert!(!get_oauth_flow_state()
-            .lock()
-            .unwrap()
-            .as_ref()
-            .unwrap()
-            .code_claimed);
+        assert!(
+            !get_oauth_flow_state()
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .code_claimed
+        );
     }
 
     #[tokio::test]

@@ -1060,7 +1060,8 @@ pub async fn set_data_dir(
     proxy_state: tauri::State<'_, crate::commands::proxy::ProxyServiceState>,
     cf_state: tauri::State<'_, crate::commands::cloudflared::CloudflaredState>,
 ) -> Result<String, String> {
-    let new_path = migrate_data_dir_guarded(PathBuf::from(path), true, &proxy_state, &cf_state).await?;
+    let new_path =
+        migrate_data_dir_guarded(PathBuf::from(path), true, &proxy_state, &cf_state).await?;
     Ok(modules::account::format_data_dir_path(&new_path))
 }
 
@@ -1072,7 +1073,13 @@ pub async fn migrate_data_dir(
     proxy_state: tauri::State<'_, crate::commands::proxy::ProxyServiceState>,
     cf_state: tauri::State<'_, crate::commands::cloudflared::CloudflaredState>,
 ) -> Result<(), String> {
-    migrate_data_dir_guarded(PathBuf::from(new_path), clean_source, &proxy_state, &cf_state).await?;
+    migrate_data_dir_guarded(
+        PathBuf::from(new_path),
+        clean_source,
+        &proxy_state,
+        &cf_state,
+    )
+    .await?;
     Ok(())
 }
 

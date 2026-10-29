@@ -24,10 +24,7 @@ pub async fn ip_filter_middleware(
     } else if security_config.whitelist.enabled || peer_ip(&request).is_some() {
         // A trusted proxy with an invalid forwarding chain must not inherit the
         // proxy's own whitelist/token permissions. Reject it before auth and logs.
-        return create_blocked_response(
-            "unknown",
-            "Unable to verify the client IP.",
-        );
+        return create_blocked_response("unknown", "Unable to verify the client IP.");
     }
 
     if let Some(ip) = &client_ip {
@@ -434,7 +431,13 @@ mod tests {
         }
         // The same invalid identity is rejected with the whitelist disabled,
         // before token ACLs could treat the proxy itself as the caller.
-        state.security.write().await.security_monitor.whitelist.enabled = false;
+        state
+            .security
+            .write()
+            .await
+            .security_monitor
+            .whitelist
+            .enabled = false;
         assert_eq!(
             app.clone()
                 .oneshot(request_from(
