@@ -272,6 +272,9 @@ pub fn record_usage(
     reported_total_tokens: Option<u32>,
 ) -> Result<(), String> {
     let conn = connect_db()?;
+    // Raw history and the hourly view must commit together. A failed aggregate
+    // update must not leave a request visible only in some statistics views.
+    let transaction = conn.unchecked_transaction().map_err(|e| e.to_string())?;
     let timestamp = chrono::Local::now().timestamp();
     let cache_reported = u32::from(input_tokens.zip(cached_tokens).is_some());
     let cache_reported_input = input_tokens.zip(cached_tokens).map(|(input, _)| input);
@@ -281,14 +284,14 @@ pub fn record_usage(
     let total_reported = u32::from(reported_total_tokens.is_some());
 
     // Insert into raw usage table
-    conn.execute(
+    transaction.execute(
         "INSERT INTO token_usage (timestamp, account_email, model, input_tokens, output_tokens, cached_tokens, reasoning_tokens, total_tokens, cache_reported, reported_total_tokens)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?8)",
         params![timestamp, account_email, model, input_tokens, output_tokens, cached_tokens, reasoning_tokens, reported_total_tokens, cache_reported],
     ).map_err(|e| e.to_string())?;
 
     let hour_bucket = chrono::Local::now().format("%Y-%m-%d %H:00").to_string();
-    conn.execute(
+    transaction.execute(
         "INSERT INTO token_stats_hourly (hour_bucket, account_email, total_input_tokens, total_output_tokens, total_cached_tokens, total_reasoning_tokens, total_tokens, request_count, cache_reported_requests, cache_reported_input_tokens, cache_reported_tokens, reported_total_tokens, total_reported_requests, output_reported_requests, input_reported_requests)
          VALUES (?1, ?2, COALESCE(?3, 0), COALESCE(?4, 0), COALESCE(?5, 0), COALESCE(?6, 0), COALESCE(?7, 0), 1, ?8, COALESCE(?9, 0), COALESCE(?10, 0), COALESCE(?7, 0), ?11, ?12, ?13)
          ON CONFLICT(hour_bucket, account_email) DO UPDATE SET
@@ -308,7 +311,7 @@ pub fn record_usage(
         params![hour_bucket, account_email, input_tokens, output_tokens, cached_tokens, reasoning_tokens, reported_total_tokens, cache_reported, cache_reported_input, cache_reported_tokens, total_reported, output_reported, input_reported],
     ).map_err(|e| e.to_string())?;
 
-    Ok(())
+    transaction.commit().map_err(|e| e.to_string())
 }
 
 /// Attach current weekly usage without loading raw history or persisting derived totals.
@@ -1104,6 +1107,42 @@ pub fn get_account_trend_daily(days: i64) -> Result<Vec<AccountTrendPoint>, Stri
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn aggregate_write_failure_rolls_back_raw_usage() {
+        let _data = crate::proxy::monitor::prompt_log_tests::TestDataDir::new();
+        init_db().unwrap();
+        let conn = connect_db().unwrap();
+        conn.execute_batch("CREATE TRIGGER reject_hourly BEFORE INSERT ON token_stats_hourly BEGIN SELECT RAISE(FAIL, 'aggregate unavailable'); END;").unwrap();
+        assert!(record_usage(
+            "atomic@test",
+            "gemini",
+            Some(1),
+            Some(2),
+            None,
+            None,
+            Some(3)
+        )
+        .is_err());
+        assert_eq!(get_summary_stats(0).unwrap().total_requests, 0);
+        let raw: u64 = conn
+            .query_row("SELECT COUNT(*) FROM token_usage", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(raw, 0);
+        conn.execute_batch("DROP TRIGGER reject_hourly;").unwrap();
+        record_usage(
+            "atomic@test",
+            "gemini",
+            Some(1),
+            Some(2),
+            None,
+            None,
+            Some(3),
+        )
+        .unwrap();
+        assert_eq!(get_summary_stats(0).unwrap().total_requests, 1);
+        assert_eq!(get_model_stats(0).unwrap()[0].request_count, 1);
+    }
+
     #[test]
     fn legacy_database_upgrade_keeps_derived_totals_separate_and_new_nulls_readable() {
         let _data = crate::proxy::monitor::prompt_log_tests::TestDataDir::new();
