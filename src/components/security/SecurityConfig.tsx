@@ -1,8 +1,8 @@
 import React, { useEffect, useState } from 'react';
 import { useTranslation } from 'react-i18next';
-import { request as invoke } from '../../utils/request';
 import { Save, AlertTriangle, Shield, ShieldCheck } from 'lucide-react';
 import { showToast } from '../common/ToastContainer';
+import { useConfigStore } from '../../stores/useConfigStore';
 
 interface IpBlacklistConfig {
     enabled: boolean;
@@ -34,8 +34,12 @@ export const SecurityConfig: React.FC = () => {
     const loadConfig = async () => {
         setLoading(true);
         try {
-            const data = await invoke<SecurityMonitorConfig>('get_security_config');
-            setConfig(data);
+            await useConfigStore.getState().loadConfig();
+            const { config: current, error } = useConfigStore.getState();
+            if (error || !current?.proxy.security_monitor) {
+                throw new Error(error || 'Security configuration unavailable');
+            }
+            setConfig(current.proxy.security_monitor);
         } catch (e) {
             console.error('Failed to load security config', e);
             showToast(t('security.config.load_error'), 'error');
@@ -48,7 +52,21 @@ export const SecurityConfig: React.FC = () => {
         if (!config) return;
         setSaving(true);
         try {
-            await invoke('update_security_config', { config: { ...config, trusted_proxies: (config.trusted_proxies ?? []).map(s => s.trim()).filter(Boolean), cors_allowed_origins: (config.cors_allowed_origins ?? []).map(s => s.trim()).filter(Boolean) } });
+            if (!useConfigStore.getState().config) {
+                await useConfigStore.getState().loadConfig();
+            }
+            const { config: current } = useConfigStore.getState();
+            if (!current) throw new Error(useConfigStore.getState().error || 'Configuration unavailable');
+            const security = {
+                ...config,
+                trusted_proxies: (config.trusted_proxies ?? []).map(s => s.trim()).filter(Boolean),
+                cors_allowed_origins: (config.cors_allowed_origins ?? []).map(s => s.trim()).filter(Boolean),
+            };
+            await useConfigStore.getState().saveConfig({
+                ...current,
+                proxy: { ...current.proxy, security_monitor: security },
+            }, true);
+            setConfig(security);
             showToast(t('security.config.save_success'), 'success');
         } catch (e) {
             console.error('Failed to save security config', e);

@@ -30,6 +30,7 @@ import {
     FlaskConical
 } from 'lucide-react';
 import { AppConfig, ProxyConfig, StickySessionConfig, ExperimentalConfig } from '../types/config';
+import { useConfigStore } from '../stores/useConfigStore';
 import HelpTooltip from '../components/common/HelpTooltip';
 import ModalDialog from '../components/common/ModalDialog';
 import { showToast } from '../components/common/ToastContainer';
@@ -167,7 +168,7 @@ export default function ApiProxy() {
         active_accounts: 0,
     });
 
-    const [appConfig, setAppConfig] = useState<AppConfig | null>(null);
+    const appConfig = useConfigStore(state => state.config);
     const [activeMenuTab, setActiveMenuTab] = useState<'settings' | 'models' | 'cli' | 'protocols'>('settings');
     const [configLoading, setConfigLoading] = useState(true);
     const [configError, setConfigError] = useState<string | null>(null);
@@ -536,8 +537,9 @@ export default function ApiProxy() {
         setConfigLoading(true);
         setConfigError(null);
         try {
-            const config = await invoke<AppConfig>('load_config');
-            setAppConfig(config);
+            await useConfigStore.getState().loadConfig();
+            const { config, error } = useConfigStore.getState();
+            if (error || !config) throw new Error(error || 'Configuration unavailable');
 
             // 恢复 Cloudflared 持久化状态
             if (config.cloudflared) {
@@ -545,14 +547,6 @@ export default function ApiProxy() {
                 setCfToken(config.cloudflared.token || '');
                 setCfCustomDomain(config.cloudflared.custom_domain || '');
                 setCfUseHttp2(config.cloudflared.use_http2 !== false); // 默认开启 HTTP/2
-            }
-
-            // 恢复 Cloudflared 状态并实现持久化同步
-            if (config.cloudflared) {
-                setCfMode(config.cloudflared.mode || 'quick');
-                setCfToken(config.cloudflared.token || '');
-                setCfCustomDomain(config.cloudflared.custom_domain || '');
-                setCfUseHttp2(config.cloudflared.use_http2 !== false); // 默认 true
             }
         } catch (error) {
             console.error('加载配置失败:', error);
@@ -579,10 +573,8 @@ export default function ApiProxy() {
 
 
     const saveConfig = async (newConfig: AppConfig) => {
-        // 1. 立即更新 UI 状态，确保流畅
-        setAppConfig(newConfig);
         try {
-            await invoke('save_config', { config: newConfig });
+            await useConfigStore.getState().saveConfig(newConfig, true);
         } catch (error) {
             console.error('保存配置失败:', error);
             showToast(`${t('common.error')}: ${error}`, 'error');
@@ -592,11 +584,7 @@ export default function ApiProxy() {
     const handleSaveProxySettings = async () => {
         if (!appConfig) return;
         try {
-            await invoke('save_config', { config: appConfig });
-            const refreshed = await invoke<AppConfig>('load_config');
-            if (refreshed) {
-                setAppConfig(refreshed);
-            }
+            await useConfigStore.getState().saveConfig(appConfig, true);
             showToast(t('common.saved'), 'success');
         } catch (error) {
             console.error('保存配置失败:', error);
@@ -615,8 +603,7 @@ export default function ApiProxy() {
         newConfig.custom_mapping = { ...(newConfig.custom_mapping || {}), [trimmedKey]: value };
 
         try {
-            await invoke('update_model_mapping', { config: newConfig });
-            setAppConfig({ ...appConfig, proxy: newConfig });
+            await useConfigStore.getState().saveConfig({ ...appConfig, proxy: newConfig }, true);
             console.log('[DEBUG] Mapping updated successfully');
             showToast(t('common.saved'), 'success');
         } catch (error) {
@@ -641,8 +628,7 @@ export default function ApiProxy() {
         };
 
         try {
-            await invoke('update_model_mapping', { config: newConfig });
-            setAppConfig({ ...appConfig, proxy: newConfig });
+            await useConfigStore.getState().saveConfig({ ...appConfig, proxy: newConfig }, true);
             showToast(t('common.success'), 'success');
         } catch (error) {
             console.error('Failed to reset mapping:', error);
@@ -799,23 +785,11 @@ export default function ApiProxy() {
             custom_mapping: { ...appConfig.proxy.custom_mapping, ...selectedPresetData.mappings } as Record<string, string>
         };
 
-        // 备份旧配置用于回滚
-        const oldConfig = { ...appConfig };
-
         try {
-            // 1. 乐观更新：立即更新 UI
-            setAppConfig({ ...appConfig, proxy: newConfig });
+            await useConfigStore.getState().saveConfig({ ...appConfig, proxy: newConfig }, true);
             showToast(t('proxy.router.presets_applied') + ` (${selectedPresetData.name})`, 'success');
-
-            // 2. 后台异步保存
-            await invoke('update_model_mapping', { config: newConfig });
-
-            // 3. 重新加载配置以确保一致性
-            await loadConfig();
         } catch (error) {
             console.error('Failed to apply presets:', error);
-            // 3. 失败回滚
-            setAppConfig(oldConfig);
             showToast(`${t('common.error')}: ${error}`, 'error');
         }
     };
@@ -826,8 +800,7 @@ export default function ApiProxy() {
         delete newCustom[key];
         const newConfig = { ...appConfig.proxy, custom_mapping: newCustom };
         try {
-            await invoke('update_model_mapping', { config: newConfig });
-            setAppConfig({ ...appConfig, proxy: newConfig });
+            await useConfigStore.getState().saveConfig({ ...appConfig, proxy: newConfig }, true);
         } catch (error) {
             console.error('Failed to remove custom mapping:', error);
         }
@@ -929,8 +902,7 @@ export default function ApiProxy() {
                         auto_start: false
                     }
                 };
-                setAppConfig(newConfig);
-                await invoke('save_config', { config: newConfig });
+                await useConfigStore.getState().saveConfig(newConfig, true);
             } else {
                 const newConfig = {
                     ...appConfig,
@@ -939,8 +911,7 @@ export default function ApiProxy() {
                         auto_start: true
                     }
                 };
-                setAppConfig(newConfig);
-                await invoke('save_config', { config: newConfig });
+                await useConfigStore.getState().saveConfig(newConfig, true);
                 // 使用当前的 appConfig.proxy 启动
                 await invoke('start_proxy_service', { config: newConfig.proxy });
             }
