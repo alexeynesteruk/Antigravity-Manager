@@ -278,6 +278,7 @@ struct AccountResponse {
     email: String,
     name: Option<String>,
     priority: u8,
+    max_concurrency: Option<u32>,
     is_current: bool,
     disabled: bool,
     disabled_reason: Option<String>,
@@ -381,6 +382,7 @@ fn to_account_response(
         email: account.email.clone(),
         name: account.name.clone(),
         priority: account.priority,
+        max_concurrency: account.max_concurrency,
         is_current: current_id.as_ref() == Some(&account.id),
         disabled: account.disabled,
         disabled_reason: account.disabled_reason.clone(),
@@ -1448,6 +1450,7 @@ async fn admin_list_accounts(
                 email: acc.email,
                 name: acc.name,
                 priority: acc.priority,
+                max_concurrency: acc.max_concurrency,
                 is_current,
                 disabled: acc.disabled,
                 disabled_reason: acc.disabled_reason,
@@ -1554,6 +1557,7 @@ async fn admin_get_current_account(
                 email: acc.email,
                 name: acc.name,
                 priority: acc.priority,
+                max_concurrency: acc.max_concurrency,
                 is_current: true,
                 disabled: acc.disabled,
                 disabled_reason: acc.disabled_reason,
@@ -2589,8 +2593,20 @@ struct SetDataDirRequest {
 }
 
 async fn admin_set_data_dir(
+    State(state): State<AppState>,
     Json(payload): Json<SetDataDirRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    // Keep the service paused until the copy and active-path switch complete.
+    // Holding this guard also prevents a concurrent /proxy/start from racing it.
+    let running = state.is_running.read().await;
+    if *running {
+        return Err((
+            StatusCode::CONFLICT,
+            Json(ErrorResponse {
+                error: "Stop the proxy service before changing the data directory".into(),
+            }),
+        ));
+    }
     let path = payload.path;
     let new_path = tokio::task::spawn_blocking(move || {
         crate::modules::account::migrate_data_dir(std::path::PathBuf::from(path))
@@ -2610,6 +2626,7 @@ async fn admin_set_data_dir(
             Json(ErrorResponse { error: e }),
         )
     })?;
+    drop(running);
     Ok(Json(crate::modules::account::format_data_dir_path(
         &new_path,
     )))
@@ -5193,6 +5210,35 @@ mod image_scheduler_tests {
     }
 
     #[test]
+    fn redacted_account_response_preserves_concurrency_overrides() {
+        let token = crate::models::TokenData::new(
+            "private-access".into(),
+            "private-refresh".into(),
+            3600,
+            None,
+            None,
+            None,
+            false,
+            None,
+        );
+        let mut account = crate::models::Account::new(
+            "test-concurrency".into(),
+            "test-concurrency@test.invalid".into(),
+            token,
+        );
+        for limit in [None, Some(0), Some(4)] {
+            account.max_concurrency = limit;
+            let payload =
+                serde_json::to_value(super::to_account_response(&account, &None)).unwrap();
+            assert_eq!(payload.get("max_concurrency"), Some(&serde_json::json!(limit)));
+            assert!(payload.get("token").is_none());
+            let serialized = payload.to_string();
+            assert!(!serialized.contains("private-access"));
+            assert!(!serialized.contains("private-refresh"));
+        }
+    }
+
+    #[test]
     fn test_switch_request_deserialization_with_and_without_target_ide() {
         use super::SwitchRequest;
         let with_ide: SwitchRequest =
@@ -5394,5 +5440,38 @@ mod oauth_callback_boundary_tests {
             .unwrap();
             assert_eq!(response.status(), StatusCode::BAD_REQUEST);
         }
+    }
+}
+
+#[cfg(test)]
+mod data_dir_boundary_tests {
+    use super::*;
+    use tower::ServiceExt;
+
+    #[tokio::test]
+    async fn active_headless_proxy_rejects_data_directory_migration() {
+        let _dir = crate::proxy::monitor::prompt_log_tests::TestDataDir::new();
+        let target = tempfile::tempdir().unwrap();
+        let state = super::config_reload_tests::test_state();
+        *state.is_running.write().await = true;
+        let original = crate::modules::account::get_data_dir().unwrap();
+        let response = Router::new()
+            .route("/api/system/data-dir", post(admin_set_data_dir))
+            .with_state(state)
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/api/system/data-dir")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(
+                        serde_json::json!({ "path": target.path().join("moved") }).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        assert_eq!(crate::modules::account::get_data_dir().unwrap(), original);
+        assert!(!target.path().join("moved").exists());
     }
 }

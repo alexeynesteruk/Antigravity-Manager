@@ -1049,7 +1049,7 @@ fn read_location_pointer() -> Option<PathBuf> {
 
 fn write_location_pointer(dir: &Path) -> Result<(), String> {
     let pointer = location_pointer_path()?;
-    fs::write(&pointer, format_data_dir_path(dir).as_bytes())
+    crate::utils::fs::write_atomic(&pointer, format_data_dir_path(dir).as_bytes())
         .map_err(|e| format!("写入数据目录指针失败: {}", e))
 }
 
@@ -1089,8 +1089,11 @@ fn apply_data_dir(dir: &Path) -> Result<(), String> {
     let dir = normalize_data_dir_path(dir);
     ensure_dir(&dir)?;
     if is_default_data_dir(&dir) {
-        if let Ok(pointer) = location_pointer_path() {
-            let _ = fs::remove_file(pointer);
+        let pointer = location_pointer_path()?;
+        match fs::remove_file(pointer) {
+            Ok(()) => {},
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {},
+            Err(error) => return Err(format!("Failed to reset data directory pointer: {}", error)),
         }
     } else {
         write_location_pointer(&dir)?;
@@ -1163,6 +1166,11 @@ pub fn get_data_dir() -> Result<PathBuf, String> {
 
 /// Move the data directory to `new_dir`, persist the location, and switch all runtime lookups.
 pub fn migrate_data_dir(new_dir: PathBuf) -> Result<PathBuf, String> {
+    migrate_data_dir_with_cleanup(new_dir, true)
+}
+
+pub(crate) fn migrate_data_dir_with_cleanup(new_dir: PathBuf, clean_source: bool) -> Result<PathBuf, String> {
+    let _writer = lock_account_file_updates()?;
     let new_dir = normalize_data_dir_path(new_dir);
     let new_dir = if new_dir.as_os_str().is_empty() {
         return Err("目标数据目录不能为空".to_string());
@@ -1174,7 +1182,7 @@ pub fn migrate_data_dir(new_dir: PathBuf) -> Result<PathBuf, String> {
             .join(new_dir)
     };
 
-    let old_dir = normalize_data_dir_path(get_data_dir()?);
+    let old_dir = resolve_existing_path(&get_data_dir()?);
     if paths_equivalent(&old_dir, &new_dir) {
         apply_data_dir(&old_dir)?;
         return Ok(resolve_existing_path(&old_dir));
@@ -1184,30 +1192,31 @@ pub fn migrate_data_dir(new_dir: PathBuf) -> Result<PathBuf, String> {
         return Err("不能把数据目录迁移到自身内部".to_string());
     }
 
-    if new_dir.exists() {
-        if new_dir.is_file() {
-            return Err("目标路径已存在且不是目录".to_string());
-        }
-        if !dir_is_empty(&new_dir)? {
-            return Err("目标目录不是空文件夹，请选择空目录或新路径".to_string());
-        }
-        copy_dir_recursive(&old_dir, &new_dir)?;
-        let _ = fs::remove_dir_all(&old_dir);
-    } else if let Some(parent) = new_dir.parent() {
-        fs::create_dir_all(parent).map_err(|e| format!("创建目标父目录失败: {}", e))?;
-        match fs::rename(&old_dir, &new_dir) {
-            Ok(()) => {}
-            Err(_) => {
-                copy_dir_recursive(&old_dir, &new_dir)?;
-                let _ = fs::remove_dir_all(&old_dir);
-            }
-        }
-    } else {
-        return Err("目标路径无效".to_string());
+    if new_dir.exists() && !new_dir.is_dir() {
+        return Err("Target data path is not a directory".to_string());
     }
-
+    fs::create_dir_all(&new_dir).map_err(|e| format!("Failed to create target data directory: {}", e))?;
+    // Resolve again after creation: a previously missing relative path or an
+    // existing ancestor symlink can otherwise hide a target inside the source.
     let resolved = resolve_existing_path(&new_dir);
+    if paths_equivalent(&old_dir, &resolved) || is_nested_data_dir(&resolved, &old_dir) {
+        return Err("Target data directory must stay outside the source".to_string());
+    }
+    if !dir_is_empty(&resolved)? {
+        return Err("Target data directory must be empty".to_string());
+    }
+    copy_dir_recursive(&old_dir, &resolved)?;
+    // Keep the recoverable source until the new location has been atomically
+    // persisted and selected for runtime lookups. A failed pointer write must
+    // never strand the only copy of the user's accounts at an unknown path.
     apply_data_dir(&resolved)?;
+    if clean_source {
+        if let Err(error) = fs::remove_dir_all(&old_dir) {
+            crate::modules::logger::log_warn(&format!(
+                "Data directory migrated; source cleanup deferred: {}", error
+            ));
+        }
+    }
     Ok(resolved)
 }
 
@@ -1245,6 +1254,8 @@ fn try_migrate_legacy_single_file(
         entries.iter().collect()
     } else if let Some(entries) = value.get("accounts").and_then(|v| v.as_array()) {
         entries.iter().collect()
+    } else if let Some(entries) = value.get("accounts").and_then(|v| v.as_object()) {
+        entries.values().collect()
     } else if let Some(entries) = value.as_object() {
         entries.values().collect()
     } else {
@@ -1307,12 +1318,14 @@ fn try_migrate_legacy_single_file(
     }
     let new_index = AccountIndex {
         version: "2.0".to_string(),
-        current_account_id: summaries.first().map(|s| s.id.clone()),
+        current_account_id: value.get("current_account_id")
+            .and_then(|id| id.as_str()).filter(|id| ids.contains(*id)).map(str::to_string)
+            .or_else(|| summaries.first().map(|s| s.id.clone())),
         accounts: summaries,
-        current_target_ide: None,
-        current_classic_account_id: None,
-        current_ide_account_id: None,
-        current_agy_account_id: None,
+        current_target_ide: value.get("current_target_ide").and_then(|target| target.as_str()).map(str::to_string),
+        current_classic_account_id: value.get("current_classic_account_id").and_then(|id| id.as_str()).filter(|id| ids.contains(*id)).map(str::to_string),
+        current_ide_account_id: value.get("current_ide_account_id").and_then(|id| id.as_str()).filter(|id| ids.contains(*id)).map(str::to_string),
+        current_agy_account_id: value.get("current_agy_account_id").and_then(|id| id.as_str()).filter(|id| ids.contains(*id)).map(str::to_string),
     };
     // The original index is replaced only after every shard write succeeds.
     save_account_index_in_dir(data_dir, &new_index)?;
@@ -1399,18 +1412,17 @@ fn load_account_index_in_dir(data_dir: &PathBuf) -> Result<AccountIndex, String>
         return Ok(recovered);
     }
 
-    // 1. 优先尝试作为新版规范的轻量索引 (AccountIndex) 解析（毫秒级瞬时直出）
+    // Serde accepts full Account objects as AccountSummary while ignoring their
+    // token fields. Recognize credential archives before that lossy parse.
+    if let Some(migrated) = try_migrate_legacy_single_file(data_dir, &sanitized)? {
+        return Ok(migrated);
+    }
     if let Ok(index) = serde_json::from_str::<AccountIndex>(&sanitized) {
         crate::modules::logger::log_info(&format!(
             "Successfully loaded index with {} accounts",
             index.accounts.len()
         ));
         return Ok(index);
-    }
-
-    // 2. 若新版格式未命中，才检查是否为旧版单文件格式，无缝触发自动分片并创建 -backup
-    if let Some(migrated) = try_migrate_legacy_single_file(data_dir, &sanitized)? {
-        return Ok(migrated);
     }
 
     // 3. 仍无法解析时，执行容灾重建
@@ -3870,21 +3882,31 @@ pub async fn batch_import_accounts_logic(
             prepared_accounts.push(account);
             if prepared_accounts.len() == COMMIT_BATCH_SIZE {
                 let batch = std::mem::take(&mut prepared_accounts);
-                tokio::task::spawn_blocking(move || commit_imported_accounts(batch))
+                let errors = tokio::task::spawn_blocking(move || commit_imported_accounts(batch))
                     .await
                     .map_err(|e| format!("Batch import writer failed: {}", e))??;
+                success_counter.fetch_sub(errors.len(), Ordering::SeqCst);
+                failed_counter.fetch_add(errors.len(), Ordering::SeqCst);
+                errors_list.lock().await.extend(errors);
             }
         }
     }
 
+    if !prepared_accounts.is_empty() {
+        let errors = tokio::task::spawn_blocking(move || commit_imported_accounts(prepared_accounts))
+            .await
+            .map_err(|e| format!("Batch import writer failed: {}", e))??;
+        success_counter.fetch_sub(errors.len(), Ordering::SeqCst);
+        failed_counter.fetch_add(errors.len(), Ordering::SeqCst);
+        errors_list.lock().await.extend(errors);
+    }
     let success_count = success_counter.load(Ordering::SeqCst);
     let failed_count = failed_counter.load(Ordering::SeqCst);
     let all_errors = errors_list.lock().await.clone();
-
-    if !prepared_accounts.is_empty() {
-        tokio::task::spawn_blocking(move || commit_imported_accounts(prepared_accounts))
-            .await
-            .map_err(|e| format!("Batch import writer failed: {}", e))??;
+    if let Some(handle) = app {
+        let _ = handle.emit("accounts://import-progress", crate::models::BatchImportProgress {
+            current: total, total, success: success_count, failed: failed_count, current_email: None,
+        });
     }
 
     crate::modules::logger::log_info(&format!(
@@ -3902,11 +3924,13 @@ pub async fn batch_import_accounts_logic(
 
 /// Reconcile against the latest index after network work, keeping concurrent edits
 /// and reusing IDs even when a batch contains duplicate verified identities.
-fn commit_imported_accounts(prepared: Vec<Account>) -> Result<(), String> {
+fn commit_imported_accounts(prepared: Vec<Account>) -> Result<Vec<String>, String> {
     let _writer = lock_account_file_updates()?;
-    let _index_lock = ACCOUNT_INDEX_LOCK.lock().map_err(|e| e.to_string())?;
     let mut index = load_account_index()?;
+    let mut errors = Vec::new();
     for mut incoming in prepared {
+        let email = incoming.email.clone();
+        let saved = (|| -> Result<Account, String> {
         let existing_id = index
             .accounts
             .iter()
@@ -3929,6 +3953,15 @@ fn commit_imported_accounts(prepared: Vec<Account>) -> Result<(), String> {
             incoming = latest;
         }
         save_account(&incoming)?;
+        Ok(incoming)
+        })();
+        let incoming = match saved {
+            Ok(incoming) => incoming,
+            Err(error) => {
+                errors.push(format!("{}: {}", email, error));
+                continue;
+            }
+        };
         let summary = account_summary(&incoming);
         if let Some(current) = index.accounts.iter_mut().find(|s| s.id == incoming.id) {
             *current = summary;
@@ -3939,7 +3972,8 @@ fn commit_imported_accounts(prepared: Vec<Account>) -> Result<(), String> {
     if index.current_account_id.is_none() {
         index.current_account_id = index.accounts.first().map(|s| s.id.clone());
     }
-    save_account_index(&index)
+    save_account_index(&index)?;
+    Ok(errors)
 }
 
 #[cfg(test)]
@@ -3961,6 +3995,79 @@ mod legacy_migration_safety_tests {
                 None,
             ),
         )
+    }
+
+    #[test]
+    fn wrapped_legacy_accounts_are_migrated_before_summary_deserialization() {
+        let root = tempfile::tempdir().unwrap();
+        let archive = serde_json::json!({
+            "version": "1.0", "accounts": [account("one"), account("two")],
+            "current_account_id": "two", "current_ide_account_id": "two", "current_target_ide": "ide"
+        });
+        fs::write(root.path().join(ACCOUNTS_INDEX), serde_json::to_vec(&archive).unwrap()).unwrap();
+        let index = load_account_index_in_dir(&root.path().to_path_buf()).unwrap();
+        assert_eq!(index.current_account_id.as_deref(), Some("two"));
+        assert_eq!(index.current_ide_account_id.as_deref(), Some("two"));
+        for id in ["one", "two"] {
+            let restored = load_account_at_path(&root.path().join("accounts").join(format!("{id}.json"))).unwrap();
+            assert_eq!(restored.token.refresh_token, "refresh");
+        }
+    }
+
+    #[test]
+    fn wrapped_legacy_map_preserves_every_credential() {
+        let root = tempfile::tempdir().unwrap();
+        let raw = serde_json::json!({"accounts": {"one": account("one"), "two": account("two")}}).to_string();
+        let index = try_migrate_legacy_single_file(&root.path().to_path_buf(), &raw).unwrap().unwrap();
+        assert_eq!(index.accounts.len(), 2);
+        assert!(root.path().join("accounts/one.json").exists());
+        assert!(root.path().join("accounts/two.json").exists());
+    }
+
+    #[test]
+    fn batch_shard_failure_preserves_successful_imports_in_index() {
+        let _data = crate::proxy::monitor::prompt_log_tests::TestDataDir::new();
+        let root = get_data_dir().unwrap();
+        fs::create_dir_all(root.join("accounts/blocked.json")).unwrap();
+        let errors = commit_imported_accounts(vec![account("first"), account("blocked"), account("last")]).unwrap();
+        assert_eq!(errors.len(), 1);
+        assert!(errors[0].starts_with("blocked@example.test:"));
+        let ids: Vec<_> = load_account_index().unwrap().accounts.into_iter().map(|account| account.id).collect();
+        assert_eq!(ids, vec!["first", "last"]);
+        assert_eq!(load_account("first").unwrap().token.refresh_token, "refresh");
+    }
+
+    #[test]
+    fn pointer_failure_keeps_source_and_runtime_location_recoverable() {
+        let _data = crate::proxy::monitor::prompt_log_tests::TestDataDir::new();
+        let root = get_data_dir().unwrap();
+        fs::write(root.join("marker"), "recoverable").unwrap();
+        let target_root = tempfile::tempdir().unwrap();
+        let pointer = target_root.path().join("pointer-is-directory");
+        fs::create_dir(&pointer).unwrap();
+        struct RestorePointer(Option<std::ffi::OsString>);
+        impl Drop for RestorePointer {
+            fn drop(&mut self) {
+                if let Some(value) = &self.0 { std::env::set_var("ABV_DATA_DIR_POINTER_FILE", value); }
+                else { std::env::remove_var("ABV_DATA_DIR_POINTER_FILE"); }
+            }
+        }
+        let _restore = RestorePointer(std::env::var_os("ABV_DATA_DIR_POINTER_FILE"));
+        std::env::set_var("ABV_DATA_DIR_POINTER_FILE", &pointer);
+        assert!(migrate_data_dir(target_root.path().join("target")).is_err());
+        assert_eq!(get_data_dir().unwrap(), root);
+        assert_eq!(fs::read_to_string(root.join("marker")).unwrap(), "recoverable");
+    }
+
+    #[test]
+    fn missing_target_alias_into_source_is_rejected_before_copy() {
+        let _data = crate::proxy::monitor::prompt_log_tests::TestDataDir::new();
+        let root = get_data_dir().unwrap();
+        fs::write(root.join("marker"), "source").unwrap();
+        let target = root.parent().unwrap().join(".").join(root.file_name().unwrap()).join("child");
+        assert!(migrate_data_dir(target.clone()).is_err());
+        assert_eq!(fs::read_to_string(root.join("marker")).unwrap(), "source");
+        assert!(!target.join("marker").exists());
     }
 
     #[test]
