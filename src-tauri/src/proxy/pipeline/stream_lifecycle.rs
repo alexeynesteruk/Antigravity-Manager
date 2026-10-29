@@ -287,6 +287,18 @@ where
                             }
                         }
                         None => {
+                            // A valid final data line can arrive without a newline.
+                            // Process it before deciding that EOF contained no content.
+                            if !buffer.is_empty() && !handler.is_terminal() {
+                                let line_str = String::from_utf8_lossy(&buffer);
+                                let line = line_str.trim();
+                                if !line.is_empty() {
+                                    for frame in handler.process_line(line) {
+                                        yield Ok(frame);
+                                    }
+                                }
+                                buffer.clear();
+                            }
                             // [关键契约守卫] 若上游到达 EOF 时未处于终止态，且从未产生任何正文或工具调用（无论是否产生了思考）：
                             // 严禁作为正常 EOF 终结或伪造收尾帧！如实作为 Err 透传底层中断，
                             // 促使 Claude Code 等客户端状态机捕获 ConnectionLost 并自动触发原生重试。
@@ -552,6 +564,25 @@ mod tests {
         assert!(full_output.contains("processed:data: world_without_newline"));
         assert!(full_output.contains("[finalized]"));
         assert!(!full_output.contains("[initial_error]"));
+    }
+
+    #[tokio::test]
+    async fn first_content_or_terminal_line_without_newline_survives_eof() {
+        for (line, finalized) in [("data: only_content", true), ("data: terminal_stop", false)] {
+            let upstream = futures::stream::iter(vec![Ok::<_, String>(Bytes::from(line))]);
+            let config = StreamLifecycleConfig::new("test", "tail_eof", String::new());
+            let mut stream =
+                run_stream_lifecycle(Box::pin(upstream), MockHandler::new(false, false), config);
+            let mut output = String::new();
+            while let Some(item) = stream.next().await {
+                output.push_str(&String::from_utf8_lossy(
+                    &item.expect("valid unterminated data line"),
+                ));
+            }
+            assert!(output.contains(&format!("processed:{line}")));
+            assert_eq!(output.contains("[finalized]"), finalized);
+            assert!(!output.contains("[initial_error]"));
+        }
     }
 
     #[tokio::test]
