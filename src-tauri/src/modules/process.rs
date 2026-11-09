@@ -202,6 +202,80 @@ pub fn is_process_running_by_name(target_name: &str) -> bool {
     false
 }
 
+/// Check if an Antigravity ACP server (`agy_acp_server`) process is currently running.
+pub fn is_acp_server_running() -> bool {
+    let mut system = System::new();
+    system.refresh_processes(sysinfo::ProcessesToUpdate::All);
+    for (_pid, process) in system.processes() {
+        let name = process.name().to_string_lossy().to_lowercase();
+        if name.contains("agy_acp_server") {
+            return true;
+        }
+        let args_match = process.cmd().iter().any(|arg| {
+            arg.to_string_lossy()
+                .to_lowercase()
+                .contains("agy_acp_server")
+        });
+        if args_match {
+            return true;
+        }
+        if let Some(exe) = process.exe() {
+            if exe
+                .to_string_lossy()
+                .to_lowercase()
+                .contains("agy_acp_server")
+            {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Terminate running `agy_acp_server` processes so the host IDE plugin respawns them with new credentials.
+pub fn kill_acp_server_processes() -> usize {
+    let mut system = System::new();
+    system.refresh_processes(sysinfo::ProcessesToUpdate::All);
+    let current_pid = std::process::id();
+    let mut killed = 0;
+
+    for (pid, process) in system.processes() {
+        let pid_u32 = pid.as_u32();
+        if pid_u32 == current_pid {
+            continue;
+        }
+        let name = process.name().to_string_lossy().to_lowercase();
+        let args_str = process
+            .cmd()
+            .iter()
+            .map(|a| a.to_string_lossy().to_lowercase())
+            .collect::<Vec<_>>()
+            .join(" ");
+        let exe_str = process
+            .exe()
+            .map(|e| e.to_string_lossy().to_lowercase())
+            .unwrap_or_default();
+
+        if is_manager_or_tools_process(&name, &exe_str, &args_str) {
+            continue;
+        }
+
+        if name.contains("agy_acp_server")
+            || args_str.contains("agy_acp_server")
+            || exe_str.contains("agy_acp_server")
+        {
+            crate::modules::logger::log_info(&format!(
+                "[ACP] Terminating agy_acp_server process (PID: {}) to reload switched credentials",
+                pid_u32
+            ));
+            force_kill_pid(pid_u32);
+            killed += 1;
+        }
+    }
+
+    killed
+}
+
 /// Helper process discriminator to filter out sub-processes, audio/gpu/renderers, crashpads, and language servers
 pub(crate) fn is_helper_process(name: &str, args_str: &str, exe_path: &str) -> bool {
     let name_lower = name.to_lowercase();
@@ -229,6 +303,7 @@ pub(crate) fn is_helper_process(name: &str, args_str: &str, exe_path: &str) -> b
         || exe_lower.contains("crashpad")
         || exe_lower.contains("helper")
         || exe_lower.contains("language_server")
+        || is_language_server_process(name, exe_path)
         || is_ide_agy_hub(name, exe_path, args_str)
 }
 
@@ -970,6 +1045,7 @@ fn close_antigravity_impl(timeout_secs: u64, target_ide: Option<&str>) -> Result
             let start = std::time::Instant::now();
             while start.elapsed() < Duration::from_secs(graceful_timeout) {
                 if !is_antigravity_running(target_ide) {
+                    sweep_orphan_language_servers(target_ide);
                     crate::modules::logger::log_info("All Antigravity processes gracefully closed");
                     return Ok(());
                 }
@@ -1005,15 +1081,18 @@ fn close_antigravity_impl(timeout_secs: u64, target_ide: Option<&str>) -> Result
 
                 // Final check
                 if !is_antigravity_running(target_ide) {
+                    sweep_orphan_language_servers(target_ide);
                     crate::modules::logger::log_info("All processes exited after forced cleanup");
                     return Ok(());
                 }
             } else {
+                sweep_orphan_language_servers(target_ide);
                 crate::modules::logger::log_info("All processes exited after SIGTERM");
                 return Ok(());
             }
         } else {
             // Only consider not running when pids is empty, don't error here as it might already be closed
+            sweep_orphan_language_servers(target_ide);
             crate::modules::logger::log_info("Antigravity not running, no need to close");
             return Ok(());
         }
@@ -1078,6 +1157,7 @@ fn close_antigravity_impl(timeout_secs: u64, target_ide: Option<&str>) -> Result
             let start = std::time::Instant::now();
             while start.elapsed() < Duration::from_secs(graceful_timeout) {
                 if !is_antigravity_running(target_ide) {
+                    sweep_orphan_language_servers(target_ide);
                     crate::modules::logger::log_info("Antigravity gracefully closed");
                     return Ok(());
                 }
@@ -1099,6 +1179,7 @@ fn close_antigravity_impl(timeout_secs: u64, target_ide: Option<&str>) -> Result
                 }
             }
         } else {
+            sweep_orphan_language_servers(target_ide);
             crate::modules::logger::log_info(
                 "No Antigravity processes found to close (possibly filtered or not running)",
             );
@@ -1111,6 +1192,7 @@ fn close_antigravity_impl(timeout_secs: u64, target_ide: Option<&str>) -> Result
 
     while final_check_start.elapsed() < final_check_timeout {
         if !is_antigravity_running(target_ide) {
+            sweep_orphan_language_servers(target_ide);
             crate::modules::logger::log_info("Antigravity closed successfully");
             return Ok(());
         }
@@ -1143,6 +1225,7 @@ fn close_antigravity_impl(timeout_secs: u64, target_ide: Option<&str>) -> Result
         );
     }
 
+    sweep_orphan_language_servers(target_ide);
     crate::modules::logger::log_info("Antigravity closed successfully");
     Ok(())
 }
@@ -1990,6 +2073,40 @@ mod tests {
     }
 
     #[test]
+    fn test_matches_target_client_for_agy_language_server() {
+        assert!(matches_target_client(
+            Some("ide"),
+            "agy",
+            "/Users/me/.gemini/bin/agy",
+            "agy",
+            "--hub --hub-port=52542 --app_data_dir=antigravity"
+        ));
+        assert!(matches_target_client(
+            Some("ide"),
+            "agy.exe",
+            "C:\\Users\\me\\.gemini\\bin\\agy.exe",
+            "agy.exe",
+            "--hub --hub-port=52542 --app_data_dir=antigravity"
+        ));
+        // Classic mode should not match IDE language server agy
+        assert!(!matches_target_client(
+            None,
+            "agy",
+            "/Users/me/.gemini/bin/agy",
+            "agy",
+            "--hub --hub-port=52542 --app_data_dir=antigravity"
+        ));
+        // Standalone CLI execution without --hub / antigravity should not match IDE
+        assert!(!matches_target_client(
+            Some("ide"),
+            "agy",
+            "/Users/me/.gemini/bin/agy",
+            "agy",
+            "version"
+        ));
+    }
+
+    #[test]
     fn app_bundle_root_splits_by_component() {
         use std::path::{Path, PathBuf};
         assert_eq!(
@@ -2063,6 +2180,16 @@ mod tests {
             "crashpad_handler",
             "",
             "/Applications/Antigravity.app/Contents/Frameworks/Electron Framework.framework/Helpers/chrome_crashpad_handler"
+        ));
+        assert!(is_helper_process(
+            "agy",
+            "--hub --hub-port=52542 --app_data_dir=antigravity",
+            "/Users/me/.gemini/bin/agy"
+        ));
+        assert!(is_helper_process(
+            "agy.exe",
+            "--hub --hub-port=52542 --app_data_dir=antigravity",
+            "C:\\Users\\me\\.gemini\\bin\\agy.exe"
         ));
     }
 

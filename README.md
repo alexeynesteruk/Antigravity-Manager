@@ -1,5 +1,4 @@
 # Antigravity Tools 🚀
-> Professional Account Management & Protocol Proxy System for AI Services (v4.9.8)
 
 <div align="center">
   <img src="public/icon.png" width="100" height="100" alt="Antigravity Tools Logo">
@@ -11,7 +10,6 @@
       <img src="https://img.shields.io/github/v/release/lbjlaq/Antigravity-Manager?color=blue&style=flat-square" alt="GitHub release">
     </a>
     <a href="https://github.com/lbjlaq/Antigravity-Manager">
-      <img src="https://img.shields.io/badge/Version-4.9.8-blue?style=flat-square" alt="Version">
     </a>
     <img src="https://img.shields.io/badge/Tauri-v2-orange?style=flat-square" alt="Tauri">
     <img src="https://img.shields.io/badge/Backend-Rust-red?style=flat-square" alt="Rust">
@@ -199,6 +197,20 @@ docker run -d --name antigravity-manager \
   lbjlaq/antigravity-manager:latest
 
 # Forgot keys? Run `docker logs antigravity-manager` or `grep -E '"api_key"|"admin_password"' ~/.antigravity_tools/gui_config.json`
+```
+
+### Option D: Android Termux Native Deployment (ARM64 Headless)
+For Android users and lightweight self-hosting (e.g. running alongside SillyTavern / Lumiverse as a local API gateway on phone), we provide native `aarch64-linux-android` (Bionic libc) headless binaries without requiring Debian PRoot or Docker:
+
+```bash
+# One-line installer for Termux ($PREFIX/bin/antigravity-server)
+curl -sSL https://raw.githubusercontent.com/lbjlaq/Antigravity-Manager/main/scripts/install-termux.sh | bash
+
+# Run mode 1: Standard server (allows browser access to Web UI for dashboard management)
+antigravity-server
+
+# Run mode 2: Pure proxy mode (completely disables Web UI to save battery & eliminate LAN attack surface)
+antigravity-server --no-web
 ```
 
 > [!TIP]
@@ -514,7 +526,6 @@ In clients that support OpenAI protocol (e.g., Cherry Studio), you can configure
 
 ## 📝 Changelog
 
-> Latest version **v4.9.8** (2026-10-17): Automatic seamless hot-switch for Antigravity Classic upon quota depletion or threshold breach with streamlined dual-pool cards (Ref #3509); native evolution supporting Antigravity CLI (`agy`) with automatic shell wrapper injection, thinking effort disassembly, and independent 3-client active account detection with contextual badges (Ref #3686, Ref #3630); comprehensive 403 error body capture and action URL extraction (captcha verification/appeal) with closed-loop self-healing recovery (Ref #3630, Ref #3684); Claude Code 2.1.301 protocol alignment with anti-WAF identity sanitization, full-link `request-id` injection, and Claude 5 model family integration (PR #3689, Ref #3684, Ref #3686); active reference tracking in JSON Schema recursive flattening to eliminate exponential replication and Linux VPS OOM (SIGKILL 137) crashes, array schema normalization with terminal ARRAY items guards to prevent Gemini 400 errors, adaptive first-chunk Peek timeout extension to 60s/90s/120s for reasoning models, zero-downtime atomic pool reload eliminating 503 errors, and anti-regression rate limit protection (PR #3694, Fixes #3690, Ref #3682, Ref #3693); complete removal of 100% 429-yielding Prod endpoints, relaxed streaming first-chunk watchdog to 120s baseline, multi-turn role preservation for Responses array inputs, and elimination of 0ms optimistic reset storms (PR #3691, PR #3672, PR #3687, PR #3685, Fixes #3506, Ref #3525); traffic monitor inspector overhaul with Postman-style single-tab view, structured vs raw code views, key-value headers tables with Bearer masking, standard dual-link HAR 1.2 export, and 12-language localization coverage (thanks to @cubelikeplayDaniel, @EricZhou05, @blackdm666, @jeikl).
 
 👉 **[View Full Changelog → CHANGELOG.md](CHANGELOG.md)**
 

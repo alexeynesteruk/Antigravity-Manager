@@ -62,7 +62,7 @@ export function getModelQuotaDisplay(modelId: string, model: ModelQuota | undefi
         .reduce<(typeof buckets)[number] | undefined>((chosen, bucket) =>
             !chosen || bucket.remaining_fraction < chosen.remaining_fraction ? bucket : chosen, undefined);
     const weekly = buckets.filter(bucket => /week|7d/i.test(`${bucket.window} ${bucket.bucket_id}`)
-        && bucket.remaining_fraction <= 0.001 && Date.parse(bucket.reset_time) > Date.now())
+        && bucket.remaining_fraction <= 0.015 && Date.parse(bucket.reset_time) > Date.now())
         .reduce<(typeof buckets)[number] | undefined>((chosen, bucket) =>
             !chosen || Date.parse(bucket.reset_time) > Date.parse(chosen.reset_time) ? bucket : chosen, undefined);
     return {
@@ -148,8 +148,8 @@ export function getModelConstrainedQuota(
     const fiveHourResetTime = fiveHourBucket?.reset_time || model?.reset_time;
     const weeklyResetTime = weeklyBucket?.reset_time;
 
-    // 2. 状态判定
-    const isWeeklyExhausted = rawWeekly !== null && rawWeekly <= 0;
+    // 2. 状态判定 (周配额低于 1.5% 即实际见底，木桶短板生效)
+    const isWeeklyExhausted = rawWeekly !== null && rawWeekly <= 1;
     const isWeeklyConstrained = isWeeklyExhausted || (rawWeekly !== null && raw5h !== null && rawWeekly < raw5h);
     const is5hCooling = raw5h !== null && raw5h <= 0 && (rawWeekly === null || rawWeekly > 0);
 
@@ -314,15 +314,16 @@ function summarizeSupportedModels(models: ModelQuota[], key: 'gemini' | 'claude'
  * 提取 Gemini Models、Claude & GPT models 以及 Gemini 4 Argon 的聚合配额
  * @param groups 配额组数据 (quota_groups)
  * @param fallbackModels 兜底模型列表 (models)
- * @param tier 账号订阅类型 ('ultra' | 'pro' | 'free')
+ * @param tier 账号订阅类型 ('ultra' | 'pro' | 'enterprise' | 'free')
  */
 export function getGroupQuotaSummaries(
     groups: QuotaGroup[] = [],
     fallbackModels: ModelQuota[] = [],
-    tier?: 'ultra' | 'pro' | 'free'
+    tier?: 'ultra' | 'pro' | 'enterprise' | 'free'
 ): GroupQuotaSummary[] {
     const isFreeTier = tier === 'free';
     const isUltraTier = tier === 'ultra';
+    const isEnterpriseTier = tier === 'enterprise';
 
     const findGroupBuckets = (target: 'gemini' | 'claude' | 'argon') => {
         const directBuckets = (groups || []).filter(group => {
@@ -439,7 +440,8 @@ export function getGroupQuotaSummaries(
         const effectiveWeekly = rawWeekly;
         const effectiveWeeklyResetTime = weeklyResetTime;
 
-        const isWeeklyExhausted = effectiveWeekly !== undefined && effectiveWeekly <= 0;
+        // 周配额低于 1.5% (取整 <= 1%) 时实际已无法支撑请求，木桶短板生效触发周熔断
+        const isWeeklyExhausted = effectiveWeekly !== undefined && effectiveWeekly <= 1;
         const isWeeklyConstrained = isWeeklyExhausted || (effectiveWeekly !== undefined && raw5h !== undefined && effectiveWeekly < raw5h);
 
         const labelKey = key === 'argon'
@@ -458,6 +460,37 @@ export function getGroupQuotaSummaries(
             return key === 'claude' ? (n.startsWith('claude') || n.startsWith('gpt')) : n.startsWith('gemini');
         });
         const { dynamicLabel, supportedModels } = summarizeSupportedModels(matchedForSummary, key);
+
+        // [3P MODEL ZERO DEFENSE] 若账号在该模型组下无任何实际未禁用的支持模型（如不支持 Opus 5.5 且 4.6/GPT 不存在），
+        // 严格留空 (fiveHour: undefined, weekly: undefined)，杜绝因上游返回通用 3P 桶而展示虚假满额
+        if (key === 'claude' && matchedForSummary.length === 0) {
+            return {
+                key,
+                labelKey,
+                defaultLabel,
+                dynamicLabel,
+                supportedModels,
+                fiveHour: undefined,
+                weekly: undefined,
+                isWeeklyConstrained: false,
+                isWeeklyExhausted: false,
+            };
+        }
+
+        // 企业账号走 Vertex AI 组织资源池，没有个人 5H/Weekly 滑动窗口约束，统一展示为 100% 满额可用
+        if (isEnterpriseTier && matchedForSummary.length > 0) {
+            return {
+                key,
+                labelKey,
+                defaultLabel,
+                dynamicLabel,
+                supportedModels,
+                fiveHour: { percentage: 100, resetTime: undefined },
+                weekly: { percentage: 100, resetTime: undefined },
+                isWeeklyConstrained: false,
+                isWeeklyExhausted: false,
+            };
+        }
 
         return {
             key,

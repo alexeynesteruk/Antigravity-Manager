@@ -64,9 +64,6 @@ pub fn wrap_request_v2(
     let is_target_claude = final_model_name.to_lowercase().contains("claude");
 
     let lower_model = final_model_name.to_lowercase();
-    let tb_config = crate::proxy::config::get_thinking_budget_config();
-    let is_client_control =
-        tb_config.control_source == crate::proxy::config::ThinkingControlSource::Client;
 
     let client_budget = inner_request
         .get("generationConfig")
@@ -92,13 +89,6 @@ pub fn wrap_request_v2(
         })
         .and_then(|v| v.as_str());
 
-    let client_switch = crate::proxy::pipeline::extract_client_thinking_switch(
-        None,
-        client_budget.map(|b| if b <= 0 { 0 } else { b as u64 }),
-        client_level,
-    );
-    let is_client_disabled = is_client_control && client_switch.is_disabled();
-
     let is_under_v3 = crate::proxy::model_specs::is_gemini_under_v3(final_model_name)
         || crate::proxy::model_specs::is_gemini_under_v3(original_model);
     let force_server_thinking = !is_under_v3
@@ -107,8 +97,8 @@ pub fn wrap_request_v2(
             original_model,
         ]);
     let is_preview = lower_model.contains("preview");
-    let should_inject = !is_client_disabled
-        && !is_under_v3
+    // 客户端直控模式已下线：思考开关仅通过路由层（降档）表达
+    let should_inject = !is_under_v3
         && (force_server_thinking
             || lower_model.contains("thinking")
             || (crate::proxy::model_specs::is_gemini_v3_or_above(final_model_name) && !is_preview));
@@ -346,67 +336,6 @@ pub fn wrap_request_v2(
         || lower_model.contains("agent")
         || lower_model.contains("gemini")
     {
-        // [NEW] Extract OpenAI/Claude-style max_tokens before mutably borrowing gen_config
-        let req_max_tokens = inner_request
-            .get("max_tokens")
-            .or_else(|| inner_request.get("max_completion_tokens"))
-            .or_else(|| inner_request.get("maxCompletionTokens"))
-            .or_else(|| inner_request.get("maxTokens"))
-            .and_then(|v| v.as_u64());
-
-        // Determine model family and capability beforehand to avoid borrow checker conflicts
-        let is_claude = lower_model.contains("claude");
-
-        if should_inject {
-            // Scope for borrowing inner_request/gen_config
-            let has_thinking = if is_claude {
-                inner_request.get("thinking").is_some()
-            } else {
-                inner_request
-                    .get("generationConfig")
-                    .and_then(|v| v.as_object())
-                    .map_or(false, |gc| gc.get("thinkingConfig").is_some())
-            };
-
-            let tb_config = crate::proxy::config::get_thinking_budget_config();
-            let is_client_control =
-                tb_config.control_source == crate::proxy::config::ThinkingControlSource::Client;
-
-            let default_budget =
-                crate::proxy::model_specs::get_thinking_budget(final_model_name, token);
-
-            let is_explicit_tier =
-                crate::proxy::model_specs::is_explicit_heuristic_tier_model(final_model_name);
-
-            // [ANTI-POLLUTION] 对齐 Anthropic 与 OpenAI：对于未设置思考配置或显式档位模型，设定权威 default_budget；对于裸模型保留客户端配置供后续 resolve_authoritative_thinking_budget 仲裁
-            // 客户端直接控制模式下，严禁篡改覆盖客户端的思考意图
-            let should_override_budget = !is_client_control && (!has_thinking || is_explicit_tier);
-
-            if should_override_budget {
-                tracing::debug!(
-                    "[Gemini-Wrap] Enforcing authoritative thinking budget {} for {}",
-                    default_budget,
-                    final_model_name
-                );
-
-                let gen_config = inner_request
-                    .as_object_mut()
-                    .unwrap()
-                    .entry("generationConfig")
-                    .or_insert(json!({}))
-                    .as_object_mut()
-                    .unwrap();
-
-                gen_config.insert(
-                    "thinkingConfig".to_string(),
-                    json!({
-                        "includeThoughts": true,
-                        "thinkingBudget": default_budget
-                    }),
-                );
-            }
-        }
-
         // Re-acquire gen_config to satisfy borrow checker and scope requirements for later logic
         let gen_config = inner_request
             .as_object_mut()
@@ -421,19 +350,13 @@ pub fn wrap_request_v2(
         }
 
         if force_server_thinking {
-            let default_budget =
-                crate::proxy::model_specs::get_thinking_budget(final_model_name, token);
             let thinking_config = gen_config
                 .entry("thinkingConfig".to_string())
                 .or_insert(json!({}))
                 .as_object_mut()
                 .unwrap();
+            // 只表达“开启思考”；具体预算/等级由流水线按官方模型结构体决定
             thinking_config.insert("includeThoughts".to_string(), json!(true));
-            if !thinking_config.contains_key("thinkingBudget")
-                && !thinking_config.contains_key("thinkingLevel")
-            {
-                thinking_config.insert("thinkingBudget".to_string(), json!(default_budget));
-            }
             tracing::debug!(
                 "[Gemini-Wrap] Forced includeThoughts=true for keyword model {}",
                 final_model_name
@@ -471,16 +394,9 @@ pub fn wrap_request_v2(
             client_level.as_deref(),
         );
 
-        let tb_config = crate::proxy::config::get_thinking_budget_config();
-        let is_client_control =
-            tb_config.control_source == crate::proxy::config::ThinkingControlSource::Client;
-        let budget_opt = if has_thinking_config || force_server_thinking {
+        let budget_opt = if should_inject || has_thinking_config {
             let mut gc_val = serde_json::Value::Object(std::mem::take(gen_config));
-            let client_budget_for_pipeline = if is_client_control {
-                client_budget.filter(|b| *b >= 0).map(|b| b as u64)
-            } else {
-                client_budget.filter(|b| *b > 0).map(|b| b as u64)
-            };
+            let client_budget_for_pipeline = client_budget.filter(|b| *b > 0).map(|b| b as u64);
             let resolved =
                 crate::proxy::pipeline::InboundThinkingPipeline::configure_inbound_thinking(
                     final_model_name,
@@ -498,146 +414,35 @@ pub fn wrap_request_v2(
             None
         };
 
-        if !is_client_control {
-            if let Some(tc) = gen_config
-                .get_mut("thinkingConfig")
-                .and_then(|v| v.as_object_mut())
-            {
-                tracing::info!(
-                    "[Gemini-Wrap] Pipeline thinking budget {:?} for {} (client_level={:?})",
-                    budget_opt,
-                    final_model_name,
-                    client_level
-                );
+        if let Some(tc) = gen_config
+            .get_mut("thinkingConfig")
+            .and_then(|v| v.as_object_mut())
+        {
+            // 官方字段迁移后 thinkingLevel 是主流通道，必须原样保留；
+            // 仅当模型确实走预算通道（已携带 thinkingBudget）时才清理等级，避免把唯一通道删空。
+            if tc.contains_key("thinkingBudget") {
                 tc.remove("thinkingLevel");
             }
+            tracing::info!(
+                "[Gemini-Wrap] Pipeline thinking config for {} (pipeline_budget={:?}, budget={:?}, level={:?}, client_level={:?})",
+                final_model_name,
+                budget_opt,
+                tc.get("thinkingBudget"),
+                tc.get("thinkingLevel"),
+                client_level
+            );
         }
 
-        // [FIX #1747] Ensure max_tokens (maxOutputTokens) is greater than thinking_budget
-        // Google v1internal requires maxOutputTokens > thinkingBudget.
-        // [FIX #1825] Handle adaptive fallback (incl. -1 and thinkingLevel)
-        let thinking_config_opt = gen_config.get("thinkingConfig");
-        let is_adaptive = thinking_config_opt.map_or(false, |t| {
-            t.get("thinkingLevel").is_some()
-                || t.get("thinkingBudget").is_none()
-                || t.get("thinkingBudget").and_then(|v| v.as_i64()) == Some(-1)
-        }) || (thinking_config_opt
-            .and_then(|t| t.get("thinkingBudget").and_then(|v| v.as_u64()))
-            == Some(32768)
-            && is_claude);
-
-        if let Some(thinking_config) = gen_config.get("thinkingConfig") {
-            let budget_opt = thinking_config
-                .get("thinkingBudget")
-                .and_then(|v| v.as_i64());
-
-            // For adaptive or dynamic mode, we only need to ensure max tokens is large.
-            // For fixed budget, we must satisfy maxOutputTokens > thinkingBudget.
-            let current_max = gen_config
-                .get("maxOutputTokens")
-                .and_then(|v| v.as_u64())
-                .or(req_max_tokens);
-
-            if is_adaptive {
-                if current_max.map_or(true, |m| m < 131072) {
-                    gen_config.insert("maxOutputTokens".to_string(), json!(131072));
-                }
-            } else if let Some(budget_i64) = budget_opt {
-                if budget_i64 > 0 {
-                    let budget = budget_i64 as u64;
-                    let min_required_max = budget + 8192;
-                    if current_max.map_or(true, |m| m <= budget) {
-                        tracing::info!(
-                            "[Gemini-Wrap] Bumping maxOutputTokens from {:?} to {} to satisfy thinkingBudget ({})",
-                            current_max, min_required_max, budget
-                        );
-                        gen_config.insert("maxOutputTokens".to_string(), json!(min_required_max));
-                    }
-                }
-            }
-        }
-    }
-
-    // [NEW] 按模型对 maxOutputTokens 进行三层限额 (Dynamic > Static Default > 65535)
-    // 修复: gemini-cli 等客户端发送的 131072 超过部分模型支持的上限，导致 v1internal 返回 400 INVALID_ARGUMENT
-    {
-        let final_cap = crate::proxy::model_specs::get_max_output_tokens(final_model_name, token);
-        let gen_config = inner_request
-            .as_object_mut()
-            .unwrap()
-            .entry("generationConfig")
-            .or_insert(serde_json::json!({}))
-            .as_object_mut()
-            .unwrap();
-        if let Some(current) = gen_config.get("maxOutputTokens").and_then(|v| v.as_u64()) {
-            if current > final_cap {
-                tracing::debug!(
-                    "[Gemini-Wrap] Capped maxOutputTokens from {} to {} for model {}",
-                    current,
-                    final_cap,
-                    final_model_name
-                );
-                gen_config.insert("maxOutputTokens".to_string(), serde_json::json!(final_cap));
-            }
-        }
-
-        // 确保模型限额截断后依然满足 Google v1internal 硬约束：maxOutputTokens > thinkingBudget
-        let user_provided_max = gen_config.get("maxOutputTokens").and_then(|v| v.as_u64());
-        let raw_budget = gen_config
-            .get("thinkingConfig")
-            .and_then(|tc| tc.get("thinkingBudget"))
-            .and_then(|v| v.as_i64());
-
-        if let Some(budget) = raw_budget {
-            if budget > 0 {
-                let mut final_budget = budget;
-                let mut final_max = user_provided_max.unwrap_or(final_cap);
-
-                // 保留明确的思考预算，不用输出/思考比值推测客户端的速答意图。
-                if final_budget > 0 {
-                    // 【分支 2: 常规深度推理 - 官方容量能包住时优先自动扩充 m】
-                    if final_budget as u64 + 1024 <= final_cap {
-                        if final_max <= final_budget as u64 {
-                            final_max = final_budget as u64 + 1024;
-                            tracing::info!(
-                                "[Gemini-Wrap] Auto-expanded maxOutputTokens to {} to preserve thinkingBudget ({}) within official final_cap ({}) for model {}",
-                                final_max, final_budget, final_cap, final_model_name
-                            );
-                        }
-                    } else {
-                        // 【分支 3: 官方物理天花板硬顶兜底】
-                        final_max = final_cap;
-                        final_budget = if final_cap > 1024 {
-                            (final_cap - 1024) as i64
-                        } else if final_cap > 1 {
-                            (final_cap - 1) as i64
-                        } else {
-                            0
-                        };
-                        tracing::info!(
-                            "[Gemini-Wrap] Budget exceeded official ceiling: clamped maxOutputTokens to {} and thinkingBudget to {}",
-                            final_max, final_budget
-                        );
-                    }
-                }
-
-                gen_config.insert("maxOutputTokens".to_string(), serde_json::json!(final_max));
-                if let Some(tc) = gen_config
-                    .get_mut("thinkingConfig")
-                    .and_then(|v| v.as_object_mut())
-                {
-                    tc.insert(
-                        "thinkingBudget".to_string(),
-                        serde_json::json!(final_budget),
-                    );
-                }
-            }
-        }
-
+        // maxOutputTokens 的硬顶与 budget 协商已由 `configure_inbound_thinking` 统一完成，
+        // 适配层不再二次改写（历史上四份不同 overhead 会互相覆写）。
         if is_under_v3 {
             gen_config.remove("thinkingConfig");
         }
     }
+
+    // maxOutputTokens 三层限额与 6x intent / 自动扩容 / 物理天花板兜底
+    // 已全部收敛到 `pipeline::InboundThinkingPipeline::configure_inbound_thinking`，
+    // 四协议共用同一份协商逻辑，此处不再保留第二套实现。
 
     // This caused upstream to return empty/invalid responses, leading to 'NoneType' object has no attribute 'strip' in Python clients.
     // relying on upstream defaults or user provided values is safer.

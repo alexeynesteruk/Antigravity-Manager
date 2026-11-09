@@ -480,71 +480,198 @@ pub async fn complete_oauth_flow(
     oauth::exchange_code_with_client(&code, &redirect_uri, Some(&client_key)).await
 }
 
+/// Snapshot active OAuth flow context `(redirect_uri, state, client_key)` if present.
+pub fn get_active_oauth_flow_context() -> Option<(String, String, String)> {
+    let lock = get_oauth_flow_state().lock().ok()?;
+    let state = lock.as_ref()?;
+    Some((
+        state.redirect_uri.clone(),
+        state.state.clone(),
+        state.client_key.clone(),
+    ))
+}
+
+/// Parse manual OAuth input (full callback URL, schemeless callback URL, query string, or raw code).
+/// Returns `(decoded_code, extracted_state)`.
+pub fn parse_manual_oauth_input(raw_input: &str) -> Result<(String, Option<String>), String> {
+    let trimmed = raw_input.trim();
+    if trimmed.is_empty() {
+        return Err("Authorization code cannot be empty".to_string());
+    }
+
+    let extract_from_url = |url: &Url| -> Result<Option<(String, Option<String>)>, String> {
+        let mut code = None;
+        let mut state = None;
+        let mut oauth_error = None;
+        for (k, v) in url.query_pairs() {
+            match k.as_ref() {
+                "code" if !v.trim().is_empty() => code = Some(v.trim().to_string()),
+                "state" if !v.trim().is_empty() => state = Some(v.trim().to_string()),
+                "error" if !v.trim().is_empty() => oauth_error = Some(v.trim().to_string()),
+                _ => {}
+            }
+        }
+        if let Some(err) = oauth_error {
+            return Err(format!("OAuth callback returned error: {}", err));
+        }
+        Ok(code.map(|c| (c, state)))
+    };
+
+    // 1. Standard URL starting with http:// or https://
+    if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
+        let url = Url::parse(trimmed).map_err(|e| format!("Invalid callback URL: {}", e))?;
+        if let Some(res) = extract_from_url(&url)? {
+            return Ok(res);
+        }
+        return Err("Callback URL does not contain a 'code' query parameter".to_string());
+    }
+
+    // 2. Schemeless localhost/127.0.0.1/[::1] URL or query fragment containing "code=" or "error="
+    if trimmed.starts_with("localhost:")
+        || trimmed.starts_with("127.0.0.1:")
+        || trimmed.starts_with("[::1]:")
+        || trimmed.contains("code=")
+        || trimmed.contains("error=")
+    {
+        let candidate = if trimmed.starts_with('?') || trimmed.starts_with('/') {
+            format!("http://localhost{}", trimmed)
+        } else if trimmed.contains("://") {
+            trimmed.to_string()
+        } else if trimmed.starts_with("localhost")
+            || trimmed.starts_with("127.0.0.1")
+            || trimmed.starts_with("[::1]")
+        {
+            format!("http://{}", trimmed)
+        } else {
+            format!("http://localhost/?{}", trimmed.trim_start_matches('&'))
+        };
+
+        if let Ok(url) = Url::parse(&candidate) {
+            if let Some(res) = extract_from_url(&url)? {
+                return Ok(res);
+            }
+        }
+    }
+
+    // 3. Raw authorization code (possibly URL-encoded like "4%2F0A...")
+    let dummy_url = Url::parse(&format!("http://localhost/?code={}", trimmed))
+        .map_err(|_| "Invalid authorization code format".to_string())?;
+    let decoded_code = dummy_url
+        .query_pairs()
+        .find(|(k, _)| k == "code")
+        .map(|(_, v)| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+        .ok_or_else(|| "Authorization code cannot be empty".to_string())?;
+
+    Ok((decoded_code, None))
+}
+
 /// Manually submit an OAuth code to complete the flow.
-/// This is used when the user manually copies the code/URL from the browser
-/// because the localhost callback couldn't be reached (e.g. in Docker/remote).
+/// Synchronously exchanges the code using the prepared flow's redirect_uri and client_key.
 pub async fn submit_oauth_code(
     code_input: String,
     state_input: Option<String>,
-) -> Result<(), String> {
-    // This entrypoint is authenticated IPC/admin traffic. Pasting a bare code is
-    // supported, while a pasted callback URL must carry its matching nonce.
-    let (code, nonce, redirect) =
-        if code_input.starts_with("http://") || code_input.starts_with("https://") {
-            let mut url =
-                Url::parse(&code_input).map_err(|_| "Invalid OAuth callback URL".to_string())?;
-            let code = url
-                .query_pairs()
-                .find(|(key, _)| key == "code")
-                .map(|(_, value)| value.into_owned())
-                .ok_or_else(|| "OAuth callback URL has no code".to_string())?;
-            let nonce = url
-                .query_pairs()
-                .find(|(key, _)| key == "state")
-                .map(|(_, value)| value.into_owned())
-                .ok_or_else(|| "OAuth callback URL has no state".to_string())?;
-            if state_input
-                .as_deref()
-                .is_some_and(|provided| provided != nonce)
-            {
-                return Err("OAuth state mismatch".to_string());
+) -> Result<oauth::TokenResponse, String> {
+    let (code, extracted_state) = parse_manual_oauth_input(&code_input)?;
+    let effective_state = state_input
+        .filter(|s| !s.trim().is_empty())
+        .or(extracted_state);
+
+    let (redirect_uri, client_key, code_tx) = {
+        let lock = get_oauth_flow_state().lock().map_err(|e| e.to_string())?;
+        if let Some(state) = lock.as_ref() {
+            if let Some(ref provided_state) = effective_state {
+                if provided_state != &state.state {
+                    return Err("OAuth state mismatch (CSRF protection)".to_string());
+                }
             }
-            url.set_query(None);
-            url.set_fragment(None);
-            (code, Some(nonce), Some(url.to_string()))
+            (
+                state.redirect_uri.clone(),
+                state.client_key.clone(),
+                state.code_tx.clone(),
+            )
         } else {
-            (code_input, state_input, None)
-        };
-    if code.trim().is_empty() {
-        return Err("OAuth authorization code is empty".to_string());
-    }
-    let tx = {
-        let mut pending = get_oauth_flow_state()
-            .lock()
-            .map_err(|_| "OAuth state lock corrupted".to_string())?;
-        let flow = pending
-            .as_mut()
-            .ok_or_else(|| "No active OAuth flow found".to_string())?;
-        flow.claim_code(nonce.as_deref(), redirect.as_deref(), redirect.is_some())?;
-        flow.code_tx.clone()
+            return Err(
+                "No active OAuth flow found. Please click 'Start OAuth' first.".to_string(),
+            );
+        }
     };
-    // The capacity-one channel is only claimed once; never wait indefinitely.
-    tx.try_send(Ok(code))
-        .map_err(|_| "OAuth flow receiver is unavailable; start authorization again".to_string())?;
-    crate::modules::logger::log_info("Received manual OAuth code submission");
-    Ok(())
+
+    crate::modules::logger::log_info(&format!(
+        "Exchanging manual OAuth code with redirect_uri: {}, client_key: {}",
+        redirect_uri, client_key
+    ));
+
+    // Exchange with the exact redirect_uri and client_key stored in the flow.
+    // If exchange fails, cancel flow to ensure corrupted/expired state is not reused.
+    let token_res =
+        match oauth::exchange_code_with_client(&code, &redirect_uri, Some(&client_key)).await {
+            Ok(res) => res,
+            Err(e) => {
+                crate::modules::logger::log_warn(&format!(
+                    "OAuth exchange failed during manual submission, cleaning up flow state: {}",
+                    e
+                ));
+                cancel_oauth_flow();
+                return Err(e);
+            }
+        };
+
+    // Also notify code_tx in case a background listener (e.g. Desktop flow) is awaiting code_rx
+    let _ = code_tx.try_send(Ok(code));
+
+    // Clean up flow state
+    cancel_oauth_flow();
+
+    Ok(token_res)
 }
+
+/// Get the active flow's client_key for callback matching
+pub fn get_active_flow_client_key(state_param: Option<&str>) -> Option<String> {
+    if let Ok(lock) = get_oauth_flow_state().lock() {
+        if let Some(s) = lock.as_ref() {
+            if let Some(expected_state) = state_param {
+                if s.state == expected_state {
+                    return Some(s.client_key.clone());
+                }
+            } else {
+                return Some(s.client_key.clone());
+            }
+        }
+    }
+    None
+}
+
 /// Manually prepare an OAuth flow without starting listeners.
 /// Useful for Web/Docker environments where we only need manual code submission.
 pub fn prepare_oauth_flow_manually(
     redirect_uri: String,
-    state_str: String,
     oauth_client_key: Option<String>,
-) -> Result<(String, mpsc::Receiver<Result<String, String>>, String), String> {
+) -> Result<String, String> {
+    // 1. Check if we can reuse existing flow state
+    if let Ok(lock) = get_oauth_flow_state().lock() {
+        if let Some(s) = lock.as_ref() {
+            let same_client = match oauth_client_key.as_ref() {
+                Some(key) => s.client_key == key.to_ascii_lowercase(),
+                None => true,
+            };
+            if same_client && s.redirect_uri == redirect_uri {
+                return Ok(s.auth_url.clone());
+            }
+        }
+    }
+
+    // 2. Clear old state if different or fresh flow requested
+    if let Ok(mut lock) = get_oauth_flow_state().lock() {
+        if let Some(s) = lock.as_mut() {
+            let _ = s.cancel_tx.send(true);
+            *lock = None;
+        }
+    }
+
+    let state_str = uuid::Uuid::new_v4().to_string();
     let (auth_url, resolved_client_key) =
         oauth::get_auth_url_with_client(&redirect_uri, &state_str, oauth_client_key.as_deref())?;
-
-    let client_key = resolved_client_key.clone();
 
     let (cancel_tx, _cancel_rx) = watch::channel(false);
     let (code_tx, code_rx) = mpsc::channel(1);
@@ -556,20 +683,20 @@ pub fn prepare_oauth_flow_manually(
         // Replacing and cancelling the previous flow is one atomic transition.
         if let Some(previous) = pending.replace(OAuthFlowState {
             auth_url: auth_url.clone(),
-            redirect_uri: redirect_uri.clone(),
+            redirect_uri,
             state: state_str,
             client_key: resolved_client_key,
             created_at: Instant::now(),
             code_claimed: false,
             cancel_tx,
             code_tx,
-            code_rx: None, // We return it directly
+            code_rx: Some(code_rx),
         }) {
             let _ = previous.cancel_tx.send(true);
         }
     }
 
-    Ok((auth_url, code_rx, client_key))
+    Ok(auth_url)
 }
 
 #[cfg(test)]
@@ -798,5 +925,83 @@ mod callback_security_tests {
                 .auth_url,
             first
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_manual_oauth_input_full_url() {
+        let input = "http://localhost:8045/auth/callback?state=state-123&code=4%2F0AeanS0_test_code&scope=email+profile";
+        let (code, state) =
+            parse_manual_oauth_input(input).expect("should parse full callback url");
+        assert_eq!(code, "4/0AeanS0_test_code");
+        assert_eq!(state.as_deref(), Some("state-123"));
+    }
+
+    #[test]
+    fn test_parse_manual_oauth_input_schemeless_localhost_url() {
+        let input = "localhost:8045/auth/callback?code=4%2F0AeanS0_schemeless&state=st-999";
+        let (code, state) =
+            parse_manual_oauth_input(input).expect("should parse schemeless callback url");
+        assert_eq!(code, "4/0AeanS0_schemeless");
+        assert_eq!(state.as_deref(), Some("st-999"));
+    }
+
+    #[test]
+    fn test_parse_manual_oauth_input_raw_encoded_and_decoded_code() {
+        let (code1, state1) =
+            parse_manual_oauth_input("  4%2F0AeanS0_encoded_raw  ").expect("should decode raw %2F");
+        assert_eq!(code1, "4/0AeanS0_encoded_raw");
+        assert!(state1.is_none());
+
+        let (code2, state2) =
+            parse_manual_oauth_input("4/0AeanS0_plain_raw").expect("should keep plain raw code");
+        assert_eq!(code2, "4/0AeanS0_plain_raw");
+        assert!(state2.is_none());
+    }
+
+    #[test]
+    fn test_parse_manual_oauth_input_rejects_error_callback_and_empty() {
+        let err = parse_manual_oauth_input(
+            "http://localhost:8045/auth/callback?error=access_denied&state=s1",
+        )
+        .unwrap_err();
+        assert!(err.contains("access_denied"));
+
+        assert!(parse_manual_oauth_input("   ").is_err());
+    }
+
+    #[test]
+    fn test_prepare_oauth_flow_manually_reuse() {
+        let redirect_uri = "http://localhost:8045/auth/callback".to_string();
+        let url1 = prepare_oauth_flow_manually(redirect_uri.clone(), None)
+            .expect("First prepare should succeed");
+        let url2 = prepare_oauth_flow_manually(redirect_uri.clone(), None)
+            .expect("Second prepare should succeed");
+
+        assert_eq!(
+            url1, url2,
+            "Subsequent calls with same parameters should reuse the active flow URL"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_submit_oauth_code_state_mismatch_and_cleanup() {
+        let redirect_uri = "http://localhost:8045/auth/callback".to_string();
+        let _ = prepare_oauth_flow_manually(redirect_uri.clone(), None)
+            .expect("prepare should succeed");
+
+        // Submit with deliberately mismatched state
+        let err = submit_oauth_code("test_code".to_string(), Some("wrong-state".to_string()))
+            .await
+            .unwrap_err();
+        assert!(err.contains("CSRF protection"));
+
+        // Clean up
+        cancel_oauth_flow();
+        assert!(get_active_oauth_flow_context().is_none());
     }
 }

@@ -30,12 +30,19 @@ pub static TEST_CONFIG_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 static GLOBAL_THINKING_BUDGET_CONFIG: OnceLock<RwLock<ThinkingBudgetConfig>> = OnceLock::new();
 
 /// 获取当前 Thinking Budget 配置
+///
+/// [2026-10-29] 官方已把 Gemini 3.8/4 与 Claude 5.5 全量迁移到 `thinkingLevel`，
+/// 网关不再提供「客户端自适应（Client Direct Control）」模式，也不再用自造的档位预算表。
+/// 这里强制归一到 `Gateway`：旧配置文件里的 `client` 会在读取时被忽略，
+/// 保证四个协议适配层全部走「官方结构体为准」的统一通道。
 pub fn get_thinking_budget_config() -> ThinkingBudgetConfig {
-    GLOBAL_THINKING_BUDGET_CONFIG
+    let mut cfg = GLOBAL_THINKING_BUDGET_CONFIG
         .get()
         .and_then(|lock| lock.read().ok())
         .map(|cfg| cfg.clone())
-        .unwrap_or_default()
+        .unwrap_or_default();
+    cfg.control_source = ThinkingControlSource::Gateway;
+    cfg
 }
 
 /// 更新全局 Thinking Budget 配置
@@ -624,13 +631,17 @@ impl Default for ThinkingBudgetMode {
 }
 
 /// Thinking Budget 配置
+///
+/// 官方模型目录已收录的模型完全由官方 `thinkingBudget` / `thinkingLevel` 驱动；
+/// 这里的数值仅作为「官方目录未收录的实验模型」的兜底，且必须 `mode = Custom`。
+/// 设置界面已不再暴露这些字段，保留仅为兼容旧配置与 headless 用户。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ThinkingBudgetConfig {
     /// 控制权大选择：网关控制 vs 客户端控制
     #[serde(default = "default_control_source")]
     pub control_source: ThinkingControlSource,
 
-    // --- Gemini Flash 系列配置 ---
+    // --- Gemini Flash 系列配置（仅对官方目录未收录模型生效）---
     #[serde(default = "default_thinking_budget_mode")]
     pub flash_mode: ThinkingBudgetMode,
     #[serde(default = "default_flash_low")]
@@ -665,7 +676,7 @@ pub struct ThinkingBudgetConfig {
     #[serde(default = "default_claude_high")]
     pub claude_high: i32, // 默认 16000
 
-    // --- 历史向后兼容字段 ---
+    // --- 历史向后兼容字段（仅对官方目录未收录模型生效）---
     #[serde(default = "default_thinking_budget_mode")]
     pub mode: ThinkingBudgetMode,
     #[serde(default = "default_thinking_budget_custom_value")]
@@ -799,15 +810,15 @@ fn default_sliding_strategy() -> String {
 /// 多模态交互与保鲜滑窗配置
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct MultimodalConfig {
-    /// 是否启用多模态历史保鲜滑动窗口 (默认关闭，贯彻保真透传)
-    #[serde(default)]
+    /// 是否启用多模态历史保鲜滑动窗口 (默认开启，自动防范长上下文堆积多图导致请求体膨胀及 504)
+    #[serde(default = "default_enable_sliding_window")]
     pub enable_sliding_window: bool,
 
     /// 保鲜策略模式: "count" (按图片张数) 或 "memory" (按累积内存大小)
     #[serde(default = "default_sliding_strategy")]
     pub strategy: String,
 
-    /// 滑动窗口保鲜最大图片张数（默认 10，填 0 为不限张数）
+    /// 滑动窗口保鲜最大图片张数（默认 5，填 0 为不限张数）
     #[serde(default = "default_max_fresh_images")]
     pub max_fresh_images: usize,
 
@@ -820,8 +831,12 @@ pub struct MultimodalConfig {
     pub max_total_image_mb: usize,
 }
 
+fn default_enable_sliding_window() -> bool {
+    true
+}
+
 fn default_max_fresh_images() -> usize {
-    10
+    5
 }
 
 fn default_max_total_image_mb() -> usize {
@@ -831,7 +846,7 @@ fn default_max_total_image_mb() -> usize {
 impl Default for MultimodalConfig {
     fn default() -> Self {
         Self {
-            enable_sliding_window: false,
+            enable_sliding_window: default_enable_sliding_window(),
             strategy: default_sliding_strategy(),
             max_fresh_images: default_max_fresh_images(),
             strip_remote_urls: false,
@@ -848,7 +863,10 @@ pub struct UploadTimeoutConfig {
     #[serde(default = "default_connect_secs")]
     pub connect_secs: u64,
 
-    /// 上传带宽（Mbps，默认 2.0，推荐 1-5 Mbps）
+    /// 上传带宽下限（Mbps，默认 0.8，推荐 0.5-5 Mbps）
+    ///
+    /// 语义是「声明的最慢上行」：预算 = 请求体大小 ÷ 该值 × (1 + 额外等待系数)，
+    /// 因此**调大该值会缩短上传预算**；实测比声明值更慢时只会放宽、不会收紧。
     #[serde(default = "default_min_upload_mbps")]
     pub min_upload_mbps: f64,
 
@@ -860,12 +878,12 @@ pub struct UploadTimeoutConfig {
     #[serde(default = "default_upload_stall_secs")]
     pub stall_secs: u64,
 
-    /// 统一首字延迟的旧版兼容下限（秒，默认 0 = 不额外抬高）
+    /// 已废弃：仅为配置 round-trip 保留，不再参与首字预算。
     ///
-    /// 自本版本起「首响应头」与「首字」合并为统一首字延迟（TTFB≡TTFT），
-    /// 实际预算 = max(用户 TTFT 设置, 按 token 规模的自适应下限) + 媒体增量，
+    /// 「首响应头」与「首字」已合并为统一首字延迟（TTFB≡TTFT），唯一来源是
+    /// [`StreamTimeoutConfig::initial_ttft_secs`] + 按 token 规模的自适应下限；
     /// 媒体增量：常规 +0 / 图片 +45 / 视频 +60 / 辅助 −30，备用端点增量减半。
-    /// 本字段仅在非 0 时作为上述结果的**下限**，不再有 30/25s 的内置绝对表。
+    /// 新配置请只使用 `initial_ttft_secs`。
     #[serde(default = "default_header_wait_secs")]
     pub header_wait_secs: u64,
 
@@ -883,7 +901,7 @@ fn default_connect_secs() -> u64 {
 }
 
 fn default_min_upload_mbps() -> f64 {
-    2.0
+    0.8
 }
 
 fn default_extra_wait_ratio() -> f64 {
@@ -1115,8 +1133,17 @@ pub struct ProxyConfig {
     pub auto_start: bool,
 
     /// 自定义精确模型映射表 (key: 原始模型名, value: 目标模型名)
-    #[serde(default)]
+    #[serde(default = "default_custom_mapping")]
     pub custom_mapping: std::collections::HashMap<String, String>,
+
+    /// 自定义模型对外暴露状态 (key: 原始模型名, value: 是否对外暴露)
+    /// 默认精确条目对外暴露 (true)，内置兼容暗路由规则不暴露 (false)
+    #[serde(default = "default_custom_mapping_expose")]
+    pub custom_mapping_expose: std::collections::HashMap<String, bool>,
+
+    /// 内置映射版本号，用于无感迁移与防复活保障
+    #[serde(default = "default_builtin_mapping_version")]
+    pub builtin_mapping_version: u32,
 
     /// API 请求超时时间(秒)
     #[serde(default = "default_request_timeout")]
@@ -1222,6 +1249,12 @@ pub struct ProxyConfig {
     /// 上游发送阶段分级超时配置 (连接 → 上传 → 等待响应头)
     #[serde(default)]
     pub upload_timeouts: UploadTimeoutConfig,
+
+    /// 遇到限流账号自动进小黑屋 (QoS 降速熔断守卫)
+    /// - false: 默认关闭。直接忽略校验时长，不标记疑似限速，不进小黑屋，不解绑会话。
+    /// - true: 开启。当账号 TTFT 显著异常时标记疑似限速，累计超标关入小黑屋并解绑会话。
+    #[serde(default)]
+    pub qos_auto_jail: bool,
 }
 
 /// Request log retention policy.
@@ -1327,8 +1360,30 @@ pub struct UpstreamProxyConfig {
     pub url: String,
 }
 
+pub fn default_builtin_mapping_version() -> u32 {
+    1
+}
+
 pub fn default_custom_mapping() -> std::collections::HashMap<String, String> {
-    std::collections::HashMap::new()
+    let mut m = std::collections::HashMap::new();
+    m.insert("claude-fable-*".to_string(), "auto:claude-opus".to_string());
+    m.insert(
+        "claude-opus-4-7*".to_string(),
+        "auto:claude-opus-4-7".to_string(),
+    );
+    m.insert(
+        "claude-haiku-*".to_string(),
+        "auto:gemini-flash-low".to_string(),
+    );
+    m
+}
+
+pub fn default_custom_mapping_expose() -> std::collections::HashMap<String, bool> {
+    let mut m = std::collections::HashMap::new();
+    m.insert("claude-fable-*".to_string(), false);
+    m.insert("claude-opus-4-7*".to_string(), false);
+    m.insert("claude-haiku-*".to_string(), false);
+    m
 }
 
 impl Default for ProxyConfig {
@@ -1342,6 +1397,8 @@ impl Default for ProxyConfig {
             admin_password: None,
             auto_start: false,
             custom_mapping: default_custom_mapping(),
+            custom_mapping_expose: default_custom_mapping_expose(),
+            builtin_mapping_version: default_builtin_mapping_version(),
             request_timeout: default_request_timeout(),
             enable_logging: true,       // 默认开启，支持 token 统计功能
             capture_health_logs: false, // 默认关闭，过滤 GET 探活与第三方网关探测请求且不入库
@@ -1367,6 +1424,7 @@ impl Default for ProxyConfig {
             upload_timeouts: UploadTimeoutConfig::default(),
             image_thinking_mode: None,
             image_scheduler: ImageSchedulerConfig::default(),
+            qos_auto_jail: false,
         }
     }
 }

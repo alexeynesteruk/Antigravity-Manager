@@ -622,6 +622,10 @@ pub async fn save_config(
             .axum_server
             .update_proxy_pool(config.proxy.proxy_pool.clone())
             .await;
+        // 更新 QoS 自动限流进小黑屋机制开关
+        instance
+            .axum_server
+            .update_qos_auto_jail(config.proxy.qos_auto_jail);
         // 更新熔断配置
         instance
             .token_manager
@@ -650,6 +654,10 @@ pub async fn save_config(
             .axum_server
             .update_proxy_pool(config.proxy.proxy_pool.clone())
             .await;
+        // 更新 QoS 自动限流进小黑屋机制开关
+        admin
+            .axum_server
+            .update_qos_auto_jail(config.proxy.qos_auto_jail);
         admin
             .axum_server
             .token_manager
@@ -729,9 +737,16 @@ pub async fn cancel_oauth_login() -> Result<(), String> {
 
 /// 手动提交 OAuth Code (用于 Docker/远程环境无法自动回调时)
 #[tauri::command]
-pub async fn submit_oauth_code(code: String, state: Option<String>) -> Result<(), String> {
+pub async fn submit_oauth_code(
+    app_handle: tauri::AppHandle,
+    code: String,
+    state: Option<String>,
+) -> Result<crate::models::Account, String> {
     modules::logger::log_info("收到手动提交 OAuth Code 请求");
-    modules::oauth_server::submit_oauth_code(code, state).await
+    let service = modules::account_service::AccountService::new(
+        crate::modules::integration::SystemManager::Desktop(app_handle),
+    );
+    service.submit_oauth_code(code, state).await
 }
 
 #[tauri::command]
@@ -832,11 +847,14 @@ pub async fn sync_account_from_db(
     let index = modules::account::load_account_index()?;
     let current_target = index.current_target_ide.as_deref();
     let is_agy = current_target == Some("agy");
+    let is_acp = modules::integration::is_acp_target(current_target);
 
-    // 1. Read the credential source used by the selected client. For agy, do
-    // not mistake an older file credential for the active keyring account.
+    // 1. Read the credential source used by the selected client. For agy/acp, do
+    // not mistake an older file/DB credential for the active client account.
     let credential = if is_agy {
         modules::integration::read_from_system_keyring_only().map(|state| state.refresh_token)
+    } else if is_acp {
+        modules::integration::read_acp_credentials().map(|state| state.refresh_token)
     } else {
         modules::migration::get_refresh_token_from_db(current_target)
     };
@@ -865,7 +883,7 @@ pub async fn sync_account_from_db(
 
     // 4. For the CLI, reconcile only the matching managed account; importing
     // all local sources could select an unrelated IDE account if refresh fails.
-    let mut account = if is_agy {
+    let mut account = if is_agy || is_acp {
         modules::account::find_agy_account(modules::account::list_accounts()?, &db_refresh_token)?
     } else {
         modules::migration::import_from_db(current_target).await?
@@ -1155,15 +1173,23 @@ pub async fn show_mini_view(app: tauri::AppHandle) -> Result<(), String> {
 /// 设置窗口主题（用于同步 Windows 标题栏按钮颜色）
 #[tauri::command]
 pub async fn set_window_theme(window: tauri::Window, theme: String) -> Result<(), String> {
-    use tauri::Theme;
+    #[cfg(not(target_os = "android"))]
+    {
+        use tauri::Theme;
 
-    let tauri_theme = match theme.as_str() {
-        "dark" => Some(Theme::Dark),
-        "light" => Some(Theme::Light),
-        _ => None, // system default
-    };
+        let tauri_theme = match theme.as_str() {
+            "dark" => Some(Theme::Dark),
+            "light" => Some(Theme::Light),
+            _ => None, // system default
+        };
 
-    window.set_theme(tauri_theme).map_err(|e| e.to_string())
+        window.set_theme(tauri_theme).map_err(|e| e.to_string())
+    }
+    #[cfg(target_os = "android")]
+    {
+        let _ = (window, theme);
+        Ok(())
+    }
 }
 
 /// 获取 Antigravity 可执行文件路径
@@ -1450,12 +1476,24 @@ pub async fn update_account_priority(
     proxy_state: tauri::State<'_, crate::commands::proxy::ProxyServiceState>,
     account_id: String,
     priority: u8,
+    model_priorities: Option<std::collections::HashMap<String, u8>>,
 ) -> Result<(), String> {
-    modules::account::update_account_priority(&account_id, priority)?;
+    let has_model_override = model_priorities.is_some();
+    let saved_model_priorities = modules::account::update_account_priority_with_models(
+        &account_id,
+        priority,
+        model_priorities,
+    )?;
     if let Some(instance) = proxy_state.instance.read().await.as_ref() {
-        instance
-            .token_manager
-            .update_account_priority(&account_id, priority);
+        instance.token_manager.update_account_model_priorities(
+            &account_id,
+            priority,
+            if has_model_override {
+                Some(saved_model_priorities)
+            } else {
+                None
+            },
+        );
     }
     Ok(())
 }
@@ -1591,30 +1629,34 @@ pub async fn get_token_stats_summary(hours: i64) -> Result<TokenStatsSummary, St
 #[tauri::command]
 pub async fn get_token_stats_by_model(
     hours: i64,
+    view_mode: Option<String>,
 ) -> Result<Vec<crate::modules::token_stats::ModelTokenStats>, String> {
-    crate::modules::token_stats::get_model_stats(hours)
+    crate::modules::token_stats::get_model_stats(hours, view_mode.as_deref())
 }
 
 #[tauri::command]
 pub async fn get_token_stats_model_trend_minute(
     minutes: i64,
     step_minutes: i64,
+    view_mode: Option<String>,
 ) -> Result<Vec<crate::modules::token_stats::ModelTrendPoint>, String> {
-    crate::modules::token_stats::get_model_trend_minute(minutes, step_minutes)
+    crate::modules::token_stats::get_model_trend_minute(minutes, step_minutes, view_mode.as_deref())
 }
 
 #[tauri::command]
 pub async fn get_token_stats_model_trend_hourly(
     hours: i64,
+    view_mode: Option<String>,
 ) -> Result<Vec<crate::modules::token_stats::ModelTrendPoint>, String> {
-    crate::modules::token_stats::get_model_trend_hourly(hours)
+    crate::modules::token_stats::get_model_trend_hourly(hours, view_mode.as_deref())
 }
 
 #[tauri::command]
 pub async fn get_token_stats_model_trend_daily(
     days: i64,
+    view_mode: Option<String>,
 ) -> Result<Vec<crate::modules::token_stats::ModelTrendPoint>, String> {
-    crate::modules::token_stats::get_model_trend_daily(days)
+    crate::modules::token_stats::get_model_trend_daily(days, view_mode.as_deref())
 }
 
 #[tauri::command]
@@ -1713,6 +1755,8 @@ pub async fn exit_app(app: tauri::AppHandle) -> Result<(), String> {
 
         // 4. 给予底层套接字彻底注销的微小缓冲，然后干净退出进程
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        // `process::exit` 会绕过 Tauri 事件循环，签名缓存必须在退出前主动 flush。
+        crate::proxy::signature_cache::flush_on_exit();
         std::process::exit(0);
     });
     Ok(())

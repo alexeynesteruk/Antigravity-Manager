@@ -24,8 +24,11 @@ pub struct GeminiStreamHandler {
     image_success_model: String,
     thinking_acc: Option<TurnAccumulator>,
     saw_image_data: bool,
+    saw_finish_reason: bool,
+    saw_function_call: bool,
     has_content: bool,
     has_thinking: bool,
+    is_thinking_active: bool,
 }
 
 impl GeminiStreamHandler {
@@ -52,8 +55,11 @@ impl GeminiStreamHandler {
             image_success_model,
             thinking_acc: Some(TurnAccumulator::with_anchor(causal_anchor)),
             saw_image_data: false,
+            saw_finish_reason: false,
+            saw_function_call: false,
             has_content: false,
             has_thinking: false,
+            is_thinking_active: false,
         }
     }
 }
@@ -119,22 +125,37 @@ impl ProtocolStreamHandler for GeminiStreamHandler {
             .cloned()
             .unwrap_or_default();
 
+        let mut chunk_has_finish_reason = false;
         for cand in &parts_snapshot {
+            if cand.get("finishReason").and_then(|v| v.as_str()).is_some()
+                || cand.get("finish_reason").and_then(|v| v.as_str()).is_some()
+            {
+                self.saw_finish_reason = true;
+                chunk_has_finish_reason = true;
+            }
             if let Some(parts) = cand
                 .get("content")
                 .and_then(|c| c.get("parts"))
                 .and_then(|p| p.as_array())
             {
                 for part in parts {
-                    if part.get("text").is_some()
-                        || part.get("functionCall").is_some()
+                    let is_thought = part.get("thought").and_then(|v| v.as_bool()) == Some(true);
+                    if is_thought {
+                        self.has_thinking = true;
+                        self.is_thinking_active = true;
+                    } else {
+                        self.is_thinking_active = false;
+                    }
+                    if part.get("functionCall").is_some() {
+                        self.saw_function_call = true;
+                        self.has_content = true;
+                        // 工具调用是明确的行动输出，必然意味着思考阶段已结束。
+                        self.is_thinking_active = false;
+                    } else if (!is_thought && part.get("text").is_some())
                         || part.get("inlineData").is_some()
                         || part.get("inline_data").is_some()
                     {
                         self.has_content = true;
-                    }
-                    if part.get("thought").and_then(|v| v.as_bool()) == Some(true) {
-                        self.has_thinking = true;
                     }
                     if let Some(acc) = self.thinking_acc.as_mut() {
                         acc.ingest_part(part);
@@ -154,6 +175,11 @@ impl ProtocolStreamHandler for GeminiStreamHandler {
                     }
                 }
             }
+        }
+
+        // finishReason 表示生成已收尾，思考阶段不再活跃。
+        if chunk_has_finish_reason {
+            self.is_thinking_active = false;
         }
 
         // 注入工具调用 ID
@@ -181,6 +207,10 @@ impl ProtocolStreamHandler for GeminiStreamHandler {
         self.has_thinking
     }
 
+    fn is_thinking_active(&self) -> bool {
+        self.is_thinking_active
+    }
+
     fn emit_finalize(&mut self) -> Vec<Bytes> {
         // 图片生成成功统计仅在优雅结束时提交（错误路径不会走到这里）
         if self.track_image_success && self.saw_image_data {
@@ -192,8 +222,80 @@ impl ProtocolStreamHandler for GeminiStreamHandler {
                 );
             }
         }
-        // Gemini 正常 EOF 不额外下发 [DONE]，保持既有行为
+
+        // [Fixes #3813] 情形 B 异常收尾：上游输出了正文但未下发任何 finishReason 即遭遇未预期 EOF
+        // 必须提供明确的合成终态与 finishMessage 诊断，标明流在正常完成前被提前截断，杜绝下游误判为正常结束
+        if self.has_content && !self.saw_finish_reason {
+            self.saw_finish_reason = true;
+            let finish_reason = if self.saw_function_call {
+                "STOP"
+            } else {
+                "MAX_TOKENS"
+            };
+
+            let recovery_json = serde_json::json!({
+                "candidates": [{
+                    "finishReason": finish_reason,
+                    "finishMessage": "Stream closed prematurely (EOF without finishReason) by upstream. Preceding content preserved by gateway.",
+                    "gatewayInterrupted": true,
+                    "index": 0
+                }]
+            });
+
+            return vec![Bytes::from(format!(
+                "data: {}\n\n",
+                serde_json::to_string(&recovery_json).unwrap_or_default()
+            ))];
+        }
+
+        // 正常流（已含 finishReason）：Gemini 正常 EOF 不额外下发 [DONE]，保持既有行为
         Vec::new()
+    }
+
+    fn emit_abnormal_finalize(&mut self, error_report: &StreamErrorReport) -> Vec<Bytes> {
+        let mut chunks = Vec::new();
+
+        // 终态与内容防护：若上游已下发 finishReason 或从未产生任何正文/工具调用，绝不可伪造收尾
+        if !self.has_content || self.saw_finish_reason {
+            return chunks;
+        }
+        self.saw_finish_reason = true;
+
+        // 工具调用契约保护：若本轮已有工具调用输出，终结原因保持 STOP，否则标记 MAX_TOKENS
+        let finish_reason = if self.saw_function_call {
+            "STOP"
+        } else {
+            "MAX_TOKENS"
+        };
+
+        // [Fixes #3813] 诊断信息如实传达：通过官方标准 finishMessage 及流内诊断字段透传真实中断原因，
+        // 既保全已生成的成千上万 token 与客户端兼容性，又彻底避免下游将连接中断/超时误诊为模型自然输出上限
+        let error_msg = error_report.client_message();
+        let finish_message = format!(
+            "Stream interrupted before completion ({}): {}. Preceding content preserved by gateway.",
+            error_report.classified.error_type,
+            error_report.raw
+        );
+
+        let recovery_json = serde_json::json!({
+            "candidates": [{
+                "finishReason": finish_reason,
+                "finishMessage": finish_message,
+                "gatewayInterrupted": true,
+                "gatewayError": {
+                    "type": error_report.classified.error_type,
+                    "message": error_msg,
+                    "raw": error_report.raw
+                },
+                "index": 0
+            }]
+        });
+
+        chunks.push(Bytes::from(format!(
+            "data: {}\n\n",
+            serde_json::to_string(&recovery_json).unwrap_or_default()
+        )));
+        chunks
     }
 
     fn emit_initial_error(&mut self, error_report: &StreamErrorReport) -> Vec<Bytes> {
@@ -221,5 +323,350 @@ impl ProtocolStreamHandler for GeminiStreamHandler {
         if let Some(acc) = self.thinking_acc.take() {
             acc.commit(&self.session_id);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use futures::StreamExt;
+
+    fn test_gemini_handler() -> GeminiStreamHandler {
+        GeminiStreamHandler::new(
+            None,
+            "session_gemini_phase".to_string(),
+            "gemini-2.5-pro".to_string(),
+            0,
+            "anchor".to_string(),
+            false,
+            None,
+            "acc@example.com".to_string(),
+            "gemini-2.5-pro".to_string(),
+        )
+    }
+
+    #[test]
+    fn test_gemini_handler_tracks_thinking_phase_lifecycle() {
+        let mut handler = test_gemini_handler();
+
+        handler.process_line(
+            r#"data: {"candidates":[{"content":{"parts":[{"thought":true,"text":"Pondering."}]}}]}"#,
+        );
+        assert!(handler.has_thinking());
+        assert!(handler.is_thinking_active());
+        assert!(!handler.has_content());
+
+        handler
+            .process_line(r#"data: {"candidates":[{"content":{"parts":[{"text":"Answer."}]}}]}"#);
+        assert!(handler.has_content());
+        assert!(!handler.is_thinking_active());
+
+        // finishReason-only chunk must also close the thinking phase.
+        let mut finish_handler = test_gemini_handler();
+        finish_handler.process_line(
+            r#"data: {"candidates":[{"content":{"parts":[{"thought":true,"text":"Pondering."}]}}]}"#,
+        );
+        assert!(finish_handler.is_thinking_active());
+        finish_handler.process_line(r#"data: {"candidates":[{"finishReason":"STOP"}]}"#);
+        assert!(!finish_handler.is_thinking_active());
+    }
+
+    #[tokio::test]
+    async fn test_gemini_stream_abnormal_interruption_preserves_content_without_tampering() {
+        let chunk1_json = serde_json::json!({
+            "response": {
+                "candidates": [{
+                    "content": {
+                        "parts": [{ "text": "Here is code:\n```rust\nfn main() {" }]
+                    }
+                }]
+            }
+        });
+
+        let items: Vec<Result<Bytes, String>> = vec![
+            Ok(Bytes::from(format!(
+                "data: {}\n\n",
+                serde_json::to_string(&chunk1_json).unwrap()
+            ))),
+            Err("error reading a body from connection: connection reset by peer".to_string()),
+        ];
+
+        let handler = GeminiStreamHandler::new(
+            Some("trace_gemini_test".to_string()),
+            "session_gemini_test".to_string(),
+            "gemini-2.5-pro".to_string(),
+            1,
+            "anchor".to_string(),
+            false,
+            None,
+            "acc@example.com".to_string(),
+            "gemini-2.5-pro".to_string(),
+        );
+
+        let lifecycle_cfg = crate::proxy::pipeline::StreamLifecycleConfig::new(
+            "gemini",
+            "test_gemini_stream_abnormal_interruption",
+            "test".to_string(),
+        );
+
+        let mut stream = crate::proxy::pipeline::run_stream_lifecycle(
+            Box::pin(futures::stream::iter(items)),
+            handler,
+            lifecycle_cfg,
+        );
+
+        let mut all_chunks = Vec::new();
+        while let Some(result) = stream.next().await {
+            if let Ok(bytes) = result {
+                all_chunks.push(String::from_utf8(bytes.to_vec()).unwrap());
+            }
+        }
+        let output = all_chunks.join("");
+
+        assert!(output.contains("__cloudCodeMeta"));
+        assert!(output.contains("```rust\\nfn main() {"));
+        // 绝不注入虚假网关告警或篡改出站正文
+        assert!(!output.contains("网关提示"));
+        assert!(!output.contains("Gateway Notice"));
+        assert!(output.contains("MAX_TOKENS"));
+        // [Fixes #3813] 断流异常必须包含真实错误类型与诊断 finishMessage
+        assert!(output.contains("finishMessage"));
+        assert!(output.contains("gatewayInterrupted"));
+        assert!(output.contains("connection reset by peer"));
+    }
+
+    #[tokio::test]
+    async fn test_gemini_stream_eof_without_finish_reason_emits_premature_diagnostic() {
+        let chunk_without_finish = serde_json::json!({
+            "response": {
+                "candidates": [{
+                    "content": {
+                        "parts": [{ "text": "Incomplete answer before EOF" }]
+                    },
+                    "index": 0
+                }]
+            }
+        });
+
+        // 模拟情形 B：产生了正文，但上游未经下发 finishReason 直接静默 EOF 退出
+        let items: Vec<Result<Bytes, String>> = vec![Ok(Bytes::from(format!(
+            "data: {}\n\n",
+            serde_json::to_string(&chunk_without_finish).unwrap()
+        )))];
+
+        let handler = GeminiStreamHandler::new(
+            Some("trace_gemini_premature_eof".to_string()),
+            "session_gemini_premature_eof".to_string(),
+            "gemini-2.5-pro".to_string(),
+            1,
+            "anchor".to_string(),
+            false,
+            None,
+            "acc@example.com".to_string(),
+            "gemini-2.5-pro".to_string(),
+        );
+
+        let lifecycle_cfg = crate::proxy::pipeline::StreamLifecycleConfig::new(
+            "gemini",
+            "test_gemini_premature_eof",
+            "test".to_string(),
+        );
+
+        let mut stream = crate::proxy::pipeline::run_stream_lifecycle(
+            Box::pin(futures::stream::iter(items)),
+            handler,
+            lifecycle_cfg,
+        );
+
+        let mut all_chunks = Vec::new();
+        while let Some(result) = stream.next().await {
+            if let Ok(bytes) = result {
+                all_chunks.push(String::from_utf8(bytes.to_vec()).unwrap());
+            }
+        }
+        let output = all_chunks.join("");
+
+        assert!(output.contains("Incomplete answer before EOF"));
+        assert!(output.contains("MAX_TOKENS"));
+        assert!(output.contains("gatewayInterrupted"));
+        assert!(output.contains("Stream closed prematurely"));
+    }
+
+    #[tokio::test]
+    async fn test_gemini_stream_pure_thinking_does_not_set_has_content_and_propagates_err() {
+        let thinking_json = serde_json::json!({
+            "response": {
+                "candidates": [{
+                    "content": {
+                        "parts": [{ "thought": true, "text": "Thinking deeply..." }]
+                    }
+                }]
+            }
+        });
+
+        let items: Vec<Result<Bytes, String>> = vec![
+            Ok(Bytes::from(format!(
+                "data: {}\n\n",
+                serde_json::to_string(&thinking_json).unwrap()
+            ))),
+            Err("error reading a body from connection: connection reset by peer".to_string()),
+        ];
+
+        let handler = GeminiStreamHandler::new(
+            Some("trace_gemini_thinking".to_string()),
+            "session_gemini_thinking".to_string(),
+            "gemini-2.5-pro".to_string(),
+            1,
+            "anchor".to_string(),
+            false,
+            None,
+            "acc@example.com".to_string(),
+            "gemini-2.5-pro".to_string(),
+        );
+
+        let lifecycle_cfg = crate::proxy::pipeline::StreamLifecycleConfig::new(
+            "gemini",
+            "test_gemini_thinking",
+            "test".to_string(),
+        );
+
+        let mut stream = crate::proxy::pipeline::run_stream_lifecycle(
+            Box::pin(futures::stream::iter(items)),
+            handler,
+            lifecycle_cfg,
+        );
+
+        let mut all_chunks = Vec::new();
+        let mut got_err = false;
+        while let Some(result) = stream.next().await {
+            match result {
+                Ok(bytes) => all_chunks.push(String::from_utf8(bytes.to_vec()).unwrap()),
+                Err(_) => {
+                    got_err = true;
+                }
+            }
+        }
+        let output = all_chunks.join("");
+
+        // 思考阶段如实透传错误，严禁下发假正文与 MAX_TOKENS 伪造收尾
+        assert!(got_err, "Pure thinking interruption must propagate error");
+        assert!(!output.contains("MAX_TOKENS"));
+    }
+
+    #[tokio::test]
+    async fn test_gemini_stream_completed_stream_does_not_double_finalize() {
+        let completed_json = serde_json::json!({
+            "response": {
+                "candidates": [{
+                    "content": {
+                        "parts": [{ "text": "Hello world" }]
+                    },
+                    "finishReason": "STOP",
+                    "index": 0
+                }]
+            }
+        });
+
+        let items: Vec<Result<Bytes, String>> = vec![
+            Ok(Bytes::from(format!(
+                "data: {}\n\n",
+                serde_json::to_string(&completed_json).unwrap()
+            ))),
+            // 上游在下发带 STOP 数据包后断开
+            Err("connection reset by peer".to_string()),
+        ];
+
+        let handler = GeminiStreamHandler::new(
+            Some("trace_gemini_done".to_string()),
+            "session_gemini_done".to_string(),
+            "gemini-2.5-pro".to_string(),
+            1,
+            "anchor".to_string(),
+            false,
+            None,
+            "acc@example.com".to_string(),
+            "gemini-2.5-pro".to_string(),
+        );
+
+        let lifecycle_cfg = crate::proxy::pipeline::StreamLifecycleConfig::new(
+            "gemini",
+            "test_gemini_done",
+            "test".to_string(),
+        );
+
+        let mut stream = crate::proxy::pipeline::run_stream_lifecycle(
+            Box::pin(futures::stream::iter(items)),
+            handler,
+            lifecycle_cfg,
+        );
+
+        let mut all_chunks = Vec::new();
+        while let Some(result) = stream.next().await {
+            if let Ok(bytes) = result {
+                all_chunks.push(String::from_utf8(bytes.to_vec()).unwrap());
+            }
+        }
+        let output = all_chunks.join("");
+
+        // 已正常下发 STOP 的流，严禁再次触发 emit_abnormal_finalize 附加 MAX_TOKENS
+        assert!(output.contains(r#""finishReason":"STOP""#));
+        assert!(!output.contains("MAX_TOKENS"));
+    }
+
+    #[tokio::test]
+    async fn test_gemini_stream_normal_eof_reaches_emit_finalize() {
+        let completed_json = serde_json::json!({
+            "response": {
+                "candidates": [{
+                    "content": {
+                        "parts": [{ "text": "Normal completion" }]
+                    },
+                    "finishReason": "STOP",
+                    "index": 0
+                }]
+            }
+        });
+
+        // 正常流：上游正常以 EOF (None) 终结，而非 Err 中断
+        let items: Vec<Result<Bytes, String>> = vec![Ok(Bytes::from(format!(
+            "data: {}\n\n",
+            serde_json::to_string(&completed_json).unwrap()
+        )))];
+
+        let handler = GeminiStreamHandler::new(
+            Some("trace_gemini_eof".to_string()),
+            "session_gemini_eof".to_string(),
+            "gemini-2.5-pro".to_string(),
+            1,
+            "anchor".to_string(),
+            false,
+            None,
+            "acc@example.com".to_string(),
+            "gemini-2.5-pro".to_string(),
+        );
+
+        let lifecycle_cfg = crate::proxy::pipeline::StreamLifecycleConfig::new(
+            "gemini",
+            "test_gemini_eof",
+            "test".to_string(),
+        );
+
+        let mut stream = crate::proxy::pipeline::run_stream_lifecycle(
+            Box::pin(futures::stream::iter(items)),
+            handler,
+            lifecycle_cfg,
+        );
+
+        let mut all_chunks = Vec::new();
+        while let Some(result) = stream.next().await {
+            if let Ok(bytes) = result {
+                all_chunks.push(String::from_utf8(bytes.to_vec()).unwrap());
+            }
+        }
+        let output = all_chunks.join("");
+
+        assert!(output.contains("Normal completion"));
+        assert!(output.contains(r#""finishReason":"STOP""#));
+        assert!(!output.contains("MAX_TOKENS"));
     }
 }

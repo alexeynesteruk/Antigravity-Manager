@@ -1,9 +1,17 @@
+export type ModelPriorityGroup = 'gemini' | 'claude';
+
+export interface ModelPriorities {
+    gemini?: number;
+    claude?: number;
+}
+
 export interface Account {
     id: string;
     email: string;
     name?: string;
     priority?: number;
     max_concurrency?: number | null;
+    model_priorities?: ModelPriorities;
     token: TokenData;
     device_profile?: DeviceProfile;
     device_history?: DeviceProfileVersion[];
@@ -15,6 +23,8 @@ export interface Account {
     proxy_disabled_reason?: string;
     proxy_disabled_at?: number;
     protected_models?: string[];
+    /** 模型级 403 冻结（只影响对应模型，不影响其他模型） */
+    forbidden_models?: string[];
     live_limited_models?: Record<string, LiveLimitStatus>;
     custom_label?: string;  // 用户自定义标签
     qos_status?: 'suspicious' | 'jailed' | 'probing' | 'half_open' | null; // 运行时 QoS 状态
@@ -23,6 +33,12 @@ export interface Account {
     validation_blocked_until?: number;
     validation_blocked_reason?: string;
     validation_url?: string;
+    /** 上游已确认的账号封禁（如 TOS_VIOLATION），只有生产端点探测恢复后才会清除 */
+    banned?: boolean;
+    banned_code?: string;
+    banned_reason?: string;
+    banned_at?: number;
+    ban_appeal_url?: string;
     created_at: number;
     last_used: number;
 }
@@ -34,6 +50,8 @@ export interface ActiveClientsStatus {
     ide_email?: string | null;
     agy_account_id?: string | null;
     agy_email?: string | null;
+    acp_account_id?: string | null;
+    acp_email?: string | null;
 }
 
 export interface LiveLimitStatus {
@@ -52,6 +70,9 @@ export interface TokenData {
     expiry_timestamp: number;
     token_type: string;
     email?: string;
+    project_id?: string;
+    is_gcp_tos?: boolean;
+    oauth_client_key?: string;
 }
 
 export interface QuotaData {
@@ -121,20 +142,26 @@ export interface DeviceProfileVersion {
  * **完全相同的全量目录**（都含 claude-* / gpt-*，且 remainingFraction 恒为 1），
  * 用它推断会把所有免费号判成 Pro —— 这正是「free 账号被标记成 pro」的根因。
  */
-export function getAccountTier(account: { quota?: QuotaData | null }): 'ultra' | 'pro' | 'free' {
+export function getAccountTier(account: { quota?: QuotaData | null; token?: { is_gcp_tos?: boolean; oauth_client_key?: string } }): 'ultra' | 'pro' | 'enterprise' | 'free' {
     const rawTier = account.quota?.subscription_tier?.trim().toLowerCase();
+    const clientKey = account.token?.oauth_client_key?.trim().toLowerCase();
+    const isEnterpriseClient = Boolean(clientKey && (clientKey === 'antigravity_gcp' || clientKey.includes('gcp') || clientKey.includes('vertex')));
+
+    if (rawTier?.includes('enterprise') || rawTier?.startsWith('gcp_') || isEnterpriseClient) {
+        return 'enterprise';
+    }
+
     if (!rawTier) return 'free';
 
     // Ultra 档（"helium" 是 Ultra 的内部代号：GDP_HELIUM / GOOGLE_ONE_HELIUM）
     if (rawTier.includes('ultra') || rawTier.includes('helium')) return 'ultra';
     // 免费档：free-tier / "Antigravity Starter Quota"
     if (rawTier.includes('free') || rawTier.includes('starter')) return 'free';
-    // 付费档：g1-pro-tier / standard-tier / "Google AI Pro" / premium / advanced
+    // 付费档：g1-pro-tier / "Google AI Pro" / premium / advanced
     if (
         rawTier.includes('pro') ||
         rawTier.includes('premium') ||
-        rawTier.includes('advanced') ||
-        rawTier.includes('standard')
+        rawTier.includes('advanced')
     ) {
         return 'pro';
     }
@@ -167,10 +194,10 @@ export function hasAccountArgonCapability(account: { quota?: QuotaData | null })
 export function checkArgonEligibility(
     groups: QuotaGroup[] = [],
     models: ModelQuota[] = [],
-    tier?: 'ultra' | 'pro' | 'free'
+    tier?: 'ultra' | 'pro' | 'enterprise' | 'free'
 ): boolean {
-    // 判据 1: Ultra 旗舰套餐（原生全量支持 Argon，共享或内置高阶池）
-    if (tier === 'ultra') {
+    // 判据 1: Ultra 旗舰套餐 / Enterprise 企业授权（原生全量支持 Argon，共享或内置高阶池）
+    if (tier === 'ultra' || tier === 'enterprise') {
         const hasExplicitDisabled = models.some(m => {
             const n = (m?.name || '').toLowerCase();
             return /argon/i.test(n) && (n.includes('-disabled') || n.endsWith('_disabled') || (m as any)?.disabled);
@@ -206,8 +233,32 @@ export function checkArgonEligibility(
  * 订阅等级的展示文案。所有徽标都应使用它，避免直接把后端的原始字符串
  * （如 "Antigravity Starter Quota"）渲染到界面上。
  */
-export function getTierLabel(tier: 'ultra' | 'pro' | 'free'): string {
+export function getTierLabel(tier: 'ultra' | 'pro' | 'enterprise' | 'free'): string {
     return tier.toUpperCase();
+}
+
+export function getEffectiveModelPriority(
+    account: { priority?: number; model_priorities?: ModelPriorities },
+    group: ModelPriorityGroup
+): number {
+    const override = account.model_priorities?.[group];
+    if (typeof override === 'number' && override >= 1 && override <= 100) {
+        return override;
+    }
+    return typeof account.priority === 'number' && account.priority >= 1 && account.priority <= 100
+        ? account.priority
+        : 50;
+}
+
+export function hasCustomModelPriorities(account: {
+    priority?: number;
+    model_priorities?: ModelPriorities;
+}): boolean {
+    if (!account.model_priorities) return false;
+    const base = typeof account.priority === 'number' ? account.priority : 50;
+    const g = account.model_priorities.gemini;
+    const c = account.model_priorities.claude;
+    return (typeof g === 'number' && g !== base) || (typeof c === 'number' && c !== base);
 }
 
 export interface ImportAccountEntry {

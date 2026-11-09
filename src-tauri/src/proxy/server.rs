@@ -287,6 +287,7 @@ struct AccountResponse {
     proxy_disabled_reason: Option<String>,
     proxy_disabled_at: Option<i64>,
     protected_models: Vec<String>,
+    forbidden_models: Vec<String>,
     live_limited_models: HashMap<String, crate::models::account::LiveLimitStatus>,
     /// [NEW] 403 验证阻止状态
     validation_blocked: bool,
@@ -298,6 +299,11 @@ struct AccountResponse {
     /// 出现在响应里，前端 AccountErrorDialog 的首选分支因此恒为 undefined、只能回退去
     /// 解析 validation_blocked_reason 里的嵌套 JSON（issue #3631）。
     validation_url: Option<String>,
+    banned: bool,
+    banned_code: Option<String>,
+    banned_reason: Option<String>,
+    banned_at: Option<i64>,
+    ban_appeal_url: Option<String>,
     quota: Option<QuotaResponse>,
     device_bound: bool,
     last_used: i64,
@@ -391,6 +397,7 @@ fn to_account_response(
         proxy_disabled_reason: account.proxy_disabled_reason.clone(),
         proxy_disabled_at: account.proxy_disabled_at,
         protected_models: account.protected_models.iter().cloned().collect(),
+        forbidden_models: account.forbidden_models.iter().cloned().collect(),
         live_limited_models: account.live_limited_models.clone(),
         quota: account.quota.as_ref().map(|q| QuotaResponse {
             models: q
@@ -416,6 +423,11 @@ fn to_account_response(
         validation_blocked_until: account.validation_blocked_until,
         validation_blocked_reason: account.validation_blocked_reason.clone(),
         validation_url: account.validation_url.clone(),
+        banned: account.banned,
+        banned_code: account.banned_code.clone(),
+        banned_reason: account.banned_reason.clone(),
+        banned_at: account.banned_at,
+        ban_appeal_url: account.ban_appeal_url.clone(),
         qos_status: account.qos_status.clone(),
         qos_reset_seconds: account.qos_reset_seconds,
     }
@@ -507,6 +519,11 @@ impl AxumServer {
             .set_user_agent_override(config.user_agent_override.clone())
             .await;
         tracing::info!("User-Agent 配置已热更新: {:?}", config.user_agent_override);
+    }
+
+    pub fn update_qos_auto_jail(&self, enabled: bool) {
+        self.token_manager.set_qos_auto_jail(enabled);
+        tracing::info!("QoS 自动限流进小黑屋机制已热更新: enabled={}", enabled);
     }
 
     pub async fn set_running(&self, running: bool) {
@@ -935,6 +952,7 @@ impl AxumServer {
             .route("/proxy/cloudflared/stop", post(admin_cloudflared_stop))
             .route("/system/open-folder", post(admin_open_folder))
             .route("/proxy/stats", get(admin_get_proxy_stats))
+            .route("/proxy/test-model", post(admin_test_model))
             .route("/logs", get(admin_get_proxy_logs_filtered))
             .route("/logs/count", get(admin_get_proxy_logs_count_filtered))
             .route("/logs/disk-size", get(admin_get_proxy_db_disk_size))
@@ -1023,6 +1041,16 @@ impl AxumServer {
             .route("/system/updates/check", post(admin_check_for_updates))
             .route("/system/updates/touch", post(admin_update_last_check_time))
             .route("/system/updates/save", post(admin_save_update_settings))
+            .route("/system/hub/fingerprint", get(admin_get_hub_fingerprint))
+            .route("/system/hub/check-update", get(admin_check_hub_update))
+            .route(
+                "/system/hub/detect-fingerprint",
+                post(admin_detect_remote_hub_fingerprint),
+            )
+            .route(
+                "/system/timeouts/effective-first-byte",
+                get(admin_get_effective_first_byte_timeouts),
+            )
             .route(
                 "/system/autostart/status",
                 get(admin_is_auto_launch_enabled),
@@ -1121,15 +1149,26 @@ impl AxumServer {
             .layer(DefaultBodyLimit::max(max_body_size)) // 放宽 body 大小限制
             .with_state(state.clone());
 
-        // 静态文件托管 (用于 Headless/Docker 模式)
-        let dist_path = std::env::var("ABV_DIST_PATH").unwrap_or_else(|_| "dist".to_string());
-        let app = if std::path::Path::new(&dist_path).exists() {
-            tracing::info!("正在托管静态资源: {}", dist_path);
-            app.fallback_service(tower_http::services::ServeDir::new(&dist_path).fallback(
-                tower_http::services::ServeFile::new(format!("{}/index.html", dist_path)),
-            ))
-        } else {
+        // 静态文件托管 (用于 Headless/Docker 模式，可通过 ABV_DISABLE_WEB 显式关闭)
+        let disable_web = std::env::var("ABV_DISABLE_WEB")
+            .map(|v| matches!(v.to_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+            .unwrap_or(false);
+
+        let app = if disable_web {
+            tracing::info!("Web 管理控制台已通过配置或入参关闭 (Pure-Proxy 纯代理模式)");
             app
+        } else {
+            let dist_path = resolve_static_dist_path();
+            if let Some(path_buf) = dist_path {
+                let path_str = path_buf.to_string_lossy().to_string();
+                tracing::info!("正在托管静态资源: {}", path_str);
+                app.fallback_service(tower_http::services::ServeDir::new(&path_buf).fallback(
+                    tower_http::services::ServeFile::new(path_buf.join("index.html")),
+                ))
+            } else {
+                tracing::warn!("未找到前端静态资源目录 (dist)，Web 仪表盘静态托管未激活");
+                app
+            }
         };
 
         // 绑定地址（使用 socket2 开启 SO_REUSEADDR，通配地址自动开启 IPv6/IPv4 双栈支持）
@@ -1326,6 +1365,30 @@ fn bind_dual_stack_socket(port: u16) -> Result<tokio::net::TcpListener, String> 
         .map_err(|e| format!("转换为 Tokio TcpListener 失败 ([::]:{}): {}", port, e))
 }
 
+/// 解析前端静态资源目录，不依赖当前工作目录。
+/// 优先级：ABV_DIST_PATH > ./dist > 可执行文件同级 dist > 可执行文件上级 ../share/antigravity/dist
+fn resolve_static_dist_path() -> Option<std::path::PathBuf> {
+    use std::path::PathBuf;
+
+    let mut candidates: Vec<PathBuf> = Vec::new();
+    if let Ok(p) = std::env::var("ABV_DIST_PATH") {
+        if !p.trim().is_empty() {
+            candidates.push(PathBuf::from(p));
+        }
+    }
+    candidates.push(PathBuf::from("dist"));
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            candidates.push(dir.join("dist"));
+            candidates.push(dir.join("../share/antigravity/dist"));
+        }
+    }
+
+    candidates
+        .into_iter()
+        .find(|p| p.join("index.html").is_file())
+}
+
 /// 绑定 TCP 监听器（启用地址复用，遇通配地址如 0.0.0.0 / :: 时自动开启 IPv6/IPv4 双栈支持）
 fn bind_tcp_listener(host: &str, port: u16) -> Result<tokio::net::TcpListener, String> {
     let clean_host = host.trim_matches('[').trim_matches(']');
@@ -1459,11 +1522,17 @@ async fn admin_list_accounts(
                 proxy_disabled_reason: acc.proxy_disabled_reason,
                 proxy_disabled_at: acc.proxy_disabled_at,
                 protected_models: acc.protected_models.into_iter().collect(),
+                forbidden_models: acc.forbidden_models.into_iter().collect(),
                 live_limited_models: acc.live_limited_models,
                 validation_blocked: acc.validation_blocked,
                 validation_blocked_until: acc.validation_blocked_until,
                 validation_blocked_reason: acc.validation_blocked_reason,
                 validation_url: acc.validation_url,
+                banned: acc.banned,
+                banned_code: acc.banned_code,
+                banned_reason: acc.banned_reason,
+                banned_at: acc.banned_at,
+                ban_appeal_url: acc.ban_appeal_url,
                 quota,
                 device_bound: acc.device_profile.is_some(),
                 last_used: acc.last_used,
@@ -1566,11 +1635,17 @@ async fn admin_get_current_account(
                 proxy_disabled_reason: acc.proxy_disabled_reason,
                 proxy_disabled_at: acc.proxy_disabled_at,
                 protected_models: acc.protected_models.into_iter().collect(),
+                forbidden_models: acc.forbidden_models.into_iter().collect(),
                 live_limited_models: acc.live_limited_models,
                 validation_blocked: acc.validation_blocked,
                 validation_blocked_until: acc.validation_blocked_until,
                 validation_blocked_reason: acc.validation_blocked_reason,
                 validation_url: acc.validation_url,
+                banned: acc.banned,
+                banned_code: acc.banned_code,
+                banned_reason: acc.banned_reason,
+                banned_at: acc.banned_at,
+                ban_appeal_url: acc.ban_appeal_url,
                 quota,
                 device_bound: acc.device_profile.is_some(),
                 last_used: acc.last_used,
@@ -1783,12 +1858,25 @@ async fn admin_refresh_all_quotas() -> Result<impl IntoResponse, (StatusCode, Js
 
 // --- OAuth Handlers ---
 
+#[derive(Deserialize, Default)]
+struct AdminOAuthRequest {
+    #[serde(
+        default,
+        alias = "client_key",
+        alias = "clientKey",
+        alias = "oauthClientKey"
+    )]
+    oauth_client_key: Option<String>,
+}
+
 async fn admin_prepare_oauth_url(
     State(state): State<AppState>,
+    body: Option<Json<AdminOAuthRequest>>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    let client_key = body.and_then(|b| b.0.oauth_client_key);
     let url = state
         .account_service
-        .prepare_oauth_url(None)
+        .prepare_oauth_url(client_key)
         .await
         .map_err(|e| {
             (
@@ -1801,10 +1889,12 @@ async fn admin_prepare_oauth_url(
 
 async fn admin_start_oauth_login(
     State(state): State<AppState>,
+    body: Option<Json<AdminOAuthRequest>>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    let client_key = body.and_then(|b| b.0.oauth_client_key);
     let account = state
         .account_service
-        .start_oauth_login(None)
+        .start_oauth_login(client_key)
         .await
         .map_err(|e| {
             (
@@ -1860,17 +1950,23 @@ async fn admin_submit_oauth_code(
     State(state): State<AppState>,
     Json(payload): Json<SubmitCodeRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    state
+    let account = state
         .account_service
         .submit_oauth_code(payload.code, payload.state)
         .await
-        .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ErrorResponse { error: e }),
-            )
-        })?;
-    Ok(StatusCode::OK)
+        .map_err(|e| (StatusCode::BAD_REQUEST, Json(ErrorResponse { error: e })))?;
+
+    if let Err(e) = state.token_manager.load_accounts().await {
+        error!(
+            "Failed to reload accounts after manual OAuth code submission: {}",
+            e
+        );
+    }
+
+    Ok((
+        StatusCode::OK,
+        Json(serde_json::json!({ "account": account })),
+    ))
 }
 
 #[derive(Deserialize)]
@@ -2068,6 +2164,13 @@ async fn admin_save_config(
         .upstream
         .set_user_agent_override(new_config.proxy.user_agent_override.clone())
         .await;
+
+    // 同步 QoS 自动限流进小黑屋机制开关
+    state
+        .token_manager
+        .set_qos_auto_jail(new_config.proxy.qos_auto_jail);
+
+    // 同步健康检查日志捕获开关
     state
         .monitor
         .set_capture_health_logs(new_config.proxy.capture_health_logs);
@@ -2274,6 +2377,7 @@ async fn admin_update_model_mapping(
     })?;
 
     app_config.proxy.custom_mapping = config.custom_mapping;
+    app_config.proxy.custom_mapping_expose = config.custom_mapping_expose;
 
     crate::modules::config::save_app_config(&app_config).map_err(|e| {
         (
@@ -2553,6 +2657,126 @@ async fn admin_get_proxy_stats(
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
     let stats = state.monitor.get_stats().await;
     Ok(Json(stats))
+}
+
+#[derive(serde::Deserialize)]
+struct AdminTestModelRequest {
+    model: String,
+    #[serde(default, rename = "targetAccountId")]
+    target_account_id: Option<String>,
+}
+
+fn probe_selection_error_response(
+    error: crate::modules::probe::ProbeSelectionError,
+) -> (StatusCode, Json<ErrorResponse>) {
+    let status = match error {
+        crate::modules::probe::ProbeSelectionError::NoCandidates => StatusCode::BAD_REQUEST,
+        crate::modules::probe::ProbeSelectionError::AllCandidatesFailed { .. } => {
+            StatusCode::BAD_GATEWAY
+        }
+    };
+    (
+        status,
+        Json(ErrorResponse {
+            error: error.to_string(),
+        }),
+    )
+}
+
+async fn admin_test_model(
+    State(state): State<AppState>,
+    Json(payload): Json<AdminTestModelRequest>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    let port = state.port;
+    let accounts = crate::modules::account::list_accounts().unwrap_or_default();
+
+    let (chosen_account, token, pid) = if let Some(acc_id) = payload
+        .target_account_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+    {
+        let acc = accounts
+            .iter()
+            .find(|a| a.id == acc_id)
+            .cloned()
+            .ok_or_else(|| {
+                (
+                    StatusCode::NOT_FOUND,
+                    Json(ErrorResponse {
+                        error: "未找到指定的账号".to_string(),
+                    }),
+                )
+            })?;
+        let (t, p) = crate::modules::quota::get_valid_token_for_warmup(&acc)
+            .await
+            .map_err(|e| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(ErrorResponse { error: e }),
+                )
+            })?;
+        (acc, t, p)
+    } else {
+        // Web 端“自动调度”遵循反代号池语义：默认排除手动禁用反代的账号。
+        let probe =
+            crate::modules::probe::pick_auto_probe_account(&accounts, &payload.model, false)
+                .await
+                .map_err(probe_selection_error_response)?;
+        (probe.account, probe.access_token, probe.project_id)
+    };
+
+    let warmup_url = format!("http://127.0.0.1:{}/internal/warmup", port);
+    let body = serde_json::json!({
+        "email": chosen_account.email,
+        "model": payload.model,
+        "access_token": token,
+        "project_id": pid,
+        "account_id": chosen_account.id,
+        "probe_intent": true
+    });
+
+    let client = rquest::Client::builder()
+        .timeout(std::time::Duration::from_secs(60))
+        .no_proxy()
+        .build()
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    error: format!("创建客户端失败: {}", e),
+                }),
+            )
+        })?;
+
+    let resp = client
+        .post(&warmup_url)
+        .header("Content-Type", "application/json")
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    error: format!("发送预热检测请求失败: {}", e),
+                }),
+            )
+        })?;
+
+    let result = resp
+        .json::<crate::proxy::handlers::warmup::WarmupResponse>()
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    error: format!("解析预热检测结果失败: {}", e),
+                }),
+            )
+        })?;
+
+    Ok(Json(result))
 }
 
 async fn admin_get_data_dir_path() -> impl IntoResponse {
@@ -2836,6 +3060,7 @@ struct StatsPeriodQuery {
     hours: Option<i64>,
     days: Option<i64>,
     weeks: Option<i64>,
+    view_mode: Option<String>,
 }
 
 async fn admin_get_token_stats_hourly(
@@ -2947,7 +3172,11 @@ async fn admin_get_token_stats_by_model(
     Query(p): Query<StatsPeriodQuery>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
     let hours = p.hours.unwrap_or(168);
-    let res = tokio::task::spawn_blocking(move || token_stats::get_model_stats(hours)).await;
+    let view_mode = p.view_mode;
+    let res = tokio::task::spawn_blocking(move || {
+        token_stats::get_model_stats(hours, view_mode.as_deref())
+    })
+    .await;
 
     match res {
         Ok(Ok(stats)) => Ok(Json(stats)),
@@ -2965,9 +3194,12 @@ async fn admin_get_token_stats_by_model(
 }
 
 async fn admin_get_token_stats_model_trend_hourly(
+    Query(p): Query<StatsPeriodQuery>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    let res = tokio::task::spawn_blocking(|| {
-        token_stats::get_model_trend_hourly(24) // Default 24 hours
+    let hours = p.hours.unwrap_or(24);
+    let view_mode = p.view_mode;
+    let res = tokio::task::spawn_blocking(move || {
+        token_stats::get_model_trend_hourly(hours, view_mode.as_deref())
     })
     .await;
 
@@ -2987,9 +3219,12 @@ async fn admin_get_token_stats_model_trend_hourly(
 }
 
 async fn admin_get_token_stats_model_trend_daily(
+    Query(p): Query<StatsPeriodQuery>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    let res = tokio::task::spawn_blocking(|| {
-        token_stats::get_model_trend_daily(7) // Default 7 days
+    let days = p.days.unwrap_or(7);
+    let view_mode = p.view_mode;
+    let res = tokio::task::spawn_blocking(move || {
+        token_stats::get_model_trend_daily(days, view_mode.as_deref())
     })
     .await;
 
@@ -3165,6 +3400,50 @@ async fn admin_is_auto_launch_enabled() -> impl IntoResponse {
     Json(false)
 }
 
+async fn admin_get_hub_fingerprint() -> impl IntoResponse {
+    Json(crate::modules::hub_version::get_current_hub_fingerprint())
+}
+
+async fn admin_check_hub_update() -> impl IntoResponse {
+    let current = crate::constants::OFFICIAL_HUB_VERSION.to_string();
+    let latest = crate::modules::hub_version::fetch_remote_hub_release()
+        .await
+        .map(|release| release.version);
+    let update_available = latest
+        .as_deref()
+        .map_or(false, crate::modules::hub_version::is_update_available);
+
+    Json(crate::commands::proxy::HubUpdateStatus {
+        current,
+        latest,
+        update_available,
+    })
+}
+
+#[derive(Debug, Deserialize)]
+struct DetectHubFingerprintPayload {
+    #[serde(rename = "customVersion", alias = "custom_version")]
+    custom_version: Option<String>,
+    #[serde(rename = "customCl", alias = "custom_cl")]
+    custom_cl: Option<String>,
+}
+
+async fn admin_detect_remote_hub_fingerprint(
+    Json(payload): Json<DetectHubFingerprintPayload>,
+) -> impl IntoResponse {
+    let fp = crate::modules::hub_version::detect_and_update_hub_fingerprint_with(
+        payload.custom_version.as_deref(),
+        payload.custom_cl.as_deref(),
+        true,
+    )
+    .await;
+    Json(fp)
+}
+
+async fn admin_get_effective_first_byte_timeouts() -> impl IntoResponse {
+    Json(crate::commands::proxy::get_effective_first_byte_timeouts())
+}
+
 async fn admin_toggle_auto_launch(Json(_payload): Json<serde_json::Value>) -> impl IntoResponse {
     // Note: Autostart requires tauri::AppHandle.
     StatusCode::NOT_IMPLEMENTED
@@ -3183,6 +3462,7 @@ struct BulkDeleteRequest {
 }
 
 async fn admin_delete_accounts(
+    State(state): State<AppState>,
     Json(payload): Json<BulkDeleteRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
     crate::modules::account::delete_accounts(&payload.account_ids).map_err(|e| {
@@ -3191,14 +3471,39 @@ async fn admin_delete_accounts(
             Json(ErrorResponse { error: e }),
         )
     })?;
+
+    // [FIX #3806] 批量删除后立即重新加载 TokenManager
+    if let Err(e) = state.token_manager.load_accounts().await {
+        tracing::warn!("[API] Failed to reload accounts after bulk deletion: {}", e);
+    }
+
     Ok(StatusCode::OK)
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum BatchImportPayload {
+    Wrapped {
+        entries: Vec<crate::models::ImportAccountEntry>,
+    },
+    Bare(Vec<crate::models::ImportAccountEntry>),
+}
+
+impl BatchImportPayload {
+    fn into_entries(self) -> Vec<crate::models::ImportAccountEntry> {
+        match self {
+            Self::Wrapped { entries } => entries,
+            Self::Bare(entries) => entries,
+        }
+    }
 }
 
 async fn admin_batch_import_accounts(
     State(state): State<AppState>,
-    Json(payload): Json<Vec<crate::models::ImportAccountEntry>>,
+    Json(payload): Json<BatchImportPayload>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    let result = crate::modules::account::batch_import_accounts_logic(None, payload)
+    let entries = payload.into_entries();
+    let result = crate::modules::account::batch_import_accounts_logic(None, entries)
         .await
         .map_err(|e| {
             (
@@ -3284,9 +3589,16 @@ struct ToggleProxyRequest {
 }
 
 #[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct AccountPriorityRequest {
     #[serde(deserialize_with = "crate::models::account::deserialize_priority")]
     priority: u8,
+    #[serde(
+        default,
+        alias = "model_priorities",
+        deserialize_with = "crate::models::account::deserialize_optional_model_priorities"
+    )]
+    model_priorities: Option<std::collections::HashMap<String, u8>>,
 }
 
 async fn admin_update_account_priority(
@@ -3294,17 +3606,27 @@ async fn admin_update_account_priority(
     Path(account_id): Path<String>,
     Json(payload): Json<AccountPriorityRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    crate::modules::account::update_account_priority(&account_id, payload.priority).map_err(
-        |e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ErrorResponse { error: e }),
-            )
+    let has_model_override = payload.model_priorities.is_some();
+    let saved_model_priorities = crate::modules::account::update_account_priority_with_models(
+        &account_id,
+        payload.priority,
+        payload.model_priorities,
+    )
+    .map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse { error: e }),
+        )
+    })?;
+    state.token_manager.update_account_model_priorities(
+        &account_id,
+        payload.priority,
+        if has_model_override {
+            Some(saved_model_priorities)
+        } else {
+            None
         },
-    )?;
-    state
-        .token_manager
-        .update_account_priority(&account_id, payload.priority);
+    );
     Ok(StatusCode::OK)
 }
 
@@ -3757,11 +4079,14 @@ async fn admin_sync_account_from_db(
     })?;
     let current_target = index.current_target_ide.as_deref();
     let is_agy = current_target == Some("agy");
+    let is_acp = crate::modules::integration::is_acp_target(current_target);
 
     // 逻辑参考自 sync_account_from_db command
     let credential = if is_agy {
         crate::modules::integration::read_from_system_keyring_only()
             .map(|state| state.refresh_token)
+    } else if is_acp {
+        crate::modules::integration::read_acp_credentials().map(|state| state.refresh_token)
     } else {
         migration::get_refresh_token_from_db(current_target)
     };
@@ -3784,7 +4109,7 @@ async fn admin_sync_account_from_db(
         }
     }
 
-    let account = if is_agy {
+    let account = if is_agy || is_acp {
         let accounts = account::list_accounts().map_err(|e| {
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -3921,10 +4246,12 @@ async fn admin_get_cli_config_content(
 
 #[derive(Deserialize)]
 struct OAuthParams {
-    code: String,
+    code: Option<String>,
     state: Option<String>,
     #[allow(dead_code)]
     scope: Option<String>,
+    error: Option<String>,
+    error_description: Option<String>,
 }
 
 fn html_escape(value: &str) -> String {
@@ -3936,42 +4263,78 @@ fn html_escape(value: &str) -> String {
         .replace('\'', "&#39;")
 }
 
-async fn finish_web_oauth(
-    state: &AppState,
-    code: &str,
-    redirect: &str,
-    client: &str,
-) -> Result<(), String> {
-    let token =
-        crate::modules::oauth::exchange_code_with_client(code, redirect, Some(client)).await?;
-    state.account_service.process_oauth_token(token).await?;
-    state.token_manager.reload_all_accounts().await?;
-    Ok(())
-}
-
 async fn handle_oauth_callback(
     Query(params): Query<OAuthParams>,
     headers: HeaderMap,
     State(state): State<AppState>,
 ) -> Result<Html<String>, StatusCode> {
-    let code = params.code;
+    if let Some(err) = params.error {
+        let desc = params.error_description.unwrap_or_else(|| err.clone());
+        error!("OAuth callback received error from provider: {}", desc);
+        crate::modules::oauth_server::cancel_oauth_flow();
+        return Ok(Html(format!(
+            r#"<html><body style="font-family:sans-serif;text-align:center;padding:50px;"><h1 style="color:red;">❌ Authorization Failed</h1><p>Provider returned error: {}</p></body></html>"#,
+            desc
+        )));
+    }
 
-    // Exchange token
+    let code = match params.code {
+        Some(c) if !c.trim().is_empty() => c,
+        _ => {
+            return Ok(Html(
+                r#"<html><body style="font-family:sans-serif;text-align:center;padding:50px;"><h1 style="color:red;">❌ Authorization Failed</h1><p>Missing authorization code in callback.</p></body></html>"#
+                    .to_string(),
+            ));
+        }
+    };
+
     let port = state.security.read().await.port;
     let host = headers.get("host").and_then(|h| h.to_str().ok());
     let proto = headers
         .get("x-forwarded-proto")
         .and_then(|h| h.to_str().ok());
-    let redirect_uri = get_oauth_redirect_uri(port, host, proto);
 
-    let nonce = params.state.as_deref().ok_or(StatusCode::BAD_REQUEST)?;
-    let client_key =
-        crate::modules::oauth_server::claim_pending_oauth_callback(Some(nonce), &redirect_uri)
-            .map_err(|_| StatusCode::BAD_REQUEST)?;
-    let result = finish_web_oauth(&state, &code, &redirect_uri, &client_key).await;
-    crate::modules::oauth_server::finish_pending_oauth_callback(nonce);
-    match result {
-        Ok(()) => {
+    let (redirect_uri, preferred_client_key) = if let Some((
+        flow_redirect_uri,
+        expected_state,
+        flow_client_key,
+    )) =
+        crate::modules::oauth_server::get_active_oauth_flow_context()
+    {
+        if params.state.as_deref() != Some(&expected_state) {
+            error!("OAuth callback state mismatch (CSRF protection)");
+            return Ok(Html(
+                r#"<html><body style="font-family:sans-serif;text-align:center;padding:50px;"><h1 style="color:red;">❌ Authorization Failed</h1><p>Error: OAuth state mismatch (CSRF protection)</p></body></html>"#
+                    .to_string(),
+            ));
+        }
+        (flow_redirect_uri, Some(flow_client_key))
+    } else {
+        (get_oauth_redirect_uri(port, host, proto, None), None)
+    };
+
+    match crate::modules::oauth::exchange_code_with_client(
+        &code,
+        &redirect_uri,
+        preferred_client_key.as_deref(),
+    )
+    .await
+    {
+        Ok(token_resp) => {
+            if let Err(e) = state.account_service.process_oauth_token(token_resp).await {
+                error!("Failed to save account in OAuth callback: {}", e);
+                return Ok(Html(format!(
+                    r#"<html><body><h1>Authorization Failed</h1><p>Failed to save account: {}</p></body></html>"#,
+                    html_escape(&e)
+                )));
+            }
+
+            crate::modules::oauth_server::cancel_oauth_flow();
+
+            if let Err(e) = state.token_manager.load_accounts().await {
+                error!("Failed to reload accounts after OAuth callback: {}", e);
+            }
+
             // Success HTML
             Ok(Html(format!(
                 r#"
@@ -4034,6 +4397,7 @@ async fn handle_oauth_callback(
         }
         Err(e) => {
             error!("OAuth exchange failed: {}", e);
+            crate::modules::oauth_server::cancel_oauth_flow();
             Ok(Html(format!(
                 r#"<html><body><h1>Authorization Failed</h1><p>Error: {}</p></body></html>"#,
                 html_escape(&e)
@@ -4063,60 +4427,64 @@ async fn admin_prepare_oauth_url_web(
     let proto = headers
         .get("x-forwarded-proto")
         .and_then(|h| h.to_str().ok());
-    let redirect_uri = get_oauth_redirect_uri(port, host, proto);
+    let redirect_uri =
+        get_oauth_redirect_uri(port, host, proto, client_query.oauth_client_key.as_deref());
 
-    let state_str = uuid::Uuid::new_v4().to_string();
-
-    // 初始化授权流状态，以及后台处理器
-    let (auth_url, mut code_rx, client_key) =
-        crate::modules::oauth_server::prepare_oauth_flow_manually(
-            redirect_uri.clone(),
-            state_str.clone(),
-            client_query.oauth_client_key,
+    let auth_url = crate::modules::oauth_server::prepare_oauth_flow_manually(
+        redirect_uri,
+        client_query.oauth_client_key,
+    )
+    .map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse { error: e }),
         )
-        .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ErrorResponse { error: e }),
-            )
-        })?;
-
-    // 启动后台任务处理回调/手动提交的代码
-    let background_state = state.clone();
-    let flow_nonce = state_str.clone();
-    tokio::spawn(async move {
-        match tokio::time::timeout(std::time::Duration::from_secs(10 * 60), code_rx.recv()).await {
-            Ok(Some(Ok(code))) => {
-                if let Err(error) =
-                    finish_web_oauth(&background_state, &code, &redirect_uri, &client_key).await
-                {
-                    error!("Background OAuth exchange failed: {}", error);
-                }
-            }
-            Ok(Some(Err(error))) => error!("Background OAuth failed: {}", error),
-            Ok(None) => {}
-            Err(_) => error!("Background OAuth flow expired"),
-        }
-        crate::modules::oauth_server::finish_pending_oauth_callback(&flow_nonce);
-    });
+    })?;
 
     Ok(Json(serde_json::json!({
         "url": auth_url,
-        "state": state_str
     })))
 }
 
-/// 辅助函数：获取 OAuth 重定向 URI
-/// 强制使用 localhost，以绕过 Google 2.0 政策对 IP 地址和非 HTTPS 环境的拦截。
-/// 只有在显式设置了 ABV_PUBLIC_URL (例如用户配置了 HTTPS 域名) 时才会使用外部地址。
-fn get_oauth_redirect_uri(port: u16, _host: Option<&str>, _proto: Option<&str>) -> String {
-    if let Ok(public_url) = std::env::var("ABV_PUBLIC_URL") {
-        let base = public_url.trim_end_matches('/');
-        format!("{}/auth/callback", base)
-    } else {
-        // 强制返回 localhost。远程部署时，用户可通过回填功能完成授权。
-        format!("http://localhost:{}/auth/callback", port)
+fn is_loopback_url(raw_url: &str) -> bool {
+    if let Ok(parsed) = url::Url::parse(raw_url.trim()) {
+        if let Some(host) = parsed.host_str() {
+            let h = host.trim_matches(|c| c == '[' || c == ']');
+            return h.eq_ignore_ascii_case("localhost") || h == "127.0.0.1" || h == "::1";
+        }
     }
+    false
+}
+
+fn resolve_oauth_redirect_uri(
+    port: u16,
+    public_url_override: Option<&str>,
+    is_builtin_client: bool,
+) -> String {
+    if let Some(raw_public_url) = public_url_override {
+        let base = raw_public_url.trim().trim_end_matches('/');
+        if !base.is_empty() {
+            if !is_builtin_client || is_loopback_url(base) {
+                return format!("{}/auth/callback", base);
+            }
+            crate::modules::logger::log_warn(&format!(
+                "Ignored non-loopback ABV_PUBLIC_URL '{}' for built-in Google OAuth client (loopback required); falling back to http://localhost:{}/auth/callback",
+                base, port
+            ));
+        }
+    }
+    format!("http://localhost:{}/auth/callback", port)
+}
+
+fn get_oauth_redirect_uri(
+    port: u16,
+    _host: Option<&str>,
+    _proto: Option<&str>,
+    client_key: Option<&str>,
+) -> String {
+    let public_url = std::env::var("ABV_PUBLIC_URL").ok();
+    let is_builtin = crate::modules::oauth::is_builtin_oauth_client(client_key);
+    resolve_oauth_redirect_uri(port, public_url.as_deref(), is_builtin)
 }
 
 // ============================================================================
@@ -5374,7 +5742,7 @@ mod gateway_integration_tests {
 
 #[cfg(test)]
 mod save_update_settings_payload_tests {
-    use super::SaveUpdateSettingsPayload;
+    use super::{resolve_oauth_redirect_uri, SaveUpdateSettingsPayload};
     use crate::modules::update_checker::UpdateChannel;
 
     #[test]
@@ -5414,6 +5782,103 @@ mod save_update_settings_payload_tests {
         let payload: SaveUpdateSettingsPayload =
             serde_json::from_value(serde_json::json!({ "unknown": 1 })).unwrap();
         assert!(payload.into_patch().is_empty());
+    }
+
+    #[test]
+    fn batch_import_payload_accepts_wrapped_and_bare() {
+        use super::BatchImportPayload;
+        // 1. 验证 Web 模式下 invoke("batch_import_accounts", { entries }) 发出的 {"entries": [...]}
+        let wrapped: BatchImportPayload = serde_json::from_value(serde_json::json!({
+            "entries": [
+                { "email": "test@example.com", "refresh_token": "1//test_rt" }
+            ]
+        }))
+        .expect("wrapped payload should deserialize");
+        let entries = wrapped.into_entries();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].email.as_deref(), Some("test@example.com"));
+
+        // 2. 验证原生 API POST 的裸数组 [...]
+        let bare: BatchImportPayload = serde_json::from_value(serde_json::json!([
+            { "email": "bare@example.com", "refresh_token": "1//bare_rt" }
+        ]))
+        .expect("bare payload should deserialize");
+        let entries = bare.into_entries();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].email.as_deref(), Some("bare@example.com"));
+    }
+
+    #[test]
+    fn test_resolve_oauth_redirect_uri_loopback_guard() {
+        assert_eq!(
+            resolve_oauth_redirect_uri(8045, None, true),
+            "http://localhost:8045/auth/callback"
+        );
+        assert_eq!(
+            resolve_oauth_redirect_uri(8045, Some("https://my-domain.example.com/"), true),
+            "http://localhost:8045/auth/callback"
+        );
+        assert_eq!(
+            resolve_oauth_redirect_uri(8045, Some("http://127.0.0.1:18045/"), true),
+            "http://127.0.0.1:18045/auth/callback"
+        );
+        assert_eq!(
+            resolve_oauth_redirect_uri(8045, Some("http://localhost:18045/"), true),
+            "http://localhost:18045/auth/callback"
+        );
+        assert_eq!(
+            resolve_oauth_redirect_uri(8045, Some("https://my-domain.example.com/"), false),
+            "https://my-domain.example.com/auth/callback"
+        );
+    }
+}
+
+#[cfg(test)]
+mod admin_test_model_tests {
+    use super::*;
+    use crate::modules::probe::ProbeSelectionError;
+
+    #[test]
+    fn test_probe_selection_error_status_mapping() {
+        let (no_candidates, _) = probe_selection_error_response(ProbeSelectionError::NoCandidates);
+        assert_eq!(no_candidates, StatusCode::BAD_REQUEST);
+
+        let (all_failed, _) =
+            probe_selection_error_response(ProbeSelectionError::AllCandidatesFailed {
+                reasons: vec!["account@example.com: token refresh failed".to_string()],
+            });
+        assert_eq!(all_failed, StatusCode::BAD_GATEWAY);
+    }
+
+    #[test]
+    fn test_admin_test_model_request_deserialization() {
+        use super::AdminTestModelRequest;
+
+        // 1. 带 targetAccountId 的请求（Web 前端单模型测试）
+        let with_account: AdminTestModelRequest = serde_json::from_value(serde_json::json!({
+            "model": "gemini-2.5-pro",
+            "targetAccountId": "acc-12345"
+        }))
+        .expect("should deserialize with targetAccountId");
+        assert_eq!(with_account.model, "gemini-2.5-pro");
+        assert_eq!(with_account.target_account_id.as_deref(), Some("acc-12345"));
+
+        // 2. targetAccountId 为 null（Web 前端自动调度模式）
+        let auto_dispatch_null: AdminTestModelRequest = serde_json::from_value(serde_json::json!({
+            "model": "gemini-2.5-flash",
+            "targetAccountId": null
+        }))
+        .expect("should deserialize with null targetAccountId");
+        assert_eq!(auto_dispatch_null.model, "gemini-2.5-flash");
+        assert_eq!(auto_dispatch_null.target_account_id, None);
+
+        // 3. 缺少 targetAccountId 字段（原生 API 调用）
+        let bare: AdminTestModelRequest = serde_json::from_value(serde_json::json!({
+            "model": "claude-sonnet-4-5"
+        }))
+        .expect("should deserialize without targetAccountId");
+        assert_eq!(bare.model, "claude-sonnet-4-5");
+        assert_eq!(bare.target_account_id, None);
     }
 }
 

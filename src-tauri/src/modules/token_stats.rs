@@ -57,6 +57,8 @@ pub struct TokenStatsSummary {
     pub input_reported_requests: u64,
     pub total_requests: u64,
     pub unique_accounts: u64,
+    #[serde(default)]
+    pub avg_ttft_ms: Option<f64>,
 }
 
 /// Per-model token statistics
@@ -76,6 +78,8 @@ pub struct ModelTokenStats {
     pub output_reported_requests: u64,
     pub input_reported_requests: u64,
     pub request_count: u64,
+    #[serde(default)]
+    pub avg_ttft_ms: Option<f64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -190,6 +194,12 @@ pub fn init_db() -> Result<(), String> {
         "cached_tokens INTEGER NOT NULL DEFAULT 0",
     )?;
     add_column_if_missing(&conn, "token_usage", "reasoning_tokens INTEGER")?;
+    add_column_if_missing(&conn, "token_usage", "requested_model TEXT")?;
+    add_column_if_missing(&conn, "token_usage", "ttft_ms REAL")?;
+    let _ = conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_token_requested_model ON token_usage (requested_model)",
+        [],
+    );
     add_column_if_missing(
         &conn,
         "token_stats_hourly",
@@ -224,20 +234,25 @@ pub fn init_db() -> Result<(), String> {
                  timestamp INTEGER NOT NULL,
                  account_email TEXT NOT NULL,
                  model TEXT NOT NULL,
+                 requested_model TEXT,
                  input_tokens INTEGER,
                  output_tokens INTEGER,
                  cached_tokens INTEGER,
                  reasoning_tokens INTEGER,
                  total_tokens INTEGER,
                  reported_total_tokens INTEGER,
-                 cache_reported INTEGER NOT NULL DEFAULT 0
+                 cache_reported INTEGER NOT NULL DEFAULT 0,
+                 ttft_ms REAL
              );
              INSERT INTO token_usage
-                 (id, timestamp, account_email, model, input_tokens, output_tokens, cached_tokens,
-                  reasoning_tokens, total_tokens, reported_total_tokens, cache_reported)
-             SELECT id, timestamp, account_email, model, NULLIF(input_tokens, 0), NULLIF(output_tokens, 0),
+                 (id, timestamp, account_email, model, requested_model, input_tokens, output_tokens,
+                  cached_tokens, reasoning_tokens, total_tokens, reported_total_tokens, cache_reported,
+                  ttft_ms)
+             SELECT id, timestamp, account_email, model, requested_model, NULLIF(input_tokens, 0),
+                    NULLIF(output_tokens, 0),
                     CASE WHEN cache_reported = 0 AND cached_tokens = 0 THEN NULL ELSE cached_tokens END,
-                    NULLIF(reasoning_tokens, 0), total_tokens, reported_total_tokens, cache_reported
+                    NULLIF(reasoning_tokens, 0), total_tokens, reported_total_tokens, cache_reported,
+                    ttft_ms
              FROM token_usage_before_nullable;
              DROP TABLE token_usage_before_nullable;
              CREATE INDEX idx_token_timestamp ON token_usage (timestamp DESC);
@@ -258,10 +273,84 @@ pub fn init_db() -> Result<(), String> {
     ] {
         add_column_if_missing(&conn, "token_stats_hourly", column)?;
     }
+    let _ = conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_token_requested_model ON token_usage (requested_model)",
+        [],
+    );
+    // 历史数据平滑迁移：针对旧版本未记录 requested_model 的记录，依据默认路由规则反推并回填实际路由模型
+    migrate_legacy_unmapped_models(&conn);
+
     Ok(())
 }
 
-/// Record token usage from a request
+/// 历史数据兼容迁移：针对 requested_model IS NULL 的历史记录，将其原先记录的模型保留至 requested_model，
+/// 并通过网关统一路由解析器计算其真实生效的物理/路由模型填入 model 字段。
+fn migrate_legacy_unmapped_models(conn: &Connection) {
+    let unmapped_models: Vec<String> = {
+        let mut stmt = match conn
+            .prepare("SELECT DISTINCT model FROM token_usage WHERE requested_model IS NULL")
+        {
+            Ok(s) => s,
+            Err(_) => return,
+        };
+        let rows = match stmt.query_map([], |row| row.get::<_, String>(0)) {
+            Ok(r) => r,
+            Err(_) => return,
+        };
+        rows.filter_map(|r| r.ok()).collect()
+    };
+
+    if unmapped_models.is_empty() {
+        return;
+    }
+
+    let default_custom = crate::proxy::config::default_custom_mapping();
+    for original_model in unmapped_models {
+        let routed_model = crate::proxy::common::model_mapping::resolve_model_route(
+            &original_model,
+            &default_custom,
+        );
+
+        // 如果原始模型与路由模型不同，说明历史记录存的是客户端原始名，需要迁移成：
+        // model = routed_model (实际路由模型), requested_model = original_model (原始请求模型)
+        // 如果相同，直接将 requested_model 置为 original_model
+        let _ = conn.execute(
+            "UPDATE token_usage SET model = ?1, requested_model = ?2 WHERE model = ?2 AND requested_model IS NULL",
+            params![routed_model, original_model],
+        );
+    }
+}
+
+/// Record routed usage, including the client-requested model name and TTFT.
+///
+/// Counts are concrete because this entry point is only used once a response
+/// reported them. Missing upstream fields stay on `record_usage`.
+pub fn record_usage_with_route(
+    account_email: &str,
+    model: &str,
+    requested_model: Option<&str>,
+    input_tokens: u32,
+    output_tokens: u32,
+    cached_tokens: u32,
+    reasoning_tokens: u32,
+    ttft_ms: Option<f64>,
+) -> Result<(), String> {
+    record_usage_detailed(
+        account_email,
+        model,
+        requested_model,
+        Some(input_tokens),
+        Some(output_tokens),
+        Some(cached_tokens),
+        Some(reasoning_tokens),
+        Some(input_tokens.saturating_add(output_tokens)),
+        ttft_ms,
+    )
+}
+
+/// Record token usage from a request.
+///
+/// Absent counts stay NULL so an unreported field is not stored as zero.
 pub fn record_usage(
     account_email: &str,
     model: &str,
@@ -270,6 +359,30 @@ pub fn record_usage(
     cached_tokens: Option<u32>,
     reasoning_tokens: Option<u32>,
     reported_total_tokens: Option<u32>,
+) -> Result<(), String> {
+    record_usage_detailed(
+        account_email,
+        model,
+        None,
+        input_tokens,
+        output_tokens,
+        cached_tokens,
+        reasoning_tokens,
+        reported_total_tokens,
+        None,
+    )
+}
+
+fn record_usage_detailed(
+    account_email: &str,
+    model: &str,
+    requested_model: Option<&str>,
+    input_tokens: Option<u32>,
+    output_tokens: Option<u32>,
+    cached_tokens: Option<u32>,
+    reasoning_tokens: Option<u32>,
+    reported_total_tokens: Option<u32>,
+    ttft_ms: Option<f64>,
 ) -> Result<(), String> {
     let conn = connect_db()?;
     // Raw history and the hourly view must commit together. A failed aggregate
@@ -283,11 +396,11 @@ pub fn record_usage(
     let output_reported = u32::from(output_tokens.is_some());
     let total_reported = u32::from(reported_total_tokens.is_some());
 
-    // Insert into raw usage table
+    // Insert into raw usage table. Raw history and the hourly aggregate commit together.
     transaction.execute(
-        "INSERT INTO token_usage (timestamp, account_email, model, input_tokens, output_tokens, cached_tokens, reasoning_tokens, total_tokens, cache_reported, reported_total_tokens)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?8)",
-        params![timestamp, account_email, model, input_tokens, output_tokens, cached_tokens, reasoning_tokens, reported_total_tokens, cache_reported],
+        "INSERT INTO token_usage (timestamp, account_email, model, requested_model, input_tokens, output_tokens, cached_tokens, reasoning_tokens, total_tokens, cache_reported, reported_total_tokens, ttft_ms)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?9, ?11)",
+        params![timestamp, account_email, model, requested_model, input_tokens, output_tokens, cached_tokens, reasoning_tokens, reported_total_tokens, cache_reported, ttft_ms],
     ).map_err(|e| e.to_string())?;
 
     let hour_bucket = chrono::Local::now().format("%Y-%m-%d %H:00").to_string();
@@ -738,6 +851,20 @@ pub fn get_summary_stats(hours: i64) -> Result<TokenStatsSummary, String> {
         )
         .map_err(|e| e.to_string())?;
 
+    let cutoff_timestamp = if hours <= 0 {
+        0
+    } else {
+        chrono::Local::now().timestamp() - (hours * 3600)
+    };
+
+    let avg_ttft_ms: Option<f64> = conn
+        .query_row(
+            "SELECT ROUND(AVG(ttft_ms), 1) FROM token_usage WHERE timestamp >= ?1 AND ttft_ms IS NOT NULL AND ttft_ms > 0",
+            [cutoff_timestamp],
+            |row| row.get(0),
+        )
+        .unwrap_or(None);
+
     Ok(TokenStatsSummary {
         total_input_tokens: total_input,
         total_output_tokens: total_output,
@@ -752,10 +879,21 @@ pub fn get_summary_stats(hours: i64) -> Result<TokenStatsSummary, String> {
         input_reported_requests,
         total_requests: requests,
         unique_accounts,
+        avg_ttft_ms,
     })
 }
 
-pub fn get_model_stats(hours: i64) -> Result<Vec<ModelTokenStats>, String> {
+fn model_column_expr(view_mode: Option<&str>) -> &'static str {
+    match view_mode {
+        Some("requested") => "COALESCE(NULLIF(requested_model, ''), model)",
+        _ => "model",
+    }
+}
+
+pub fn get_model_stats(
+    hours: i64,
+    view_mode: Option<&str>,
+) -> Result<Vec<ModelTokenStats>, String> {
     let conn = connect_db()?;
     let cutoff = if hours <= 0 {
         0
@@ -763,9 +901,9 @@ pub fn get_model_stats(hours: i64) -> Result<Vec<ModelTokenStats>, String> {
         chrono::Local::now().timestamp() - (hours * 3600)
     };
 
-    let mut stmt = conn
-        .prepare(
-            "SELECT model,
+    let model_expr = model_column_expr(view_mode);
+    let sql = format!(
+        "SELECT {col} as agg_model,
                 COALESCE(SUM(input_tokens), 0) as input,
                 COALESCE(SUM(output_tokens), 0) as output,
                 COALESCE(SUM(cached_tokens), 0) as cached,
@@ -777,13 +915,16 @@ pub fn get_model_stats(hours: i64) -> Result<Vec<ModelTokenStats>, String> {
                 SUM(CASE WHEN cache_reported = 1 THEN cached_tokens ELSE 0 END),
                 COUNT(reported_total_tokens),
                 COUNT(output_tokens),
-                COUNT(input_tokens)
+                COUNT(input_tokens),
+                ROUND(AVG(CASE WHEN ttft_ms > 0 THEN ttft_ms ELSE NULL END), 1) as avg_ttft
          FROM token_usage
          WHERE timestamp >= ?1
-         GROUP BY model
+         GROUP BY agg_model
          ORDER BY total DESC",
-        )
-        .map_err(|e| e.to_string())?;
+        col = model_expr
+    );
+
+    let mut stmt = conn.prepare(&sql).map_err(|e| e.to_string())?;
 
     let rows = stmt
         .query_map([cutoff], |row| {
@@ -801,6 +942,7 @@ pub fn get_model_stats(hours: i64) -> Result<Vec<ModelTokenStats>, String> {
                 total_reasoning_tokens: row.get(4)?,
                 total_tokens: row.get(5)?,
                 request_count: row.get(6)?,
+                avg_ttft_ms: row.get(13)?,
             })
         })
         .map_err(|e| e.to_string())?;
@@ -815,6 +957,7 @@ pub fn get_model_stats(hours: i64) -> Result<Vec<ModelTokenStats>, String> {
 pub fn get_model_trend_minute(
     minutes: i64,
     step_minutes: i64,
+    view_mode: Option<&str>,
 ) -> Result<Vec<ModelTrendPoint>, String> {
     let conn = connect_db()?;
     let step_secs = step_minutes.max(1) * 60;
@@ -824,17 +967,19 @@ pub fn get_model_trend_minute(
         chrono::Local::now().timestamp() - (minutes * 60)
     };
 
-    let mut stmt = conn
-        .prepare(
-            "SELECT strftime('%Y-%m-%d %H:%M', datetime(timestamp - (timestamp % ?2), 'unixepoch', 'localtime')) as minute_bucket,
-                model,
+    let model_expr = model_column_expr(view_mode);
+    let sql = format!(
+        "SELECT strftime('%Y-%m-%d %H:%M', datetime(timestamp - (timestamp % ?2), 'unixepoch', 'localtime')) as minute_bucket,
+                {col} as agg_model,
                 SUM(reported_total_tokens) as total
          FROM token_usage
          WHERE timestamp >= ?1
-         GROUP BY minute_bucket, model
+         GROUP BY minute_bucket, agg_model
          ORDER BY minute_bucket ASC",
-        )
-        .map_err(|e| e.to_string())?;
+        col = model_expr
+    );
+
+    let mut stmt = conn.prepare(&sql).map_err(|e| e.to_string())?;
 
     let mut trend_map: std::collections::BTreeMap<
         String,
@@ -862,7 +1007,10 @@ pub fn get_model_trend_minute(
         .collect())
 }
 
-pub fn get_model_trend_hourly(hours: i64) -> Result<Vec<ModelTrendPoint>, String> {
+pub fn get_model_trend_hourly(
+    hours: i64,
+    view_mode: Option<&str>,
+) -> Result<Vec<ModelTrendPoint>, String> {
     let conn = connect_db()?;
     let cutoff = if hours <= 0 {
         0
@@ -870,17 +1018,19 @@ pub fn get_model_trend_hourly(hours: i64) -> Result<Vec<ModelTrendPoint>, String
         chrono::Local::now().timestamp() - (hours * 3600)
     };
 
-    let mut stmt = conn
-        .prepare(
-            "SELECT strftime('%Y-%m-%d %H:00', datetime(timestamp, 'unixepoch', 'localtime')) as hour_bucket,
-                model,
+    let model_expr = model_column_expr(view_mode);
+    let sql = format!(
+        "SELECT strftime('%Y-%m-%d %H:00', datetime(timestamp, 'unixepoch', 'localtime')) as hour_bucket,
+                {col} as agg_model,
                 SUM(reported_total_tokens) as total
          FROM token_usage
          WHERE timestamp >= ?1
-         GROUP BY hour_bucket, model
+         GROUP BY hour_bucket, agg_model
          ORDER BY hour_bucket ASC",
-        )
-        .map_err(|e| e.to_string())?;
+        col = model_expr
+    );
+
+    let mut stmt = conn.prepare(&sql).map_err(|e| e.to_string())?;
 
     let mut trend_map: std::collections::BTreeMap<
         String,
@@ -908,7 +1058,10 @@ pub fn get_model_trend_hourly(hours: i64) -> Result<Vec<ModelTrendPoint>, String
         .collect())
 }
 
-pub fn get_model_trend_daily(days: i64) -> Result<Vec<ModelTrendPoint>, String> {
+pub fn get_model_trend_daily(
+    days: i64,
+    view_mode: Option<&str>,
+) -> Result<Vec<ModelTrendPoint>, String> {
     let conn = connect_db()?;
     let cutoff = if days <= 0 {
         0
@@ -916,17 +1069,19 @@ pub fn get_model_trend_daily(days: i64) -> Result<Vec<ModelTrendPoint>, String> 
         chrono::Local::now().timestamp() - (days * 24 * 3600)
     };
 
-    let mut stmt = conn
-        .prepare(
-            "SELECT strftime('%Y-%m-%d', datetime(timestamp, 'unixepoch', 'localtime')) as day_bucket,
-                model,
+    let model_expr = model_column_expr(view_mode);
+    let sql = format!(
+        "SELECT strftime('%Y-%m-%d', datetime(timestamp, 'unixepoch', 'localtime')) as day_bucket,
+                {col} as agg_model,
                 SUM(reported_total_tokens) as total
          FROM token_usage
          WHERE timestamp >= ?1
-         GROUP BY day_bucket, model
+         GROUP BY day_bucket, agg_model
          ORDER BY day_bucket ASC",
-        )
-        .map_err(|e| e.to_string())?;
+        col = model_expr
+    );
+
+    let mut stmt = conn.prepare(&sql).map_err(|e| e.to_string())?;
 
     let mut trend_map: std::collections::BTreeMap<
         String,
@@ -1140,7 +1295,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(get_summary_stats(0).unwrap().total_requests, 1);
-        assert_eq!(get_model_stats(0).unwrap()[0].request_count, 1);
+        assert_eq!(get_model_stats(0, None).unwrap()[0].request_count, 1);
     }
 
     #[test]
@@ -1190,7 +1345,7 @@ mod tests {
         )
         .unwrap();
         init_db().unwrap();
-        let model = get_model_stats(0).unwrap().remove(0);
+        let model = get_model_stats(0, None).unwrap().remove(0);
         assert_eq!(model.request_count, 4);
         assert_eq!(model.total_tokens, 0);
         assert_eq!(model.total_reported_requests, 1);
@@ -1212,8 +1367,8 @@ mod tests {
         assert_eq!(summary.total_tokens, 0);
         assert_eq!(summary.total_reported_requests, 1);
         for trend in [
-            get_model_trend_hourly(0).unwrap(),
-            get_model_trend_daily(0).unwrap(),
+            get_model_trend_hourly(0, None).unwrap(),
+            get_model_trend_daily(0, None).unwrap(),
         ] {
             let totals: Vec<_> = trend
                 .iter()
@@ -1407,12 +1562,79 @@ mod tests {
         let conn = connect_db().unwrap();
         conn.execute("UPDATE token_usage SET cache_reported = 0", [])
             .unwrap();
-        let model = get_model_stats(0).unwrap().remove(0);
+        let model = get_model_stats(0, None).unwrap().remove(0);
         assert_eq!(model.cache_reported_requests, 0);
         assert_eq!(model.cache_reported_input_tokens, 0);
         assert_eq!(model.cache_reported_tokens, 0);
         // Old rows have no recoverable classification; their positive legacy total
         // must not become a known-subset numerator with an unknown denominator.
         assert_eq!(model.total_cached_tokens, 80);
+    }
+
+    #[test]
+    fn test_requested_model_aggregation_and_legacy_migration() {
+        use rusqlite::{params, Connection};
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE token_usage (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp INTEGER NOT NULL,
+                account_email TEXT NOT NULL,
+                model TEXT NOT NULL,
+                requested_model TEXT,
+                input_tokens INTEGER NOT NULL DEFAULT 0,
+                output_tokens INTEGER NOT NULL DEFAULT 0,
+                cached_tokens INTEGER NOT NULL DEFAULT 0,
+                reasoning_tokens INTEGER NOT NULL DEFAULT 0,
+                total_tokens INTEGER NOT NULL DEFAULT 0
+            );",
+        )
+        .unwrap();
+
+        // 模拟：请求 claude-3-7-sonnet，实际路由到了 fable-5
+        conn.execute(
+            "INSERT INTO token_usage (timestamp, account_email, model, requested_model, input_tokens, output_tokens, cached_tokens, reasoning_tokens, total_tokens)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            params![1_700_000_000, "user@example.com", "fable-5", "claude-3-7-sonnet", 100, 200, 0, 0, 300],
+        ).unwrap();
+
+        // 验证按 routed 聚合（默认）
+        let expr_routed = model_column_expr(None);
+        let sql_routed = format!("SELECT {expr_routed} as agg_model, SUM(total_tokens) FROM token_usage GROUP BY agg_model");
+        let (m_routed, total_routed): (String, i64) = conn
+            .query_row(&sql_routed, [], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap();
+        assert_eq!(m_routed, "fable-5");
+        assert_eq!(total_routed, 300);
+
+        // 验证按 requested 聚合
+        let expr_requested = model_column_expr(Some("requested"));
+        let sql_requested = format!("SELECT {expr_requested} as agg_model, SUM(total_tokens) FROM token_usage GROUP BY agg_model");
+        let (m_req, total_req): (String, i64) = conn
+            .query_row(&sql_requested, [], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap();
+        assert_eq!(m_req, "claude-3-7-sonnet");
+        assert_eq!(total_req, 300);
+
+        // 验证历史旧数据迁移逻辑 (针对 requested_model 为 NULL 的老数据)
+        conn.execute(
+            "INSERT INTO token_usage (timestamp, account_email, model, requested_model, input_tokens, output_tokens, cached_tokens, reasoning_tokens, total_tokens)
+             VALUES (?1, ?2, ?3, NULL, ?4, ?5, ?6, ?7, ?8)",
+            params![1_700_000_100, "user@example.com", "claude-haiku-4-5-20251001", 50, 50, 0, 0, 100],
+        ).unwrap();
+
+        migrate_legacy_unmapped_models(&conn);
+
+        // 迁移后，根据 default_custom_mapping，claude-haiku-4-5-20251001 实际路由为 gemini-3.8-flash-low，而 requested_model 为原始请求名
+        let (m_migrated, req_migrated): (String, Option<String>) = conn
+            .query_row(
+                "SELECT model, requested_model FROM token_usage WHERE timestamp = 1700000100",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+
+        assert_eq!(m_migrated, "gemini-3.8-flash-low");
+        assert_eq!(req_migrated.as_deref(), Some("claude-haiku-4-5-20251001"));
     }
 }

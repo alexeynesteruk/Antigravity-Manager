@@ -12,6 +12,7 @@ import {
     ServerCog,
 } from "lucide-react";
 import { StreamTimeoutConfig, UploadTimeoutConfig } from "../../types/config";
+import { request as invoke } from "../../utils/request";
 import { showToast } from "../common/ToastContainer";
 
 interface TimeoutSettingsProps {
@@ -28,12 +29,14 @@ const DEFAULT_STREAM: Required<StreamTimeoutConfig> = {
     streaming_sliding_secs: 120,
 };
 
-const DEFAULT_UPLOAD: Required<UploadTimeoutConfig> = {
+type DefaultUpload = Omit<Required<UploadTimeoutConfig>, "header_wait_secs">;
+
+const DEFAULT_UPLOAD: DefaultUpload = {
     connect_secs: 10,
-    min_upload_mbps: 2,
+    // 与后端 default_min_upload_mbps 对齐（0.8）：该值是「声明的最慢上行」，越小越宽松
+    min_upload_mbps: 0.8,
     extra_wait_ratio: 0.4,
     stall_secs: 45,
-    header_wait_secs: 0,
     large_body_threshold_mb: 8,
     large_body_endpoint_attempts: 1,
 };
@@ -43,7 +46,6 @@ type UploadField =
     | "min_upload_mbps"
     | "extra_wait_ratio"
     | "stall_secs"
-    | "header_wait_secs"
     | "large_body_threshold_mb"
     | "large_body_endpoint_attempts";
 
@@ -65,7 +67,6 @@ export const TimeoutSettings: React.FC<TimeoutSettingsProps> = ({
         min_upload_mbps: String(uploadConfig?.min_upload_mbps ?? DEFAULT_UPLOAD.min_upload_mbps),
         extra_wait_ratio: String(uploadConfig?.extra_wait_ratio ?? DEFAULT_UPLOAD.extra_wait_ratio),
         stall_secs: String(uploadConfig?.stall_secs ?? DEFAULT_UPLOAD.stall_secs),
-        header_wait_secs: String(uploadConfig?.header_wait_secs ?? DEFAULT_UPLOAD.header_wait_secs),
         large_body_threshold_mb: String(uploadConfig?.large_body_threshold_mb ?? DEFAULT_UPLOAD.large_body_threshold_mb),
         large_body_endpoint_attempts: String(uploadConfig?.large_body_endpoint_attempts ?? DEFAULT_UPLOAD.large_body_endpoint_attempts),
     }));
@@ -82,7 +83,6 @@ export const TimeoutSettings: React.FC<TimeoutSettingsProps> = ({
             min_upload_mbps: String(uploadConfig?.min_upload_mbps ?? DEFAULT_UPLOAD.min_upload_mbps),
             extra_wait_ratio: String(uploadConfig?.extra_wait_ratio ?? DEFAULT_UPLOAD.extra_wait_ratio),
             stall_secs: String(uploadConfig?.stall_secs ?? DEFAULT_UPLOAD.stall_secs),
-            header_wait_secs: String(uploadConfig?.header_wait_secs ?? DEFAULT_UPLOAD.header_wait_secs),
             large_body_threshold_mb: String(uploadConfig?.large_body_threshold_mb ?? DEFAULT_UPLOAD.large_body_threshold_mb),
             large_body_endpoint_attempts: String(uploadConfig?.large_body_endpoint_attempts ?? DEFAULT_UPLOAD.large_body_endpoint_attempts),
         });
@@ -91,7 +91,6 @@ export const TimeoutSettings: React.FC<TimeoutSettingsProps> = ({
         uploadConfig?.min_upload_mbps,
         uploadConfig?.extra_wait_ratio,
         uploadConfig?.stall_secs,
-        uploadConfig?.header_wait_secs,
         uploadConfig?.large_body_threshold_mb,
         uploadConfig?.large_body_endpoint_attempts,
     ]);
@@ -123,7 +122,6 @@ export const TimeoutSettings: React.FC<TimeoutSettingsProps> = ({
         min_upload_mbps: parseUpload("min_upload_mbps"),
         extra_wait_ratio: parseUpload("extra_wait_ratio"),
         stall_secs: parseUpload("stall_secs"),
-        header_wait_secs: parseUpload("header_wait_secs"),
         large_body_threshold_mb: parseUpload("large_body_threshold_mb"),
         large_body_endpoint_attempts: parseUpload("large_body_endpoint_attempts"),
         ...overrides,
@@ -136,20 +134,30 @@ export const TimeoutSettings: React.FC<TimeoutSettingsProps> = ({
         ...overrides,
     });
 
-    // 统一首字延迟（TTFT）派生：媒体类型只保留相对增量，不再维护独立绝对超时表。
-    // 与后端 upstream::client 的 first_byte_offset_secs / MAX_FIRST_BYTE_* 保持一致。
-    const TTFT_BASE_CAP = 150;
-    const TTFT_CEILING = 210;
-    const ttftBaseSecs = (() => {
-        const raw = Number(streamRaw.initial_ttft_secs);
-        const value = Number.isFinite(raw) && raw > 0 ? raw : DEFAULT_STREAM.initial_ttft_secs;
-        return Math.min(Math.max(value, 15), TTFT_BASE_CAP);
-    })();
-    const clampFirstByte = (v: number) => Math.min(Math.max(v, 15), TTFT_CEILING);
-    const firstByteText = clampFirstByte(ttftBaseSecs);
-    const firstByteImage = clampFirstByte(ttftBaseSecs + 45);
-    const firstByteVideo = clampFirstByte(ttftBaseSecs + 60);
-    const firstByteAux = clampFirstByte(ttftBaseSecs - 30);
+    // 统一首字延迟（TTFT）的生效值由后端计算下发（`get_effective_first_byte_timeouts`），
+    // 前端不再复刻 150 / 210 / +45 / +60 / -30 这一组常量，避免与 upstream::client 漂移。
+    const [firstByte, setFirstByte] = useState<{
+        text: number;
+        image: number;
+        video: number;
+        aux: number;
+        cap: number;
+    } | null>(null);
+    useEffect(() => {
+        let cancelled = false;
+        invoke("get_effective_first_byte_timeouts")
+            .then((res: any) => {
+                if (!cancelled && res && typeof res.text === "number") {
+                    setFirstByte(res);
+                }
+            })
+            .catch(() => {
+                // Web / 非 Tauri 运行模式：不展示派生行
+            });
+        return () => {
+            cancelled = true;
+        };
+    }, [streamConfig?.initial_ttft_secs]);
 
     const handleUploadInput = (field: UploadField, text: string) => {
         const isDecimal = field === "min_upload_mbps" || field === "extra_wait_ratio";
@@ -179,6 +187,16 @@ export const TimeoutSettings: React.FC<TimeoutSettingsProps> = ({
     };
 
     const handleUploadBlur = (field: UploadField) => {
+        if (field === "connect_secs") {
+            // 与后端 base_client_builder 的 3..120s 夹取对齐，避免前端显示值与生效值不一致
+            const parsed = parseInt(uploadRaw.connect_secs, 10);
+            const value = Number.isNaN(parsed)
+                ? DEFAULT_UPLOAD.connect_secs
+                : Math.min(Math.max(parsed, 3), 120);
+            setUploadRaw((prev) => ({ ...prev, connect_secs: String(value) }));
+            onUploadChange(mergedUpload({ connect_secs: value }));
+            return;
+        }
         if (uploadRaw[field] === "") {
             setUploadRaw((prev) => ({ ...prev, [field]: String(DEFAULT_UPLOAD[field]) }));
             onUploadChange(mergedUpload({ [field]: DEFAULT_UPLOAD[field] } as Partial<UploadTimeoutConfig>));
@@ -207,7 +225,6 @@ export const TimeoutSettings: React.FC<TimeoutSettingsProps> = ({
             min_upload_mbps: String(DEFAULT_UPLOAD.min_upload_mbps),
             extra_wait_ratio: String(DEFAULT_UPLOAD.extra_wait_ratio),
             stall_secs: String(DEFAULT_UPLOAD.stall_secs),
-            header_wait_secs: String(DEFAULT_UPLOAD.header_wait_secs),
             large_body_threshold_mb: String(DEFAULT_UPLOAD.large_body_threshold_mb),
             large_body_endpoint_attempts: String(DEFAULT_UPLOAD.large_body_endpoint_attempts),
         });
@@ -364,6 +381,7 @@ export const TimeoutSettings: React.FC<TimeoutSettingsProps> = ({
                     <div className="font-semibold">{t("proxy.upload_timeouts.formula_title")}</div>
                     <div className="font-mono">
                         {t("proxy.timeouts.auto_summary", {
+                            mbps: parseUpload("min_upload_mbps"),
                             big: estimateUploadSecs(47),
                         })}
                     </div>
@@ -479,16 +497,18 @@ export const TimeoutSettings: React.FC<TimeoutSettingsProps> = ({
                 <ul className="pl-4 list-disc space-y-0.5 text-gray-600 dark:text-gray-400">
                     <li>{t("proxy.timeouts.header_fallback_items")}</li>
                 </ul>
+                {firstByte && (
                 <div className="pt-1 text-gray-600 dark:text-gray-400">
                     {t("proxy.timeouts.first_byte_effective", {
-                        text: firstByteText,
-                        image: firstByteImage,
-                        video: firstByteVideo,
-                        aux: firstByteAux,
-                        cap: TTFT_BASE_CAP,
-                        defaultValue: `text ${firstByteText}s / image ${firstByteImage}s / video ${firstByteVideo}s / aux ${firstByteAux}s`,
+                        text: firstByte.text,
+                        image: firstByte.image,
+                        video: firstByte.video,
+                        aux: firstByte.aux,
+                        cap: firstByte.cap,
+                        defaultValue: `text ${firstByte.text}s / image ${firstByte.image}s / video ${firstByte.video}s / aux ${firstByte.aux}s`,
                     })}
                 </div>
+                )}
             </div>
 
             {/* 底部操作栏 */}

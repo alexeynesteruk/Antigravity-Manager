@@ -1506,16 +1506,33 @@ impl SignatureCache {
     }
 
     /// 退出/维护时尽力刷盘：把队列和 dirty 集合中的签名写入 SQLite。
-    pub fn flush_persist(&self, timeout: Duration) {
+    /// 尽力把队列中的签名写入 SQLite；返回是否在超时内收到 worker 确认。
+    ///
+    /// 供退出路径使用：`true` 只代表「队列已被处理」，写失败仍会回填 dirty 重试；
+    /// 返回 `false` 时调用方只需记日志，不应阻塞退出。
+    pub fn flush_persist(&self, timeout: Duration) -> bool {
         if self.persist_mode != PersistMode::Async {
-            return;
+            return true;
         }
         let (ack_tx, ack_rx) = sync_channel(1);
-        if tool_sig_persist_sender()
-            .try_send(ToolSigPersistCmd::Flush { ack: ack_tx })
-            .is_ok()
-        {
-            let _ = ack_rx.recv_timeout(timeout);
+        match tool_sig_persist_sender().try_send(ToolSigPersistCmd::Flush { ack: ack_tx }) {
+            Ok(()) => match ack_rx.recv_timeout(timeout) {
+                Ok(()) => true,
+                Err(_) => {
+                    tracing::warn!(
+                        timeout_ms = timeout.as_millis() as u64,
+                        "Signature cache flush timed out; recent writes may be lost on exit"
+                    );
+                    false
+                }
+            },
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "Signature cache flush skipped: writer queue unavailable"
+                );
+                false
+            }
         }
     }
 
@@ -1532,6 +1549,13 @@ impl SignatureCache {
             let _ = ack_rx.recv_timeout(Duration::from_secs(5));
         }
     }
+}
+
+/// 进程退出前的统一尽力 flush（可在任意线程/上下文调用）。
+///
+/// 注意：它有 2s 阻塞上限，只应在退出路径调用，不能放进请求链路。
+pub fn flush_on_exit() {
+    SignatureCache::global().flush_persist(Duration::from_secs(2));
 }
 
 #[cfg(test)]

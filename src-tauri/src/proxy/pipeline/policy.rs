@@ -27,14 +27,8 @@ impl UpstreamClassification {
             return UpstreamClassification::InternalGatewayMessage;
         }
 
-        // 1. 优先排除网关自身内部错误（防自噬死循环）
-        if lower.contains("all accounts limited")
-            || lower.contains("no accounts available")
-            || lower.contains("all accounts failed")
-            || lower.contains("token pool is empty")
-            || lower.contains("all accounts exhausted")
-            || lower.contains("all accounts unhealthy")
-        {
+        // 1. 优先排除网关自身内部错误（防自噬死循环与假 503 误报）
+        if Self::is_internal_gateway_exhaustion(&lower) {
             return UpstreamClassification::InternalGatewayMessage;
         }
 
@@ -56,6 +50,10 @@ impl UpstreamClassification {
         }
 
         // 3. 判定 Thinking 签名失效或跨模型异构签名污染
+        //
+        // cue 集合是四协议的并集（Claude 适配器历史上维护了最宽的一份，
+        // 包含字段缺失 / 反序列化失败 / 块顺序错误等上游原始措辞）。
+        // 任何新增方言都应补到这里，而不是在各适配器里再写一份 contains。
         let has_signature_error_cue = lower.contains("invalid thought signature")
             || lower.contains("invalid `signature`")
             || lower.contains("invalid signature")
@@ -63,7 +61,13 @@ impl UpstreamClassification {
             || lower.contains("thoughtsignature")
             || lower.contains("thinking.signature")
             || lower.contains("thinking.thinking")
-            || lower.contains("corrupted thought signature");
+            || lower.contains("corrupted thought signature")
+            || lower.contains("failed to deserialise")
+            || lower.contains("thinking block")
+            || lower.contains("found `text`")
+            || lower.contains("found 'text'")
+            || lower.contains("must be `thinking`")
+            || lower.contains("must be 'thinking'");
 
         if status == 400 && has_signature_error_cue {
             return UpstreamClassification::ThoughtSignatureError;
@@ -89,6 +93,21 @@ impl UpstreamClassification {
         UpstreamClassification::OtherClientError(status)
     }
 
+    /// 统一判定是否为网关内部账号池耗尽/限流错误（杜绝假 503 误报）
+    pub fn is_internal_gateway_exhaustion(lower: &str) -> bool {
+        (lower.contains("all accounts")
+            && (lower.contains("limited")
+                || lower.contains("rate-limited")
+                || lower.contains("rate_limited")
+                || lower.contains("failed")
+                || lower.contains("unhealthy")
+                || lower.contains("exhausted")
+                || lower.contains("suspended")))
+            || lower.contains("no accounts available")
+            || lower.contains("token pool is empty")
+            || lower.contains("no quota accounts")
+    }
+
     /// 该分类是否应该触发 TokenManager 的账号冷却锁定
     pub fn should_lock_account(&self) -> bool {
         matches!(self, UpstreamClassification::RateLimited { .. })
@@ -96,12 +115,12 @@ impl UpstreamClassification {
 
     /// 这个账号不能再被当前会话粘住。401 / 403 / 404 / 429 / 529。
     pub fn abandons_sticky_account(&self) -> bool {
-        match self {
-            UpstreamClassification::RateLimited { .. } => true,
-            UpstreamClassification::ModelNotFound => true,
-            UpstreamClassification::OtherClientError(401 | 403) => true,
-            _ => false,
-        }
+        matches!(
+            self,
+            UpstreamClassification::RateLimited { .. }
+                | UpstreamClassification::ModelNotFound
+                | UpstreamClassification::OtherClientError(401 | 403 | 404 | 429)
+        )
     }
 
     /// 该分类是否为模型不存在
@@ -163,6 +182,20 @@ impl UpstreamClassification {
     }
 }
 
+/// 404「单模型不可用」的统一处置（协议无关）
+///
+/// 四个适配器过去各写 30 行：标记账号对**该模型**临时熔断，再决定是否换号。
+/// 这里只保留决策与副作用，协议专属的响应体仍由适配器构造。
+///
+/// `mark` 由调用方注入（`token_manager.mark_model_unsupported`），避免 Pipeline
+/// 直接依赖账号层实现。
+///
+/// 返回 `true` 表示账号池仍有其他候选，调用方应换号重试。
+pub fn apply_model_not_found(attempt: usize, pool_size: usize, mut mark: impl FnMut()) -> bool {
+    mark();
+    attempt < pool_size
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -186,6 +219,11 @@ mod tests {
         assert!(unauth.abandons_sticky_account());
         let forbidden = UpstreamClassification::classify(403, "forbidden", None);
         assert!(forbidden.abandons_sticky_account());
+
+        let client_429 = UpstreamClassification::OtherClientError(429);
+        assert!(client_429.abandons_sticky_account());
+        let client_404 = UpstreamClassification::OtherClientError(404);
+        assert!(client_404.abandons_sticky_account());
     }
 
     #[test]

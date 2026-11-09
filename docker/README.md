@@ -49,6 +49,7 @@ You can pull the pre-built image directly from Docker Hub and start it without f
 # Start the container (replace your-secret-key with a strong key)
 docker run -d \
   --name antigravity-manager \
+  --init \
   -p 8045:8045 \
   -e API_KEY=your-api-key \
   -e WEB_PASSWORD=your-login-password \
@@ -58,14 +59,17 @@ docker run -d \
 ```
 
 > [!TIP]
+> The image ENTRYPOINT already includes `tini`. `docker run --init` and compose `init: true` are extra insurance. Keeping both is safe.
+>
 > **🧪 Try the Beta / Preview Images**:
 > To use the latest Beta pre-release features, pull the matching Beta version tag (pre-release builds are published independently and never overwrite the `latest` stable tag):
 > ```bash
 > # Pull a specific Beta pre-release
 > docker pull lbjlaq/antigravity-manager:v4.8.2-beta.0
-> 
-> # Run the Beta container
+>
+> # Run the Beta container (keep --init)
 > docker run -d --name antigravity-manager-beta \
+>   --init \
 >   -p 8045:8045 \
 >   -e API_KEY=your-api-key \
 >   -e WEB_PASSWORD=your-login-password \

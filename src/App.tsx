@@ -24,8 +24,12 @@ import { listen } from '@tauri-apps/api/event';
 import { isTauri } from './utils/env';
 import { request as invoke } from './utils/request';
 import { AdminAuthGuard } from './components/common/AdminAuthGuard';
+import { showToast } from './components/common/ToastContainer';
 import MiniView from './components/layout/MiniView';
 import { getCurrentWindow } from '@tauri-apps/api/window';
+
+// 官方 Hub 更新提示每进程只飘一次（避免 React StrictMode 双挂载重复弹）
+let hubUpdateNoticeShown = false;
 
 const router = createBrowserRouter([
   {
@@ -84,7 +88,7 @@ const router = createBrowserRouter([
 function App() {
   const { config, loadConfig } = useConfigStore();
   const { fetchCurrentAccount, fetchAccounts } = useAccountStore();
-  const { i18n } = useTranslation();
+  const { t, i18n } = useTranslation();
 
   useEffect(() => {
     loadConfig();
@@ -287,6 +291,37 @@ function App() {
     // Delay check to avoid blocking initial render
     const timer = setTimeout(checkUpdates, 2000);
     return () => clearTimeout(timer);
+  }, []);
+
+  // 官方 Hub 版本提示：只提示，不改变出站指纹（CL 无法自动获取，必须与版本成对校准）
+  // 文案走 i18n（hub_update.available），各语言仅翻译尾部说明，版本前缀保持统一
+  useEffect(() => {
+    if (typeof window !== 'undefined' && window.location.search.includes('mini')) return;
+    if (hubUpdateNoticeShown) return;
+    let cancelled = false;
+    const timer = setTimeout(async () => {
+      try {
+        const res = await invoke<{ current: string; latest: string | null; update_available: boolean }>('check_hub_update');
+        if (cancelled || hubUpdateNoticeShown) return;
+        if (res?.update_available && res.latest) {
+          hubUpdateNoticeShown = true;
+          showToast(
+            t('hub_update.available', {
+              version: res.latest,
+              defaultValue: 'antigravity hub latest: {{version}}',
+            }),
+            'info',
+            8000
+          );
+        }
+      } catch {
+        // 静默：更新提示失败不影响任何功能
+      }
+    }, 3000);
+    return () => {
+      cancelled = true;
+      clearTimeout(timer);
+    };
   }, []);
 
   const isMini =

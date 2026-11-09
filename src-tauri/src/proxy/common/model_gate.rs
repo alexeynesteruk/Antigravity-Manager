@@ -63,6 +63,48 @@ pub fn resolve_requested_model(
         .unwrap_or_else(|| requested.to_string())
 }
 
+/// 已下线模型族硬门禁（作用于**映射后的最终出站模型 ID**，而非客户端原始请求名）。
+///
+/// - **Claude**：全部 3.x 及任何 < 4.6 的版本（含 4.5 / 4-5 系列）
+/// - **Gemini**：全部 2.x 及更低大版本（2.5-pro / 2.5-flash / 2.0-flash …）
+///
+/// 调用方必须先应用自定义映射 / 自适应暗路由再判定：已下线的旧名允许作为**入站别名键**
+/// 指向合规模型（别名本身不参与判定），但映射后的目标自身仍属已下线族时一律返回
+/// 404 `model not exist`；内部“旧名→新模型”的兼容映射同样不得把已下线模型“洗白”后绕过闸门。
+pub fn is_retired_model_id(model: &str) -> bool {
+    let raw = model.trim().to_lowercase();
+    let id = raw.strip_prefix("models/").unwrap_or(raw.as_str()).trim();
+
+    // 生图模型族独立管理（配额桶、请求类型、尺寸后缀都与文本模型不同），
+    // 不得因版本号被“已下线”规则误杀（如 gemini-3-pro-image / gemini-3.1-flash-image 及其 -2k/-4k 变体）。
+    if id.contains("image") || id.starts_with("imagen") {
+        return false;
+    }
+
+    if let Some(rest) = id.strip_prefix("gemini-") {
+        // 仅对带版本号的 Gemini ID 判定；gemini-pro / gemini-flash 这类别名交由基准线过滤器处理
+        if let Some((major, _minor)) = model_mapping::parse_version_tuple(rest) {
+            return major <= 2;
+        }
+        return false;
+    }
+
+    if id.contains("claude") {
+        if id.contains("fable") || id.contains("mythos") {
+            if let Some(version) = crate::proxy::model_specs::parse_claude_version_tuple(id) {
+                return version < (5, 0);
+            }
+            return false;
+        }
+        if let Some(version) = crate::proxy::model_specs::parse_claude_version_tuple(id) {
+            return version < (4, 6);
+        }
+        return id.contains("claude-3") || id.contains("claude-2");
+    }
+
+    false
+}
+
 /// 生图模型族变体归一化（唯一实现位于 `model_mapping`，此处保留同名入口供门禁调用）。
 pub fn strip_image_variant_suffix(id: &str) -> String {
     crate::proxy::common::model_mapping::strip_image_variant_suffix(id)
@@ -125,6 +167,9 @@ fn is_image_family_allowed(requested: &str, allowed: &HashSet<String>) -> bool {
 /// 2. 官方基准目录
 /// 3. agent 工具一键配置的旗舰模型列表
 /// 4. 自定义映射的键与目标值（客户端可显式调用别名）
+///
+/// 注：已下线族别名不登记进本集合——入站请求会先经自定义映射解析为合规目标再判定，
+/// 因此别名无需出现在放行集合中即可正常放行。
 pub async fn downstream_exposed_models(
     custom_mapping: &tokio::sync::RwLock<HashMap<String, String>>,
     token_manager: &TokenManager,
@@ -139,8 +184,12 @@ pub async fn downstream_exposed_models(
     .into_iter()
     .collect();
 
-    for id in model_mapping::get_supported_models() {
-        allowed.insert(id);
+    // 冷启动（号池尚未同步模型目录）才用官方目录兜底；一旦有真实可用集合，
+    // 严格只暴露 available ∪ agent 配置 ∪ 自定义别名，避免“字典存在但未开通”的条目外泄。
+    if token_manager.get_all_collected_models().is_empty() {
+        for id in model_mapping::get_supported_models() {
+            allowed.insert(id);
+        }
     }
     for core in crate::proxy::cli_sync::get_core_gateway_models() {
         allowed.insert(core.id.to_string());
@@ -149,12 +198,52 @@ pub async fn downstream_exposed_models(
     {
         let mapping = custom_mapping.read().await;
         for (key, target) in mapping.iter() {
+            // 自适应协议目标不对外暴露为具体模型 ID
+            if target.starts_with("auto:") {
+                continue;
+            }
+            // 已下线模型族不得因自定义映射而重新出现
+            if is_retired_model_id(key) || is_retired_model_id(target) {
+                continue;
+            }
             allowed.insert(key.clone());
             allowed.insert(target.clone());
         }
     }
 
+    // 裸名派生统一走 strip_tier_suffix（与路由层同口径，覆盖 -xhigh / @default 等）；
+    // 只保留仍符合旗舰基准线的基底名，避免把已下线模型重新派生出来。
+    let derived_bare: Vec<String> = allowed
+        .iter()
+        .filter_map(|id| {
+            let base = model_mapping::strip_tier_suffix(id);
+            (base != *id && model_mapping::is_model_compliant_with_baseline(&base)).then_some(base)
+        })
+        .collect();
+    allowed.extend(derived_bare);
+
+    // 最后统一剔除已下线模型族（目录数据 / agent 工具列表可能仍含历史条目）
+    allowed.retain(|id| !is_retired_model_id(id));
+
     allowed
+}
+
+/// 族级兜底是否适用
+///
+/// 只有在 router **确实改写过模型名**时才允许用“同族基底存在”放行：
+/// - 别名：`gemini-3-flash` → `gemini-3.8-flash-tiered`（可用于兼容仍在使用旧别名的客户端）
+/// - 裸名 → 档位：`gemini-3.8-flash` → `gemini-3.8-flash-tiered`
+///
+/// 若 router 原样透传（`routed == final_model`），说明它不认识这个 id；
+/// 此时 `strip_tier_suffix` 会误抹 `-thinking` / `@default` 等非档位尾巴，
+/// 一旦放行，无效 model-id 会被发往上游，并按账号逐个写入 900s 单模型熔断。
+fn family_fallback_applicable(
+    exact_allowed: bool,
+    routed_allowed: bool,
+    final_model: &str,
+    routed: &str,
+) -> bool {
+    !exact_allowed && !routed_allowed && routed != final_model
 }
 
 /// 入站模型闸门主入口。
@@ -168,11 +257,21 @@ pub async fn gate_inbound_model(
         return ModelGate::NotFound;
     }
 
-    // Resolve explicit aliases before validating current catalog availability.
-    let final_model = {
+    // 自定义映射与号池自适应暗路由前置解析：
+    // 用户显式声明的别名与 auto: 自适应协议目标优先转换为目标物理/逻辑模型
+    let raw_target = {
         let mapping = custom_mapping.read().await;
         resolve_requested_model(requested, &mapping)
     };
+    let final_model =
+        model_mapping::resolve_adaptive_target(&raw_target, requested, None, Some(token_manager));
+
+    // 已下线模型族硬门禁：检查 **映射后的真实出站模型**，
+    // 允许用户把已下线的旧名作为别名键映射到合规模型。
+    if is_retired_model_id(&final_model) {
+        tracing::warn!("[ModelGate] Rejected retired model family: {}", final_model);
+        return ModelGate::NotFound;
+    }
 
     let only_raw_quota_models = crate::modules::config::load_app_config()
         .map(|cfg| cfg.proxy.only_raw_quota_models)
@@ -188,18 +287,165 @@ pub async fn gate_inbound_model(
         return ModelGate::Allow(final_model);
     }
 
-    let allowed =
+    let mut allowed =
         downstream_exposed_models(custom_mapping, token_manager, only_raw_quota_models).await;
-    if allowed.is_empty() || !allowed.contains(&final_model) {
-        // 生图模型族允许尺寸/预览变体（-preview / -2k / -4k / -16x9 等）宽松命中基底模型
-        if !is_image_family_allowed(&final_model, &allowed) {
+    if allowed.is_empty() {
+        // 号池有元数据、但全部被基准线过滤（例如只上报了已下线模型）时 fail-open，
+        // 避免把整池可用流量误杀成 404；具体模型仍由下游路由/上游决定。
+        tracing::warn!(
+            "[ModelGate] Exposed model set is empty after baseline filtering; fail-open for '{}'",
+            final_model
+        );
+        return ModelGate::Allow(final_model);
+    }
+
+    // [ROUTE PARITY] 门禁必须与真正出站路由同口径：历史别名 / 裸名先交给 router 解析一次，
+    // 否则 `gemini-3-flash` 这类 router 仍支持的别名会在门禁处被误杀。
+    let routed = crate::proxy::common::model_mapping::resolve_model_route_with_effort(
+        &final_model,
+        &std::collections::HashMap::new(),
+        None,
+    );
+    let strip = |s: &str| model_mapping::strip_tier_suffix(s);
+
+    let mut exact_allowed = allowed.contains(&final_model);
+    let mut routed_allowed = allowed.contains(&routed);
+    // 族级兜底：routed 的具体档位可能未被号池上报（例如只报 high/medium/low），
+    // 只要同族基底在集合里就视为可用，具体档位由路由层决定。
+    // 但仅限“router 真正改写过模型名”的场景（别名 / 裸名→档位）：
+    // `-thinking` / `@default` 这类 router 不认识的尾巴不能被 `strip_tier_suffix` 抹平后放行，
+    // 否则无效 model-id 会穿透门禁、打到上游并给每个账号写入 900s 熔断。
+    let mut family_member =
+        if family_fallback_applicable(exact_allowed, routed_allowed, &final_model, &routed) {
+            allowed.iter().find(|a| strip(a) == strip(&routed)).cloned()
+        } else {
+            None
+        };
+
+    let mut exposed = exact_allowed
+        || routed_allowed
+        || family_member.is_some()
+        || is_image_family_allowed(&final_model, &allowed)
+        || is_image_family_allowed(&routed, &allowed);
+
+    // 新账号可能刚刚导入并带来新的模型授权；拒绝前先自愈刷新一次池快照，
+    // 再按最新 allowed 集合重新判定存在性与族级兜底。
+    if !exposed {
+        token_manager.refresh_pool_for_gate_if_stale().await;
+        allowed =
+            downstream_exposed_models(custom_mapping, token_manager, only_raw_quota_models).await;
+        if allowed.is_empty() {
+            tracing::warn!(
+                "[ModelGate] Exposed model set is empty after gate self-heal; fail-open for '{}'",
+                final_model
+            );
+            return ModelGate::Allow(final_model);
+        }
+        exact_allowed = allowed.contains(&final_model);
+        routed_allowed = allowed.contains(&routed);
+        family_member =
+            if family_fallback_applicable(exact_allowed, routed_allowed, &final_model, &routed) {
+                allowed.iter().find(|a| strip(a) == strip(&routed)).cloned()
+            } else {
+                None
+            };
+        exposed = exact_allowed
+            || routed_allowed
+            || family_member.is_some()
+            || is_image_family_allowed(&final_model, &allowed)
+            || is_image_family_allowed(&routed, &allowed);
+        if !exposed {
             return ModelGate::NotFound;
         }
     }
 
-    // 第二道：该模型在整池是否还有任何正配额账号
-    if token_manager.accounts_with_positive_quota(&final_model) == 0 {
-        return ModelGate::NoQuota;
+    // 第二道：用“门禁实际认可的模型名”查整池配额。
+    // 注意：routed 只用于校验；真正出站模型仍由 handler 带 effort 重新路由。
+    let quota_model = if exact_allowed {
+        final_model.clone()
+    } else if routed_allowed {
+        routed.clone()
+    } else if let Some(member) = family_member {
+        member
+    } else {
+        final_model.clone()
+    };
+    let accounts_quota = token_manager.accounts_with_positive_quota(&quota_model);
+    let accounts_final = if quota_model != final_model {
+        token_manager.accounts_with_positive_quota(&final_model)
+    } else {
+        accounts_quota
+    };
+    if accounts_quota == 0 && accounts_final == 0 {
+        // 配额刷新/新账号导入会通过异步 reload 队列更新内存池；如果门禁只读
+        // 旧快照就返回 502，而唯一消费 reload 队列的 `get_token_filtered` 又
+        // 永远不可达，就会形成「no quota accounts 卡住 10~15 分钟」的死锁。
+        // 因此在下“整池无配额”结论前，强制刷新一次账号池并复查。
+        token_manager.refresh_pool_for_gate_if_stale().await;
+
+        let retry_quota = token_manager.accounts_with_positive_quota(&quota_model);
+        let retry_final = if quota_model != final_model {
+            token_manager.accounts_with_positive_quota(&final_model)
+        } else {
+            retry_quota
+        };
+        if retry_quota == 0 && retry_final == 0 {
+            return ModelGate::NoQuota;
+        }
+    }
+
+    ModelGate::Allow(final_model)
+}
+
+/// 「只查存在性」的入站模型闸门（不做整池配额检查）
+///
+/// 用于生图等与文本模型配额桶不同源的入口：先把“模型名写错 / 已下线”在选号之前拦下，
+/// 避免错误文案拖到重试循环里被误当成账号故障；同时不因配额桶缺失而误杀。
+///
+/// 拒绝时的文案与 [`gate_inbound_model`] 完全一致，均为网关自答（不罚号、不轮换）。
+pub async fn gate_inbound_model_exists(
+    requested_model: Option<&str>,
+    custom_mapping: &tokio::sync::RwLock<HashMap<String, String>>,
+    token_manager: &TokenManager,
+) -> ModelGate {
+    let requested = requested_model.map(str::trim).unwrap_or("");
+    if requested.is_empty() {
+        return ModelGate::NotFound;
+    }
+
+    let raw_target = {
+        let mapping = custom_mapping.read().await;
+        resolve_requested_model(requested, &mapping)
+    };
+    let final_model =
+        model_mapping::resolve_adaptive_target(&raw_target, requested, None, Some(token_manager));
+
+    // 检查映射后的真实出站模型，允许旧名作为自定义别名键。
+    if is_retired_model_id(&final_model) {
+        tracing::warn!("[ModelGate] Rejected retired model family: {}", final_model);
+        return ModelGate::NotFound;
+    }
+
+    // 冷启动（号池尚未同步模型目录）：只做已下线检查，避免误杀
+    if token_manager.get_all_collected_models().is_empty() {
+        return ModelGate::Allow(final_model);
+    }
+
+    let allowed = downstream_exposed_models(custom_mapping, token_manager, false).await;
+    if allowed.is_empty() {
+        tracing::warn!(
+            "[ModelGate] Exposed model set is empty after baseline filtering; fail-open for '{}'",
+            final_model
+        );
+        return ModelGate::Allow(final_model);
+    }
+    if !allowed.contains(&final_model) && !is_image_family_allowed(&final_model, &allowed) {
+        // 新账号可能刚刚导入并带来新的模型授权；拒绝前先自愈刷新一次池快照。
+        token_manager.refresh_pool_for_gate_if_stale().await;
+        let refreshed = downstream_exposed_models(custom_mapping, token_manager, false).await;
+        if !refreshed.contains(&final_model) && !is_image_family_allowed(&final_model, &refreshed) {
+            return ModelGate::NotFound;
+        }
     }
 
     ModelGate::Allow(final_model)
@@ -257,6 +503,21 @@ pub fn is_gateway_self_answer(text: &str) -> bool {
         .any(|sentinel| lower.contains(*sentinel))
 }
 
+/// 网关自答的唯一处置口径：状态码 + 对外文案。
+///
+/// 供各协议在错误循环里做**防御性短路**：即使这些文案从任何异常路径冒泡到重试循环，
+/// 也必须"直接返回、不罚号、不解绑粘性、不轮换"——它们不对应任何账号。
+pub fn self_answer_disposition(text: &str) -> Option<(axum::http::StatusCode, &'static str)> {
+    let lower = text.to_lowercase();
+    if lower.contains(MODEL_NOT_EXIST) {
+        return Some((axum::http::StatusCode::NOT_FOUND, MODEL_NOT_EXIST));
+    }
+    if lower.contains(NO_QUOTA_ACCOUNTS) {
+        return Some((axum::http::StatusCode::BAD_GATEWAY, NO_QUOTA_ACCOUNTS));
+    }
+    None
+}
+
 /// 网关拒绝时写入「转出报文」面板的英文详细说明。
 ///
 /// 日志列表的账号列只放一句短标语（`model not exist` / `no quota accounts`），
@@ -299,6 +560,48 @@ mod tests {
             resolve_requested_model("gemini-2.5-pro", &mapping),
             "gemini-3.1-pro-high"
         );
+    }
+
+    #[test]
+    fn family_fallback_only_for_router_rewrites() {
+        // 别名 / 裸名 → 档位：router 改写了名字，允许用同族基底放行
+        assert!(family_fallback_applicable(
+            false,
+            false,
+            "gemini-3-flash",
+            "gemini-3.8-flash-tiered"
+        ));
+        assert!(family_fallback_applicable(
+            false,
+            false,
+            "gemini-3.8-flash",
+            "gemini-3.8-flash-tiered"
+        ));
+        // router 原样透传（-thinking / @default 这类非档位尾巴）：必须拒绝，
+        // 否则无效 id 会穿透门禁打到上游并污染账号级模型熔断
+        for id in [
+            "gemini-3.8-flash-thinking",
+            "gemini-3.8-flash@default",
+            "gemini-3.8-flash-exp",
+        ] {
+            assert!(
+                !family_fallback_applicable(false, false, id, id),
+                "{id} must not use family fallback"
+            );
+        }
+        // 已精确命中 / routed 命中：不需要也不允许兜底
+        assert!(!family_fallback_applicable(
+            true,
+            false,
+            "gemini-3.8-flash",
+            "gemini-3.8-flash-tiered"
+        ));
+        assert!(!family_fallback_applicable(
+            false,
+            true,
+            "gemini-3-flash",
+            "gemini-3.8-flash-tiered"
+        ));
     }
 
     fn set(items: &[&str]) -> HashSet<String> {
@@ -362,6 +665,122 @@ mod tests {
     }
 
     #[test]
+    fn retired_model_families_are_blocked() {
+        for model in [
+            "gemini-2.5-pro",
+            "gemini-2.5-flash",
+            "gemini-2.5-flash-lite",
+            "gemini-2.5-flash-thinking",
+            "gemini-2.0-flash",
+            "models/gemini-2.5-pro",
+        ] {
+            assert!(
+                is_retired_model_id(model),
+                "{model} 应判定为已下线 Gemini 2.x"
+            );
+        }
+
+        for model in [
+            "claude-3-5-sonnet-20241022",
+            "claude-3-7-sonnet",
+            "claude-3-opus",
+            "claude-sonnet-4-5",
+            "claude-opus-4-5-thinking",
+            "claude-3-5-haiku-20241022",
+            "claude-3-haiku",
+            "claude-haiku-4-5",
+            "claude-haiku-4-5-20251001",
+            "claude-fable-4",
+        ] {
+            assert!(
+                is_retired_model_id(model),
+                "{model} 应判定为已下线 Claude 模型 (< 4.6)"
+            );
+        }
+
+        for model in [
+            "gemini-3.1-flash-lite",
+            "gemini-3.8-flash-high",
+            "gemini-4-argon",
+            "claude-sonnet-4-6",
+            "claude-opus-4-6-thinking",
+            "claude-opus-5-5-high",
+            "gpt-oss-120b-medium",
+            "claude-fable-5",
+            "claude-fable-5-1",
+            "claude-haiku-5-5",
+            "claude-opus-4-7",
+        ] {
+            assert!(!is_retired_model_id(model), "{model} 不应被误杀");
+        }
+    }
+
+    #[test]
+    fn test_adaptive_dark_routing_bypasses_retired_check() {
+        let default_custom = crate::proxy::config::default_custom_mapping();
+        let raw_target = resolve_requested_model("claude-haiku-4-5", &default_custom);
+        let final_model =
+            model_mapping::resolve_adaptive_target(&raw_target, "claude-haiku-4-5", None, None);
+        assert_eq!(final_model, "gemini-3.8-flash-low");
+        assert!(!is_retired_model_id(&final_model));
+    }
+
+    #[test]
+    fn issue_3815_custom_aliases_resolve_before_retired_check() {
+        // 复现 Issue #3815：别名键自带 "claude-<低版本>" 形态时，必须先把映射解析成
+        // 真实出站模型再判定下线，否则任何自定义别名都会被硬门禁直接误杀。
+        let mut mapping = HashMap::new();
+        mapping.insert(
+            "claude-4-argon-fast".to_string(),
+            "gemini-4-argon-medium".to_string(),
+        );
+        mapping.insert(
+            "claude-3.5-flash-high".to_string(),
+            "gemini-3.8-flash-high".to_string(),
+        );
+        mapping.insert(
+            "claude-3-5-sonnet-*".to_string(),
+            "claude-sonnet-4-6".to_string(),
+        );
+
+        assert!(
+            is_retired_model_id("claude-4-argon-fast"),
+            "前提：未映射的别名键本身会被已下线判定命中"
+        );
+
+        // 精确 / 点号规范化对齐 / 通配符三条路径都必须先解析，再对目标做下线判定
+        for (alias, expected) in [
+            ("claude-4-argon-fast", "gemini-4-argon-medium"),
+            ("claude-3.5-flash-high", "gemini-3.8-flash-high"),
+            ("claude-3-5-sonnet-20241022", "claude-sonnet-4-6"),
+        ] {
+            let resolved = resolve_requested_model(alias, &mapping);
+            assert_eq!(resolved, expected, "{alias} 应解析为映射目标");
+            assert!(
+                !is_retired_model_id(&resolved),
+                "{alias} 的目标 {resolved} 不应被判为已下线"
+            );
+        }
+    }
+
+    #[test]
+    fn image_model_families_are_never_retired() {
+        for model in [
+            "gemini-3-pro-image",
+            "gemini-3-pro-image-preview",
+            "gemini-3-pro-image-4k",
+            "gemini-3.1-flash-image",
+            "gemini-3.1-flash-image-4k-16x9",
+            "imagen-3.0",
+        ] {
+            assert!(
+                !is_retired_model_id(model),
+                "{model} 属于生图模型族，不得下线"
+            );
+        }
+    }
+
+    #[test]
     fn image_variant_suffixes_hit_base_family() {
         let allowed = set(&["gemini-3-pro-image", "gemini-3.1-flash-image"]);
         for model in [
@@ -394,6 +813,24 @@ mod tests {
             "{\"message\":\"no quota accounts\"}"
         ));
         assert!(!is_gateway_self_answer("quota exceeded for this model"));
+
+        // 统一处置口径：404 / 502，且与账号故障无关
+        assert_eq!(
+            self_answer_disposition("HTTP 404: model not exist"),
+            Some((StatusCode::NOT_FOUND, MODEL_NOT_EXIST))
+        );
+        assert_eq!(
+            self_answer_disposition("no quota accounts"),
+            Some((StatusCode::BAD_GATEWAY, NO_QUOTA_ACCOUNTS))
+        );
+        assert_eq!(self_answer_disposition("rate limited"), None);
+
+        // 分类器必须优先归为 InternalGatewayMessage：既不锁号也不解绑粘性
+        let cls =
+            crate::proxy::pipeline::UpstreamClassification::classify(502, MODEL_NOT_EXIST, None);
+        assert!(cls.is_internal_gateway_message());
+        assert!(!cls.should_lock_account());
+        assert!(!cls.abandons_sticky_account());
     }
 
     #[test]

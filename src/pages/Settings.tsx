@@ -1,5 +1,5 @@
 import { useState, useEffect, startTransition } from 'react';
-import { Save, Github, User, MessageCircle, ExternalLink, RefreshCw, Heart, Coffee, LayoutDashboard, Users, Network, Activity, BarChart3, Settings as SettingsIcon, Lock, CheckCircle2, Globe, Send, KeyRound, Copy, Check } from 'lucide-react';
+import { Save, Github, User, MessageCircle, ExternalLink, RefreshCw, Heart, Coffee, LayoutDashboard, Users, Network, Activity, BarChart3, Settings as SettingsIcon, Lock, CheckCircle2, Globe, Send, KeyRound, Copy, Check, ShieldAlert } from 'lucide-react';
 import { request as invoke } from '../utils/request';
 import { open } from '@tauri-apps/plugin-dialog';
 import { useConfigStore } from '../stores/useConfigStore';
@@ -46,12 +46,14 @@ function Settings() {
     const { config, loadConfig, saveConfig, updateLanguage, updateTheme } = useConfigStore();
     const { enable, disable, isEnabled } = useDebugConsole();
     const [activeTab, setActiveTab] = useState<'general' | 'account' | 'proxy' | 'advanced' | 'debug' | 'about'>('general');
-    const [appVersion, setAppVersion] = useState<string>('5.0.1-beta.8');
+    const [appVersion, setAppVersion] = useState<string>('5.0.4-beta.5');
     const [formData, setFormData] = useState<AppConfig>({
         language: 'zh',
         theme: 'system',
         auto_refresh: false,
-        refresh_interval: 15,
+        refresh_interval: 10,
+        startup_refresh: true,
+        startup_refresh_max_accounts: 15,
         auto_sync: false,
         sync_interval: 5,
         auto_switch_classic_depleted: false,
@@ -103,8 +105,8 @@ function Settings() {
             use_http2: true
         },
         circuit_breaker: {
-            enabled: false,
-            backoff_steps: [30, 60, 120, 300, 600]
+            enabled: true,
+            backoff_steps: [60, 300, 1800, 7200]
         },
         hidden_menu_items: [],  // 菜单显示设置：默认不隐藏任何菜单项
 
@@ -1021,6 +1023,52 @@ function Settings() {
                                     </label>
                                 </div>
 
+                                <div className="mt-5 pt-5 border-t border-gray-50 dark:border-base-300 flex items-center justify-between gap-4 animate-in slide-in-from-top-1 duration-200">
+                                    <div className="min-w-0 flex-1">
+                                        <div className="text-sm font-bold text-gray-900 dark:text-gray-100">{t('settings.account.startup_refresh')}</div>
+                                        <p className="text-xs text-gray-500 dark:text-gray-400 mt-0.5">{t('settings.account.startup_refresh_desc')}</p>
+                                        {formData.startup_refresh !== false && (
+                                            <div className="mt-2 flex flex-wrap items-center gap-2">
+                                                <label className="text-[11px] font-bold text-gray-500 dark:text-gray-400 uppercase tracking-wider">{t('settings.account.startup_refresh_limit')}</label>
+                                                <input
+                                                    type="number"
+                                                    className="w-16 px-2 py-1 bg-gray-50 dark:bg-base-200 border border-gray-100 dark:border-base-300 rounded-md focus:ring-2 focus:ring-blue-500 outline-none text-xs font-bold text-blue-600 dark:text-blue-400"
+                                                    min="0"
+                                                    max="100000"
+                                                    value={formData.startup_refresh_max_accounts ?? 15}
+                                                    onChange={(e) => {
+                                                        const parsed = parseInt(e.target.value);
+                                                        setFormData({
+                                                            ...formData,
+                                                            startup_refresh_max_accounts: Number.isNaN(parsed) ? 0 : Math.min(Math.max(parsed, 0), 100000),
+                                                        });
+                                                    }}
+                                                />
+                                                <span className="text-[11px] text-gray-500 dark:text-gray-400">{t('settings.account.startup_refresh_limit_hint')}</span>
+                                            </div>
+                                        )}
+                                    </div>
+                                    <label className="relative inline-flex items-center cursor-pointer">
+                                        <input
+                                            type="checkbox"
+                                            className="sr-only peer"
+                                            checked={formData.startup_refresh !== false}
+                                            onChange={async (e) => {
+                                                const enabled = e.target.checked;
+                                                const newConfig = { ...formData, startup_refresh: enabled };
+                                                setFormData(newConfig);
+                                                // Hot Save
+                                                try {
+                                                    await saveConfig(newConfig);
+                                                } catch (error) {
+                                                    showToast(`${t('common.error')}: ${error}`, 'error');
+                                                }
+                                            }}
+                                        />
+                                        <div className="w-11 h-6 bg-gray-200 dark:bg-base-300 peer-focus:outline-none rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border-gray-300 after:border after:rounded-full after:h-5 after:w-5 after:transition-all peer-checked:bg-blue-500 shadow-inner"></div>
+                                    </label>
+                                </div>
+
                                 <div className="mt-5 pt-5 border-t border-gray-50 dark:border-base-300 flex items-center gap-4 animate-in slide-in-from-top-1 duration-200">
                                     <label className="text-xs font-bold text-gray-500 dark:text-gray-400 uppercase tracking-wider">{t('settings.account.refresh_interval')}</label>
                                     <div className="relative">
@@ -1742,6 +1790,47 @@ function Settings() {
                                         </div>
                                     </div>
                                 )}
+                            </div>
+
+                            {/* 遇到限流账号自动进小黑屋 (QoS 降速熔断) 开关 */}
+                            <div className="group bg-white dark:bg-base-100 rounded-xl p-5 border border-gray-100 dark:border-base-200 hover:border-amber-200 transition-all duration-300 shadow-sm relative overflow-hidden">
+                                <div className="absolute top-0 right-0 w-24 h-24 bg-amber-500/5 -mr-12 -mt-12 rounded-full blur-2xl group-hover:bg-amber-500/10 transition-colors"></div>
+                                <div className="flex items-center justify-between relative z-10">
+                                    <div className="flex items-center gap-4">
+                                        <div className="w-10 h-10 rounded-xl bg-amber-50 dark:bg-amber-900/20 flex items-center justify-center text-amber-500 group-hover:bg-amber-500 group-hover:text-white transition-all duration-300 shadow-sm">
+                                            <ShieldAlert size={18} />
+                                        </div>
+                                        <div>
+                                            <div className="font-bold text-gray-900 dark:text-gray-100 text-sm">
+                                                {t('dashboard.qos_auto_jail', '自动小黑屋')} (QoS)
+                                            </div>
+                                            <p className="text-[11px] text-gray-500 dark:text-gray-400 mt-0.5 leading-tight max-w-[340px]">
+                                                {t('dashboard.qos_auto_jail_enabled_tip', '开启后遇响应过长的限速账号将自动隔离并解绑会话；关闭时直接忽略校验时长。')}
+                                            </p>
+                                        </div>
+                                    </div>
+                                    <label className="relative inline-flex items-center cursor-pointer scale-90">
+                                        <input
+                                            type="checkbox"
+                                            className="sr-only peer"
+                                            checked={formData.proxy?.qos_auto_jail ?? false}
+                                            onChange={(e) => {
+                                                const nextVal = e.target.checked;
+                                                const updated = {
+                                                    ...formData,
+                                                    proxy: {
+                                                        ...formData.proxy,
+                                                        qos_auto_jail: nextVal,
+                                                    },
+                                                };
+                                                setFormData(updated);
+                                                saveConfig({ ...updated, auto_refresh: true })
+                                                    .catch(err => console.error('Save failed:', err));
+                                            }}
+                                        />
+                                        <div className="w-11 h-6 bg-gray-200 dark:bg-base-300 peer-focus:outline-none rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border-gray-300 after:border after:rounded-full after:h-5 after:w-5 after:transition-all peer-checked:bg-amber-500 shadow-inner"></div>
+                                    </label>
+                                </div>
                             </div>
                         </div>
                     )}

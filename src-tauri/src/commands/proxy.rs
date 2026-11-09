@@ -272,6 +272,7 @@ pub async fn ensure_admin_server(
     // 默认空 TokenManager 用于管理界面
     let app_data_dir = crate::modules::account::get_data_dir()?;
     let token_manager = Arc::new(TokenManager::new(app_data_dir));
+    token_manager.set_qos_auto_jail(config.qos_auto_jail);
     // [NEW] 加载账号数据，否则管理界面统计为 0
     let _ = token_manager.load_accounts().await;
 
@@ -635,6 +636,7 @@ pub async fn update_model_mapping(
     // 2. 无论是否运行，都保存到全局配置持久化
     let mut app_config = crate::modules::config::load_app_config().map_err(|e| e)?;
     app_config.proxy.custom_mapping = config.custom_mapping;
+    app_config.proxy.custom_mapping_expose = config.custom_mapping_expose;
     crate::modules::config::save_app_config(&app_config).map_err(|e| e)?;
 
     Ok(())
@@ -881,20 +883,25 @@ pub async fn test_model_connectivity(
 
     let accounts = crate::modules::account::list_accounts().unwrap_or_default();
 
-    let (chosen_account, token, pid) = if let Some(ref acc_id) = target_account_id {
-        if !acc_id.is_empty() {
-            let acc = accounts
-                .iter()
-                .find(|a| &a.id == acc_id)
-                .cloned()
-                .ok_or_else(|| "未找到指定的账号".to_string())?;
-            let (t, p) = crate::modules::quota::get_valid_token_for_warmup(&acc).await?;
-            (acc, t, p)
-        } else {
-            pick_auto_test_account(&accounts).await?
-        }
+    let (chosen_account, token, pid) = if let Some(acc_id) = target_account_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+    {
+        let acc = accounts
+            .iter()
+            .find(|a| a.id == acc_id)
+            .cloned()
+            .ok_or_else(|| "未找到指定的账号".to_string())?;
+        let (t, p) = crate::modules::quota::get_valid_token_for_warmup(&acc).await?;
+        (acc, t, p)
     } else {
-        pick_auto_test_account(&accounts).await?
+        // 桌面端探活是诊断入口，允许包含手动禁用反代的账号；
+        // Web 端自动调度走反代号池语义，见 proxy/server.rs。
+        let probe = crate::modules::probe::pick_auto_probe_account(&accounts, &model, true)
+            .await
+            .map_err(|e| e.to_string())?;
+        (probe.account, probe.access_token, probe.project_id)
     };
 
     let warmup_url = format!("http://127.0.0.1:{}/internal/warmup", port);
@@ -903,7 +910,8 @@ pub async fn test_model_connectivity(
         "model": model,
         "access_token": token,
         "project_id": pid,
-        "account_id": chosen_account.id
+        "account_id": chosen_account.id,
+        "probe_intent": true
     });
 
     let client = rquest::Client::builder()
@@ -932,55 +940,79 @@ pub async fn test_model_connectivity(
     Ok(result)
 }
 
-async fn pick_auto_test_account(
-    accounts: &[crate::models::account::Account],
-) -> Result<(crate::models::account::Account, String, String), String> {
-    let candidates: Vec<_> = accounts
-        .iter()
-        .filter(|a| !a.disabled && !a.proxy_disabled)
-        .cloned()
-        .collect();
-
-    if candidates.is_empty() {
-        return Err(
-            "当前没有开启反代的可用账号，请先在账号页面开启至少一个账号的反代，或指定具体账号测试"
-                .to_string(),
-        );
-    }
-
-    // 优先选择配额充足且健康的账号 (按各模型中最高剩余配额从大到小排序)
-    let mut sorted_candidates = candidates;
-    sorted_candidates.sort_by(|a, b| {
-        let quota_a = a
-            .quota
-            .as_ref()
-            .and_then(|q| q.models.iter().map(|m| m.percentage).max())
-            .unwrap_or(0);
-        let quota_b = b
-            .quota
-            .as_ref()
-            .and_then(|q| q.models.iter().map(|m| m.percentage).max())
-            .unwrap_or(0);
-        quota_b.cmp(&quota_a)
-    });
-
-    let mut last_err = None;
-    for acc in sorted_candidates {
-        match crate::modules::quota::get_valid_token_for_warmup(&acc).await {
-            Ok((t, p)) => return Ok((acc, t, p)),
-            Err(e) => {
-                last_err = Some(e);
-            }
-        }
-    }
-
-    Err(last_err.unwrap_or_else(|| "无法获取候选账号的有效凭证".to_string()))
-}
-
 /// 获取当前生效的官方 Hub 指纹信息
 #[tauri::command]
 pub async fn get_hub_fingerprint() -> Result<crate::modules::hub_version::HubFingerprint, String> {
     Ok(crate::modules::hub_version::get_current_hub_fingerprint())
+}
+
+/// 官方 Hub 版本更新提示（仅提示，**不改变**出站指纹）
+#[derive(serde::Serialize)]
+pub struct HubUpdateStatus {
+    /// 当前硬编码校准版本
+    pub current: String,
+    /// 官方最新版本（探测失败为 None）
+    pub latest: Option<String>,
+    /// 官方是否存在比校准值更新的版本
+    pub update_available: bool,
+}
+
+/// 检查官方 Hub 是否发布了比当前校准基线更新的版本。
+///
+/// 仅供前端启动时的小提示使用：出站 UA 仍使用硬编码的版本 + CL 配对，
+/// 因为 CL 无法从任何公开端点获取，自动跟随版本号只会造成版本/CL 不一致。
+#[tauri::command]
+pub async fn check_hub_update() -> HubUpdateStatus {
+    let current = crate::constants::OFFICIAL_HUB_VERSION.to_string();
+    let latest = crate::modules::hub_version::fetch_remote_hub_release()
+        .await
+        .map(|release| release.version);
+    let update_available = latest
+        .as_deref()
+        .map_or(false, crate::modules::hub_version::is_update_available);
+
+    HubUpdateStatus {
+        current,
+        latest,
+        update_available,
+    }
+}
+
+/// 当前生效的首字节（TTFT）预算（秒）
+///
+/// 前端不再自行维护 150 / 210 / +45 / +60 / -30 一组常量，
+/// 统一由后端 `upstream::client::calculate_first_byte_wait_secs` 计算后下发。
+#[derive(serde::Serialize)]
+pub struct FirstByteTimeouts {
+    /// 常规文本
+    pub text: u64,
+    /// 图片
+    pub image: u64,
+    /// 视频
+    pub video: u64,
+    /// 辅助接口（标题生成等）
+    pub aux: u64,
+    /// 基准硬上限
+    pub cap: u64,
+}
+
+#[tauri::command]
+pub fn get_effective_first_byte_timeouts() -> FirstByteTimeouts {
+    use crate::proxy::upstream::client::{PayloadMediaKind, UpstreamClient};
+
+    let upload_cfg = crate::proxy::get_upload_timeout_config();
+    let stream_cfg = crate::proxy::get_stream_timeout_config();
+    let calc = |kind: PayloadMediaKind| {
+        UpstreamClient::calculate_first_byte_wait_secs(kind, 0, &upload_cfg, &stream_cfg, 0, false)
+    };
+
+    FirstByteTimeouts {
+        text: calc(PayloadMediaKind::TextChat),
+        image: calc(PayloadMediaKind::Image),
+        video: calc(PayloadMediaKind::Video),
+        aux: calc(PayloadMediaKind::Other),
+        cap: crate::proxy::upstream::client::MAX_FIRST_BYTE_BUDGET_SECS,
+    }
 }
 
 /// 强制探测官方远程更新源并返回最新 Hub 指纹信息
@@ -989,9 +1021,10 @@ pub async fn detect_remote_hub_fingerprint(
     custom_version: Option<String>,
     custom_cl: Option<String>,
 ) -> Result<crate::modules::hub_version::HubFingerprint, String> {
-    let fp = crate::modules::hub_version::detect_and_update_hub_fingerprint(
+    let fp = crate::modules::hub_version::detect_and_update_hub_fingerprint_with(
         custom_version.as_deref(),
         custom_cl.as_deref(),
+        true,
     )
     .await;
 

@@ -1,6 +1,7 @@
 import { useState, useMemo } from 'react';
-import { TrendingUp, ArrowRightLeft, Zap, Laptop, Code2, Terminal } from 'lucide-react';
+import { TrendingUp, ArrowRightLeft, Zap, Laptop, Code2, Terminal, Blocks } from 'lucide-react';
 import { Account, QuotaGroup, ActiveClientsStatus, getAccountTier } from '../../types/account';
+import { isAccountAbnormal } from '../../utils/accountStatus';
 import { findQuotaModel } from '../../config/modelConfig';
 import { useTranslation } from 'react-i18next';
 
@@ -11,7 +12,7 @@ interface BestAccountsProps {
     onSwitch?: (accountId: string, targetIde?: string) => void;
 }
 
-type TargetIdeType = 'classic' | 'ide' | 'agy';
+type TargetIdeType = 'classic' | 'ide' | 'agy' | 'acp';
 
 /** 从 quota_groups 中提取 5h 或 Weekly 桶百分比 (0-100) */
 function getBucketPercentage(
@@ -52,6 +53,14 @@ function get5HourQuota(
     category: 'gemini' | 'claude',
     account: Account
 ): number {
+    if (category === 'claude') {
+        const hasClaude = account.quota?.models?.some(m => {
+            const n = (m?.name || '').toLowerCase();
+            return !n.includes('-disabled') && !n.endsWith('_disabled') && !(m as any)?.disabled && (n.startsWith('claude') || n.startsWith('gpt'));
+        });
+        if (!hasClaude) return 0;
+    }
+
     const weeklyGroup = getBucketPercentage(account.quota?.quota_groups, category, 'weekly');
     // 周额度耗尽熔断保护
     if (weeklyGroup !== null && weeklyGroup <= 5) {
@@ -99,6 +108,12 @@ function BestAccounts({ accounts, currentAccountId, activeClients, onSwitch }: B
             icon: Terminal,
             activeBg: 'bg-emerald-600 text-white shadow-xs',
         },
+        {
+            key: 'acp' as TargetIdeType,
+            label: t('accounts.client_acp', 'Plugin'),
+            icon: Blocks,
+            activeBg: 'bg-violet-600 text-white shadow-xs',
+        },
     ];
 
     // 获取当前所选目标客户端当前已生效的账号 ID，推荐时智能排除
@@ -110,13 +125,20 @@ function BestAccounts({ accounts, currentAccountId, activeClients, onSwitch }: B
                 return activeClients?.ide_account_id;
             case 'agy':
                 return activeClients?.agy_account_id;
+            case 'acp':
+                return activeClients?.acp_account_id;
         }
     }, [targetIde, activeClients, currentAccountId]);
 
-    // 1. 获取按“付费账号优先 + 5h 内最多”排序的候选账号
+    // 1. 获取按“付费账号优先 + 5h 内最多”排序的候选账号（严格过滤异常/封禁/403/验证阻断，且目标模型家族未被冻结）
     const geminiSorted = useMemo(() => {
         return accounts
-            .filter(a => a.id !== currentTargetAccountId && !a.disabled && !a.validation_blocked)
+            .filter(a => (
+                a.id !== currentTargetAccountId
+                && !a.disabled
+                && !isAccountAbnormal(a)
+                && !(a.forbidden_models && a.forbidden_models.some(m => m.toLowerCase().includes('gemini')))
+            ))
             .map(a => {
                 const tier = getAccountTier(a);
                 const isPaid = tier === 'ultra' || tier === 'pro';
@@ -139,7 +161,12 @@ function BestAccounts({ accounts, currentAccountId, activeClients, onSwitch }: B
 
     const claudeSorted = useMemo(() => {
         return accounts
-            .filter(a => a.id !== currentTargetAccountId && !a.disabled && !a.validation_blocked)
+            .filter(a => (
+                a.id !== currentTargetAccountId
+                && !a.disabled
+                && !isAccountAbnormal(a)
+                && !(a.forbidden_models && a.forbidden_models.some(m => m.toLowerCase().includes('claude')))
+            ))
             .map(a => {
                 const tier = getAccountTier(a);
                 const isPaid = tier === 'ultra' || tier === 'pro';

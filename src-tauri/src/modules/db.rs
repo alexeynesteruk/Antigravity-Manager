@@ -113,13 +113,19 @@ pub fn inject_token(
 ) -> Result<String, String> {
     crate::modules::logger::log_info("Starting Token injection...");
 
-    // If using this project's built-in Client ID (antigravity_enterprise is actually the standard edition)
-    // then forcibly turn off the GCP TOS flag, to ensure the IDE uses the standard Client ID for refresh
+    // Personal clients such as the built-in standard client antigravity_enterprise
+    // must not keep a mistaken is_gcp_tos flag. Enterprise and GCP clients
+    // (antigravity_gcp and similar) must keep is_gcp_tos = true.
     if let Some(key) = oauth_client_key {
-        if key == "antigravity_enterprise" {
+        if crate::modules::oauth::is_gcp_enterprise_client(Some(key)) {
+            crate::modules::logger::log_info(
+                "[DB] GCP Enterprise client detected, preserving is_gcp_tos = true for injection.",
+            );
+            is_gcp_tos = true;
+        } else if key == "antigravity_enterprise" || key == "antigravity_personal" {
             if is_gcp_tos {
                 crate::modules::logger::log_info(
-                    "[DB] Built-in client detected, forcing Standard mode for injection.",
+                    "[DB] Standard client detected, forcing Standard mode for injection.",
                 );
                 is_gcp_tos = false;
             }

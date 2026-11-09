@@ -1723,128 +1723,167 @@ pub struct CoreModel {
     pub context_window: i64,
 }
 
-/// 导出网关全量核心模型（仅保留官方最新支持的旗舰模型及后缀派生裸模型）
-pub fn get_core_gateway_models() -> &'static [CoreModel] {
-    &[
-        // Claude 5.5 系列 (1M 上下文)
-        CoreModel {
-            id: "claude-opus-5-5",
-            context_window: 1_000_000,
-        },
-        CoreModel {
-            id: "claude-opus-5-5-high",
-            context_window: 1_000_000,
-        },
-        CoreModel {
-            id: "claude-opus-5-5-medium",
-            context_window: 1_000_000,
-        },
-        CoreModel {
-            id: "claude-opus-5-5-low",
-            context_window: 1_000_000,
-        },
-        CoreModel {
-            id: "claude-sonnet-5-5",
-            context_window: 1_000_000,
-        },
-        CoreModel {
-            id: "claude-sonnet-5-5-high",
-            context_window: 1_000_000,
-        },
-        CoreModel {
-            id: "claude-sonnet-5-5-medium",
-            context_window: 1_000_000,
-        },
-        CoreModel {
-            id: "claude-sonnet-5-5-low",
-            context_window: 1_000_000,
-        },
-        // Claude 4.6 系列 (256k 上下文)
-        CoreModel {
-            id: "claude-opus-4-6",
-            context_window: 256_000,
-        },
-        CoreModel {
-            id: "claude-opus-4-6-thinking",
-            context_window: 256_000,
-        },
-        CoreModel {
-            id: "claude-sonnet-4-6",
-            context_window: 256_000,
-        },
-        // Gemini 4 Argon 系列 (Google 旗舰推理模型，1M 上下文)
-        CoreModel {
-            id: "gemini-4-argon",
-            context_window: 1_048_576,
-        },
-        CoreModel {
-            id: "gemini-4-argon-high",
-            context_window: 1_048_576,
-        },
-        CoreModel {
-            id: "gemini-4-argon-medium",
-            context_window: 1_048_576,
-        },
-        CoreModel {
-            id: "gemini-4-argon-low",
-            context_window: 1_048_576,
-        },
-        // Gemini 3.8 Flash 系列 (1M 上下文)
-        CoreModel {
-            id: "gemini-3.8-flash",
-            context_window: 1_048_576,
-        },
-        CoreModel {
-            id: "gemini-3.8-flash-tiered",
-            context_window: 1_048_576,
-        },
-        CoreModel {
-            id: "gemini-3.8-flash-high",
-            context_window: 1_048_576,
-        },
-        CoreModel {
-            id: "gemini-3.8-flash-medium",
-            context_window: 1_048_576,
-        },
-        CoreModel {
-            id: "gemini-3.8-flash-low",
-            context_window: 1_048_576,
-        },
-        // Gemini 3.1 Pro & 专用模型
-        CoreModel {
-            id: "gemini-3.1-pro",
-            context_window: 1_048_576,
-        },
-        CoreModel {
-            id: "gemini-3.1-pro-high",
-            context_window: 1_048_576,
-        },
-        CoreModel {
-            id: "gemini-3.1-pro-low",
-            context_window: 1_048_576,
-        },
-        CoreModel {
-            id: "gemini-3.5-flash-lite",
-            context_window: 1_048_576,
-        },
-        CoreModel {
-            id: "gemini-3.1-flash-lite",
-            context_window: 1_048_576,
-        },
-        CoreModel {
-            id: "gemini-3.1-flash-image",
-            context_window: 65_536,
-        },
-        // GPT-OSS 官方支持系列
-        CoreModel {
-            id: "gpt-oss-120b",
-            context_window: 131_072,
-        },
-        CoreModel {
-            id: "gpt-oss-120b-medium",
-            context_window: 131_072,
-        },
-    ]
+static CORE_GATEWAY_MODELS: &[CoreModel] = &[
+    // Claude 5.5 系列 (1M 上下文)
+    CoreModel {
+        id: "claude-opus-5-5",
+        context_window: 1_000_000,
+    },
+    CoreModel {
+        id: "claude-opus-5-5-high",
+        context_window: 1_000_000,
+    },
+    CoreModel {
+        id: "claude-opus-5-5-medium",
+        context_window: 1_000_000,
+    },
+    CoreModel {
+        id: "claude-opus-5-5-low",
+        context_window: 1_000_000,
+    },
+    CoreModel {
+        id: "claude-sonnet-5-5",
+        context_window: 1_000_000,
+    },
+    CoreModel {
+        id: "claude-sonnet-5-5-high",
+        context_window: 1_000_000,
+    },
+    CoreModel {
+        id: "claude-sonnet-5-5-medium",
+        context_window: 1_000_000,
+    },
+    CoreModel {
+        id: "claude-sonnet-5-5-low",
+        context_window: 1_000_000,
+    },
+    // Claude 4.6 系列 (256k 上下文)
+    CoreModel {
+        id: "claude-opus-4-6",
+        context_window: 256_000,
+    },
+    CoreModel {
+        id: "claude-opus-4-6-thinking",
+        context_window: 256_000,
+    },
+    CoreModel {
+        id: "claude-sonnet-4-6",
+        context_window: 256_000,
+    },
+    // Gemini 4 Argon 系列 (Google 旗舰推理模型，1M 上下文)
+    CoreModel {
+        id: "gemini-4-argon",
+        context_window: 1_048_576,
+    },
+    CoreModel {
+        id: "gemini-4-argon-high",
+        context_window: 1_048_576,
+    },
+    CoreModel {
+        id: "gemini-4-argon-medium",
+        context_window: 1_048_576,
+    },
+    CoreModel {
+        id: "gemini-4-argon-low",
+        context_window: 1_048_576,
+    },
+    // Gemini 3.8 Flash 系列 (1M 上下文)
+    CoreModel {
+        id: "gemini-3.8-flash",
+        context_window: 1_048_576,
+    },
+    CoreModel {
+        id: "gemini-3.8-flash-tiered",
+        context_window: 1_048_576,
+    },
+    CoreModel {
+        id: "gemini-3.8-flash-high",
+        context_window: 1_048_576,
+    },
+    CoreModel {
+        id: "gemini-3.8-flash-medium",
+        context_window: 1_048_576,
+    },
+    CoreModel {
+        id: "gemini-3.8-flash-low",
+        context_window: 1_048_576,
+    },
+    // Gemini 3.1 Pro & 专用模型
+    CoreModel {
+        id: "gemini-3.1-pro",
+        context_window: 1_048_576,
+    },
+    CoreModel {
+        id: "gemini-3.1-pro-high",
+        context_window: 1_048_576,
+    },
+    CoreModel {
+        id: "gemini-3.1-pro-low",
+        context_window: 1_048_576,
+    },
+    CoreModel {
+        id: "gemini-3.5-flash-lite",
+        context_window: 1_048_576,
+    },
+    CoreModel {
+        id: "gemini-3.1-flash-image",
+        context_window: 65_536,
+    },
+    // GPT-OSS 官方支持系列
+    CoreModel {
+        id: "gpt-oss-120b",
+        context_window: 131_072,
+    },
+    CoreModel {
+        id: "gpt-oss-120b-medium",
+        context_window: 131_072,
+    },
+];
+
+/// 当前账号池官方可用模型并集（由 TokenManager 在模型加载/刷新后写入）。
+/// 空集合 = 首启尚未拉到 quota → 回退静态全量，不阻塞一键配置。
+static AVAILABLE_MODEL_IDS: once_cell::sync::Lazy<
+    std::sync::RwLock<std::collections::HashSet<String>>,
+> = once_cell::sync::Lazy::new(|| std::sync::RwLock::new(std::collections::HashSet::new()));
+
+/// 由 TokenManager 调用：刷新“官方可用模型”全局快照（不含内部保护桶名）
+pub fn update_available_model_ids<I: IntoIterator<Item = String>>(ids: I) {
+    if let Ok(mut guard) = AVAILABLE_MODEL_IDS.write() {
+        *guard = ids.into_iter().collect();
+    }
+}
+
+/// 模型是否真实可用：精确命中，或其带后缀的具体档位存在（如 claude-opus-5-5 → claude-opus-5-5-high）
+fn model_matches_available(id: &str, set: &std::collections::HashSet<String>) -> bool {
+    set.contains(id)
+        || set
+            .iter()
+            .any(|a| a.starts_with(id) && a.as_bytes().get(id.len()) == Some(&b'-'))
+}
+
+/// 模型当前是否真实可用（全局快照；快照为空 = 尚未加载 → 放行）
+pub fn is_model_available_now(id: &str) -> bool {
+    match AVAILABLE_MODEL_IDS.read() {
+        Ok(guard) if !guard.is_empty() => model_matches_available(id, &guard),
+        _ => true,
+    }
+}
+
+/// 导出网关核心模型（仅保留当前账号池官方真实可用的模型；冷启动时回退全量）
+pub fn get_core_gateway_models() -> Vec<CoreModel> {
+    let snapshot = AVAILABLE_MODEL_IDS
+        .read()
+        .ok()
+        .map(|g| g.clone())
+        .unwrap_or_default();
+    if snapshot.is_empty() {
+        return CORE_GATEWAY_MODELS.to_vec();
+    }
+    CORE_GATEWAY_MODELS
+        .iter()
+        .filter(|m| model_matches_available(m.id, &snapshot))
+        .copied()
+        .collect()
 }
 
 /// 核心逻辑：为 JeikCode 生成/更新 config.toml 内容
@@ -1957,24 +1996,30 @@ pub fn sync_jeikcode_toml_content(
 
     let models_entry = doc.entry("models").or_insert(Item::Table(Table::new()));
     if let Some(m_table) = models_entry.as_table_mut() {
-        for m in core_models {
+        for m in &core_models {
             let mut model_table = Table::new();
             model_table.insert("account", value(target_provider_id));
             model_table.insert("model", value(m.id));
             model_table.insert("context_window", value(m.context_window));
             model_table.insert("image_input", value(true));
-            model_table.insert("reasoning_model", value(true));
+            // [2026-10-29] 思考强度由官方模型目录提供，不再硬编码 low/medium/high 三档，
+            // 也不向没有档位的模型（如 gpt-oss）强行声明 reasoning_model。
+            let efforts = crate::proxy::model_specs::available_efforts_for(m.id);
+            model_table.insert("reasoning_model", value(!efforts.is_empty()));
             model_table.insert("reasoning_history", value("exclude"));
-            model_table.insert("reasoning_effort", value("high"));
-
-            let mut levels = Array::new();
-            levels.push("low");
-            levels.push("medium");
-            levels.push("high");
-            model_table.insert(
-                "reasoning_levels",
-                Item::Value(toml_edit::Value::Array(levels)),
-            );
+            if let Some(default_effort) = efforts.last() {
+                model_table.insert("reasoning_effort", value(default_effort.as_str()));
+            }
+            if !efforts.is_empty() {
+                let mut levels = Array::new();
+                for effort in &efforts {
+                    levels.push(effort.as_str());
+                }
+                model_table.insert(
+                    "reasoning_levels",
+                    Item::Value(toml_edit::Value::Array(levels)),
+                );
+            }
 
             m_table.insert(m.id, Item::Table(model_table));
         }
@@ -2090,13 +2135,15 @@ fn build_dsh_models_yaml(selected_model: &str) -> String {
             "          - id: {}\n            name: {}\n            contextWindow: {}\n            input:\n              - text\n              - image\n            maxTokens: 128000\n",
             m.id, m.id, m.context_window
         ));
-        let has_reasoning = m.id.contains("high")
-            || m.id.contains("thinking")
-            || m.id.contains("medium")
-            || m.id.contains("low")
-            || m.id.starts_with("gemini");
-        if has_reasoning {
-            out.push_str("            reasoningEfforts:\n              off: null\n              low: low\n              medium: medium\n              high: high\n");
+        // [2026-10-29] 思考强度完全由官方模型目录提供：只写真实存在的档位后缀，
+        // 并提供 default（不指定 effort，由网关默认路由决定档位）。
+        let efforts = crate::proxy::model_specs::available_efforts_for(m.id);
+        if !efforts.is_empty() {
+            out.push_str("            reasoningEfforts:\n              off: null\n");
+            for effort in &efforts {
+                out.push_str(&format!("              {}: {}\n", effort, effort));
+            }
+            out.push_str("              default: null\n");
         }
     }
     out

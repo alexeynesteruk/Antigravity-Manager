@@ -12,6 +12,7 @@ export const AdminAuthGuard: React.FC<{ children: React.ReactNode }> = ({ childr
     const { t, i18n } = useTranslation();
     const [isAuthenticated, setIsAuthenticated] = useState(isTauri());
     const [apiKey, setApiKey] = useState('');
+    const [rememberMe, setRememberMe] = useState(false);
     const [showLangMenu, setShowLangMenu] = useState(false);
     const [isLoading, setIsLoading] = useState(false);
     const [error, setError] = useState('');
@@ -21,23 +22,23 @@ export const AdminAuthGuard: React.FC<{ children: React.ReactNode }> = ({ childr
 
         // Check session storage (priority)
         const sessionKey = sessionStorage.getItem('abv_admin_api_key');
+        const savedKey = localStorage.getItem('abv_admin_api_key');
+
         if (sessionKey) {
             setIsAuthenticated(true);
             setApiKey(sessionKey);
-            return;
-        }
-
-        // Check local storage (migration logic)
-        const savedKey = localStorage.getItem('abv_admin_api_key');
-        if (savedKey) {
-            // Migrate to sessionStorage and clean up localStorage
+            if (savedKey) {
+                setRememberMe(true);
+            }
+        } else if (savedKey) {
+            // Restore from localStorage into sessionStorage
             sessionStorage.setItem('abv_admin_api_key', savedKey);
-            localStorage.removeItem('abv_admin_api_key');
             setIsAuthenticated(true);
             setApiKey(savedKey);
+            setRememberMe(true);
         }
 
-        // Listen for the global 401 event
+        // Listen for the global 401 event. Register it even when a session is already authenticated.
         const handleUnauthorized = () => {
             sessionStorage.removeItem('abv_admin_api_key');
             localStorage.removeItem('abv_admin_api_key'); // Double cleanup just in case
@@ -72,15 +73,25 @@ export const AdminAuthGuard: React.FC<{ children: React.ReactNode }> = ({ childr
 
             if (response.ok || response.status === 204) {
                 // Verification succeeded
-                localStorage.removeItem('abv_admin_api_key');
+                if (rememberMe) {
+                    localStorage.setItem('abv_admin_api_key', trimmedKey);
+                } else {
+                    localStorage.removeItem('abv_admin_api_key');
+                }
                 setIsAuthenticated(true);
                 window.location.reload();
             } else if (response.status === 401) {
                 // Wrong password
                 sessionStorage.removeItem('abv_admin_api_key');
+                localStorage.removeItem('abv_admin_api_key');
                 setError(t('login.error_invalid_key'));
             } else {
                 // Other error, but the password might be correct
+                if (rememberMe) {
+                    localStorage.setItem('abv_admin_api_key', trimmedKey);
+                } else {
+                    localStorage.removeItem('abv_admin_api_key');
+                }
                 setIsAuthenticated(true);
                 window.location.reload();
             }
@@ -174,6 +185,17 @@ export const AdminAuthGuard: React.FC<{ children: React.ReactNode }> = ({ childr
                                 <span>{error}</span>
                             </div>
                         )}
+                        <div className="flex items-center justify-between px-1">
+                            <label className="flex items-center gap-2.5 cursor-pointer select-none text-sm text-slate-600 dark:text-slate-300 hover:text-slate-900 dark:hover:text-white transition-colors">
+                                <input
+                                    type="checkbox"
+                                    checked={rememberMe}
+                                    onChange={(e) => setRememberMe(e.target.checked)}
+                                    className="checkbox checkbox-sm rounded-lg border-slate-300 dark:border-slate-600 checked:border-blue-500 checked:bg-blue-500 [--chkbg:theme(colors.blue.500)] [--chkfg:white] transition-all cursor-pointer"
+                                />
+                                <span>{t('login.remember_me')}</span>
+                            </label>
+                        </div>
                         <button
                             type="submit"
                             disabled={isLoading || !apiKey.trim()}

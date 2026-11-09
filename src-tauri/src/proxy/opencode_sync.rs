@@ -1082,52 +1082,37 @@ fn build_gemini3_effort_variant(tier: VariantTier) -> Value {
 }
 
 /// Build variants object based on variant type
-fn build_variants_object(variant_type: Option<VariantType>) -> Option<Value> {
-    match variant_type {
-        Some(VariantType::ClaudeThinking) => {
-            let mut variants = serde_json::Map::new();
-            variants.insert("low".to_string(), build_claude_thinking_variant(8192));
-            variants.insert("medium".to_string(), build_claude_thinking_variant(16384));
-            variants.insert("high".to_string(), build_claude_thinking_variant(24576));
-            variants.insert("max".to_string(), build_claude_thinking_variant(32768));
-            Some(Value::Object(variants))
-        }
-        Some(VariantType::Gemini3Pro) => {
-            let mut variants = serde_json::Map::new();
-            variants.insert(
-                "low".to_string(),
-                build_gemini3_effort_variant(VariantTier::Low),
-            );
-            variants.insert(
-                "medium".to_string(),
-                serde_json::json!({ "disabled": true }),
-            );
-            variants.insert(
-                "high".to_string(),
-                build_gemini3_effort_variant(VariantTier::High),
-            );
-            variants.insert("max".to_string(), serde_json::json!({ "disabled": true }));
-            Some(Value::Object(variants))
-        }
-        Some(VariantType::Gemini3Flash) => {
-            let mut variants = serde_json::Map::new();
-            variants.insert(
-                "low".to_string(),
-                build_gemini3_effort_variant(VariantTier::Low),
-            );
-            variants.insert(
-                "medium".to_string(),
-                build_gemini3_effort_variant(VariantTier::Medium),
-            );
-            variants.insert(
-                "high".to_string(),
-                build_gemini3_effort_variant(VariantTier::High),
-            );
-            variants.insert("max".to_string(), serde_json::json!({ "disabled": true }));
-            Some(Value::Object(variants))
-        }
-        None => None,
+fn build_variants_object(model_id: &str, variant_type: Option<VariantType>) -> Option<Value> {
+    let variant_type = variant_type?;
+    // [2026-10-29] 档位完全由官方模型目录决定：只暴露真实存在的后缀档位，
+    // 其余（含 max）统一标记 disabled，避免 agent 里出现不存在的思考强度。
+    let efforts = crate::proxy::model_specs::available_efforts_for(model_id);
+    let has = |name: &str| efforts.iter().any(|e| e == name);
+
+    let mut variants = serde_json::Map::new();
+    for name in ["low", "medium", "high", "max"] {
+        let value = if !has(name) {
+            serde_json::json!({ "disabled": true })
+        } else {
+            match variant_type {
+                VariantType::ClaudeThinking => build_claude_thinking_variant(match name {
+                    "low" => 8192,
+                    "medium" => 16384,
+                    "high" => 24576,
+                    _ => 32768,
+                }),
+                VariantType::Gemini3Pro | VariantType::Gemini3Flash => {
+                    build_gemini3_effort_variant(match name {
+                        "low" => VariantTier::Low,
+                        "medium" => VariantTier::Medium,
+                        _ => VariantTier::High,
+                    })
+                }
+            }
+        };
+        variants.insert(name.to_string(), value);
     }
+    Some(Value::Object(variants))
 }
 
 /// Build model JSON object with full metadata
@@ -1156,7 +1141,7 @@ fn build_model_json(model_def: &ModelDef) -> Value {
     }
 
     // Build variants as object map instead of array
-    if let Some(variants) = build_variants_object(model_def.variant_type) {
+    if let Some(variants) = build_variants_object(model_def.id, model_def.variant_type) {
         model_obj.insert("variants".to_string(), variants);
     }
 
@@ -1409,7 +1394,11 @@ fn merge_catalog_models(provider: &mut Value, model_inputs: Option<&[ModelInput]
         provider["models"] = serde_json::json!({});
     }
 
-    let catalog = build_model_catalog();
+    // [2026-10-29] 一键配置只写当前账号池真实可用的模型，字典里的未开通模型一律不出现
+    let catalog: Vec<ModelDef> = build_model_catalog()
+        .into_iter()
+        .filter(|m| crate::proxy::cli_sync::is_model_available_now(m.id))
+        .collect();
     let catalog_map: HashMap<&str, &ModelDef> = catalog.iter().map(|m| (m.id, m)).collect();
 
     if let Some(models) = provider.get_mut("models").and_then(|m| m.as_object_mut()) {
@@ -1419,6 +1408,9 @@ fn merge_catalog_models(provider: &mut Value, model_inputs: Option<&[ModelInput]
         let normalized_inputs = normalize_model_inputs(model_inputs.unwrap_or(&[]));
         for input in &normalized_inputs {
             let model_id = input.id.as_str();
+            if !crate::proxy::cli_sync::is_model_available_now(model_id) {
+                continue;
+            }
             if let Some(model_def) = catalog_map.get(model_id) {
                 let catalog_model = build_model_json(model_def);
 
@@ -2356,7 +2348,7 @@ mod tests {
 
     #[test]
     fn build_variants_pro_resolve_to_real_ids() {
-        let variants = build_variants_object(Some(VariantType::Gemini3Pro))
+        let variants = build_variants_object("gemini-3.1-pro-high", Some(VariantType::Gemini3Pro))
             .expect("Gemini 3.1 Pro variants must be configured");
 
         for (name, expected_id) in [
@@ -2396,13 +2388,14 @@ mod tests {
 
     #[test]
     fn build_variants_flash_resolve_to_real_ids() {
-        let variants = build_variants_object(Some(VariantType::Gemini3Flash))
-            .expect("Gemini 3.5 Flash variants must be configured");
+        let variants =
+            build_variants_object("gemini-3.8-flash-high", Some(VariantType::Gemini3Flash))
+                .expect("Gemini 3.8 Flash variants must be configured");
 
         for (name, expected_id) in [
-            ("low", "gemini-3.5-flash-extra-low"),
-            ("medium", "gemini-3.5-flash-low"),
-            ("high", "gemini-3-flash-agent"),
+            ("low", "gemini-3.8-flash-low"),
+            ("medium", "gemini-3.8-flash-medium"),
+            ("high", "gemini-3.8-flash-high"),
         ] {
             let variant = &variants[name];
             let effort = variant["effort"]
@@ -2411,8 +2404,8 @@ mod tests {
 
             let tier = effort_to_tier(effort);
             assert_eq!(
-                resolve_real_model("gemini-3.5-flash", tier)
-                    .expect("Gemini 3.5 Flash tier must resolve")
+                resolve_real_model("gemini-3.8-flash", tier)
+                    .expect("Gemini 3.8 Flash tier must resolve")
                     .id,
                 expected_id
             );

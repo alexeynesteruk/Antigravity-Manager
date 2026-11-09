@@ -136,9 +136,17 @@ pub async fn handle_audio_transcription(
         )
         .await
         .map_err(|e| {
+            // Terminal outcomes (first byte, upload, global budget, replay limit) are classified
+            // by the pipeline. Internal markers must not leak to the client.
+            let status = crate::proxy::pipeline::terminal::classify(&e)
+                .map(|terminal| terminal.disposition().status)
+                .unwrap_or(StatusCode::BAD_GATEWAY);
             (
-                StatusCode::BAD_GATEWAY,
-                format!("Upstream request failed: {}", e),
+                status,
+                format!(
+                    "Upstream request failed: {}",
+                    crate::proxy::upstream::client::strip_internal_markers(&e)
+                ),
             )
         })?
         .response;

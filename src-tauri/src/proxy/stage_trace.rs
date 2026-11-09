@@ -399,12 +399,12 @@ pub async fn stage_trace_middleware(request: Request, next: Next) -> Response {
     }
 
     let path = request.uri().path().to_string();
-    let protocol = protocol_label(&path);
-    // 仅跟踪 AI 推理路径；健康检查 / 内部预热 / 埋点等高频杂项直接透传，避免刷爆日志
-    if protocol == "other" {
+    // 同一判断同时决定是否安装「请求预算」与「阶段时间线」——二者必须一致，
+    // 否则预算会随日志开关漂移。
+    if !is_traced_route(&path) {
         return next.run(request).await;
     }
-    let trace = StageTrace::start(protocol);
+    let trace = StageTrace::start(protocol_label(&path));
     let guard = trace.guard();
 
     trace.mark(
@@ -442,19 +442,55 @@ pub async fn stage_trace_middleware(request: Request, next: Next) -> Response {
     response
 }
 
+/// 明确「不是等上游首字」的路径前缀：不建请求预算、不记阶段时间线
+///
+/// 采用**排除名单**而非白名单：新增一条会调上游的路由时，默认就应当受预算与护栏约束，
+/// 而不是等某个人想起来再补一层 `starts_with`。历史教训：`/responses`、`/v1/completions`、
+/// `/v1/audio/transcriptions` 都曾因为不在白名单里而完全失去超时保护（连 270s 总预算都没有）。
+const EXCLUDED_ROUTE_PREFIXES: &[&str] = &[
+    // 探活 / 版本 / 能力探测：高频且不产生业务阶段
+    "/health",
+    "/version",
+    "/v1/version",
+    "/props",
+    "/v1/props",
+    // 模型清单与探测：只读本地元数据，不调上游
+    "/v1/models",
+    "/v1/model/",
+    "/v1/responses/models",
+    "/responses/models",
+    // 埋点与会话管理：本地处理
+    "/v1/api/",
+    "/v1/thinking/",
+    // 内部预热探针：网关自发的一次性探测，不应占用真实请求的预算
+    "/internal/warmup",
+];
+
+/// 该路由是否需要请求预算与阶段时间线
+pub fn is_traced_route(path: &str) -> bool {
+    !EXCLUDED_ROUTE_PREFIXES
+        .iter()
+        .any(|prefix| path.starts_with(prefix))
+}
+
 fn protocol_label(path: &str) -> &'static str {
     if path.starts_with("/v1/messages") {
         "anthropic"
     } else if path.starts_with("/v1/chat/completions") {
         "openai_chat"
-    } else if path.starts_with("/v1/responses") {
+    } else if path.starts_with("/v1/completions") {
+        "openai_completions"
+    } else if path.starts_with("/v1/responses") || path.starts_with("/responses") {
         "openai_responses"
     } else if path.starts_with("/v1beta") {
         "gemini"
     } else if path.starts_with("/v1/images") {
         "openai_images"
+    } else if path.starts_with("/v1/audio") {
+        "openai_audio"
     } else {
-        "other"
+        // 认不出名字不影响是否纳入预算；这里只用于日志标注
+        "http"
     }
 }
 
@@ -476,8 +512,57 @@ mod tests {
     fn protocol_labels_cover_all_public_routes() {
         assert_eq!(protocol_label("/v1/messages"), "anthropic");
         assert_eq!(protocol_label("/v1/chat/completions"), "openai_chat");
+        assert_eq!(protocol_label("/v1/completions"), "openai_completions");
+        assert_eq!(protocol_label("/v1/responses"), "openai_responses");
+        assert_eq!(protocol_label("/responses"), "openai_responses");
+        assert_eq!(protocol_label("/responses/compact"), "openai_responses");
         assert_eq!(protocol_label("/v1beta/models/x:generateContent"), "gemini");
-        assert_eq!(protocol_label("/health"), "other");
+        assert_eq!(protocol_label("/v1/audio/transcriptions"), "openai_audio");
+        // 认不出名字只影响日志标注，不影响是否纳入预算
+        assert_eq!(protocol_label("/health"), "http");
+    }
+
+    #[test]
+    fn budget_gate_covers_every_inference_route() {
+        // 曾经因为白名单漏掉而完全失去超时保护的入口（尤其是 Codex 的 /responses
+        // 与音频上传：后者会把 base64 音频整包上传，恰恰最需要重放护栏）
+        for path in [
+            "/v1/messages",
+            "/v1/messages/count_tokens",
+            "/v1/chat/completions",
+            "/v1/completions",
+            "/v1/responses",
+            "/responses",
+            "/responses/compact",
+            "/v1beta/models/gemini-3-pro:streamGenerateContent",
+            "/v1beta/models/gemini-3-pro/countTokens",
+            "/v1/images/generations",
+            "/v1/images/edits",
+            "/v1/audio/transcriptions",
+        ] {
+            assert!(is_traced_route(path), "{path} must be budgeted");
+        }
+
+        // 明确排除的探活 / 只读 / 本地杂项
+        for path in [
+            "/health",
+            "/healthz",
+            "/version",
+            "/v1/version",
+            "/props",
+            "/v1/props",
+            "/v1/models",
+            "/v1/models/gpt-4",
+            "/v1/model/gpt-4",
+            "/v1/models/detect",
+            "/v1/responses/models",
+            "/responses/models/x",
+            "/v1/api/event_logging/batch",
+            "/v1/thinking/end",
+            "/internal/warmup",
+        ] {
+            assert!(!is_traced_route(path), "{path} should be skipped");
+        }
     }
 
     #[test]

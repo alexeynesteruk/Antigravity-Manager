@@ -31,6 +31,9 @@ pub struct WarmupRequest {
     pub project_id: Option<String>,
     /// 可选：直接提供 Account ID
     pub account_id: Option<String>,
+    /// 诊断/定向测活意图（为 true 时测活成功允许解除单模型冻结与验证锁）
+    #[serde(default)]
+    pub probe_intent: bool,
 }
 
 /// 预热响应
@@ -151,6 +154,73 @@ pub async fn handle_warmup(
                 }
             }
         };
+
+    // [测试专用] 模拟上游未响应 / 无请求回报（网络连接超时或分阶段传输中断）
+    if req.model == "simulate_no_response" || req.model == "simulate-no-response" {
+        let duration = 15000;
+        let log_id = uuid::Uuid::new_v4().to_string();
+        let diag = "请求上游接口时网络连接失败，未收到上游请求回报（非网关服务端故障，请排查网络或代理）：Upstream send failed at https://daily-cloudcode-pa.googleapis.com/v1internal (method=streamGenerateContent, stage=upload, upload_budget=15s): Upload budget exhausted after 15s of transfer (sent 9175040/10168215 bytes, no response received)。".to_string();
+        let sug = "请检查系统代理、上游节点连通性或本地网络设置，确保能正常连接上游服务，并可在「超时设置」中调整分阶段传输预算。".to_string();
+
+        let log = ProxyRequestLog {
+            id: log_id.clone(),
+            timestamp: chrono::Utc::now().timestamp_millis(),
+            method: "POST".to_string(),
+            url: format!("/internal/warmup -> {}", req.model),
+            status: 502,
+            duration,
+            model: Some(req.model.clone()),
+            mapped_model: Some(mapped_model.clone()),
+            upstream_model: Some(mapped_model.clone()),
+            account_email: Some(req.email.clone()),
+            client_ip: Some("127.0.0.1".to_string()),
+            error: Some("Network Error: Upstream send failed (未收到请求回报)".to_string()),
+            request_body: Some(format!(
+                "{{\"type\": \"warmup\", \"model\": \"{}\"}}",
+                req.model
+            )),
+            upstream_request_body: None,
+            response_body: Some(diag.clone()),
+            input_tokens: None,
+            output_tokens: None,
+            cached_tokens: None,
+            total_tokens: None,
+            physical_requests: None,
+            reasoning_tokens: None,
+            protocol: Some("warmup".to_string()),
+            username: None,
+            request_headers: None,
+            upstream_request_headers: None,
+            response_headers: None,
+            session_id: None,
+        };
+        state.monitor.log_request(log).await;
+
+        return (
+            StatusCode::BAD_GATEWAY,
+            Json(WarmupResponse {
+                success: false,
+                message: format!("【网络请求异常（非服务端故障）】 {}", diag),
+                log_id: Some(log_id),
+                duration_ms: Some(duration),
+                status: Some(502),
+                account_email: Some(req.email.clone()),
+                account_id: if account_id.is_empty() {
+                    None
+                } else {
+                    Some(account_id.clone())
+                },
+                is_retired: None,
+                error: Some(format!(
+                    "【网络请求异常（非服务端故障）】\n诊断: {}\n建议: {}",
+                    diag, sug
+                )),
+                is_server_error: Some(false),
+                error_type: Some("upstream_network_error".to_string()),
+            }),
+        )
+            .into_response();
+    }
 
     // ===== 步骤 2: 根据模型类型构建请求体 =====
     let is_claude = mapped_model.to_lowercase().contains("claude")
@@ -365,6 +435,31 @@ pub async fn handle_warmup(
                     (true, format!("Warmup triggered for {}", req.model))
                 };
 
+                // 探活成功 = 上游已实际可用：立即清除该账号在这个模型上的
+                // 900s 临时熔断与限流锁定，避免“探活成功但调度仍等 15 分钟”。
+                if final_success && !account_id.is_empty() {
+                    state
+                        .token_manager
+                        .clear_model_unsupported(&account_id, &mapped_model);
+                    state
+                        .token_manager
+                        .clear_model_rate_limit(&account_id, &mapped_model);
+                    tracing::info!(
+                        "[Warmup-API] Cleared model breaker for {} / {} after successful probe",
+                        req.email,
+                        mapped_model
+                    );
+
+                    // 关键守卫（审查项 5）：仅当显式带有定向诊断/测活意图（probe_intent == true）时，
+                    // 成功后才允许触发自愈解限；后台定时周预热/自动轮询严禁越权清除处于冷静期的验证锁！
+                    if req.probe_intent && !account_id.is_empty() {
+                        let _ = crate::modules::account::clear_account_forbidden_and_validation(
+                            &account_id,
+                            Some(&mapped_model),
+                        );
+                    }
+                }
+
                 info!(
                     "[Warmup-API] ========== SUCCESS: {} / {} -> {} ({}ms, retired={}) ==========",
                     req.email, req.model, mapped_model, duration, is_retired
@@ -467,12 +562,14 @@ pub async fn handle_warmup(
 
                         if !resolved_account_id.is_empty() {
                             warn!(
-                                "[Warmup-API] 403 Forbidden detected for {}, marking account as forbidden",
+                                "[Warmup-API] 403 Forbidden detected for {}, marking forbidden status",
                                 req.email
                             );
-                            let _ = crate::modules::account::mark_account_forbidden(
+                            // 关键防护（审查项 4）：统一使用 mapped_model 记录冻结 scope，确保与解冻模型完全闭环
+                            let _ = crate::modules::account::mark_account_forbidden_with_model(
                                 &resolved_account_id,
                                 &error_text,
+                                Some(&mapped_model),
                             );
                         } else {
                             warn!(
@@ -524,14 +621,52 @@ pub async fn handle_warmup(
                 };
                 state.monitor.log_request(log).await;
 
+                // 检查是否命中 User-Agent 门禁或全池临时熔断
+                let custom_ua = state.upstream.get_user_agent_override().await;
+                let lang = crate::modules::config::load_app_config()
+                    .ok()
+                    .map(|c| c.language)
+                    .unwrap_or_else(|| "zh".to_string());
+                let i18n_err = crate::modules::i18n::get_gateway_error_strings(&lang);
+
+                let (final_message, error_detail, error_type) =
+                    if let Some((title, diag, sug, _category, err_code)) =
+                        crate::proxy::handlers::common::check_outdated_user_agent_issue_with_lang(
+                            &req.model,
+                            status_code,
+                            &error_text,
+                            custom_ua.as_deref(),
+                            Some(&lang),
+                        )
+                    {
+                        (
+                            format!("{} {}", title, diag),
+                            Some(format!(
+                                "{}\n{} {}\n{} {}",
+                                title,
+                                i18n_err.label_diagnosis,
+                                diag,
+                                i18n_err.label_suggestion,
+                                sug
+                            )),
+                            Some(err_code.to_string()),
+                        )
+                    } else {
+                        (
+                            format!(
+                                "Warmup failed: HTTP {} (上游拒绝，非服务端故障)",
+                                status_code
+                            ),
+                            Some(error_text),
+                            Some("upstream_error".to_string()),
+                        )
+                    };
+
                 (
                     StatusCode::from_u16(status_code).unwrap_or(StatusCode::BAD_GATEWAY),
                     Json(WarmupResponse {
                         success: false,
-                        message: format!(
-                            "Warmup failed: HTTP {} (上游拒绝，非服务端故障)",
-                            status_code
-                        ),
+                        message: final_message,
                         log_id: Some(log_id),
                         duration_ms: Some(duration),
                         status: Some(status_code),
@@ -542,9 +677,9 @@ pub async fn handle_warmup(
                             Some(account_id.clone())
                         },
                         is_retired: None,
-                        error: Some(error_text),
+                        error: error_detail,
                         is_server_error: Some(status_code >= 500),
-                        error_type: Some("upstream_error".to_string()),
+                        error_type,
                     }),
                 )
                     .into_response()

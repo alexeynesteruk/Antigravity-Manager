@@ -1,7 +1,7 @@
 {
   "$schema": "../node_modules/@tauri-apps/cli/config.schema.json",
   "productName": "Antigravity Tools",
-  "version": "4.9.9-beta.4",
+  "version": "5.0.4-beta.5",
   "identifier": "com.lbjlaq.antigravity-tools",
   "build": {
     "beforeDevCommand": "npm run dev",
@@ -39,7 +39,7 @@
       }
     ],
     "security": {
-      "csp": "default-src 'self'; img-src 'self' asset: data:; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline'; connect-src ipc: http://ipc.localhost http://127.0.0.1:* http://localhost:* http://[::1]:*"
+      "csp": "default-src 'self'; img-src 'self' asset: data:; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline'; connect-src ipc: http://ipc.localhost"
     }
   },
   "bundle": {

@@ -5,6 +5,7 @@ services:
       dockerfile: docker/Dockerfile
     image: lbjlaq/antigravity-manager
     container_name: antigravity-manager
+    init: true  # Reap zombies and forward signals. Safe alongside the image ENTRYPOINT tini.
     network_mode: host  # Use the host network so localhost:8045 is directly reachable
     # ports:  # Port mapping is not needed in host mode
     #   - "8045:8045"

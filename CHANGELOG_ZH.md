@@ -3,19 +3,664 @@
 > 完整版本历史记录。返回项目主页请查看 [README_ZH.md](README_ZH.md) | [English Changelog](CHANGELOG.md)。
 
 *   **版本演进**:
+    *   **v5.0.4-beta.5 (2026-11-08)**:
+        -   **[跨轮次前缀稳定性与多轮会话 KV 缓存保护] (PR #3889, Ref #3764, #3769, #3867, Thanks to @mclinyeshi, @cubelikeplayDaniel)**:
+            -   **锁定首个 model 轮次前的开场注入边界**: 在 `src-tauri/src/proxy/mappers/prompt_sanitizer.rs` 中将 `leading_injection_boundary` 严格限制在 `&contents[..first_model]` 切片内。首轮 assistant 回答生成后，`first_model` 索引终身固定，彻底根治跨轮次新提问到达时，末尾追加新 user 轮次导致 `cur_turn` 漂移回溯将第 1 轮 user 提问从 `Anchored` 轨篡改为 `System` 轨的严重缺陷，杜绝 100k+ 历史上下文 KV 缓存（Prompt Cache）雪崩失效。(Ref #3764, #3769, #3867, PR #3889)
+            -   **保守型流水线标记清洗**: 在 `strip_pipeline_markers` 中引入变动判定，仅当匹配并剥离真实系统提示词标记或策略文本时才执行 `.trim()`，避免无标记的干净文本末尾空白字符被意外清除导致哈希变动。(PR #3889)
+        -   **[CI 自动化门禁与 Rust 代码格式规范对齐] (Thanks to @cubelikeplayDaniel)**:
+            -   **ACP 集成测试代码格式化**: 规范化 `src-tauri/src/modules/integration.rs` 中的 `test_switch_acp_account_e2e_flow_and_project_id_preservation` 断言逻辑，修复跨平台 CI 任务因 `cargo fmt` 检查导致的构建中断，确保全平台测试链路畅通。(Fixes #3842, Ref #3844)
+
+    *   **v5.0.4-beta.4 (2026-11-08)**:
+        -   **[支持 Antigravity IDE 插件 (antigravity-acp) 账号切换与状态检测] (Fixes #3842, PR #3844, Thanks to @Al-Taie, @cubelikeplayDaniel)**:
+            -   **IDE 插件凭据无缝同步与进程重载**: 新增官方 Google Antigravity IDE 插件 (`antigravity-acp` / JetBrains & Android Studio) 客户端目标。支持将选定账号原子化写入 `$GEMINI_HOME/antigravity-acp/acp_token.json` 与 `settings.json`，并自动同步 macOS 钥匙串凭据 (`service="gemini"`, `account="antigravity-acp"`)，在优雅重启 `agy_acp_server` 后即时生效。(Fixes #3842, PR #3844)
+            -   **多端状态一致性与 CLI 对齐**: 完善 `AccountIndex` 与 `ActiveClientsStatus` 对 ACP 客户端活跃状态的自动探查与感知；CLI `switch`、`list`、`current` 命令与 Headless 运行模式全面支持 `--target acp`。(Fixes #3842, PR #3844)
+        -   **[账号操作区 2×2 胶囊布局重构、二级弹窗单窗状态机与操作列收窄] (Thanks to @cubelikeplayDaniel)**:
+            -   **紧凑 2×2 四按钮布局**: 账号卡片与列表的操作区全面重构为 2 行 2 列按钮（上排：`[切换]`、`[刷新]`；下排：`[启停]`、`[更多]`），大幅增加各操作按钮的点击靶区与水平呼吸感。
+            -   **表格操作列精确收窄**: 将表格端固定操作列宽从 `w-[240px]` 收敛至贴合按钮的 `w-[136px]`，左右内边距收敛为 `px-1`，彻底消除两侧多余留白。
+            -   **单弹窗内部视图状态机消除层叠**: 将三级标签编辑器内嵌收敛为二级管理弹窗（`AccountActionsModal`）的内部视图状态（`menu` ↔ `tags`），顶部提供平滑返回按钮，彻底根除多层 Modal Portal 弹出/关闭动画重叠卡顿与闪烁。
+            -   **弹窗多端切换卡片文本自适应**: 弹窗宽度扩展为 `max-w-2xl`，去除客户端切换卡片的强行单行截断，文本自然自适应换行，完整呈现 `Antigravity IDE 插件 (ACP - JetBrains)` 及其描述信息。
+        -   **[蹬额度模式高额度临期自愈缺陷修复与配额分组详情全面汉化] (Thanks to @cubelikeplayDaniel)**:
+            -   **临期高额度判定自愈缺陷根治**: 修复 `usePedalModeStore.ts` 的 `checkAndAutoRecover` 中误将 `pct >= 90` 作为重置判定条件的致命缺陷，使剩余 90%–100% 临期待消耗账号能够正常启动蹬额度模式，杜绝启动后瞬间被误判退出。
+            -   **账号详情配额分组全方位汉化**: 在账号详情弹窗的配额分组窗口中，对上游 Google API 的 `Gemini Models`、`Claude and GPT models`、`Gemini 4 Argon`、`Models within this group` 以及 `WEEKLY`、`5H`、`1H` 滑动时间窗口完成全量双语映射与优雅格式化。
+
+    *   **v5.0.4-beta.3 (2026-11-08)**:
+        -   **[单账号 Gemini / Claude 模型族独立调度优先级与蹬额度模式自由勾选] (PR #3879, Thanks to @vecyang1, @cubelikeplayDaniel)**:
+            -   **按模型族独立编排调度优先级**: 新增 `Account.model_priorities` 与 `ProxyToken::effective_priority`，支持在单账号内独立设置 `gemini` 与 `claude` 的调度优先级（1–100，未配置时自动继承账号默认优先级），并在账号卡片与表格直观展示 `G:x · C:y` 徽章。(PR #3879)
+            -   **蹬额度模式模型族隔离与账号自由勾选**: 开启蹬额度模式时仅将目标模型族提权至 `1`，保留另一模型族原有优先级，彻底解决跨模型族误抢流问题；弹窗新增各候选账号实际支持的模型代数徽章（如 `Claude 5.5` vs `Claude 4.6`）与复选框勾选功能，支持按需选择要消耗的账号（如跳过 4.6 仅蹬 5.5）。(PR #3879)
+        -   **[Cowork 工具在途压缩避让与粘性会话配额悬殊均衡自愈] (Thanks to @cubelikeplayDaniel)**:
+            -   **回合边界安全自动压缩**: 在 `should_trigger_cowork_auto_compact` 中增加 `is_tool_result_continuation` 工具在途守卫，Agent 工具执行链路未闭合（含 `tool_result`）期间暂缓下发 400 假报警，等待工具链闭环并回到用户新回合边界再优雅触发压缩，根治工具执行中途打崩客户端状态机并弹出 `"Your context window is full"` 模态框的问题。
+            -   **前缀缓存与配额均衡兼顾**: 在粘性会话与 60s 窗口中引入同级优先级配额悬殊迁移（当绑定账号配额 $\le 65\%$ 且池中同级/更高优先级健康账号领先 $\ge 25\%$ 时自动解绑迁移），同时对 401/403/404/429 故障即时解绑。
+        -   **[蹬额度模式重入死循环根除与 Windows 文件锁并发退避] (Fixes #3881, PR #3882, Thanks to @vigarh-netizen, @cubelikeplayDaniel)**:
+            -   **React 状态级联与互斥重入根治**: 在 `usePedalModeStore` 中引入模块级 `isProcessing` 互斥重入锁；在自动恢复与手动退出执行伊始立即重置 `active: false` 并清除本地存储，彻底阻断异步调度期间被外部刷新事件重新误判为激活状态的竞态条件。(Fixes #3881, PR #3882)
+            -   **关键配额指标特征指纹防抖**: 在 `Layout.tsx` 中引入 `prevFingerprintRef` 特征指纹防抖，仅提取账号 ID、代理禁用状态以及 Gemini/Claude 周配额百分比与官方重置时间，账号调度优先级回写不再改变特征指纹，从组件层彻底切断死循环闭环。(Fixes #3881, PR #3882)
+            -   **冗余写盘消除与异常保底重置**: 容错遍历挂起账号时严格比对当前禁用状态，跳过重复写盘；新增 `resetPedalModeState` 保底重置接口，并在 `PedalBanner.tsx` 手动退出增加异常捕获与状态重置降级。(Fixes #3881, PR #3882)
+            -   **Windows 文件系统原子替换瞬态锁指数退避**: 在 `src-tauri/src/utils/fs.rs` 的 `MoveFileExW` 逻辑中针对 `ERROR_ACCESS_DENIED (5)` 与 `ERROR_SHARING_VIOLATION (32)` 增加最大 5 次重试与指数退避（5ms, 10ms, 20ms, 40ms, 80ms），极大提升高频并发原子替换时的抗锁死容错韧性。(Fixes #3881, PR #3882)
+
+    *   **v5.0.4-beta.2 (2026-11-08)**:
+        -   **[账号状态管理与调度收敛：确立优先级模型、模型级 403 作用域与恢复权威闭环] (Ref #3863, #3865, #3875, commit 9850f750, Thanks to @jeikl, @cubelikeplayDaniel)**:
+            -   **状态优先级模型收敛**: 确立 `banned > validation > hard 403 > quota_protection > manual` 统一优先级链条，杜绝账号级封禁被模型级 403 或日配额刷新降级/冲掉，并在读写路径中全链路保持同一套判断逻辑。(Ref #3863, #3875)
+            -   **模型级 403 作用域隔离**: 引入 `forbidden_models` 模型冻结机制，单个模型的 403 仅冻结对应模型与同线通道，账号其余健康模型继续参与调度，杜绝单模型 403 导致整号停用；重构作用域匹配与路径清洗，杜绝具体模型逆向误伤模型族，文本模型不误伤生图模型。(Ref #3863, #3865)
+            -   **恢复权威与防越权解限**: 引入 `probe_intent` 严格区分定向测活与自动预热，禁止后台自动调度越权解封，账号级封禁/403 仅由真实生产探测 `Healthy` 解除；定向测活成功精准解开对应通道模型与验证锁，保持异构模型（Claude/Opus）与 TOS 封禁严格隔离。(Ref #3863, #3875)
+            -   **意图与系统锁物理隔离**: 物理拆分 `manual_proxy_disabled` 与运行时系统锁，系统解限绝不越权恢复用户手动禁用的账号，修复手动开关覆盖系统锁导致的状态不一致。(Ref #3863, #3875)
+            -   **老版本读时自愈与全局写锁索引同步**: 反代调度加载时自动平滑迁移老格式模型 403，统一 `until == 0` 的 24 小时兜底自愈判定；实现 `set_account_index_proxy_disabled` 全局写锁更新，消除并发索引覆盖与控制台漂移日志。(Ref #3863, #3875)
+
+    *   **v5.0.4-beta.1 (2026-11-08)**:
+        -   **[403 封禁锁状态机与配额刷新防覆写：根治日配额 200 OK 冲掉 403 缺陷并新增异常账号一键筛选] (Fixes #3863, Ref #3865, PR #3875, commit fc45775c, a079bdf9, 3010f9e8, Thanks to @cubelikeplayDaniel, @jeikl)**:
+            -   **403 状态硬锁定保持**: 确立 403 封禁状态高于日配额 200 OK 契约。在 `update_quota` 与 `update_account_quota_internal` 中引入锁定守卫，无论后台定时刷新还是手动刷新日配额，现存 403 `is_forbidden` 与 `proxy_disabled` 标记绝对不被冲掉，彻底解决“刷新额度 403 凭空消失，调用一次又报错”的严重缺陷。(Fixes #3863, PR #3875)
+            -   **生产测活精准安全自愈**: 仅当生产端点真实探测返回 `Healthy` 时方可解除非模型级 403 锁；模型定向受限保留模型锁，杜绝拉取普通日配额欺骗解限。(commit a079bdf9, 3010f9e8)
+            -   **账号列表「异常」快捷过滤与直达**: 账号管理页工具栏新增「异常」快捷过滤按钮，一键聚合展示所有 banned / validation_blocked / 403 账号并显示精确计数；仪表盘「健康度 & 风控」卡片支持点击直达异常过滤视图。(Ref #3865, PR #3875)
+        -   **[UI 交互与弹窗层级修复：根治添加账号按钮穿透更新弹窗] (Fixes #3853, PR #3872, Thanks to @cubelikeplayDaniel)**:
+            -   根除添加账号触发按钮残留的 `relative z-[100]` 逃逸层级，防止按钮穿透更新弹窗浮层；将全局版本更新通知卡片层级规范提升至 `z-[200]`，确保始终位于顶层不被遮挡。(Fixes #3853, PR #3872)
+        -   **[启动配额异步刷新与工具栏操作] (Ref #3726, PR #3871, Thanks to @lbjlaq)**:
+            -   客户端启动后按账号配置上限异步静默刷新配额，并在账号工具栏中补齐手动刷新入口。(Ref #3726, PR #3871)
+        -   **[蹬额度模式稳定性与视觉体验优化] (Ref #3870, commit 73d798c5, 0f734f57, Thanks to @cubelikeplayDaniel)**:
+            -   补齐 reset 退出语义测试与 reduced-motion 无障碍兼容；优化浅色主题视觉呈现与待蹬账号高亮状态标识，提升多账号自愈与切换流畅度。(Ref #3870, commit 73d798c5, 0f734f57)
+        -   **[Web 端测活自动调度与安全自愈] (Ref #3861, Ref #3869, PR #3868, commit fb32517a, 8232798c, 2677d8c6, 32735f92, Thanks to @cubelikeplayDaniel)**:
+            -   统合 Web 端测活自动调度选号与凭据刷新，下沉选号逻辑并按目标模型排序，测活成功按模型与受限原因安全自愈，拦截 TOS 封禁与跨模型误解限。(Ref #3861, PR #3868)
+        -   **[分级配额契约与自愈架构重构：根治跨模型重置时间污染与零配额死锁，实现周硬配额绝对优先与安全自愈] (Fixes #3840, #3845, PR #3852, Thanks to @jeikl, @cubelikeplayDaniel)**:
+            -   **Weekly 硬配额优先契约 (P0-1)**: 严格落实周窗口与短期 5 小时滚动窗口的层级约束。当周硬配额耗尽（0%）时，系统严禁仅因短期 5h 窗口重置而误触发账号自愈；多周桶（如 Argon WTU 7d）并发耗尽时需全部桶到期自愈，方可解除配额耗尽锁定并恢复调度准入。(Fixes #3840, PR #3852)
+            -   **模型大类组级隔离 (P0-2)**: 重置时间提取与模型映射全面解耦，按模型大类族群（Argon / 3P / Gemini）维护独立重置映射与窗口快照；当模型重置时间映射非空时，严禁未匹配模型回退至全局全局最早重置时间，彻底杜绝 Argon 重置到期污染普通 Gemini 模型或导致错误提权。(Fixes #3845, PR #3852)
+            -   **准入资格与调度排序解耦 (P1-4)**: 拆分 `has_candidate_quota_admission`（布尔准入资格）与 `get_candidate_quota`（排序权重计算）；自愈到期账号赋予保守正向 sentinel (20)，既能及时参与候选调度竞争，又绝不抢占与压制具备健康正配额（40%~100%）的高可用账号。(PR #3852)
+            -   **实时配额刷新全状态同步 (P1-2, P1-3)**: `fetch_and_lock_with_realtime_quota` 与 `load_single_account` 同步提取 `model_reset_times`、`model_weekly_reset_times` 与详细 `model_quota_windows`，多桶同窗口取最早截止时间戳 (`.min(ts)`)，并在接收新配额组时彻底清空旧映射防止跨窗口陈旧时间戳污染，实现动态模型族映射与快照一致性；同时健壮兼容 camelCase `quotaGroups` 结构。(PR #3852)
+            -   **熔断锁模型级精准解限与 429 退避保护 (P1-6)**: 账号重载与正配额快照恢复时，对各模型分别进行正配额校验并按模型粒度调用 `reconcile_quota_recovery`，防止正向 Gemini 模型提前解禁尚在耗尽状态的 Claude 模型，仅精准释放已恢复的 `QuotaExhausted` 状态，严格保留 429 `RateLimitExceeded` 速率退避时间。(PR #3852)
+            -   **账号级锁与全局兜底边界收敛 (P1-7)**: 任一模型恢复正配额时同步解除账号级“全模型耗尽” `QuotaExhausted` 锁；全局 reset 兜底收紧为仅当短期与周周期两个 per-model map 均为空时才生效，彻底封堵残余跨族时间污染。(PR #3852)
+        -   **[Docker 容器健康检查超时修复与 Tini Init 进程泄漏治理] (Fixes #3850, PR #3854, Thanks to @cubelikeplayDaniel)**:
+            -   修复 Docker 镜像缺少 `tini` init 进程导致僵尸进程堆积缺陷；优化 HEALTHCHECK curl 超时参数，防止每 2-3 小时因检查堆叠造成容器假死 503。(Fixes #3850, PR #3854)
+        -   **[上传带宽语义与预算对齐：根治大请求体 15s 误杀] (Ref #3763, Ref #3821, PR #3857, Thanks to @wakeupnotfound)**:
+            -   上传超时预算只允许随请求体体积放宽，严禁反向收紧导致大请求体被提前 15s 误杀；公式示例改用解析后的实际数值，并在 12 种语言中明确“保守最低上行”语义与推荐范围（0.5-5 Mbps）。(Ref #3763, Ref #3821, PR #3857)
+        -   **[账号封禁识别与无配额门禁卡死修复] (Ref #3525, #3630, #3631, #3840, commit 03c83b10, Thanks to @jeikl)**:
+            -   增加生产端点 `TOS_VIOLATION` 探测与申诉链接提取，封禁账号即时移出调度池；502 门禁前增加磁盘账号池节流重载与映射模型复查，新账号导入后可秒级放行。(Ref #3525, #3630, #3631, #3840)
+        -   **[文本内嵌 Data URL 视觉自愈与超大 Token 计费治理] (PR #3864, Ref #3830, Thanks to @mclinyeshi)**:
+            -   将序列化进纯文本（如 Codex memory 提取的 rollout JSON）中的 Data URL 图像提升为规范 `inlineData` 部件（按内容去重），彻底消除数十万字符 Base64 被上游按文本 Token 逐字计费（输入膨胀至 500k+ tokens 且极度拉长首字延迟）的缺陷；
+            -   日志精简防护：在前端简要视图与后端持久化审计中自动折叠大段 Base64，防止前端与 SQLite 数据库被巨量字符串卡死。(PR #3864)
+        -   **[Responses 协议工具调用与回执相邻性对齐：根治 Claude 400 与 Gemini 缓存跳变] (PR #3866, PR #3867, Thanks to @mclinyeshi)**:
+            -   在统一流水线中将 Codex `/v1/responses` 夹在 `functionCall` 轮与 `functionResponse` 轮之间的纯文本过程说明折回调用轮（全协议通用）：Claude 目标彻底根治上游判定夹层文本为非法 prefill 导致会话中断报 HTTP 400（`This model does not support assistant message prefill`）的缺陷；Gemini 目标消除夹层纯文本轮在相邻轮次间签名闪烁导致的上下文缓存失效，保护长对话缓存命中。(PR #3866, PR #3867)
+
+    *   **v5.0.4-beta.0 (2026-11-06)**:
+        -   **[Android 原生架构支持：Termux ARM64 无容器部署与 Headless 运行环境] (Fixes #3818, Thanks to @sandwitchers)**:
+            -   **Android Termux 原生无容器支持**: 新增 `aarch64-linux-android` (Bionic libc) 原生后端构建目标与一键安装脚本 `scripts/install-termux.sh`，摆脱 PRoot / chroot / Docker 等容器层开销，在 Android 设备上实现超轻量、低功耗的原生 API 网关与 Web 控制台运行。(Fixes #3818, Thanks to @sandwitchers)
+            -   **零账号死锁与仪表盘准入修复**: 修复无账号或服务未就绪时静态资源与鉴权中间件的拦截死锁，确保 0 账号冷启动下 Web 控制台与管理接口正常放行，用户可无阻进入控制台添加账号或配置服务。(Fixes #3818)
+            -   **静态资源智能级联探测**: 新增 `resolve_static_dist_path` 探测算法，支持 `ABV_DIST_PATH` 环境变量优先指定，并级联搜索 `./dist`、`<exe_dir>/dist` 及 `$PREFIX/share/antigravity/dist`，彻底解除对当前执行目录的强依赖。(Fixes #3818)
+            -   **构建流水线与资源包分发补全**: 修正 CI 交叉编译打包流程，将前端 `dist` 完整打包入 `antigravity-server-android-arm64.tar.gz` 归档，安装脚本自动解压并软链接至系统标准路径。(Fixes #3818)
+            -   **服务端命令行帮助拦截修复**: 优先接管 `--help` / `-h` 参数，解决此前被底层通用 CLI 错误捕获导致无法输出 server 参数（`-p`, `-h`, `--no-web`, `--pure-proxy`）的问题。(Fixes #3818)
+            -   **Web 端模型连通性测活端点补齐**: 为 Headless 独立 Web 服务补全注册 `POST /api/proxy/test-model` 路由，修复在网页端点击模型「测活」按钮返回 405 Method Not Allowed 并报错的问题。(Fixes #3818)
+
+    *   **v5.0.3 (2026-11-06)**:
+        -   **[配额归因治理：根治 503 污染与配额假死，重构大桶调度与优先级竞争] (Fixes #3838, #3841, #3821, PR #3845, Ref #3827, #3840)**:
+            -   **根除 503 归因污染（占全量 5xx 的 92.6%）**: 网关内部限流判据统一收敛至 `policy::is_internal_gateway_exhaustion` 单一权威源，补全此前漏判的 `All accounts rate-limited`（旧列表只写 `all accounts limited`），本地号池限流不再被误报为上游 503；同步收敛 `rate_limit.rs` 与 `token_manager.rs` 中另两处漂移实现。(Fixes #3838)
+            -   **403 封禁专用归因**: 为 `TOS_VIOLATION` / `PERMISSION_DENIED` 新增 `account_forbidden` 错误码与 12 语言文案，账号封禁不再被 403→503 映射后与容量枯竭混淆。(Fixes #3838)
+            -   **配额耗尽与自适应熔断彻底解耦**: 确立不变式「上游告知的配额耗尽是客观物理事实，绝不受熔断开关影响」。修复熔断关闭时 `if !config.enabled { return; }` 抢先拦截导致 `Individual quota reached` 被丢弃、账号既不置 0% 也不锁定的缺陷；新增 `is_quota_exhausted_or_explicit_limited`，熔断关闭时同样拦截 `QuotaExhausted` 账号。(PR #3845, Thanks to @cubelikeplayDaniel)
+            -   **重试循环引入账号排除机制**: 各协议重试循环维护 `attempted_accounts` 并传入 `get_token_filtered`，根治 P2C 依据历史配额权重反复锤击刚 429 账号的问题，全池遍历后快速失败。(PR #3845, Thanks to @cubelikeplayDaniel)
+            -   **消除 0 配额高优账号饥饿全池（优先级倒置死锁）**: 将 `select_with_p2c` 的配额过滤前置于优先级收敛，确立「优先级只在具备该模型有效正配额的健康账号之间竞争」；修复临期账号被置 `priority=1` 后配额归零仍剔除全部满额账号并报「无可用账号」的严重缺陷。(Ref #3840)
+            -   **配额诊断采信上游权威信号**: 新增 L1 上游 `quotaResetTimeStamp` 优先锁定，四类配额桶（Argon 独立桶 / Ultra 共享大桶 / 普通 Gemini 大桶 / 3P 桶）耗尽时直接采信官方恢复时刻；锁定源按硬配额优先排序，修复上游省略 `remainingFraction` 时被读成满额的假满额盲区，并封堵全池 0 配额裸奔放行漏洞。(Fixes #3841)
+            -   **前端熔断默认值修正**: `circuit_breaker` 初始默认改为 `enabled: true`，避免在设置页点击保存时意外关闭熔断器。(PR #3845)
+        -   **[蹬额度模式重构为最高调度优先级] (PR #3840, Thanks to @zepeng-jin)**:
+            -   **解除暴力禁用，改为优先级竞争**: 激活时不再通过 `proxy_disabled = true` 挂起其他账号，改为将临期账号优先级提升至 `1`（默认 50），彻底消除 Prompt Caching 击穿、并发挤压唯一账号触发 429、以及账号实体级禁用造成跨模型误伤三重顽疾；老会话留在原账号保住缓存，新会话优先消耗临期额度，并发自动外溢。(PR #3840, Thanks to @zepeng-jin)
+            -   **平滑自动恢复**: 待蹬账号周配额耗尽（0%）或到达重置时间后，按 `originalPriorities` 精准恢复初始优先级，并保留旧版本残留挂起状态的容错清理。(PR #3840, Thanks to @zepeng-jin)
+        -   **[超时契约与流式生命周期统一：解除硬截断、四协议共用一条流水线] (Fixes #3816, Fixes #3821, Ref #3763, PR #3817)**:
+            -   **废除硬编码截断**: 下线 135s/160s 硬截断（低于 medium 实测 p90 130.9s，会把本可成功的慢长请求反向判为 504 并引发重试风暴）；首字基准恢复 180s、多模态上限 270s、全局请求预算 270s 统一下沉至 pipeline，剩余预算不足时直接短路。(Fixes #3821)
+            -   **Codex / Legacy 收敛至统一生命周期**: `create_codex_sse_stream` 与 `create_legacy_sse_stream` 由手写 `select!` 改为 `ProtocolStreamHandler` 适配器，统一交由 `run_stream_lifecycle` 接管 3s 心跳、首字宽限、思考/正文阶段跃迁、稳态滑动超时与异常收尾；Gemini 补齐 `is_thinking_active`，思考期不再被误判为过渡断崖。(Ref #3816, PR #3817, Thanks to @cubelikeplayDaniel)
+            -   **过渡断崖自适应跃迁**: 修复深思考模型输出思考块后上游整包缓冲巨型 `functionCall` 引发长静默、被 120s 稳态超时截断导致 HTTP 200 无输出的硬伤，静默期自动跃迁至 `Transition` 阶段并给予 180s 宽限与 `: ping` 保活。(Fixes #3816, Thanks to @mclinyeshi)
+            -   **终态全量解绑会话粘性**: `TerminalDisposition` 将 `FirstByte` / `Upload` / `GlobalBudget` 全部纳入 `abandon_sticky_account`，消除卡在同一慢账号反复等满多轮 3 分钟的死锁。(Fixes #3821)
+            -   **上传与重放护栏**: 上传停滞超时与自适应上传预算解耦并保底不低于连接超时；大请求体跨账号重放门限放宽至 4MB、上限 3 次，抑制上行放大。(Fixes #3821)
+        -   **[模型路由与门禁：自定义映射最高优先级、旧版模型硬下线] (Fixes #2065, Ref #3764, #3769, #3815, PR #3787)**:
+            -   **入站模型门禁四道判定**: 缺失 model → 404 `model not exist`；自定义映射优先（精确 / 大小写 / 规范化 / 通配符）；映射结果须存在于「下游开放列表 ∪ agent 工具列表 ∪ 官方目录 ∪ 映射值」；全池无正配额 → 502 `no quota accounts`；冷启动无元数据时 fail-open，网关代答的 404/502 走 `is_gateway_self_answer` 单源豁免，不再锁号或解绑粘性。(Ref #3764, #3769)
+            -   **自定义映射升为物理最前位**: 高于官方热更新淘汰重定向，修复映射命中后被 `resolve_bare_tiered_model_route` 二次篡改为 `tiered`/`medium` 的缺陷；默认档位翻转为 High 优先，上游 503 `MODEL_CAPACITY_EXHAUSTED` 时原地升档自愈。
+            -   **旧版模型硬下线与先映射后判定**: Claude 3.x / < 4.6 与 Gemini 2.x 硬门禁（生图族独立豁免），并锁定「先映射后判定」顺序，允许旧名作为入站别名指向合规模型。(Ref #3815)
+            -   **号池自适应暗路由**: 删除 `CLAUDE_TO_GEMINI` 静态硬编码，新增 `auto:gemini-flash-low` / `auto:claude-opus` / `auto:claude-opus-4-7` 自适应目标，依据实时正配额在 Opus 5.5 / 4.6 / 4.7 间择优降级；`custom_mapping` 与 `custom_mapping_expose` 解耦并引入 `builtin_mapping_version` 无感迁移。(Fixes #2065, PR #3787, Thanks to @cubelikeplayDaniel)
+            -   **上游物理模型收敛**: 移除 `modelVersion` 覆写 `upstream_model` 的逻辑（上游内部构件名会污染已仲裁好的路由结果），统一以各协议 `X-Upstream-Model` 为唯一权威源。(Ref #3658, #3654)
+            -   **官方思考迁移对齐**: `thinkingLevel` 优先、`thinkingBudget` 兜底，出站指纹校准至 2.28.0 / CL 1008300195，列表与一键配置仅暴露账号真实可用模型。(Ref #3751)
+        -   **[多模态自愈与保鲜滑窗：坏图就地修复、Responses 协议补齐] (Fixes #3758, #3824, #3756, PR #3759, PR #3830)**:
+            -   **坏图 400 就地自愈**: 识别 `400 Unable to process input image` 后不锁号、不解绑粘性以保护 Prefix Cache，原地替换结构化占位符并即时重试；单图场景写入 SHA-256 至 `ImageBlacklist`（FIFO 上限 2000）持久免疫，多图场景仅做当轮替换防误杀。(Fixes #3758, PR #3759, Thanks to @cubelikeplayDaniel)
+            -   **多模态保鲜滑窗默认开启**: `enable_sliding_window = true`、默认保留最新 5 张图；开启滑窗时豁免网关入口多图硬拦截，交由管线裁剪，避免 Codex 长对话误杀。(Fixes #3824)
+            -   **Responses 协议补齐**: 简要日志对 `input_image` / Data URL / `function_call_output` 递归 Base64 脱敏，Token 估算器新增 Responses 分支与视觉 Token 折算。(PR #3830, Thanks to @mclinyeshi)
+            -   **生图看门狗放宽与空图诊断**: 首选端点 90s、备选 45s、总预算 135s；新增协议无关的空图诊断提取器，上游 200 但无图不再视为假成功。(Fixes #3756)
+            -   **Cowork 自动压缩对齐**: 移除 1M 模型一刀切豁免与工具轮次阻断，按 `effective_threshold` 精准触发，并补齐 10 次双轨对照实验矩阵单测。(Fixes #3821, PR #3835, PR #3836, Thanks to @cubelikeplayDaniel)
+        -   **[提示词清洗分轨与入站安全加固] (Fixes #3764, #3781, Ref #425, #146, PR #3746)**:
+            -   **清洗轨道收敛为 System / Content / Anchored**: 当前轮只清洗 `<system*>` / `<identity*>` 标签内部，标签外用户正文逐字保留，单轮翻译、校对、代码审计不再被改写为官方身份；注入区边界按「最后一条 user 消息的最后一个 text part」裁定。(Fixes #3764)
+            -   **身份正则双重防护与多轮幂等**: 桥接段不跨行，新增疑问句与跨子句连词豁免，保护 `compute_prefix_hash` 的前缀稳定性与 Prompt Caching。(Fixes #3764)
+            -   **CTF / 安全策略自适应剥离**: 在 System 轨与全文本轨正则剥离注入的 CTF/安全免责声明，代码块深度隔离，空 Part 自动剔除、空 `systemInstruction` 物理注销。(Fixes #3781)
+            -   **Gzip 入站解压**: 挂载 `RequestDecompressionLayer`，置于 `auth` 之后（防解压炸弹）、`monitor` 之前（保证审计拿到真实明文）。(Ref #425, #146, PR #3746, Thanks to @cubelikeplayDaniel)
+        -   **[账号体系与企业接入：GCP Vertex AI、IDE 2.6.0 切号、多条链路一致性] (Fixes #3823, #3829, #3806, #3802, #3791, #3754)**:
+            -   **GCP / Vertex AI 企业账号支持**: 对齐官方企业客户端凭据体系，支持 `antigravity_gcp` 独立注册与动态鉴权；账号详情新增 Project ID 查看/修改与「自动获取」（`loadCodeAssist` 嗅探 `cloudaicompanionProject`，超时 3s→12s 并接入全局代理池），修复普通账号被误标 `ENTERPRISE` 的判据。(Fixes #3823)
+            -   **Antigravity IDE 2.6.0+ 切号**: SQLite `state.vscdb` + 系统 Keyring + 文件三级双写，字段对齐 `expires_in` / `id_token_email`；进程身份判定收敛为 `classify_process` 单一入口，只认可执行文件名/路径，杜绝 `taskkill /F /T` 误杀 VS Code；孤儿 `agy` 语言服务按目标隔离清理。(Fixes #3762, #3770, #3778, #3829, Thanks to @modded-soldier-9, @fuyangtian2003-beep)
+            -   **经典版切号补全**: 统一写入 `jetski-standalone-oauth-token` 本地降级凭据，并原子备份 + 双写 `state.vscdb`。(Fixes #3829)
+            -   **账号删除一致性**: 调度池以 `accounts.json` 索引为唯一准入清单，孤儿凭据文件只告警不删；删除流程失败点前置（索引先落盘再删文件）。(Fixes #3806, Thanks to @cubelikeplayDaniel, @dnmdngcsb)
+            -   **Web / Docker 链路**: OAuth 修复（禁止重复 Prepare、内置客户端强制 loopback 回退、换码失败主动清理脏状态、手动输入弹性解析）；新增「记住登录凭据」；更新设置接口改为局部补丁合并，修复返回 400 与通道被重置。(Fixes #3802, #3791, #3754, Thanks to @cubelikeplayDaniel, @dandelion-promise520)
+            -   **DeepSeek Harness 一键同步**: 覆盖 macOS / Windows / Linux，写入 `cordis.patch.yml` 与 `.credentials.yaml`，CLI 新增 `antigravity-tools sync`；移除 lookahead 正则改用纯文本分块状态机，根治 Regex panic。(PR #3761, Thanks to @wakeupnotfound)
+        -   **[平台稳定性：Linux 远程桌面保活、macOS Mini 视窗、界面缩放] (Fixes #3752, #3757, #3744, Ref #3748, PR #3766)**:
+            -   **Linux X11/xrdp 保活**: 挂载 `XSetIOErrorHandler` 并重构 `_exit` 线程级隔离，远程桌面断开不再秒杀 8045 反代；GTK 托盘菜单调度至主线程；xrdp / VNC 环境自动启用 WebKit 软件渲染。(Fixes #3752, #3757, Thanks to @hazerwin)
+            -   **macOS Mini 视窗**: `switch_to_main_window` 统一回到原生主线程，Mini 唤起统一 `Accessory` 策略，消除前台级联跳出与跨线程死锁；底部 CSS 阴影改为原生圆角。(Fixes #3744, Ref #3748)
+            -   **界面与字体缩放**: 桌面端 `webview.setZoom()`、Web/CSS zoom 回退，支持 `Cmd/Ctrl + = / - / 0` 与 85%~150% 档位，Mini 双重守卫隔离缩放。(PR #3766, Thanks to @nicolastinkl)
+            -   **托盘与交互**: 托盘左键行为偏好 `tray_click_action`、5px 超细滚动条移入渐显、APIKEY.FUN 双 11 临时活动标签（含 `bump-version` 到期自动提醒）。(Ref #3748)
+        -   **[性能与可观测性：工具签名缓存重构、Token 双视角统计、QoS 死锁修复] (PR #3765, PR #3774, Fixes #3810, #3749, #3783)**:
+            -   **工具签名缓存重构**: L1 由 `Mutex<HashMap>` 改 `DashMap` 分片、容量 500→10000；新增 `ag-tool-sig-writer` 后台线程（有界队列 + 单事务 512 条）与 `PERSIST_SEQ` 双层水位防脏签名复活；读路径批量 `IN` 查询 + 4 条只读连接池；新增 `CacheProfile` 按 CPU/内存/部署形态自适应。(PR #3765, PR #3774, Thanks to @zepeng-jin)
+            -   **Token 统计双视角 + TTFT**: `token_usage` 新增 `requested_model` / `ttft_ms`，区分「实际路由模型」与「请求模型」并自动迁移历史数据；总览、深度洞察与经典看板全量集成首字延迟，控制栏极简重构。(Fixes #3810)
+            -   **QoS 修复与开关**: 修复到期巡检 DashMap 同线程读写自死锁（两阶段读取 + 置换）；新增 `qos_auto_jail`（默认关闭），关闭时清零全池小黑屋并跳过 Strike 判定。(Fixes #3749, #3783, Thanks to @TakimotoUki)
+            -   **真实 TTFT 闭环**: `StreamTtftCapture` 在流结束后回填生效端点的纯净首包耗时，前端拦截 `<= 0` 防负数展示；Gemini 流中断透传 `finishMessage` 与 `gatewayError` 真实原因。(Fixes #3813)
+        -   **[调度粘性与 3P 配额治理] (Fixes #3789, #3809, #3795, #3750, #3797)**:
+            -   **多智能体根会话归一化**: `extract_root_session_id` 裁剪 `:step:N` / `:agent:...` / `--step-N` 等派生后缀，粘性键归拢到根会话；新增 `AffinityScope::ApiKey` 凭据级强粘性（环境变量 `ANTIGRAVITY_SCHEDULING_AFFINITY_SCOPE`）。(Fixes #3789)
+            -   **3P 幽灵配额治理**: 无 Claude/GPT 授权时主动剥离通用 3P 配额组，前端渲染 `-` 占位，消除虚假 100% 满额；配额刷新默认间隔 15→10 分钟。(Fixes #3809)
+            -   **Argon / Ultra 收敛**: 统一 `hasAccountArgonCapability` 与 `checkArgonEligibility` 判据，Ultra 合法继承 Gemini 通用配额池，修复调度 503 与徽章隐藏。(Fixes #3750)
+            -   **Hub 指纹与门禁诊断**: 官方 Hub 指纹升级至 2.28.0 / CL 1008300195 并支持 Headless 异步探测；补齐 12 语种网关错误诊断与设置保存修复。(Fixes #3797, Ref #3750)
+        -   **[发布说明] (Ref #3845)**: 本版为 5.0.3 预发布线（`beta.0` ~ `beta.5`）的正式转正，功能与此前 beta 完全一致；`v5.0.3-beta.4` 因发布流水线 GitHub API 瞬时 500 未产出 Release，其修复已随后续版本交付。感谢本轮全部贡献者：@cubelikeplayDaniel、@mclinyeshi、@modded-soldier-9、@zepeng-jin、@fuyangtian2003-beep、@wakeupnotfound、@wthsama、@nicolastinkl、@hazerwin、@ddmixi、@dandelion-promise520、@dnmdngcsb、@EricZhou05、@Ran-Xing、@TakimotoUki、@W2514、@lbjlaq。
+
+    *   **v5.0.3-beta.5 (2026-11-06)**:
+        -   **[解耦客观物理配额耗尽与自适应熔断，增加单请求重试账号排除] (PR #3845, Thanks to @cubelikeplayDaniel)**:
+            -   **物理事实优先于自适应策略**: 将「上游告知的配额耗尽」与「自适应熔断退避开关」彻底解耦。此前熔断关闭时，`if !config.enabled { return; }` 位于配额判据之前，导致 Google 明确返回 `Individual quota reached` 时信号被丢弃——账号配额不会置 0% 也不会锁定。现确立不变式：账号已被上游告知配额耗尽是客观物理事实，绝不受熔断开关影响。(PR #3845, Thanks to @cubelikeplayDaniel)
+            -   **重试循环引入账号排除机制**: 修复多轮重试锤击同一耗尽账号的问题。此前 `get_token` 传入空的 `excluded_accounts`，P2C 可能因历史配额权重再次选中刚 429 的账号。现各协议重试循环维护 `attempted_accounts` 并传入 `get_token_filtered`，全池遍历后快速失败。(PR #3845, Thanks to @cubelikeplayDaniel)
+            -   **熔断关闭时不再旁路实时锁定**: 新增 `is_quota_exhausted_or_explicit_limited`，即使熔断关闭也能正确拦截处于 `QuotaExhausted` 状态的账号。
+            -   **前端熔断默认值修正**: `circuit_breaker` 初始默认改为 `enabled: true`，避免用户在设置页点击保存时意外关闭熔断器。(PR #3845, Thanks to @cubelikeplayDaniel)
+        -   **[修复 beta.4 发布流水线失败] (Ref #3845)**:
+            -   **问题背景**: beta.4 的 Release 流水线在 `publish-release` 步骤遭遇 GitHub API 瞬时 500 错误（其余 10 个构建作业均成功），导致 Release 对象未创建、`updater.json` 缺失，用户无法感知该版本。
+            -   **修复方式**: 删除悬空的 `v5.0.3-beta.4` tag，直接发布 beta.5，将 PR #3845 的修复与 beta.3 以来的全部改动一并交付。
+
+    *   **v5.0.3-beta.4 (2026-11-05)**:
+        -   **[重新发布：修复 beta.3 自动更新失效] (Ref #3840)**:
+            -   **问题背景**: beta.3 发布后因补充 `cargo fmt` 格式修复而重指 tag，导致 Release 流水线对同一 tag 二次构建并覆盖产物，签名随之变化。已安装 beta.3 的客户端会因签名不匹配而无法原地更新，降级为跳转下载。
+            -   **修复方式**: 发布 beta.4 新版本号，使存量用户走正常版本升级路径，自动更新恢复正常。功能上 beta.4 与 beta.3 完全一致，仅含 rustfmt 格式修正。
+            -   **配套保证**: 本次已确认 CI（含 `cargo fmt --check`）全部通过后再打 tag，避免重复覆盖。
+
+    *   **v5.0.3-beta.3 (2026-11-05)**:
+        -   **[根治 503 归因污染与配额假死：重构配额大桶调度、自定义映射优先级与超时契约] (Fixes #3838, #3841, Ref #3821, #3827, #3840)**:
+            -   **根除 503 归因污染（占全量 5xx 的 92.6%）**: 统一收敛网关内部限流判据至 `policy::is_internal_gateway_exhaustion` 单一权威源，补全此前漏判的 `All accounts rate-limited`（旧列表只写 `all accounts limited`，导致本地账号池限流被误报为上游 503）；同步收敛 `rate_limit.rs` 与 `token_manager.rs` 中另两处独立漂移的判据实现。(Fixes #3838)
+            -   **新增 403 封禁专用归因**: 为 `TOS_VIOLATION` / `PERMISSION_DENIED` 新增 `account_forbidden` 错误码与 12 语言文案，账号封禁不再被 403→503 映射后与容量枯竭混淆。(Fixes #3838)
+            -   **配额诊断升级为采信上游权威信号**: 新增 L1 上游 `quotaResetTimeStamp` 优先锁定，四类配额桶（Argon 独立桶 / Ultra 共享大桶 / 普通 Gemini 大桶 / 3P 桶）耗尽时直接采信官方恢复时刻，比本地推算更可靠且不受上游改文案影响；`is_quota_depleted_signal` 统一判据大小写不敏感，保留 `check quota` 作为 1.5% 木桶触发入口并显式排除 TPM 瞬态限流（避免全池级联锁定，Fixes #3506）。(Fixes #3841)
+            -   **锁定源按硬配额优先排序**: 桶判据由「仅 weekly」放宽为「命中分组内任意桶 ≤ 1.5%」，weekly 耗尽则锁 weekly reset，仅当 weekly 健康、只有 5h 耗尽时才锁 5h 短周期——既避免 5h 一恢复就去试而 weekly 仍为 0 造成反复调度，也避免把几十分钟可恢复的账号锁上一整天。
+            -   **修复配额假满额盲区**: 处理上游对已耗尽模型直接省略 `remainingFraction` 的场景（原先 `unwrap_or(100)` 会读成满额），并在优先账号、会话粘性与 60s 复用窗口统一采用多键容错配额匹配。
+            -   **配额调度闭环**: 封堵全池 0 配额裸奔放行漏洞；修复 `accounts_with_positive_quota` 的 3P 路径缺 `available_models` 兜底导致单个 3P 模型 0% 就让整池命中 502 `no quota accounts` 门禁的问题；100% 原样透传上游配额到期 429 响应，禁止网关改写。
+            -   **消除 0 配额高优账号饥饿全池（优先级倒置死锁）**: 将 `select_with_p2c` 的配额过滤前置于优先级收敛，确立不变式「优先级只在具备该模型有效正配额的健康账号之间竞争」。修复蹬额度模式把临期账号设为 `priority=1` 后，该账号配额归零且空闲时会把其他满额账号剔除、进而 `return None` 报「无可用账号」的严重缺陷。(Ref #3840)
+            -   **模型路由：确立用户自定义映射最高优先级**: 自定义映射提升至物理最前位，高于官方热更新淘汰重定向；修复映射命中后被后置 `resolve_bare_tiered_model_route` 二次篡改为 `tiered`/`medium` 的缺陷；默认档位选择器翻转为 High 优先（实测 medium/tiered 在上游处于容量枯竭状态）；新增上游 503 `MODEL_CAPACITY_EXHAUSTED` 原地升档 High 自愈能力。
+            -   **超时契约：解除硬截断，前后端闭环**: 废除 135s/160s 超时硬编码截断（该值低于 medium 实测 p90 130.9s，会把本可成功的慢长请求反向判为 504 并引发重试风暴）；首字基准恢复 180s、多模态上限放宽至 270s；打通前端大请求体重放门限配置，消除后端硬编码 4MB 与前端 8MB 的双轨漂移。
+        -   **[蹬额度模式重构为最高调度优先级] (PR #3840, Thanks to @zepeng-jin)**:
+            -   **解除暴力禁用，改为优先级竞争**: 激活蹬额度模式时不再通过 `proxy_disabled = true` 挂起其他账号，改为把临期账号调度优先级提升至 `1`（默认 50）。彻底消除三重症结：既有会话因强制 Failover 导致 Prompt Caching 击穿、多并发压在唯一账号上触发 429、以及账号实体级禁用造成跨模型误伤。(PR #3840, Thanks to @zepeng-jin)
+            -   **并发弹性保底**: 老会话继续留在已绑定账号以保住缓存，新会话 100% 优先消耗临期账号，并发流量自动外溢至其他空闲账号。
+            -   **平滑自动恢复**: 待蹬账号周配额全部消耗（0%）或到达重置时间后，按 `originalPriorities` 精准恢复初始优先级；并保留旧版本残留挂起状态的容错清理逻辑。(PR #3840, Thanks to @zepeng-jin)
+
+    *   **v5.0.3-beta.2 (2026-11-04)**:
+        -   **[主端点偶发抖动沙箱降级抢占导致的端点毒化修复] (Fixes #3827, PR #3833, Thanks to @modded-soldier-9)**:
+            -   **沙箱端点隔离与防抢占排序**: 在上游端点调度中引入沙箱端点探测与分区保护机制，确保 `daily-cloudcode-pa.sandbox.googleapis.com` 永不因统计权重抢占 Daily 主端点，根除跨区 IP 触发 400（User location is not supported）后导致的整号熔断与 504 误判问题。(Fixes #3827, PR #3833, Thanks to @modded-soldier-9)
+            -   **沙箱 400 容错与长冷却降级**: 沙箱端点返回 400 时允许继续轮询下一个健康端点，并自动施加至少 300 秒长冷却惩罚，避免次级端点连续抖动。
+        -   **[经典版一键切号遗漏本地降级凭据及状态双写修复] (Fixes #3829, PR #3834, Thanks to @modded-soldier-9)**:
+            -   **经典版与 IDE 凭据双写平权**: 修复在 Antigravity 经典版（`classic`）下一键切号后重启客户端再次提示需登录认证的问题；统一经典版与 IDE 版的本地降级凭据（`jetski-standalone-oauth-token`）写入逻辑。(Fixes #3829, PR #3834, Thanks to @modded-soldier-9)
+            -   **本地 SQLite 状态安全双写与原子备份**: 若经典版用户数据目录中存在 `state.vscdb`，执行原子备份并在数据库中安全注入 token 与 `serviceMachineId`，实现状态严格双写。
+        -   **[企业与 GCP Vertex AI Project ID 智能绑定与一键自动获取] (Fixes #3823)**:
+            -   **GCP Project ID 可视化管理与持久化**: 在账号详情弹窗中新增 Project ID 设置项，支持为企业及 GCP 账号查看、手动配置或更换绑定的 Google Cloud 项目 ID，并原子更新至账号凭据存储与代理调度器。
+            -   **一键自动请求获取 Project ID**: 新增 `auto_fetch_account_project_id` 命令与前端「自动获取」按钮，调用上游 `loadCodeAssist` 自动嗅探并关联账号真实的 `cloudaicompanionProject`，极大简化企业账号接入流程。
+            -   **健壮的代理池链路与超时优化**: 优化 Project ID 获取逻辑，将原 3 秒过短硬编码超时放宽至 12 秒，并全面接入全局代理池（`ProxyPool`），确保网络抖动与跨国出口代理环境下 100% 稳定解析。
+            -   **等级识别精准校准**: 修复企业号识别中误将内置标准客户端（`antigravity_enterprise`）或历史遗留 `is_gcp_tos` 脏标记当作企业号导致普通账号被误标为 `ENTERPRISE` 的缺陷，严格按官方 `antigravity_gcp` 客户端及权威套餐返回收敛。
+            -   **12 种主流语言多语言补齐**: 为 Project ID 字段、提示说明与自动获取状态（获取中/成功/失败）补齐了中英日繁韩西葡俄土越阿缅等全量 12 种语言本地化翻译。
+        -   **[修复 Responses 协议多模态滑窗入口误杀、简要日志脱敏与 Token 估算] (PR #3830, Thanks to @mclinyeshi)**:
+            -   **滑窗启用时豁免入口多图硬拦截**: 修复在开启多模态滑动窗口（`enable_sliding_window = true`）时，网关入口因未裁剪的历史累计图片超过 32MB 硬上限而提前返回 400 阻断的缺陷；现在开启滑窗时安全放行累积历史图片（单张 >20MB 校验仍然生效），统一交由后续管线滑动窗口执行裁剪，避免 Codex 等多模态 Agent 长对话误杀。(PR #3830, Thanks to @mclinyeshi)
+            -   **补齐 Responses 简要日志 Base64 脱敏**: 在简要日志（simple）审计模式下，对 `/v1/responses` 的 `input_image`、内联 Data URL 以及工具输出（`function_call_output`）递归执行 Base64 占位脱敏（`[base64 image: xxx bytes]`），彻底解决长程看图任务导致本地数据库膨胀与前端视图卡顿的问题。(PR #3830, Thanks to @mclinyeshi)
+            -   **补齐 Responses 协议视觉 Token 估算**: 在管线 Token 估算器中补齐 Responses 格式分支，正确识别多模态图片并按视觉 Token 标准统一折算，防止多模态请求 Token 估算失真影响管线超时预算。(PR #3830, Thanks to @mclinyeshi)
+        -   **[修复普通长文本对话误触发 Cowork 自动压缩与对照实验矩阵] (Fixes #3821, Ref #3826, PR #3835, PR #3836, Thanks to @cubelikeplayDaniel)**:
+            -   **对齐配置自愈门禁与工具轮次放行**: 移除 1M 模型一刀切硬豁免与工具中途阻断，确保包含工具返回的真实 Cowork 会话在超限时能够按配置的有效阈值（`effective_threshold`）精准触发自愈压缩；修复大请求体上传预算计算中的首字节倒扣截断缺陷。(Fixes #3821, Ref #3826, PR #3835, Thanks to @cubelikeplayDaniel)
+            -   **全链路 10 次双轨对照实验矩阵**: 新增 `test_cowork_10_control_experiment_matrix` 单元测试，全面覆盖 5 次超大截断与 5 次安全放行矩阵，保障 Cowork 门禁与配置阈值契约一致性。(Fixes #3821, Ref #3826, PR #3836, Thanks to @cubelikeplayDaniel)
+
+    *   **v5.0.3-beta.1 (2026-11-04)**:
+        -   **[官方 GCP Vertex AI 企业账号支持与多协议凭据自适应隔离] (Fixes #3823)**:
+            -   **对齐官方 GCP 企业客户端凭据**: 深度逆向对齐官方 Antigravity 应用的 GCP / Vertex AI 企业授权协议架构，引入官方企业客户端（`884354919052-...`）及密钥体系，支持通过 `antigravity_gcp` 独立注册与动态鉴权，彻底解决企业组织账号授权后被误判为 Free Tier 或缺失 Vertex AI 项目配额的缺陷。(Fixes #3823)
+            -   **存量凭据数据严格向下兼容**: 账号凭据严格通过 `token.oauth_client_key` 与 `is_gcp_tos` 区分；存量使用个人版官方客户端授权的自定义域名企业邮箱（如 `@imsot.org`）100% 保持个人模式平滑刷新，杜绝因仅凭邮箱后缀切换客户端导致 Google 报 `400 invalid_grant` 的风险。
+            -   **添加账号全模式多语言支持**: 重构前端添加账号弹窗，将“个人账号 (Personal)”与“企业 / GCP (Vertex AI)”账号类型切换器提升至公共顶层区域，统一覆盖 OAuth 授权、Refresh Token 批量录入及本地 DB 导入全场景；并同步补齐了中英日繁韩西葡俄土越阿缅等 12 种主流语言的完整本地化翻译。(Fixes #3823)
+            -   **IDE 状态数据库与自适应刷新注入**: 在向本地 Antigravity IDE 数据库（`state.vscdb`）注入凭据时，根据客户端类型精准控制 Protobuf Field 6（`is_gcp_tos`）与 Vertex AI 项目映射；刷新机制自适应账号所属凭据类型，杜绝跨模式客户端混用。
+        -   **[修复免打扰模式开机自启仍弹出界面与自启状态同步] (Fixes #3820, Thanks to @W2514)**:
+            -   **启动项参数防御性模糊匹配**: 修复部分 Windows 启动项（注册表或快捷方式/任务计划）拼接参数或带引号导致启动入参无法被 `== "--minimized"` 精准全等匹配、从而错将开机自启识别为普通前台启动而弹出主窗口的缺陷；增强入参检测逻辑支持模糊包含匹配（`lower.contains("--minimized") || lower.contains("--silent") || lower.contains("--hidden")`），确保免打扰启动 100% 稳定留在系统托盘。(Fixes #3820, Thanks to @W2514)
+            -   **开机自启动配置状态原子同步**: 在 `toggle_auto_launch` 注册/注销系统自启动项时，同步将 `config.auto_launch` 原子持久化写入应用配置文件，消除前端界面配置与底层操作系统注册表之间的状态脱节。(Fixes #3820)
+        -   **[多模态保鲜滑窗默认启用与风控 403 粘性熔断自动禁用] (Fixes #3824)**:
+            -   **对齐官方多模态保鲜滑窗规范**: 深度逆向对齐官方 Antigravity 应用的旧图清理与尺寸收敛机制，将网关的多模态保鲜滑动窗口设为默认开启（`enable_sliding_window = true`），默认保留最新 5 张图片（`max_fresh_images = 5`）；彻底杜绝在长对话中多轮历史图片累积导致请求体线性膨胀至数兆、引发上传堵塞及 504 Gateway Timeout 的硬伤。(Fixes #3824)
+            -   **上传速度自适应基准放宽**: 将默认最低上传带宽基准由 2.0 Mbps 宽限至 0.8 Mbps，增强慢速代理与复杂跨国网络环境下大图与附件上传的预算容忍度。
+            -   **403 人机验证阻断全链熔断与解绑**: 修复遇到 Google `VALIDATION_REQUIRED` 人机验证挑战时，粘性会话与调度快照未做阻断校验导致客户端多次重试死锁在同一故障账号的缺陷；现在检测到人机验证阻断后，立即强制解除会话粘性绑定（`session_accounts.remove`），并在快照生成与固定账号选择中无缝降级迁移至池中健康账号。
+            -   **403 自动触发禁用反代**: 发生 403 验证阻断时，同步调用 `toggle_proxy_status` 将账号标记为 `proxy_disabled = true`，使账号即刻在前端直观呈现停用状态并彻底退出反代调度池。
+        -   **[网关超时全链路预算安全截断与终态会话粘性解绑] (Fixes #3821, Thanks to @jeikl, @cubelikeplayDaniel)**:
+            -   **客户端安全超时绝对硬顶**: 引入 `MAX_CLIENT_SAFE_TOTAL_BUDGET_SECS = 160s` 全链路安全硬上限；解决此前长文本结合多模态增量与多端点重试时总预算累加膨胀至 190s~256s 击穿下游客户端（如 JeikCode）180s 内置看门狗导致连接被强行切断为 canceled 孤儿请求的问题，为客户端看门狗预留出至少 20s 的安全缓冲，确保网关永远早于客户端吐出标准的结构化 504 响应。(Fixes #3821, Thanks to @jeikl, @cubelikeplayDaniel)
+            -   **首字预算基准与媒体上限压制**: 将上游首字节等待预算基准 `MAX_FIRST_BYTE_BUDGET_SECS` 压制至 135s，媒体增量上限 `MAX_FIRST_BYTE_CEILING_SECS` 压制至 145s；200k+ 超大上下文自适应 TTFT 下限同步对齐至 135s。(Fixes #3821, Thanks to @jeikl)
+            -   **主端点首字节宽限免预留扣减**: 修正 `reserve_for_fallback` 逻辑，仅在备用端点（`idx > 0`）尝试时预扣 1/3 预算，首选主端点（`idx == 0`）享有完整的首字节生成时间，兑现长上下文与深度思考模型的生成宽限初衷。(Fixes #3821, Thanks to @jeikl)
+            -   **终态全量解绑会话粘性**: 扩展 `pipeline::terminal::TerminalDisposition`，将 `FirstByte`、`Upload` 与 `GlobalBudget` 终态全部纳入 `abandon_sticky_account`；上游排队超时或上传网络停滞中断时，立即解除当前会话对该账号的强绑定，使客户端下一次重试自动切换到号池中的健康账号，彻底消除卡在同一慢账号死循环等满多轮 3 分钟的死锁。(Fixes #3821, Thanks to @jeikl, @cubelikeplayDaniel)
+            -   **阶段耗尽口径纠正与流式静默夹持**: 修正 `send_with_phased_budget` 中的超时判定，上传完成后的超时精准归类为 `stage=await_first_byte`；`StreamLifecycleConfig` 中的 `transition_secs` 与 `streaming_sliding_secs` 同样受限于全局请求剩余预算，杜绝流内静默越界。(Fixes #3821, Thanks to @jeikl)
+            -   **单元测试与验证全绿**: 补齐并更新 terminal 粘性解绑断言与 client 预算包线单测，`terminal::tests` 6/6 通过，`client::tests` 17/17 全部通过。(Fixes #3821)
+
+    *   **v5.0.3-beta.0 (2026-11-03)**:
+        -   **[四协议流式生命周期统一：Codex/Legacy 接入流水线，Gemini 补齐思考阶段] (Ref #3816, PR #3817, Thanks to @cubelikeplayDaniel)**:
+            -   **Codex / Legacy 收敛至统一生命周期**: 将 `create_codex_sse_stream` 与 `create_legacy_sse_stream` 由手写 `select!` 驱动改为 `ProtocolStreamHandler` 适配器，统一交由 `run_stream_lifecycle` 接管 3s 心跳、首字宽限、思考/正文阶段跃迁、稳态滑动超时与异常收尾；删除两套重复的 phase 状态机与超时分支，保留 Responses 事件流、`text_completion` 帧、工具调用缓存、grounding 引文与会话落盘 ack 语义。(Ref #3816, PR #3817, Thanks to @cubelikeplayDaniel)
+            -   **流水线通用终止钩子**: 新增 `emit_error_finalize`、`finalize_without_content` 与 `finalize_barrier` 三个可选钩子，使 Codex 的 `error + response.failed`、Legacy 的错误帧 + 单次 `[DONE]`、思考-only EOF 的 `response.incomplete` 以及落盘成功后再下发 `response.completed` 等协议契约在接入流水线后保持完全一致。(Ref #3816, PR #3817)
+            -   **Gemini 思考阶段补齐**: 为 `GeminiStreamHandler` 增加 `is_thinking_active` 状态，思考块、正文、工具调用与 `finishReason` 可正确驱动 `InitialTtft → Thinking → Streaming/Transition` 阶段机，避免思考期被误判为过渡断崖。(Ref #3816, PR #3817)
+            -   **回归测试覆盖**: 新增 Legacy 正常收尾/异常中断单次 `[DONE]` 用例与 Gemini 思考阶段迁移用例；OpenAI 22 项、Gemini 6 项、流水线生命周期 10 项定向测试全部通过。(Ref #3816, PR #3817)
+
+    *   **v5.0.2-beta.9 (2026-11-03)**:
+        -   **[Codex / Responses 流式过渡断崖自适应跃迁与首字超时预算扩容] (Fixes #3816, PR #3817, Thanks to @mclinyeshi, @cubelikeplayDaniel)**:
+            -   **过渡断崖自适应跃迁与心跳保活**: 修复 Codex Desktop 调用 `gemini-4-argon-high` 等深思考模型在输出思考块后，上游整包缓冲巨型 `functionCall`（如复杂代码或思维导图文件）引发长静默时，网关单方面在 120 秒稳态超时截断连接导致 HTTP 200 无输出并触发客户端频繁重连的硬伤；为 `create_codex_sse_stream` 与 `create_legacy_sse_stream` 引入状态机阶段追踪，在检测到思考或前导文本后的长静默时自动跃迁至 `Transition` 阶段，赋予独立的 `transition_secs` (180s) 宽限期并持续发送 `: ping\n\n` 保活连接，给予上游充足时间完成巨型工具调用的整包生成。(Fixes #3816, PR #3817, Thanks to @mclinyeshi, @cubelikeplayDaniel)
+            -   **首字节预算硬上限扩容**: 将上游首字节等待预算基准硬上限 `MAX_FIRST_BYTE_BUDGET_SECS` 由 150 秒提升至 180 秒，避免超大上下文 Prefill 且首选端点排队时过早耗尽首字预算触发多端点重传放大并在最后抛出 504 Gateway Timeout。(Fixes #3816, PR #3817, Thanks to @mclinyeshi, @cubelikeplayDaniel)
+            -   **回归测试覆盖**: 补齐 `test_codex_stream_survives_transition_cliff_after_thinking` 单元测试，模拟思考后上游长静默整包下发工具调用场景，确保流式驱动器成功跃迁并完整交付 `response.completed`。(PR #3817, Thanks to @cubelikeplayDaniel)
+
+    *   **v5.0.2-beta.8 (2026-11-02)**:
+        -   **[3P 配额解耦与无授权留空，杜绝虚假满额与幽灵配额] (Fixes #3809, Ref #3811, PR #3812, Thanks to @cubelikeplayDaniel)**:
+            -   **前端能力准入留空**: 在 `getGroupQuotaSummaries` 中增加实际授权模型校验，账号在 Claude / 3P 分组下无任何可用模型时返回空值，驱动配额卡片统一渲染占位符 `-`，消除上游空转配额组造成的虚假 100% 满额；大盘均值、短板提取与 5H 最优账号推荐同步跳过无 3P 能力账号，全池无可用账号时安全展示 `-` 而非报错。(Fixes #3809, PR #3812, Thanks to @cubelikeplayDaniel)
+            -   **后端幽灵配额隔离**: `fetch_quota_with_cache` 在账号实际可用模型不含任何 Claude / GPT 模型时主动剥离通用 3P 配额组；`Account::update_quota` 增加历史防御清理，避免旧数据反序列化复活虚假配额；`token_manager` 配额桶事件同步校验真实授权，杜绝幽灵数据向下游广播。(Fixes #3809, Ref #3811, PR #3812, Thanks to @cubelikeplayDaniel)
+            -   **回归测试覆盖**: 新增前端 `claudeQuotaSanitize` 测试与 Rust `test_update_quota_purges_phantom_3p_groups_when_no_claude_or_gpt_models`，覆盖无 3P 模型留空、正常模型展示与纯禁用模型隔离。(PR #3812, Thanks to @cubelikeplayDaniel)
+        -   **[配额自动刷新默认间隔收敛至 10 分钟] (Fixes #3809, PR #3814, Thanks to @cubelikeplayDaniel)**:
+            -   **前后端默认值原子对齐**: 将全局 `AppConfig::new()` 与设置页表单状态的 `refresh_interval` 默认值由 15 分钟调整为 10 分钟，缩短配额消耗与窗口重置后的本地状态同步延迟。(Fixes #3809, PR #3814, Thanks to @cubelikeplayDaniel)
+        -   **[入站模型门禁文档口径更正与顺序回归测试] (Ref #3815)**:
+            -   **厘清已下线判定对象**: 更正 `is_retired_model_id` 文档——硬门禁作用于映射后的最终出站模型，已下线旧名允许作为入站别名键指向合规模型；同步补充 `downstream_exposed_models` 说明，别名经映射解析后即可放行，无需登记进门禁放行集合。(Ref #3815)
+            -   **锁定先映射后判定顺序**: 新增回归测试覆盖精确 / 点号规范化 / 通配符三条自定义别名路径，防止后续重构把已下线判定重新前置而误杀用户别名。(Ref #3815)
+
+    *   **v5.0.2-beta.7 (2026-11-02)**:
+        -   **[Gemini 原生流中断真实原因透传与异常 EOF 诊断完善] (Fixes #3813)**:
+            -   **透传官方标准 finishMessage 诊断**: 解决此前 Gemini 原生流在输出部分内容后发生连接中断（如 `error reading a body from connection` 或超时）时，合成收尾帧直接写死 `MAX_TOKENS`、掩盖真实错误导致下游客户端与用户误判为达到模型输出上限的问题；在接入错误报告后，在候选帧中注入 Google 官方标准字段 `finishMessage` 及结构化 `gatewayError` / `gatewayInterrupted: true`，在遵守零正文篡改契约、保全截断前生成内容的同时，如实告知中断类型与错误原文。(Fixes #3813)
+            -   **未下发 finishReason 异常提前 EOF 兜底**: 修复上游产生正文但未经正常 `finishReason: "STOP"` 下发即直接遭遇连接 EOF 导致下游静默断流、缺少完成标记的缺陷；在正常收尾钩子中增加未完成判定并自动补发带有明确提前截断提示的收尾诊断帧，若正常下发过完成标记则严格保持静默 EOF，不破坏尾部用量帧与多 candidate 兼容性。(Fixes #3813)
+        -   **[Token 统计双视角重构、首字耗时 (TTFT) 全看板集成与控制栏极简体验升级] (Fixes #3810)**:
+            -   **分模型统计双视角支持**: 解决分模型统计仅记录客户端原始模型导致昂贵路由模型（如 Fable 5、Opus 等）消耗被掩盖的问题；在 `ProxyRequestLog` 中引入 `effective_model()`，将 Token 统计划分为「实际路由模型」（真实配额/成本消耗）与「请求模型」（原始客户端调用）两个独立视角，User Token 用量同步对齐实际生效模型。(Fixes #3810)
+            -   **多看板首字耗时 (TTFT) 统计集成**: 在 `token_usage` 表引入 `ttft_ms REAL` 首字延迟字段，在网关响应首包或非流式完成时精准捕获毫秒级延迟；全面集成至所有统计视图：**总览看板（Cyber Cockpit）** 效能仪表展示实时全局 TTFT、模型榜单标注各模型首字响应速度；**深度洞察看板（Apple Bento）** 缓存效能卡片与主力模型榜展示平均首字延迟；**经典看板**独立指标卡片增加「首字延迟」卡片，并在底部**分模型详细统计表格**中增加「首字耗时」列。
+            -   **数据库与聚合接口向下兼容**: 在 `token_usage` 表动态新增 `requested_model` 与 `ttft_ms` 字段并建立专用索引；为后端 `get_token_stats_by_model` 及模型趋势接口扩充 `view_mode` 参数，采用 `COALESCE(NULLIF(requested_model, ''), model)` 动态聚合，保证两套维度互不干扰且完美兼容既有调用。(Fixes #3810)
+            -   **历史数据自动推断迁移与误差注意事项**: 应用启动时对旧版本未包含 `requested_model` 的历史记录执行一次性自动迁移；迁移时根据网关当前的统一路由规则将真实路由模型回填到 `model`，将原始记录模型留存至 `requested_model`。**注意：由于历史调用日志随时间滚动清理，旧数据的路由目标依据当前默认规则反推迁移，对于曾经自定义修改过映射规则或经历过复杂降级轮询的历史请求，迁移后可能存在微小归属偏差**；新产生的请求则全程由网关实时精准记录。(Fixes #3810)
+            -   **「日」分类周期校正与数据防混淆**: 修复此前「日」分类底层写死按 14 天统计导致历史旧数据被误合并呈现的缺陷，精确校准为按近 24 小时 / 当天进行精准日汇总；为各时间维度补充明确的 Tooltip 浮窗提示，彻底消除不同模块周期脱节与脏数据疑虑。
+            -   **极简控制栏重构与空间释放 (Minimalist UI)**: 移除页面顶部与全局导航 Tab 重叠冗余的「Token 消费统计」大标题区域，释放大量垂直空间；将原本独立平铺导致多行折断的分钟粒度（`1h / 24h`）无缝内联嵌入至「分钟」胶囊内部；将看板切换、模型视角、时间跨度、单价配置与刷新按功能分组收敛至同一平整控制栏，彻底消除常规窗口下的孤立断行与拥挤感。
+            -   **全量 12 语种国际化支持**: 同步补齐全部 12 种系统语言关于实际路由/请求模型、首字延迟 (TTFT) 以及各时间范围 Tooltip 提示的词条与上下文指引。(Fixes #3810)
+
+    *   **v5.0.2-beta.6 (2026-11-01)**:
+        -   **[账号删除一致性修复：已删除账号不再被反代调度，加载路径零副作用] (Fixes #3806, PR #3807, Thanks to @cubelikeplayDaniel, @dnmdngcsb)**:
+            -   **调度池以索引为准入白名单**: 反代加载账号池时以 `accounts.json` 为唯一准入清单，索引外的残留凭据文件只记录警告并跳过，彻底杜绝已删除账号（幽灵账号）被重新载入轮询、向失效账号派发请求导致 503 或大请求体下触发 `Cross-account replay cap reached` 的问题。(Fixes #3806, PR #3807, Thanks to @cubelikeplayDaniel, @dnmdngcsb)
+            -   **加载路径零副作用，杜绝凭据误删**: 孤儿文件不再在加载路径被物理删除，规避批量导入「文件已落盘、索引尚未提交」窗口期、以及仅从备份恢复 `accounts/` 目录时误删 refresh token 的不可逆风险；孤儿判定同时兼容文件 stem 与文件内 `id`，避免 `stem != id` 的历史文件被误判。(PR #3807, Thanks to @cubelikeplayDaniel, @dnmdngcsb)
+            -   **热重载与删除流程收敛**: `reload_account()` 对已不在索引中的账号仅从内存池卸载并返回成功，避免启用/禁用与配额刷新时向界面透传误报；`delete_account()` 改为失败点前置（索引先落盘、成功后再删除凭据文件，删除失败向上抛错），同时保留索引外孤儿文件的兜底清理能力；批量删除后立即热重载代理池，保证 Web/CLI 与桌面端行为一致。(PR #3807, Thanks to @cubelikeplayDaniel, @dnmdngcsb)
+            -   **回归测试覆盖**: 新增与调整账号删除、调度池加载单测，分别覆盖「孤儿文件保留在磁盘但不进入调度池」与「索引外残留文件仍可通过显式删除接口兜底清理」两种终态。(PR #3807, Thanks to @cubelikeplayDaniel, @dnmdngcsb)
+
+    *   **v5.0.2-beta.5 (2026-11-01)**:
+        -   **[Web/Docker 模式 OAuth 链路修复、状态防撕裂与回填同步闭环] (Fixes #3802, PR #3803, PR #3805, Thanks to @dandelion-promise520, @cubelikeplayDaniel)**:
+            -   **消除前端重复 Prepare 与状态撕裂**: 优化 `AddAccountDialog` 中 `handleOAuthWeb` 逻辑，优先复用已生成的授权 URL，禁止点击「开始授权」时二次触发 `prepare_oauth_url`；后端 `prepare_oauth_flow_manually` 增加状态幂等复用检查（同 client 与 redirect_uri 直接返回现有 URL），彻底解决双重请求导致后台全局 Flow 状态被重置覆盖、回调 code 掉入废弃通道的硬伤。(Fixes #3802, PR #3803, Thanks to @dandelion-promise520, @cubelikeplayDaniel)
+            -   **内置客户端防重定向失配拦截 (PR #3803)**: 在 `resolve_oauth_redirect_uri` 中增加 `is_builtin_oauth_client` 环回回退防御，当使用默认内置 Google OAuth 凭据时，即使用户配置了 `ABV_PUBLIC_URL` 也强制使用 `http://localhost:<port>/auth/callback`，彻底规避因公网/局域网域名未在上游控制台注册而触发的 Google 400 `redirect_uri_mismatch` 阻断。(PR #3803, Thanks to @cubelikeplayDaniel)
+            -   **换码失败主动清理脏状态闭环 (PR #3805)**: 在手动换码 `submit_oauth_code` 及 HTTP 回调 `handle_oauth_callback` 的兑换异常分支中补充主动调用 `cancel_oauth_flow()`，当 Google 报 `invalid_grant` 或 Code 过期时立即释放全局单例 Flow 状态；前端提交失败时自动清空本地 `oauthUrl` 缓存，彻底杜绝脏状态残留导致用户重试时因状态复用死锁。(PR #3805, Thanks to @cubelikeplayDaniel)
+            -   **手动回填 CSRF 双向核对与弹性解析 (PR #3803, PR #3805)**: 前端提交手动回填时，自动从预生成的 `oauthUrl` 中解析原始 `state` 作为 `fallbackState` 传给后端，避免仅回填裸 Code 时因丢失 state 导致 CSRF 防护被跳过；升级 `parse_manual_oauth_input` 智能解析引擎，全面兼容完整 URL、无 scheme 域名（`localhost:8045/...`）、已编码 `%2F` 与裸 Code，并拦截上游 `error=access_denied` 等拒绝响应。(Fixes #3802, PR #3803, PR #3805, Thanks to @dandelion-promise520, @cubelikeplayDaniel)
+            -   **Web 兑换透传客户端凭据与号池实时同步**: 移除原 Web 模式后台游离且丢弃了 client 的 `tokio::spawn` 异步任务；手动提交以及 Web 回调统一通过 flow 绑定的 `client_key` 调用 `exchange_code_with_client` 进行兑换，并在回调成功后主动调用 `token_manager.load_accounts()` 刷新内存与文件，彻底消除因客户端不匹配导致 Google 上游报 `invalid_grant: Bad Request` 的缺陷。(Fixes #3802, PR #3803, Thanks to @dandelion-promise520, @cubelikeplayDaniel)
+            -   **无头/Docker 远程部署交互与按键守护**: 在 Web 模式手动回填输入框上方新增上下文提示，明确解释因 Google Desktop OAuth 规范限制，授权后跳转至 `localhost` 显示连接拒绝属正常安全行为，引导用户直接复制地址栏完整 URL 粘贴提交；限制「我已授权，继续」按键仅在桌面端可用，避免 Web 模式下点击造成混淆。(Fixes #3802, PR #3803, Thanks to @dandelion-promise520, @cubelikeplayDaniel)
+
+    *   **v5.0.2-beta.4 (2026-11-01)**:
+        -   **[User-Agent 官方 Hub 指纹升级、多语种门禁诊断与设置保存修复] (Fixes #3797, Ref #3750, PR #3800, Thanks to @cubelikeplayDaniel)**:
+            -   **现代官方 Hub 指纹升级**: 将设置页默认 User-Agent 示例升级为标准 Hub 格式 `antigravity/hub/2.28.0 (aidev_client; os_type=windows; arch=amd64; cl=1008300195)`，彻底消除复制旧版示例导致丢失 Hub 签名、引发上游 404 与全池 503 保护性熔断的风险；开启覆盖开关时提供高亮警示并动态注入应用探测到的最新 Hub 版本。(Fixes #3797, Ref #3750, PR #3800, Thanks to @cubelikeplayDaniel)
+            -   **配置保存可靠性修复**: 修复保存配置时因状态重载导致 User-Agent 覆盖开关意外关闭或重置清空的生命周期问题，并移除保存时的阻断弹窗。(PR #3800, Thanks to @cubelikeplayDaniel)
+            -   **全量 12 语种网关诊断体系**: 构建覆盖全部 12 种系统语言的网关错误诊断字典，基于返回报文精准识别缺少 Hub 签名、指纹门禁拦截、全池账号挂起熔断以及上游连接超时中断，提供结构化 `gateway_error` 与排查指引。(PR #3800, Thanks to @cubelikeplayDaniel)
+            -   **日志详情面板全量国际化**: 补全三栏对比、Postman 风格视图切换、单行/折行切换、复制选项及请求头参数在 12 种语言下的翻译词条。(PR #3800, Thanks to @cubelikeplayDaniel)
+        -   **[Web/Docker 模式官方 Hub 指纹探测与更新感知对齐] (Ref #3797)**:
+            -   **Web 端 Hub 指纹与更新检测路由补齐**: 在后端 Axum 路由中补齐 `/api/system/hub/fingerprint`、`/api/system/hub/check-update`、`/api/system/hub/detect-fingerprint` 与 `/api/system/timeouts/effective-first-byte` 端点实现，解决 Web 模式无法读取指纹与首包延迟的缺陷；
+            -   **前端请求层映射对齐**: 规范修正 `src/utils/request.ts` 的 `COMMAND_MAPPING` 字典，使 Web 端在启动时能够及时收到官方 Hub 新版本提示 Toast，并在设置面板中完整支持出站指纹查看与主动探测。(Ref #3797)
+        -   **[Web/Docker 模式批量导入账号 HTTP 422 修复] (Fixes #3801, Thanks to @dandelion-promise520)**:
+            -   **双重请求体形态自适应**: 后端 `BatchImportPayload` 引入 `#[serde(untagged)]` 弹性适配，同时兼容前端 `invoke('batch_import_accounts', { entries })` 发送的对象包裹形态 `{"entries": [...]}` 与原生 API 的裸数组形态 `[...]`，彻底解决 Web/Docker 远程模式下导入账号 JSON 文件反序列化失败报 422 的缺陷，并配套自动化单元测试覆盖。(Fixes #3801, Thanks to @dandelion-promise520)
+
+    *   **v5.0.2-beta.3 (2026-11-01)**:
+        -   **[账号周配额临期「蹬额度模式」与自动熔断恢复] (Fixes #3795, PR #3796, Thanks to @cubelikeplayDaniel)**:
+            -   **临期智能识别与提醒**: 独立监测账号池中 Gemini 与 Claude 的周配额状态，当剩余配额 > 5% 且距官方重置不足 24 小时主动弹出提醒窗口；支持按模型家族持久化「不再提示 Gemini / Claude」，点击「暂不启动」后进入 2 小时静默冷却，避免高频打扰。(Fixes #3795, PR #3796, Thanks to @cubelikeplayDaniel)
+            -   **快照式挂起与精准恢复**: 启动蹬额度模式时自动创建前置状态快照，临时挂起其余非目标账号（`pedal_mode_locked`）将流量全力集中至临期账号；退出时仅恢复本次挂起的账号，严格保留用户原本主动禁用的账号，杜绝号池状态错乱。(Fixes #3795, PR #3796, Thanks to @cubelikeplayDaniel)
+            -   **全量耗尽安全退出与边界防死锁**: 当且仅当全部目标账号配额降至 0% 或到达官方重置时间刷新后才自动退出；修复到达重置时间后负倒计时判定导致无法退出的死锁，并排除已被主动禁用账号被误选为目标、目标账号被删除时兜底恢复挂起账号，配额加载波动时保守防穿透避免误判提前退出。(Fixes #3795, PR #3796, Thanks to @cubelikeplayDaniel)
+            -   **顶部运行横条与手动退出**: 主界面顶部新增微交互状态 Banner，实时展示当前运行模型、已挂起账号数与待消耗账号数，并支持随时手动退出并恢复；配套中英双语 i18n 与 9 项边界场景自动化单测全覆盖。(Fixes #3795, PR #3796, Thanks to @cubelikeplayDaniel)
+        -   **[Claude Code 2.1.312 新一代模型映射与号池自适应暗路由] (Fixes #2065, Ref #1724, Ref #3731, Ref #3751, PR #3787, Thanks to @cubelikeplayDaniel)**:
+            -   **移除静态硬编码映射**: 删除 `CLAUDE_TO_GEMINI` 静态硬编码映射，彻底消除目标模型下线或改名导致整条 Claude 链路瘫痪的死锁风险。(Fixes #2065, PR #3787, Thanks to @cubelikeplayDaniel)
+            -   **自适应暗路由 (`auto:*`)**: 新增 `auto:gemini-flash-low`、`auto:claude-opus` 与 `auto:claude-opus-4-7` 号池自适应目标，依据实时正配额在 Opus 5.5 / 4.6 / 4.7 及池内其他 Claude 思考模型间自动择优与降级，防止全池耗尽后直接 502；`claude-haiku-*` 复用 `pick_background_model_from_pool` 动态挑选轻量共享池，零 Claude 编程配额损耗。(Ref #1724, Ref #3731, PR #3787, Thanks to @cubelikeplayDaniel)
+            -   **公开/暗访双态与防复活迁移**: 解耦 `custom_mapping` 与 `custom_mapping_expose`，内置三条兼容规则默认不对外暴露；引入 `builtin_mapping_version` 无感迁移，保障内置规则不被一键重置抹除；前端映射面板新增公开/暗访状态切换与一键重置恢复内置自适应映射。(Fixes #2065, PR #3787, Thanks to @cubelikeplayDaniel)
+            -   **门禁基准与思考档位穿透**: 抽取通用 `parse_claude_version_tuple` 消除脆弱重复版本解析，Claude 硬防线维持 4.6（Fable / Mythos 需 ≥ 5.0、Haiku ≥ 4.5），门禁前置阶段先解析自适应目标避免暗路由被已下线判定误杀；路由层支持自定义映射目标为裸模型时继续按客户端思考档位穿透。(Ref #3751, PR #3787, Thanks to @cubelikeplayDaniel)
+        -   **[流式异常断流优雅收尾与零正文篡改保全] (PR #3794, Thanks to @cubelikeplayDaniel)**:
+            -   **中途断流不丢已生成内容**: 重构通用 `stream_lifecycle` 状态机，精准区分「已产生正文/工具调用后中断」与「首包或纯思维链失败」；上游网络抖动、连接重置或空闲超时时执行优雅收尾并下发协议专属截断终态（Claude `max_tokens` / OpenAI `length` / Gemini `MAX_TOKENS`），彻底避免客户端抛出 `StreamTruncatedError` 丢弃已生成的上万 token 并反复重思考重置当前轮次。(PR #3794, Thanks to @cubelikeplayDaniel)
+            -   **零正文篡改与工具调用优先**: 剔除伪造 Markdown 提示横幅与未闭合代码围栏注入，保持模型原样输出，根除非流式响应与思维库污染；工具调用语义优先级全局最高，断流收尾严格保持 `tool_use` / `tool_calls`，杜绝篡改为截断语义导致下一轮 400 死锁。(PR #3794, Thanks to @cubelikeplayDaniel)
+            -   **终态与空内容防护**: 纯思维链或未产生任何正文/工具调用的中断严格保持错误向下透传，绝不伪造假收尾与空回答；为各协议补齐 `has_emitted_done` 等终态感知，防止二次终结帧向客户端投毒多余数据帧。(PR #3794, Thanks to @cubelikeplayDaniel)
+            -   **Gemini 正常流与上游空值修正**: 移除 `GeminiStreamHandler::is_terminal` 覆写，避免正常 EOF 流因提前终结跳过图片生成成功统计与模型限流清理；增强 `finishReason` 非空判定，防止上游偶发 `null` 字段导致误判，并补充正常 EOF 到达 `emit_finalize` 的单元测试。(Ref #3794, Thanks to @cubelikeplayDaniel)
+
+    *   **v5.0.2-beta.2 (2026-10-31)**:
+        -   **[多智能体根会话归一化与凭据级强粘性调度] (Fixes #3789, Thanks to @Ran-Xing)**:
+            -   **根会话派生后缀自动归一化**: 针对 AutoGPT、Cindy 群聊军团等多智能体协同框架在分工接力（Plan Step）中频繁派生瞬态 Session UUID 导致 Prompt Cache 击穿的痛点，在 `SessionScope::resolve` 中新增 `extract_root_session_id`，自动识别并裁剪 `:step:N`、`:subtask:...`、`:agent:...`、`:talk:...`、`--step-N` 等派生后缀；调度粘性键（`affinity_key`）自动归拢至根会话以锁定同一上游账号，彻底消除 Prompt Cache 击穿并恢复秒级首字响应；诊断与思维库存储键（`store_key`）依然保留完整子会话 ID，保障子任务上下文隔离。(Fixes #3789, Thanks to @Ran-Xing)
+            -   **凭据级强粘性模式 (AffinityScope::ApiKey)**: 在 `StickySessionConfig` 中扩展粘性路由绑定维度，支持在会话级（`session`，默认）与凭据级（`api_key`）之间热切换，允许将同一 API Key 来源的所有流量锁定在单一主账号上，并在触发 429 或配额归零时自动平滑 Failover；支持环境变量 `ANTIGRAVITY_SCHEDULING_AFFINITY_SCOPE` 无头覆盖。(Fixes #3789)
+            -   **UI 胶囊切换与 12 语言全量本地化**: 在 API 代理调度设置面板中新增粘性绑定维度胶囊切换控件，并为全部 12 种系统语言同步补齐多语言文案。(Fixes #3789)
+        -   **[Web/Docker 模式记住登录凭据选项] (Fixes #3791, PR #3792, Thanks to @cubelikeplayDaniel)**:
+            -   **可选凭据持久化**: 在 Web/Docker 模式鉴权弹窗中新增“记住登录凭据”勾选框，默认未勾选保持公共设备安全基线；认证成功后按需将 API Key 持久化至 `localStorage`，解决关闭浏览器标签页后反复输入密码的问题。(Fixes #3791, PR #3792, Thanks to @cubelikeplayDaniel)
+            -   **请求层平滑回退与 401 监听生命周期修复**: `request.ts` 请求附带凭据优先读取 `sessionStorage` 并回退 `localStorage`；修复已登录状态下因提前返回导致跳过注册 `abv-unauthorized` 全局事件监听器的既有生命周期缺陷。(Fixes #3791, PR #3792, Thanks to @cubelikeplayDaniel)
+        -   **[超时链路三阶段总览与说明文案优化]**:
+            -   **文案精炼与机制明确**: 优化出站流生命周期三阶段梯度超时状态机说明文案，明确过渡断崖与稳态推流滑动超时保底机制。
+
+    *   **v5.0.2-beta.1 (2026-10-30)**:
+        -   **[大请求上传超时解耦与思考模型小黑屋误封修复] (Ref #3763, Fixes #3772, Ref #3768, Ref #3781, PR #3784, Thanks to @cubelikeplayDaniel)**:
+            -   **上传停滞超时解耦与保底**: 彻底解耦 `stall_secs` 与自适应 `upload_budget_secs`，停滞超时不再随体积计算缩水至 3~5s，并强制保证绝不低于连接超时 (`max connect_secs`)，杜绝 TLS 握手及代理抖动误触发停滞中断；对 ≥256KB 请求引入 15s 上传保底时间。(Ref #3763, PR #3784, Thanks to @cubelikeplayDaniel)
+            -   **端点耗尽终态防穿透重放**: 当请求在上传阶段耗尽全部首选与备用端点时，明确标记 `UpstreamTerminal::Upload` 终态并直接向客户端返回 504 截断，杜绝中等请求因未标记终态引发跨账号盲目轮换并耗死正常账号。(Ref #3763, PR #3784, Thanks to @cubelikeplayDaniel)
+            -   **流水线深度思考特征统一收敛**: 在 `pipeline::qos` 下实现统一的 `payload_enables_thinking`，优先依据转出报文的 `generationConfig.thinkingConfig` 真实指令进行判定，并通配 `argon`、`-high`、`o1/o3/o4` 及 `v4.0+` 模型语义，从根源上消除 `gemini-3.8-flash-high` 等思考模型在多轮会话中被误判为非思考请求而按 20s 阈值连击误关小黑屋的问题。(Fixes #3772, Ref #3768, PR #3784, Thanks to @cubelikeplayDaniel)
+            -   **安全策略提示词自适应清洗**: 扩展 `RE_SECURITY_CTF_POLICY` 兼容无 `authorized` 前缀的提示词注入，并在前置快速过滤器与多行 user turn 中补全正则覆盖与自动化单测。(Ref #3781, PR #3784)
+
+    *   **v5.0.2-beta.0 (2026-10-30)**:
+        -   **[QoS 自动限流进小黑屋独立开关与忽略校验时长机制] (Fixes #3783, Thanks to @TakimotoUki)**:
+            -   **手动可控与默认关闭**: 新增 `proxy.qos_auto_jail` 配置项，默认关闭 (`false`)。针对网络延迟抖动场景，赋予用户自主选择权，避免正常账号因突发网络波动被判定为限速降速而打入小黑屋。(Fixes #3783, Thanks to @TakimotoUki)
+            -   **忽略校验时长与清空解封**: 当关闭该开关时，处理首包延迟 (TTFT) 时直接忽略时长校验，不进行 Strike 判定，不打标疑似限速 (Suspicious)，不关入小黑屋 (Jailed)，亦不解绑粘性会话；若在运行期从开启切换至关闭，立即原子清空全池小黑屋记录与惩罚记忆，全量账号即刻恢复正常调度。(Fixes #3783)
+            -   **首页快捷切换与全语言覆盖**: 在首页仪表盘顶部操作栏（紧邻可用账号右侧）新增胶囊小开关，支持一键实时热切换、三态徽章展示与详尽 Tooltip 说明；同步更新设置页反代配置，并为全部 12 种系统语言补齐原生国际化翻译词条。(Fixes #3783)
+
+    *   **v5.0.1-beta.9 (2026-10-29)**:
+        -   **[流水线收敛：终态、自愈、预算、路由、轮换与观测统一] (Ref #3763, #3751, #3735)**:
+            -   **四协议超时与全局预算统一下沉**: 四大协议（Google Responses / Chat Completions / Claude / Gemini）超时处置与 270s 全局请求预算统一由 pipeline 接管，剩余预算不足时直接短路拦截，消除跨协议漂移与无效空转。(Ref #3763, #3735)
+            -   **有状态轮换与思考自愈**: 统一思考空回复原地自愈与流式错误事件识别；有状态重试裁决与调度模式原地等待判定收敛，彻底杜绝 Claude 活锁与号池雪崩。(Ref #3751, #3763)
+            -   **模型门禁与官方思考迁移**: 对齐 2026-10-29 官方思考迁移规则（`thinkingLevel` 优先、`thinkingBudget` 兜底，显式关闭时降至最低档）；出站指纹校准至 2.28.0 / CL 1008300195；列表、一键配置与 UI 仅暴露可用模型，下线 Gemini < 3 全量模型。(Ref #3751, #3763)
+            -   **退出主动刷盘与时间线留痕**: 进程退出时主动尽力刷盘；支持阶段耗时时间线异常输出与 ≥25s 慢请求排查留痕。(Ref #3763)
+        -   **[端点流式真实 TTFT 闭环回填与防负数展示] (Ref #3763, #3751)**:
+            -   **首包探针跨阶段回填**: 新增 `StreamTtftCapture` 容器，四大协议流式返回时挂载首包探针；流式传输完毕后，在 `monitor_middleware` 中将生效端点捕获到的真实纯净 TTFT 回填至请求日志，彻底清除发头时 `-1.000` 占位符。(Ref #3763)
+            -   **前端防御与优雅降级**: `ProxyMonitor` 与 `RequestDetailModal` 增加防负数过滤（严格拦截 `<= 0`），并优先使用生效端点尝试的实际耗时兜底，彻底解决列表页首字显示 `-` 以及详情抽屉显示 `-0.0010s`（占比 `-0.0%`）的显示异常。(Ref #3751, Ref #3763)
+        -   **[前置流水线动态清洗客户端 CTF 与安全策略提示词] (Fixes #3781, Thanks to @Ran-Xing)**:
+            -   **安全策略自适应剥离**: 在 System 轨与全文本轨中正则匹配并剥离 Antigravity 注入的 CTF/安全测试免责与防御声明，支持紧邻 `# Harness` 章节（自然衔接标头）与以 `defensive use cases.` 闭合的双重自适应匹配。(Fixes #3781, Thanks to @Ran-Xing)
+            -   **代码块深度隔离与空 Block 自动修剪**: 深度隔离代码块（``` 与行内 `）确保正文代码 100% 豁免；清洗后空 Part 自动物理剔除，若 `systemInstruction` 变为空则物理注销，消除模型微调风控误拒答（False Positives）、节省上下文 Token，并杜绝 400 Bad Request。(Fixes #3781, Thanks to @Ran-Xing)
+        -   **[Antigravity IDE 2.6.0+ 切号失败与后台孤儿进程治理] (Fixes #3778, Fixes #3770, Ref #3762, PR #3780, Thanks to @lbjlaq)**:
+            -   **全链路双写注入**: 针对 Antigravity IDE (2.6.0+) 实施全链路双写，同时注入 SQLite `state.vscdb` 与系统 Keyring (`gemini:antigravity`) 及文件回退，解决核心后台 agy 语言服务继续读取旧凭据的问题。(Fixes #3778, Fixes #3770, PR #3780, Thanks to @lbjlaq)
+            -   **语言服务进程精确识别**: 在 `is_helper_process` 中纳入 `is_language_server_process`，并在 `matches_target_client` 判定 `--hub` 启动参数精确绑定 `ide` 目标。(PR #3780)
+            -   **孤儿进程清理**: 跨平台补全 `close_antigravity` 对 `sweep_orphan_language_servers` 的调用，重启或切号时彻底终止后台孤儿 agy 进程。(PR #3780, Ref #3762)
+        -   **[解除 QoS 小黑屋后直接重拉账号列表] (Ref #3749, Ref #3768, PR #3782, Thanks to @wthsama)**:
+            -   **解除与配额刷新解耦**: 解除小黑屋只重置本地运行时 QoS 状态，不再复用易因 429 报错打断列表刷新的 `handleRefresh` / `refreshQuota` 远程接口。(Ref #3768, PR #3782, Thanks to @wthsama)
+            -   **本地即时回显**: 改为直接调用 `useAccountStore.getState().fetchAccounts()` 重拉本地账号列表，解除成功后小黑屋徽章与倒计时立即消失，同时消除表格视图中多余的 3 次配额请求。(PR #3782, Thanks to @wthsama)
+
+    *   **v5.0.1-beta.8 (2026-10-29)**:
+        -   **[工具签名缓存读写闭环优化：消除 SQLite 写放大与读路径串行瓶颈] (PR #3765, PR #3774, Ref #753, Thanks to @zepeng-jin, @jeikl)**:
+            -   **写路径去重与容量对齐**: L1 `TOOL_CACHE_LIMIT` 由 500 提升至 10,000，与 SQLite L2 表上限完全对齐；`cache_tool_signature` 命中未过期同签名时仅刷新内存时间戳并跳过冗余落盘，彻底消除多轮历史重放（一次携带 125 条工具调用曾触发 250 次同步写库）导致的 10~17s 本地 CPU 与磁盘阻塞。(PR #3765, Thanks to @zepeng-jin)
+            -   **后台批写与脏签名防复活**: 新增 `ag-tool-sig-writer` 后台线程（有界队列 + 单事务最多 512 条 `INSERT OR REPLACE`），配合 `PERSIST_SEQ` 单调序号、`SESSION_MIN_PERSIST_SEQ` / `GLOBAL_MIN_PERSIST_SEQ` 双层水位与 `PENDING_SESSION_DELETES` 拦截，任意并发 Save 与 `delete_session_signature` / `invalidate_session` 交错下过期签名均被精准丢弃；写连接复用 + `prepare_cached` 预编译，表行数修剪改为每 128 条或 5 分钟节流执行，启动阶段预清理一次避免首写阻塞。(PR #3765)
+            -   **读路径批量化与只读连接池**: 新增 `get_tool_signatures_batch`，`finalize` 预取本轮全部 functionCall ID 一次 `IN` 查询并对未命中写负缓存；只读连接池默认 4 条 round-robin；L1 由单一 `Mutex<HashMap>` 改为 `DashMap` 分片，消除高并发下的全局锁争用。(PR #3774)
+            -   **删除优先级与环境自适应**: Delete 走独立高优先级通道、pending 查询降为 O(1)；队列满的 Save 进入 dirty 集合由 worker 空闲重试，Tauri Exit 尽力 flush；新增 `CacheProfile`（Low / Standard / High / Server）按 CPU、内存与部署形态自动选择 L1 容量、读池、批量、队列与保留行数，全部支持环境变量覆盖。(PR #3774)
+            -   **可观测性与配置入口**: 思考设置新增 L1/L2 命中率、批量调用/ID 数、队列丢弃、pending 删除与 L1 容量只读统计，并提供「清空签名缓存」入口（不暴露 SQLite 旋钮）；压缩历史段短路跳过无意义的签名与思考回查。(PR #3765, PR #3774)
+        -   **[首响应头并入统一首字延迟，四协议预算与重放护栏] (PR #3775, Ref #3763, Thanks to @jeikl)**:
+            -   **首字节预算统一**: 首字节预算改为 `max(用户 TTFT, 按 token 自适应)` 并封顶 150s，叠加媒体增量（常规 0 / 图片 +45 / 视频 +60 / 辅助 −30），备用端点增量减半；预算每请求一份、端点间共享并为备选预留 1/3，消除「端点 × 账号」时长相乘导致的超时误杀。(PR #3775, Ref #3763)
+            -   **终态重放抑制**: 首字节预算耗尽后不惩罚账号、不跨账号重放、直接返回 504，根治「越重试越慢」的活锁与客户端 5~10 分钟无响应。(PR #3775)
+            -   **全局预算下沉流水线**: 270s 全局预算（支持环境变量覆盖）统一下沉至 pipeline，四大协议统一生效，单次上游调用被夹到剩余预算，使全局预算成为真正的天花板。(PR #3775)
+        -   **[界面与字体缩放及全局快捷键调节] (PR #3766, Thanks to @nicolastinkl)**:
+            -   **缩放引擎双层兜底**: 桌面端优先调用 Tauri 原生 `webview.setZoom()`（WebView2 / WKWebView / WebKitGTK）实现全视口等比缩放，Web/Browser 模式与冷启动兜底平滑降级至 CSS `zoom`；`index.html` 首帧预读并预载缩放状态，杜绝视觉缩放跳变闪烁。(PR #3766, Thanks to @nicolastinkl)
+            -   **快捷键与交互边界**: 支持 `Cmd/Ctrl + =` 放大、`Cmd/Ctrl + -` 缩小、`Cmd/Ctrl + 0` 重置，调节时屏幕中上方浮现 1.2s 自动淡出的 HUD；拦截 `e.repeat` 防抖、排除 `Alt` 组合键与 `input` / `textarea` / `contentEditable` 焦点区域，修饰键按平台区分（macOS 仅 Cmd，其余平台仅 Ctrl）。(PR #3766, Thanks to @nicolastinkl)
+            -   **档位对齐与窗口隔离**: 设置 → 通用新增 85%~150% 缩放下拉与 `snapToClosestZoom`，非标准历史缓存值自动贴合合法档位，启动恢复与运行时档位口径一致；mini 悬浮窗双重守卫（启动脚本 + `applyZoom`）保持原生比例，避免 360×360 固定尺寸面板被裁切。(PR #3766)
+            -   **完整多语言**: 补齐 zh / zh-TW / en / ja / ko / es / pt / ru / tr / vi / ar / my 共 12 种语言词条，杜绝非中文界面夹杂中文。(PR #3766, Thanks to @nicolastinkl)
+
+    *   **v5.0.1-beta.7 (2026-10-28)**:
+        -   **[适配 Antigravity IDE 2.6.0 凭据结构与 agy 语言服务进程识别] (Fixes #3770, PR #3771, Thanks to @fuyangtian2003-beep)**:
+            -   **凭据序列化对齐**: 在系统 Keyring (`KeyringTokenDetails` / `KeyringPayload`) 与 CLI 文件凭据 (`AgyTokenDetails` / `AgyOAuthTokenFile`) 模型中增补 `expires_in: 3599` 以及顶层 `id_token_email`，精准契合 Antigravity IDE 2.6.0 登录强校验规范，保持旧版本 100% 向下兼容。(Fixes #3770, PR #3771, Thanks to @fuyangtian2003-beep)
+            -   **语言服务进程判定扩充**: 在 `is_language_server_process` 中补充对 `agy` / `agy.exe` 的识别与单测断言，确保 Antigravity IDE 2.6.0+ 或 agy 运行环境下热切号时彻底终止后台孤儿会话，避免旧 Session 残留。(Fixes #3770, PR #3771, Thanks to @fuyangtian2003-beep)
+            -   **跨平台路径分割兼容**: 修复 `loose_file_stem` 在非 Windows 平台对包含反斜杠 Windows 路径（如 `d:\tools\...`）的分割兼容性，确保单元测试与跨平台进程判定稳健。(Ref #3762)
+        -   **[滚动条视觉美化与移入显示微交互] (Fixes #3768, Thanks to @ddmixi)**:
+            -   **尺寸收窄与悬浮渐显**: 将报文查看器与全局滚动条宽度由 8px 收窄至 5px 极细胶囊；常态下透明隐藏，鼠标移入所在容器时平滑淡入柔和半透明滑块，悬停滑块时高亮提供拖拽反馈，彻底解决长日志视觉遮挡与碍眼问题。(Fixes #3768, Thanks to @ddmixi)
+            -   **全局通用规范对齐**: 规范化收敛 `.payload-viewer-scroll`、`.scrollbar-thin`、`.custom-scrollbar` 与 `.scrollbar-none`，完美适配明亮与暗黑黑曜石主题以及跨平台 WebView2 / 浏览器环境。(Fixes #3768)
+
+    *   **v5.0.1-beta.6 (2026-10-28)**:
+        -   **[新增入站模型门禁与惩罚链豁免，修复 429/503 误伤号池] (Ref #3764, Ref #3769, Thanks to @jeikl)**:
+            -   **模型门禁四道判定**: 缺失 model → 404 `model not exist`；自定义映射优先（精确 / 大小写 / 规范化 / 通配符），无映射保留原值；映射后必须存在于「下游开放列表 ∪ agent 工具列表 ∪ 官方目录 ∪ 映射值」；全池无正配额 → 502 `no quota accounts`。冷启动无模型元数据时 fail-open，避免启动窗口误杀全部流量。(Ref #3764)
+            -   **全入口覆盖**: 在 POST generate / messages / chat（含 Responses）之外，补齐 `:countTokens` 冒号语法与 `/v1beta/models/:model/countTokens`，并为四大协议 GET 探测端点接入门禁：`/v1/models/:model`、`/v1/model/:model`、`/v1/responses/models/:model`、`/responses/models/:model`、`/v1/models/claude/:model`、`/v1beta/models/:model`。(Ref #3764)
+            -   **惩罚链 100% 豁免**: `is_gateway_self_answer` 作为单一真理源，接入 `policy::classify`（最高优先级归为 InternalGatewayMessage）、限流解析、`mark_rate_limited(_fast/_async)`、`classify_rate_limit_reason` 与 `mark_account_transient_failure`；网关代答的 404/502 不再锁号、不再解绑粘性会话、不再写入零配额标记，彻底杜绝无辜账号连坐。(Ref #3764)
+            -   **旧版模型全面下线**: Claude 3.x / < 4.6 与 Gemini 2.x 硬门禁（优先于自定义映射），删除 `gemini-2.5-* → 3.1-flash-lite` 内部别名、opencode 静态目录 legacy 条目与 `VariantType::Gemini25Thinking`；生图模型族独立豁免，并支持 `-preview / -1k / -2k / -4k / 比例` 变体与版本同义名归一。(Ref #3769)
+            -   **去除兜底模型硬编码**: 删除三处 `INTERNAL_BACKGROUND_TASK` 常量，后台摘要模型改为号池动态推导（最新 `flash-low` → 无后缀 `flash` → 跳过）；调度器预热兜底同步改为号池驱动，无可用 flash 时跳过而非硬编码回退。(Ref #3769)
+            -   **生图可见性与配额一致性**: 列表侧仅在账号真实配额 > 0 时，才把尺寸变体归一后的基底生图模型登记进 `/v1/models`、`/v1beta/models` 与 agent 一键配置；配额闸门同步折算同族变体配额，避免「列表有、请求 502」的不一致。(Ref #3769)
+            -   **前端可观测性**: 流量日志账号列高亮展示 `model not exist`（玫红）/ `no quota accounts`（琥珀），亮色暗色均保持高对比；转出报文面板展示英文排查指引（detail + hint）。(Ref #3764)
+            -   **QoS 阶梯探针修复**: 补齐官方 v1internal 信封（`project` / `requestId` / `request` / `model` / `userAgent`），探针模型改为从账号真实元数据挑选 Flash 档，端点走 Daily → Sandbox 灾备；实测上游返回 200（TTFT ≈ 1.0–1.9s），小黑屋账号可正常自愈回到 Healthy。(Ref #3769)
+
+    *   **v5.0.1-beta.5 (2026-10-28)**:
+        -   **[提示词清洗按注入区/当前轮分轨，用户正文永久豁免] (Fixes #3764)**:
+            -   **当前轮 100% 透传**: 清洗轨道收敛为 System / Content，并为当前轮新增 Anchored 轨——只清洗 `<system*>` / `<identity*>` 标签内部，标签外用户正文逐字保留；单轮翻译、校对、代码审计类请求不再被整句改写为官方身份。(Fixes #3764)
+            -   **注入区边界按「最后一条 user 消息的最后一个 text part」裁定**: 兼容客户端把系统提示词放进首轮 user 多 part、以及在文本后追加图片/文件的形态；计费元数据 Part 在选轨道前剔除，避免下标漂移把当轮正文误判为注入区。(Fixes #3764)
+            -   **身份声明正则双重防护**: 桥接段不再跨行（消除 `You are ...` 与下一段 `Based on ...` 被整段吞噬），替换回调新增疑问句豁免与跨子句连词豁免，`你是基于什么模型开发的？` 与 `..., and it was created by ...` 均保持原样。(Fixes #3764)
+            -   **多轮清洗幂等**: 同一请求在适配层、handler 与发包前会多次清洗，新增幂等回归用例，保护 `compute_prefix_hash` 的前缀稳定性与 Prompt Caching。(Fixes #3764)
+        -   **[进程身份判定收敛为唯一入口，修复 Antigravity IDE 2.6.0 切号失败] (Fixes #3762, Thanks to @cubelikeplayDaniel)**:
+            -   **身份只来自可执行文件名/路径**: 新增 `classify_process`，命令行参数降级为 IDE / 经典判别器且只读取 Chromium `--user-data-dir` 的值；删除 `(antigravity && vscode)` 弱特征组合，杜绝把打开 antigravity 工程的 VS Code / 终端 / 资源管理器纳入 `taskkill /F /T` 关闭列表。(Fixes #3762)
+            -   **IDE 目标强制 SQLite 注入**: 目标确认为 IDE 时坚决写入 `state.vscdb`，不再因版本号 ≥ 2.0.0 误走系统 Keyring 而提示重新登录；显式 classic 选择优先。(Fixes #3762)
+            -   **Manager 守卫只看文件名**: `is_manager_or_tools_process` 的宽松兜底改为 file stem 判定，修复装在 `D:\Tools\Antigravity` / `C:\Tools\agy` 的客户端被误判为 Manager 导致的「检测不到 → 切号只写凭据不重启」静默失败。(Fixes #3762)
+            -   **孤儿语言服务按目标隔离**: `sweep_orphan_language_servers(target_ide)` 统一清理对应客户端，IDE 与经典版互不误杀。(Fixes #3762, Ref #3769)
+
+    *   **v5.0.1-beta.4 (2026-10-28)**:
+        -   **[大文件上传分阶段自适应超时与四协议签名/思考治理统一] (PR #3767, Fixes #3763, Thanks to @jeikl)**:
+            -   **分阶段超时与上传预算**: 将连接、上传、首响应头、大文件重试拆为独立阶段；上传预算按「请求体大小 ÷ 上传带宽 × (1 + 额外等待系数)」自适应计算（默认 2 Mbps + 0.4），停滞超时默认 45s 且不超过上传预算；首响应头按聊天 30/25s、图片 45/25s、视频 60/30s、其他 15/15s 调度；大文件默认只尝试一次，抑制端点 fallback 与跨账号重发造成的上行放大。(PR #3767, Fixes #3763, Thanks to @jeikl)
+            -   **Gemini 流式生命同周期统一**: Gemini 原生流式迁移到通用 `run_stream_lifecycle`，四协议共享 3s SSE 心跳与首字/状态切换/滑动三段守卫，移除手写 300s 与首包 peek，响应头返回后立即开始保活。(PR #3767, Fixes #3763, Thanks to @jeikl)
+            -   **签名重试与思考治理统一**: 400 签名错误后统一跳过 ThinkingStore hydration，由流水线清理全部真实签名、将思考块降级为普通正文（保留推理内容），Gemini 工具调用回填官方哨兵；finalize 新增 `untrusted_signatures` 模式，避免「先丢文本、再删签名」；删除 Claude `Thinking → Text` 与 OpenAI 请求体特化。(PR #3767, Fixes #3763, Thanks to @jeikl)
+            -   **自愈与预过滤对齐**: 分离 `tool_choice` 冲突与签名重试标志，Gemini 补齐 tool_choice/thinking 冲突自愈与入站签名预过滤；四协议在过载预算降级、坏图、签名错误、工具冲突四类自愈上完全对齐。(PR #3767, Fixes #3763, Thanks to @jeikl)
+            -   **配置与文案**: 前端「超时设置」精简为连接/上传/首响应头/首字四分区，新增 7 个超时字段；全部字段支持 `ANTIGRAVITY_TIMEOUT_*` 环境变量覆盖，并同步 12 国语言。(PR #3767, Fixes #3763, Thanks to @jeikl)
+
+    *   **v5.0.1-beta.3 (2026-10-27)**:
+        -   **[多模态坏图 400 端到端就地自愈与指纹黑名单免疫] (PR #3759, Fixes #3758, Thanks to @cubelikeplayDaniel)**:
+            -   **400 坏图就地降级与原地重试**: 针对客户端在长程多模态会话中发送损坏或无法被上游视觉解码器处理的图片导致 `400 Unable to process input image` 会话死锁报废问题，流水线精准识别该错误，不锁定账号、不解绑粘性会话以保护原账号 Prefix Cache；并在原地自动将损坏图片降级替换为结构化占位符后即时重试，彻底救活会话生命周期。(PR #3759, Fixes #3758, Thanks to @cubelikeplayDaniel)
+            -   **单图持久免疫与多图防误杀机制**: 当请求中仅有 1 张图片时 100% 确认损坏源，记录 SHA-256 指纹至全局黑名单并在入站通用校验处前置拦截，阻断客户端历史重放污染；多图场景下在当前轮次全部就地替换为占位文本保证会话自愈，跳过写入全局持久黑名单以防止误杀正常架构图。(PR #3759, Ref #3758, Thanks to @cubelikeplayDaniel)
+            -   **FIFO 有限容量淘汰与结构全兼容**: 坏图黑名单采用 `ImageBlacklist`（HashSet + VecDeque，上限 2000），按 O(1) 逐项淘汰最旧条目防止满载清空引发长会话击穿；并在各协议 Handler 中增加零图熔断门禁，全面兼容顶层 `request` 信封及 `systemInstruction` / `system_instruction` 双重命名。(PR #3759, Ref #3758, Thanks to @cubelikeplayDaniel)
+        -   **[生图看门狗超时放宽与多协议统一空图诊断收敛] (Fixes #3756, Ref #3756, Thanks to @jeikl)**:
+            -   **看门狗与预算放宽**: 在 `upstream/client.rs` 中将生图请求（`is_image_gen`）首选端点看门狗超时放宽至 90s、备选端点 45s、总超时预算 135s，杜绝 4K 高分辨率长耗时生图被 15s 看门狗超时误杀。(Fixes #3756, Thanks to @jeikl)
+            -   **流水线空图诊断与拒答终态判定**: 建立统一且协议无关的生图响应合法性校验与深度脱敏诊断提取器（`extract_image_generation_diagnostic`）。当上游返回 200 但未包含有效图片时严禁视为假成功，精准提取 `promptFeedback.blockReason`、`finishReason` 与安全违规拒答文本，立即终态返回 400 并阻断盲目切号。(Fixes #3756, Thanks to @jeikl)
+            -   **多协议并发调度对齐**: 在 OpenAI、Gemini、Claude 与 Codex 四大协议中对齐生图延迟确权保护与调度器并发控制，彻底根除各适配器层的重复实现与类型编译缺陷。(Fixes #3756, Ref #3756, Thanks to @jeikl)
+
+    *   **v5.0.1-beta.2 (2026-10-27)**:
+        -   **[DeepSeek Harness (DSH) 一键全环境适配与 Agent 工具交互规范对齐] (PR #3761, Ref #3761, Thanks to @wakeupnotfound, @jeikl)**:
+            -   **全环境一键双向同步**: 新增 `DeepSeekHarness` 支持，涵盖 macOS / Windows / Linux 路径探测，自动向 `~/.dsh/profiles/desktop/cordis.patch.yml`（CLI & 桌面）与 `profiles/web/cordis.patch.yml`（Web GUI: `dsh web`）注入 Antigravity 提供商与核心模型映射，并在 `~/.dsh/.credentials.yaml` 注入 API 密钥。(PR #3761, Thanks to @wakeupnotfound)
+            -   **纯文本分块重构与运行时 Panic 根除**: 彻底移除 `regex` crate 不支持的 lookahead 断言，改用高性能纯文本分块状态机重构 `cordis.patch.yml` 读写更新逻辑，根治空文件或重复同步引发的 Regex panic；修复状态探测正则反斜杠缺失缺陷；对齐默认模型为全仓库统一的 `gemini-3.8-flash-high` 并复用官方网关核心模型目录。(Ref #3761, Thanks to @jeikl)
+            -   **原生终端 CLI 同步支持**: 在 CLI 处理器中接入 `antigravity-tools sync [app] [--model <model>]` 命令，支持无头服务器环境一键同步 `dsh`、`claude`、`codex`、`opencode` 等全系 Agent 工具配置。(PR #3761, Thanks to @wakeupnotfound)
+            -   **全量卡片交互规范对齐**: 移除未安装 CLI 时的同步按钮禁用拦截，卡片同步按钮与目标模型选择下拉框常驻可用，支持预写入配置；同步状态与查看/还原按钮按实际文件与配置状态精准解耦呈现，标题完整接入 12 国 i18n 翻译。(PR #3761, Ref #3761, Thanks to @wakeupnotfound, @jeikl)
+        -   **[高阶 Argon 模型多套餐权威收敛与 Ultra 调度缺失修复] (Fixes #3750, Ref #3745, Thanks to @jeikl)**:
+            -   **多套餐收敛判据统一**: 抽象统一收敛函数 `hasAccountArgonCapability` 与 `checkArgonEligibility`，权威覆盖 Pro（专属独立分组）、Ultra（顶级共享池与全量授权）与 Free（严格隔离防呆）判据。(Fixes #3750, Ref #3745, Thanks to @jeikl)
+            -   **Ultra 调度 503 根治与配额继承**: 在 `quota.rs` 与 `token_manager.rs` 中重构配额继承逻辑，允许 Ultra 账号合法继承 Gemini 通用配额池，杜绝因缺少专属 Argon 分组被错误丢弃导致调度 503 熔断。(Fixes #3750, Ref #3745, Thanks to @jeikl)
+            -   **徽章与面板展示对齐**: 统一 `AccountCard`、`AccountTable` 与全宽周配额卡片渲染，Ultra 账号正常点亮 Argon 徽章并展示正确额度，新增 `argonCapability.test.ts` 自动化回归单元测试。(Fixes #3750, Thanks to @jeikl)
+        -   **[Token 统计零用量虚假柱状图剔除与命中率保底校验] (Fixes #3755, PR #3755, Thanks to @EricZhou05)**:
+            -   **剔除零用量伪造条形**: 优化 `TopModelsShareCard` 与 Token 统计图表渲染，严格过滤用量为 0 的虚假数据条目。(Fixes #3755, PR #3755, Thanks to @EricZhou05)
+            -   **严格命中率下限保底**: 计算缓存命中率时设定严格下限与分母校验，避免数据异常与负值显示。(Fixes #3755, PR #3755, Thanks to @EricZhou05)
+
+    *   **v5.0.1-beta.1 (2026-10-26)**:
+        -   **[Linux GTK 托盘跨线程安全调度与 _exit 进程级防误杀终极闭环] (Fixes #3757, Ref #3752, Thanks to @hazerwin)**:
+            -   **GTK 菜单主线程调度保障**: 将 `update_tray_menus` 内部的所有 `MenuItem`、`Menu` 构建与 `tray.set_menu` 统一调度到原生 UI 主线程（`app.run_on_main_thread`）执行，并在显示断开时安全短路，彻底消除 Tokio 异步工作线程跨线程操作 GTK 导致并发死锁或底层断言崩溃 `_exit(1)` 的隐患。(Fixes #3757, Thanks to @hazerwin)
+            -   **_exit 全工作线程安全隔离 (根除误杀)**: 重构 `linux_display_guard` 的 `_exit` 拦截器，除用户明确主动退出外，严禁任何主线程或后台工作线程（Tokio、WebKit IPC、GIO 等）触发 `SYS_exit_group` 秒杀整个进程组；一律通过 `pthread_exit(NULL)` 精准隔离终结故障线程，彻底守死 8045 核心反代服务生命线。(Fixes #3757, Thanks to @hazerwin)
+            -   **MiniView 定时器与高负载 IPC 颠簸优化**: 优化 MiniView 悬浮窗的单账号刷新逻辑，移除重复的全量 `fetchAccounts` 冗余拉取，并在悬浮窗隐藏/不可见时跳过定时刷新，大幅降低 500 个账号下后台大吞吐量 IPC 数据颠簸与内存开销。(Fixes #3757, Thanks to @hazerwin)
+        -   **[Web/Headless 更新设置保存 400 修复与局部补丁合并治理] (Fixes #3754)**:
+            -   **Axum 管理接口请求体双形态兼容**: `POST /api/system/updates/save` 现同时接受前端 `invoke` 映射透传的 `{"settings": {...}}` 包装体与 Headless/CLI 的平铺 JSON，彻底修复 Web 端切换预览版通道或修改自动检查更新时必然返回 400 Bad Request（content-length: 0）的问题。(Fixes #3754)
+            -   **更新设置改为局部补丁合并**: 新增 `UpdateSettingsPatch` 与 `patch_update_settings`，仅覆盖显式提供的字段；未传字段（`last_check_time`、`update_channel`）保留磁盘现值，根治切换自动检查开关会把更新通道静默重置为构建默认值、以及每次保存都清空最近检查时间并触发立即检查的连带缺陷。(Fixes #3754)
+            -   **错误透传与空补丁防呆**: 持久化失败如实返回 500 与错误体，空补丁返回 400 并附带期望字段列表，不再出现 `let _ =` 吞错导致的“写入失败仍返回 200”假成功。(Fixes #3754)
+            -   **Web 与桌面双链路语义统一**: Tauri 命令同步切换为补丁语义，前端移除 `last_check_time: 0` 硬编码并在切换通道时仅提交 `update_channel`，两条链路行为完全一致。(Fixes #3754)
+            -   **回归测试覆盖**: 新增包装体/平铺体解析、未知字段空补丁识别、补丁字段保留与空补丁拒绝等单元测试，防止后续回归。(Fixes #3754)
+
+    *   **v5.0.1-beta.0 (2026-10-26)**:
+        -   **[Linux X11/xrdp 远程桌面显示守卫升级与无感保活] (Fixes #3752, Thanks to @hazerwin)**:
+            -   **Xlib 原生底层致命错误拦截 (XSetIOErrorHandler)**: 在 `linux_display_guard` 模块中动态挂载 X11 底层 `XSetIOErrorHandler`，当 xrdp / VNC 远程桌面断开连接、网络重置或端口被扫描导致 X Socket 管道破裂（Broken pipe / Connection reset）时，直接在第一现场拦截致命 XIO 错误，置位显示断开标记并仅安全退出主 GUI 线程，确保后台 Tokio 运行时与端口 8045 核心反代服务毫秒级平滑常驻。(Fixes #3752, Thanks to @hazerwin)
+            -   **GLib 调试日志穿透与 X11 特征规则全覆盖**: 自动配置 `G_MESSAGES_DEBUG` 环境变量，彻底解决现代 GTK 3.24+ 下 `gdk_x_io_error` 发出的 `g_debug` 消息被 GLib 底层静默丢弃的问题；全面扩充 `is_display_disconnect_message` 判定规则，支持 `Fatal IO error`、`on X server`、`X connection to`、`Resource temporarily unavailable (errno 11)` 等全场景 X11 致命通信异常识别。(Fixes #3752, Thanks to @hazerwin)
+            -   **_exit 拦截器主线程隔离与意图识别防误杀**: 记录主 GUI 线程 ID 并增加用户主动退出（`USER_INITIATED_EXIT`）意图感知，严格区分“用户明确退出”与“底层显示崩溃”，彻底消除因前置漏判导致直接调用 `SYS_exit_group` 误杀进程组的致命缺陷，让使用 GUI 模式的远程桌面用户在断开后完全无感，核心代理服务绝不闪退中断。(Fixes #3752, Thanks to @hazerwin)
+            -   **远程虚拟桌面（xrdp/VNC）精准感知与软件渲染安全适配 (治本根除崩溃)**: 在 `linux_graphics.rs` 中新增虚拟桌面环境判定，当显式检测到 xrdp / VNC / 远程虚拟环境时，自动注入 `WEBKIT_DISABLE_COMPOSITING_MODE=1`、`WEBKIT_DISABLE_DMABUF_RENDERER=1` 及软件光栅化，从根源消除 WebKit 硬件加速合成器在客户端断开时由于显存缓冲区交换失败而引发的 Broken pipe，GUI 界面在远程桌面断开重连中安然存活；本地有显卡的物理 Linux 桌面 100% 保持原有 GPU 硬件加速合成不变。(Fixes #3752, Thanks to @hazerwin)
+
+    *   **v5.0.0 (2026-10-24)**:
+        -   **[基于纯净同侪校准与阶梯探针的自适应 QoS 调度系统] (Fixes #3720, PR #3725, Thanks to @jeikl, @cubelikeplayDaniel, @lbjlaq)**:
+            -   **真实首包延迟 (TTFT) 瞬态感知**: 以发出请求至收到上游首个有效 Chunk 的纯粹时间为核心指标，彻底排除输出代码量与流式传输的干扰，作为判定静默 QoS 分桶降级的权威物理依据。(Fixes #3720, PR #3725, Thanks to @jeikl)
+            -   **五重纯净同侪基线比对与防误杀体系**: 同类账号基线严格排除自身、异构 Tier、本地禁用、429 限流/零配额、小黑屋 (Jailed)、探测中 (Probing)、瞬态可疑 (Suspicious) 以及缓刑 (HalfOpen) 账号，彻底杜绝劣币毒化基准；为深度思考模型提供 35s 动态时间补偿，杜绝推理耗时误杀；设置全局雪崩制动刹车（同行均值 >= 20s 时不滥杀）与 8s~20s 迟滞死区消除边界震荡。(Fixes #3720, PR #3725, Thanks to @jeikl)
+            -   **瞬态打标与会话即刻解绑 (Session Handover)**: 首次超标打上 `Suspicious` 瞬态可疑标记（同行算均值瞬间排除它，调度器开启“只出不进”保护）；5 分钟滑动窗口内累计 2 次超标判定处于降级池，立即强制解绑粘性会话切断死锁灌水；由 P2C 调度器在纯健康号池中重新选号并立即焊死会话绑定，后续请求稳定享受 100% Prompt Cache 极速响应。(Fixes #3720, PR #3725, Thanks to @jeikl)
+            -   **后台阶梯轻量自愈探针与半开防抖机制**: 阶梯冷却梯度为 2m -> 5m -> 10m -> 15m -> 20m -> 30m，每次升级等待时钟严格从 0 重新计时；到达节点后台发起纯文本“你好”极简探针（8 秒硬超时中止，消耗 < 5 tokens）；探针通过后进入 `Half-Open` 缓刑期，经受住连续 2 次真实请求考验（TTFT < 8s）才满血出狱；引入 30 分钟惩罚记忆，复发违规直接继承高阶梯防止高频进出。(Fixes #3720, PR #3725, Thanks to @jeikl)
+            -   **QoS 小黑屋一键解除与状态倒计时透明化**: 账号管理卡片、表格与流量监控视图实时展示 QoS 状态与剩余冷却时长，并提供一键解除小黑屋限制按钮及后台接口（`release_account_qos_jail`），完整覆盖 12 种单语语言字典。(Fixes #3720, PR #3725, Thanks to @jeikl)
+        -   **[官方权威模型全景升级、分级思考传输协议与 Argon 独立配额防穿透隔离] (Fixes #3735, Ref #3720, Fixes #3737, Thanks to @jeikl, @cubelikeplayDaniel, @xiaozhi-xmu, @chenshin166-arch)**:
+            -   **模型可用性与额度解析解耦**: 彻底移除旧逻辑中 `if let Some(quota_info) = info.quota_info` 的强过滤门禁，以官方公开模型目录为基准，对 Google 上游不再为 Gemini 系（`gemini-3.8-flash-*`、`gemini-3.1-flash-lite` 等）下发 `quotaInfo` 的账号无损保留模型可用性，彻底消灭全系模型被误丢弃导致本地秒回 503 的严重缺陷。(Fixes #3737, Thanks to @xiaozhi-xmu, @chenshin166-arch, @jeikl)
+            -   **思考预算与思考等级分类模型传输 (Thinking Budget vs Thinking Level)**: 新一代分级模型（Gemini 4 Argon、Claude 5.5 系列）受控于 `thinkingLevel`（`"LOW"`, `"MEDIUM"`, `"HIGH"`），严格下发思考等级，严禁输出数字预算；传统预算模型（Gemini 3.8 Flash、Gemini 3.1 Pro、Claude 4.6 等）走 `thinkingBudget` 通道，杜绝双字段冲突 400 报错。(Fixes #3735, Thanks to @jeikl)
+            -   **官方禁用模型严格过滤与虚假配额清理**: 在 `OfficialModelInfo` 中补齐 `disabled: Option<bool>` 字段与 `is_disabled()` 判定，基准线置顶拦截 `-disabled` / `_disabled` 模型变体并从 `normalize_to_standard_id` 与账号池中彻底剥除；前端配额卡片与徽章全面过滤禁用模型，杜绝虚假展示。(Fixes #3735, Thanks to @jeikl)
+            -   **Gemini 4 Argon 调度闭环与专属配额组能力继承**: 在候选账号过滤中补齐 `token_supports_advanced_model` 与专属计费桶（`normalized_target != "claude" && token.model_quotas.contains_key(...)`）能力判定，支持 camelCase 与 snake_case 双字段形态，彻底解决 Argon 账号在调度第二阶段被误杀抛出 503 的缺陷，同时保持 Claude 5.5 / 4.6 跨代隔离不串池。(Fixes #3735, Thanks to @jeikl)
+            -   **废弃内部代号 gemini-pro-agent 彻底清退**: 在 `variant_mapping.rs` 中将 `gemini-3.1-pro` 家族规范映射由已废弃的内部代号 `gemini-pro-agent` 升级为官方标准物理模型 `gemini-3.1-pro-high`。(Fixes #3737, Thanks to @jeikl)
+            -   **Claude 协议补齐账号级动态模型自适应改写**: 选号后调用 `token_manager.resolve_dynamic_model_for_account`，实现与 OpenAI 及 Gemini 协议处理逻辑严格对称。(Fixes #3737, Thanks to @jeikl)
+            -   **全协议端点上下文窗口与最大输出参数标准化**: 在 OpenAI（`/v1/models`）、Claude（`/v1/models`）与 Gemini（`/v1beta/models`）元数据端点中引入并标准化 `context_length`、`max_tokens`、`max_output_tokens` 等规格。(Fixes #3735, Thanks to @jeikl)
+        -   **[OpenAI Responses API 结构化输出支持、流水线工具冲突治理与零误杀解壳] (Fixes #3710, Ref #3723, Thanks to @cubelikeplayDaniel, @jeikl)**:
+            -   **协议层入站规范化**: 在 `OpenAIRequest` 中支持 Responses API 的 `text.format` 规范，并在适配器中统一定位与提取 `effective_response_format`，规范化映射为 Gemini 原生 `generationConfig.responseSchema` 与 `responseMimeType: "application/json"`，打通 Codex Desktop 对话自动命名（`thread_title`）、摘要生成等后台结构化任务。(Fixes #3710, Ref #3723, Thanks to @cubelikeplayDaniel)
+            -   **后台任务思考预算收敛与防超时**: 显式遵循 `reasoning.effort: "low"`，将后台短任务的思考预算收敛在 1024 以内，彻底消除高思考模型在对话命名时触发 Codex 客户端 30 秒硬超时中断报错的隐患。(Fixes #3710, Thanks to @cubelikeplayDaniel)
+            -   **流水线统一工具冲突治理 (Pipeline First)**: 将 `responseSchema` 与 `tools` / `toolConfig` 的互斥治理下沉至 `src/proxy/pipeline/inbound.rs` 的 `align_google_request_prefix_topology_with_model` 统一出口，当检测到 `responseSchema` 生效时主动清空 `canonical_tools` 与 `canonical_tool_config`，跨协议彻底杜绝上游 400 校验拒绝。(Fixes #3710, Ref #3723, Thanks to @cubelikeplayDaniel)
+            -   **出站受控整包解壳与常规对话零误杀保障**: 在 `convert_chat_response_to_responses` 中引入 `is_structured_output` 严格门禁，常规对话 100% 原始呈现；仅在结构化任务下采用 `unwrap_outer_code_fence_if_structured` 严格整包解壳，避免破坏内嵌代码块并确保 Codex Desktop 原生 `JSON.parse` 正常解析。(Fixes #3710, Ref #3723, Thanks to @cubelikeplayDaniel)
+        -   **[Mini 桌面悬浮视窗 macOS 原生真透明、双向跨窗口同步与原生主线程调度无死锁] (Fixes #3733, Ref #3718, #3721, Ref #3738, Ref #3741, Thanks to @lbjlaq, @cubelikeplayDaniel, @jeikl)**:
+            -   **Mini 桌面悬浮视窗 macOS 原生真透明与拖拽权限健全**: 开启 Tauri `macos-private-api` 特性与原生 `macOSPrivateApi: true` 配置，彻底消除 macOS WebKit 内核强制绘制底色导致的圆角黑边矩形，带来原生级磨砂圆角透明体验；首帧注入透明脚本与 URL 标识，并在能力清单中补齐 mini 窗口拖拽及置顶操作权限。(Fixes #3733, Ref #3718, PR #3738, Thanks to @lbjlaq)
+            -   **深浅模式自适应与跨窗口多语言毫秒级同步**: Mini 悬浮窗自适应继承主控制台与操作系统的暗黑/浅色主题；接入 `app://theme-changed` 与 `app://language-changed` 跨窗口事件监听，保证主控制台与 Mini 悬浮窗无论切换语言还是主题均毫秒级双向无感同步，并补全全部 12 国语言字典。(Fixes #3733, PR #3738, Thanks to @lbjlaq)
+            -   **主线程调度与 Win32 死锁根除**: 在后端引入 `switch_to_main_window` 与 `hide_mini_view` 命令，将主窗口重建及激活（`exit_lightweight_mode`）全量调度至系统原生 UI 主线程（`app.run_on_main_thread`），彻底消除 Windows 下跨线程创建窗口导致的 Win32 消息循环死锁与自旋挂起。(Ref #3733, Ref #3738, Ref #3741, Thanks to @jeikl)
+            -   **Mini 悬浮窗 React Router 404 兜底与同步判定**: 优先从 `window.location.search` (`?mini=1`) 与 `__TAURI_INTERNALS__` 进行首帧同步判定，消除 Tauri 异步 IPC 窗口 label 延迟引发的路由竞争；并在 `createBrowserRouter` 中补齐 `errorElement` 与 `index.html` 通配符重定向，彻底消灭 404 错误页。(PR #3741, Thanks to @cubelikeplayDaniel)
+            -   **轻量模式首屏渲染就绪无感淡入**: 重建主控制台窗口时默认保持 `visible: false` 静默装载，待 ThemeManager 首屏主题与配置挂载就绪后自动淡入并对焦，彻底根除 WebView2 绘制 React DOM 前的黑底白框闪烁。(Ref #3733, Ref #3738, Thanks to @jeikl)
+        -   **[跨模型切换签名逆向重构：对齐官方 Antigravity 哨兵规范，根治 Claude 并发工具 400 崩溃] (Thanks to @jeikl, @cubelikeplayDaniel)**:
+            -   **官方 Base64 哨兵全局对齐**: 逆向分析官方 Antigravity 客户端的 Proto3 JSON 报文规范，将全局哨兵常量从纯文本升级为官方原生标准的 44 字节 Base64 密文 `c2tpcF90aG91Z2h0X3NpZ25hdHVyZV92YWxpZGF0b3I=`；同时保留旧明文哨兵兼容识别（`LEGACY_SENTINEL_SIGNATURE`），确保历史缓存零断裂。(Thanks to @jeikl)
+            -   **Claude 全链路 0 哨兵 + 并发工具严格留空**: 根据 Anthropic 验签引擎行为，彻底废除向 Claude 模型注入任何哨兵；并发工具调用场景中，签名唯一落点为首个非思考部件（首个工具或首个正文），后续所有并发工具严格留空无 `thoughtSignature` 字段，彻底消除 `Invalid signature in thinking block` 400 拦截。(Thanks to @jeikl)
+            -   **Claude ➔ Gemini 切换异构工具免检通行证**: 从 Claude 切回 Gemini 时，进站门禁自动识别历史中携带 `toolu_` 前缀的异构 Claude 工具调用，为每一个异构 `functionCall` 统一赋予 Base64 哨兵通行证，完全绕过 Gemini 对异构工具的签名校验；正文文本部件严格保持纯净。(Thanks to @jeikl)
+            -   **Gemini ➔ Claude 切换历史清洁与哨兵零落库**: 切换至 Claude 时彻底剥除历史轮次上的 Gemini 短签名与旧哨兵；在 `normalize_and_heal_signature` 中增加双重拦截，确保任何形态的哨兵值均不会写入 SQLite 持久化存储。(Thanks to @jeikl)
+        -   **[流式巨型工具调用跃迁宽限期、上游超时预算动态收敛与 Claude 429 泄漏清除] (Fixes #3739, Fixes #3713, Ref #3506, Ref #3525, Ref #3720, PR #3740, PR #3714, PR #3742, Thanks to @cubelikeplayDaniel)**:
+            -   **流式巨型工具调用缓冲跃迁宽限期**: 放宽过渡断崖自动跃迁条件为 `matches!(phase, StreamPhase::Thinking | StreamPhase::Streaming)`，允许在 Streaming 阶段生成 10,000+ tokens 巨型 `functionCall` 缓冲静默时自动跃迁至 Transition 宽限期并赋予 180s 保护，彻底消除满 120s 滑动超时被提前截断的缺陷。(Fixes #3739, PR #3740, Thanks to @cubelikeplayDaniel)
+            -   **响应头看门狗与总预算精准收敛**: 将流式首选端点 HTTP 响应头看门狗基准收敛至 30s（超大 payload 弹性放宽至 45s），备用回退预算 25s，全链路总预算大幅收敛至 55~70s（非流式严格 30s），彻底杜绝主端点在排队拥塞时长时间挂死。(Fixes #3713, PR #3714, Thanks to @cubelikeplayDaniel)
+            -   **Claude 协议接入 FailureStatusTracker 消除 429 泄漏**: 在 `claude.rs` 重试循环中完整接入 `FailureStatusTracker`，网络/看门狗超时显式记录 `GATEWAY_TIMEOUT`，最终状态码仅在全量尝试均为 429 时才返回 429，一旦包含网络超时则降级返回 504 Gateway Timeout，彻底根除客户端 1 分钟退避冻结。(PR #3714, Thanks to @cubelikeplayDaniel)
+            -   **重构多账号跨天硬配额耗尽检测与全端点故障解绑**: 将 `quotaResetDelay > 30min`（如 68 小时）且包含 `quota_exhausted` 的响应准确识别为账号级硬配额枯竭，立即执行 50ms 闪电切号；在发生全端点超时时施加 30s 冷却并原子解绑粘性会话。(PR #3714, Thanks to @cubelikeplayDaniel)
+            -   **Claude 思考预算缺省回退官方默认值**: 在 `resolve_custom_budget` 中，针对 Claude 思考模型当配置预算 `<= 0` 时统一返回 `None`，使流水线正确回退并取回官方模型结构体权威默认值（如 1024）。(Ref #3735, PR #3742, Thanks to @cubelikeplayDaniel)
+        -   **[异步高性能批量导入与冷启动秒级直出] (Fixes #3726, Thanks to @jeikl)**:
+            -   **异步流式并发与背压控制**: 新增 `batch_import_accounts` 高性能流式处理管道，基于 `buffer_unordered(6)` 严格控制在途活跃任务上限，将 494 个账号导入耗时由 28 分钟锐减至 15~20 秒（提速超 60 倍），彻底杜绝 `join_all` 造成的内存暴涨与 OOM 内核击毙。(Fixes #3726, Thanks to @jeikl)
+            -   **恢复批量导入满血配额落盘与冷启动锁解耦**: 在流式并发中每个账号并行完成 Token 换取与配额拉取，导入期 100% 具备完备配额与等级数据落盘；将 `list_accounts` 读锁改为非阻塞 `try_read()`，后台服务器启动期间绝不阻塞前端账号列表向界面的直出呈现。(Fixes #3726, Thanks to @jeikl)
+            -   **本地快照水合机制彻底消除冷启动图2空状态闪烁**: 在 `useAccountStore` 初始状态中引入 `localStorage` 本地快照同步水合，冷启动首帧直接渲染上一次全部账号列表与配额矩阵卡片，彻底消灭“0 总账号数”空态闪现。(Fixes #3726, Thanks to @jeikl)
+            -   **科学防 Google 风控体系与严格幂等性**: 注入 30ms ~ 90ms 动态散列微抖动（Jitter），集成 429 速率限制 1.5s 自动退避重试；确立小写邮箱与 Refresh Token 双重查重与原地复用（In-Place Upsert），引入孤儿文件自愈清理机制。(Fixes #3726, Thanks to @jeikl)
+        -   **[系统托盘分层配额感知、CLI (agy) 凭证隔离与原生切号] (Fixes #3719, Fixes #3728, Fixes #3686, Thanks to @Wiojelt, @bkspi, @Ran-Xing, @lbjlaq, @jeikl)**:
+            -   **全平台系统托盘悬停配额卡片与状态栏配额标题**: 富文本悬停卡片鼠标滑过即时呈现各模型剩余百分比，严格适配 Windows 128 字符限制；macOS 菜单栏图标旁原生常驻展示核心模型剩余百分比（如 `C:85% G:100%`）；托盘右键新增【迷你悬浮窗】一键呼出与状态双向联动。(Fixes #3719, Thanks to @Wiojelt, @jeikl)
+            -   **Linux 窗口抢占置顶与自动拉起根治**: 移除对外部可执行文件执行 `--version` 的危险探测，改为安全的静态文件、符号链接穿透与 `asar` 内存轻量解析，彻底消灭 Linux 桌面端主窗口被频繁抢占焦点或意外启动新实例的致命缺陷，并加入 60 秒全局版本缓存。(Fixes #3728, Thanks to @bkspi, @lbjlaq)
+            -   **解除经典款切号对 CLI 专属凭证的覆写覆盖**: 引入 `sync_agy_cli` 显式控制开关，切换经典款应用时严禁盲目冲刷 CLI 独立凭证，彻底杜绝切号凭据相互踩踏冲突。(Fixes #3728, Thanks to @lbjlaq)
+            -   **原生命令行工具集成 (`at` / `antigravity-tools`)**: 推出轻量高效的终端切号套件，支持列表查看 (`at list`)、多端当前账号探查 (`at current`) 与智能切号 (`at switch [query]`)，支持 `--continue` 原地无缝接续当前会话。(Fixes #3686, Thanks to @Ran-Xing, @lbjlaq)
+        -   **[代理池防源站泄漏、多协议鉴权增强与本地 Agent 探针兼容] (Fixes #3703, Fixes #3729, Fixes #3730, PR #3708, PR #3706, Thanks to @CarlitoDon, @cubelikeplayDaniel, @Ran-Xing, @lbjlaq)**:
+            -   **专属绑定账号防 Direct 泄漏机制**: 重构专属代理路由决策，当绑定的专属代理不健康且无可用公共节点时，强制沿用专属代理尝试出站（宁可网络报错也绝不静默回退至直连），彻底杜绝服务器真实源站 IP 泄漏至 Google 授权系统导致的风控封号风险。(Fixes #3703, PR #3706, Thanks to @cubelikeplayDaniel)
+            -   **WHATWG URL 凭据清理规范化与密文防扩散**: 先清除密码再清除用户名，兼容 HTTP/HTTPS 及 SOCKS5h 代理；当容器跨机器迁移导致解密失败时拒绝将 `ag_enc_` 密文随 HTTP CONNECT 报头明文发送给代理服务器。(PR #3706, Thanks to @cubelikeplayDaniel)
+            -   **Hermes Agent / 本地探针端点兼容与 OpenAI 模型上下文元数据增强**: 新增 `/props`、`/v1/props` 与 `/version`、`/v1/version` 只读端点，在 `/v1/models` 中注入 `context_length`、`max_tokens` 等权威容量限制，全面消除本地 Agent 握手探针警告与 404 错误。(PR #3708, Thanks to @CarlitoDon)
+            -   **Gemini 协议支持标准 URL Query 传参提取 API Key**: 重构凭据提取管道，完整覆盖 `Authorization: Bearer`、`x-api-key`、`x-goog-api-key` 及 URL Query `?key=`。(Fixes #3729, Thanks to @Ran-Xing, @lbjlaq)
+            -   **Web/Headless 模式保存配置补全内存热更新**: 完整补齐 `only_raw_quota_models` 内存写锁同步与底层 HTTP 客户端缓存热失效逻辑，实现全平台 100% 动态热重载体验。(Fixes #3730, Thanks to @Ran-Xing, @lbjlaq)
+        -   **[跨平台主流 AI Agent / CLI 身份归一化与提示词特征流控防御] (Ref #3720, Thanks to @jeikl)**:
+            -   **Agent 身份归一化广谱纳管**: 针对 Google 上游对非官方 Antigravity Harness（OpenCode、OpenClaw、Grok Build、Cursor、Cascade、Cline 等）加强语义特征流控打入慢速池的问题，扩展识别原生名谓式开场与宿主集成式声明，统一收敛对齐为官方原生 Antigravity 身份，抹除竞品生态指纹。(Ref #3720, Thanks to @jeikl)
+            -   **自适应双重扫描窗口与核心提示词绝对保护**: 将系统提示词头部扫描窗口扩展为前 8 句或前 1500 字符，可靠穿透前置元数据垫片；并在流水线入口设立最高优先级白名单守卫，确保 `JeikCode` 等核心主要提示词 100% 豁免原样透传。(Ref #3720, Thanks to @jeikl)
+        -   **[Gemini 上游协议严苛合规、工具拓扑保序与 Token 估算加固] (Fixes #3695, PR #3696, PR #3702, PR #3705, Thanks to @cubelikeplayDaniel)**:
+            -   **多轮对话角色严格交替合规 (user <-> model)**: 在上一轮为 user 时就地合并续跑提示词与 parts，防止生成连续两个 user 轮次触发 Google 400 校验拦截。(Fixes #3695, PR #3696, Thanks to @cubelikeplayDaniel)
+            -   **原生与函数工具声明拓扑保序**: 严格保留客户端传入的自定义工具与 GoogleSearch、CodeExecution 等原生工具的原生相对优先级。(Fixes #3695, PR #3696, Thanks to @cubelikeplayDaniel)
+            -   **Google countTokens 专属顶层信封清洗**: 引入 `align_count_tokens_envelope`，剥离外层 `project`、`model`、`userAgent` 及内层 `safetySettings`，杜绝顶层信封污染引发上游 400 报错。(Ref #3697, PR #3702, Thanks to @cubelikeplayDaniel)
+            -   **PipelineTokenEstimator 补全工具思考签名统计**: 在预估 Claude 协议的 `tool_use` 与 `server_tool_use` 块时，提取隐式思考签名累加至总 Tokens，解决深度工具交互下预估偏小穿透 200k 自动压缩阈值的缺陷。(Ref #3697, PR #3705, Thanks to @cubelikeplayDaniel)
+            -   **会话指纹多模态雪崩消除与 Responses 并发守卫**: 单字符短输入指纹稳定，多模态纯图片提取元数据特征摘要防止全量 Base64 序列化引发内存激增；为 completions 统一托管 RAII Drop Guard 消除幽灵并发泄露。(Ref #3697, PR #3699, PR #3700, Thanks to @cubelikeplayDaniel)
+
+    *   **v5.0.0-beta.4 (2026-10-26)**:
+        -   **[出站谷歌风控提示词清洗深度重构与全生命周期身份归一化]**:
+            -   **全面取消内部框架豁免与统一官方身份对齐**: 彻底取消原先针对 JeikCode 框架的白名单短路豁免，将包括 JeikCode、OpenCode、OpenClaw、Cherry Studio 等跨平台主流第三方 AI Agent / CLI 的原生身份声明统一对齐为官方 Antigravity 原生助手，杜绝 Google Cloud Code 上游 WAF 针对第三方框架特征的 429 RESOURCE_EXHAUSTED 伪限流拦截。
+            -   **解除窗口限制与全量/XML标签深度穿透**: 移除原先扫描前 8 句/1500字符的窗口截断限制，支持整段文本以及任意嵌套 XML 标签内部（`<tag>...</tag>`）的全量深度扫描，穿透多行插件环境垫片；广谱支持 `*code`、`*studio`、`*claw`、`pi` 等各类大小写不敏感泛化开场白。
+            -   **首个 Model 轮次之前的 User 注入块智能清洗**: 增强对对话流首个 `model` 轮次之前的 `user` 提示词块识别（针对客户端将系统提示词作为前几个 Part 放入首个 user 块的场景进行识别清洗），同时严格确保代码块（```` ```` 与行内反引号）与用户后续真实提问 100% 原始无损。
+            -   **竞品厂牌统一归一化**: 对非代码区域出现的 OpenAI、Anthropic、Qwen、字节跳动、腾讯、小米、华为、DeepSeek、Baidu 等竞品厂牌统一替换为 Google。
+        -   **[入站请求 Gzip 解压缩支持与洋葱鉴权防御增强] (Ref #425, Ref #146, PR #3746, Thanks to @cubelikeplayDaniel)**:
+            -   **挂载 RequestDecompressionLayer**: 启用 `tower-http` 的 `decompression-gzip` 特性，为 Axum 反向代理服务挂载 Gzip 请求解压缩层，满足各类特定网关与客户端发送 Gzip 压缩 Body 的入站需求。(Ref #425, Ref #146, PR #3746, Thanks to @cubelikeplayDaniel)
+            -   **遵循安全洋葱模型执行次序**: 置于 `auth_middleware` 之后防止未鉴权的大体积解压缩炸弹攻击（Zip Bomb），置于 `monitor_middleware` 之前确保审计层获得真实解码请求文本与模型字段提取。(Ref #3746, Thanks to @cubelikeplayDaniel)
+            -   **集成测试全面覆盖**: 补充端到端测试用例，覆盖 Gzip 解压与模型提取、未鉴权请求在解压前拦截防御以及未压缩明文请求的无缝兼容性。(PR #3746)
+
+    *   **v5.0.0-beta.3 (2026-10-25)**:
+        -   **[macOS 悬浮窗唤起死锁根除与前台级联跳出修复] (Fixes #3744, Ref PR #3747, Ref #3748)**:
+            -   **跨线程死锁与 0-可见窗口挂起修复**: 将 `switch_to_main_window` 统一调度到操作系统原生 UI 主线程 (`app.run_on_main_thread`) 执行，在 `exit_lightweight_mode` 中针对 macOS 立即执行 `show()`、`unminimize()` 与 `set_focus()`，根治因跨线程 AppKit 调度与 WebView2/WebKit 消息循环悬空导致的悬浮窗卡死及主控制台无法打开的问题。(Fixes #3744, Ref PR #3747)
+            -   **唤起 Mini 统一收敛至 Accessory 附属模式**: 移除原先主窗口未彻底销毁（在后台/最小化到 Dock/其他 Space）时保留 Regular 策略的缺陷逻辑，唤起 Mini 时统一设为 `ActivationPolicy::Accessory`，彻底消除 AppKit 激活 Mini 视窗时伴随整个应用激活而将后台主控制台强制拉至前台、展开最小化或触发跨 Space 屏幕跳跃的顽疾。(Fixes #3744, Ref #3748)
+            -   **收起 Mini 与主窗口重聚自适应恢复**: 封装 `hide_mini_window` 统一视窗收起流程，在失焦自动收起、点击托盘切换或手动关闭 Mini 时，若主控制台原本处于存活态（`is_visible() || is_minimized()`），精准恢复 `Regular` 策略；并在主控制台重新获得焦点时保证 `Regular` 实时在线。(Ref #3748)
+        -   **[托盘左键行为偏好配置与多国语言支持] (Ref #3748)**:
+            -   **通用设置托盘单击偏好**: 在通用设置中新增托盘单击行为偏好配置 `tray_click_action`（支持「Mini 悬浮窗」与「主控制台」两种交互偏好，默认 Mini 悬浮窗），满足不同用户的桌面交互习惯。(Ref #3748)
+            -   **紧凑胶囊卡片交互与多国语言完备**: 遵循极简设计规范，采用紧凑胶囊卡片布局，对齐通用设置视觉标准，并同步补全全部 12 国语言字典。(Ref #3748)
+        -   **[Mini 悬浮窗底部背景直角消除与真圆角透明治理] (Ref #3748)**:
+            -   **移除冗余 CSS box-shadow**: 在桌面端模式下移除最外层容器冗余的 `shadow-2xl`，完全由系统原生 NSWindow 绘制透明窗体阴影（`"shadow": true`），根治内部 CSS 阴影向下溢出在视窗边界（y = 360px）被截断形成的水平平切线与 90 度直角阴影。(Ref #3748)
+            -   **首尾两栏显式圆角与根视窗溢出截断**: 顶栏显式追加 `rounded-t-2xl`，底栏追加 `rounded-b-2xl`，杜绝 WebKit 亚像素渲染及 backdrop-filter 在容器边缘轻微溢流的问题；并将 Mini 模式下的 `#root` 设为 `overflow: hidden !important`，补全 `::-webkit-scrollbar-corner` 透明规则，彻底透出桌面原生平滑圆角。(Ref #3748)
+        -   **[QoS 到期巡检 DashMap 自死锁修复与安全读写分离] (Fixes #3749, PR #3751, Thanks to @cubelikeplayDaniel)**:
+            -   **两阶段解耦与安全读写分离**: 在 `qos_guardian.rs` 中新增 `take_expired_jails_for_probing()`，Phase 1 通过只读迭代器收集所有已到期小黑屋账号快照 `Vec<(String, usize)>`，彻底退出迭代并释放 `DashMap` 分片读锁；Phase 2 逐个安全原子置换为 `Probing` 状态并释放写锁，彻底消除后台巡检线程同线程读写自死锁导致代理端口 8045 假死挂死的问题。(Fixes #3749, PR #3751, Thanks to @cubelikeplayDaniel)
+            -   **并发防死锁回归专项测试**: 增加 `test_take_expired_jails_for_probing_does_not_deadlock` 单元测试，在独立子线程与 5 秒超时保护下执行到期提取与状态置换验证，杜绝并发死锁回归。(Fixes #3749, PR #3751)
+        -   **[官方 Hub 出站基准升级至 2.24.0 与 Headless 异步探测注入] (Fixes #3750, PR #3751, Thanks to @cubelikeplayDaniel)**:
+            -   **内置稳态基准提升**: 将 `constants.rs` 中的内置稳态基准升级至官方 Antigravity 2.24.0（`OFFICIAL_HUB_VERSION = "2.24.0"`，`OFFICIAL_HUB_CL = "1000335682"`），满足 Google 上游新一代 `gemini-4-argon` 系列模型的客户端版本门控，杜绝因陈旧指纹触发 404 NOT_FOUND 进而导致全账号池 0.326ms 熔断 503 报错。(Fixes #3750, PR #3751, Thanks to @cubelikeplayDaniel)
+            -   **Headless 异步探测远程清单**: 在 Headless 与桌面启动流程中派发后台异步任务调用 `detect_and_update_hub_fingerprint()`，确保无本地 IDE 的纯 Docker 容器在启动后即自动同步官方最新更新清单。(Fixes #3750, PR #3751)
+            -   **合成测速探针 UA 动态化**: 将 `token_manager.rs` 中的测速探针硬编码 UA 替换为 `crate::modules::hub_version::get_current_hub_user_agent()`，确保出站指纹全链路合规统一。(Fixes #3750, PR #3751)
+        -   **[Argon 配额防呆隔离与虚假继承消除] (Fixes #3745, Ref PR #3747, Thanks to @cubelikeplayDaniel)**:
+            -   **移除降级借额逻辑**: 在 `quota.rs` 中移除 Argon 模型在缺少专属分组时借用通用 Gemini 配额的降级逻辑，严格要求命中官方 Argon 独立配额组。(Fixes #3745, Ref PR #3747, Thanks to @cubelikeplayDaniel)
+            -   **内存账号池全链路清理防呆**: 在 `token_manager.rs` 的 `load_single_account`、`get_available_models_from_json` 以及实时配额刷新逻辑中，若账号未分配 Argon 专属分组，彻底从 `model_quotas`、`available_models` 和 `model_limits` 中清理，防止无权账号冒领配额并规避调度器 503 熔断。(Fixes #3745, Ref PR #3747)
+            -   **前端配额卡片精准解耦**: 在 `quotaDisplay.ts` 中修正 `hasArgon` 判定，仅在真实 `quota_groups` 中存在 Argon 分组时展示卡片，杜绝 `fallbackModels` 注入虚假 5H 滚动配额。(Fixes #3745)
+            -   **自适应重试策略边界对齐**: 在 `common.rs` 中确保硬配额快速轮换（50ms）仅在第一轮重试生效，第二轮平滑进入温和指数退避。(Fixes #3745)
+
+    *   **v5.0.0-beta.2 (2026-10-24)**:
+        -   **[官方禁用模型严格过滤、基准线拦截门禁与虚假配额展示清理] (Fixes #3735, Ref #3737)**:
+            -   **官方模型结构体补齐 disabled 字段**: 在 `OfficialModelInfo` 中补齐 `disabled: Option<bool>` 字段与 `is_disabled(&self)` 判定方法，准确捕获 Google 上游 `fetchAvailableModels` 中带有 `disabled: true` 标记的条目。(Fixes #3735)
+            -   **基准线与归一化门禁拦截禁用变体**: 在 `is_model_compliant_with_baseline` 判定中置顶拦截 `-disabled` / `_disabled` 模型变体；并在 `normalize_to_standard_id` 中对禁用模型返回 `None`，杜绝将 `gemini-4-argon-disabled` 误归一化为可调度的 `gemini-4-argon` 标准计费桶。(Fixes #3735)
+            -   **配额解析与账号池加载严格防渗透**: 在 `quota.rs` 解析 `quota_response.models` 响应及 `TokenManager` 读入本地账号文件（`load_single_account`、`get_available_models_from_json`）时，双向剔除 `is_disabled()` 及 `-disabled` 变体，防止未开放灰度模型渗入可用模型列表。(Fixes #3735, Ref #3737)
+            -   **前端配额卡片与能力徽章虚假展示治理**: 在 `isSupportedDisplayModel`、`getGroupQuotaSummaries` 及 `hasArgon` 聚合逻辑中全面过滤 `-disabled` 标记，仅当账号真正具备未禁用 Argon 模型或官方 Argon 独立配额组时才激活 Argon 徽章与卡片，彻底根除因残留标记误借普通 Gemini 周配额导致的虚假展示。(Fixes #3735)
+        -   **[Mini 视窗唤醒主控制台死锁消除、原生主线程调度与轻量模式防黑屏] (Ref #3733, Ref #3738, Ref #3741)**:
+            -   **主线程调度与死锁根除**: 在后端引入 `switch_to_main_window` 与 `hide_mini_view` 命令，将主窗口重建及激活（`exit_lightweight_mode`）全量调度至系统原生 UI 主线程（`app.run_on_main_thread`），彻底消除 Windows 下跨线程创建窗口导致的 Win32 消息循环死锁与自旋挂起。(Ref #3733, Ref #3738, Ref #3741)
+            -   **Mini 视窗与主控制台切换竞态消除**: 呼出主控制台时，先在 Rust 后端原子化隐藏未置顶的 Mini 视窗并重置活跃态，避免前端多段 await 因 WebView2 挂起导致假死。(Ref #3733, Ref #3738)
+            -   **全链路 ACL 能力权限补全**: 在 `capabilities/default.json` 中为 main 与 mini 窗口补齐 `core:window:allow-hide`、`allow-set-focus`、`allow-unminimize`、`allow-close` 等权限，防止前台窗口控制被底层 ACL 拦截。(Ref #3738)
+            -   **轻量模式首屏渲染就绪无感淡入**: 重建主控制台窗口时默认保持 `visible: false` 静默装载，待 ThemeManager 首屏主题与配置挂载就绪后自动淡入并对焦，彻底根除 WebView2 绘制 React DOM 前的黑底白框闪烁。(Ref #3733, Ref #3738)
+
+    *   **v5.0.0-beta.1 (2026-10-24)**:
+        -   **[OpenAI Responses API 结构化输出支持、流水线工具冲突治理与零误杀解壳] (Fixes #3710, Ref #3723, Thanks to @cubelikeplayDaniel)**:
+            -   **协议层入站规范化**: 在 `OpenAIRequest` 中支持 Responses API 的 `text.format` 规范，并在适配器中统一定位与提取 `effective_response_format`，规范化映射为 Gemini 原生 `generationConfig.responseSchema` 与 `responseMimeType: "application/json"`，打通 Codex Desktop 对话自动命名（`thread_title`）、摘要生成等后台结构化任务。(Fixes #3710, Ref #3723, Thanks to @cubelikeplayDaniel)
+            -   **后台任务思考预算收敛与防超时**: 显式遵循 `reasoning.effort: "low"`，将后台短任务的思考预算收敛在 1024 以内，彻底消除高思考模型在对话命名时触发 Codex 客户端 30 秒硬超时中断报错的隐患。(Fixes #3710)
+            -   **流水线统一工具冲突治理 (Pipeline First)**: 将 `responseSchema` 与 `tools` / `toolConfig` 的互斥治理下沉至 `src/proxy/pipeline/inbound.rs` 的 `align_google_request_prefix_topology_with_model` 统一出口，当检测到 `responseSchema` 生效时主动清空 `canonical_tools` 与 `canonical_tool_config`，跨协议彻底杜绝上游 400 校验拒绝。(Fixes #3710, Ref #3723)
+            -   **出站受控整包解壳与常规对话零误杀保障**: 在 `convert_chat_response_to_responses` 中引入 `is_structured_output` 严格门禁，常规对话 100% 原始呈现（杜绝日常聊天文本被误删截断）；仅在结构化任务下采用 `unwrap_outer_code_fence_if_structured` 严格整包解壳，避免破坏内嵌代码块并确保 Codex Desktop 原生 `JSON.parse` 正常解析。(Fixes #3710, Ref #3723)
+        -   **[上游超时预算动态收敛、故障账号解绑与 Claude 429 泄漏清除] (Fixes #3713, Ref #3506, Ref #3525, Ref #3720, PR #3714, Thanks to @cubelikeplayDaniel)**:
+            -   **响应头看门狗与总预算精准收敛**: 将流式首选端点 HTTP 响应头看门狗基准收敛至 30s（超大 payload 弹性放宽至 45s），备用回退预算 25s，全链路总预算由原先的 150s 大幅收敛至 55~70s（非流式严格 30s），彻底杜绝主端点在排队拥塞时长时间挂死。(Fixes #3713, PR #3714, Thanks to @cubelikeplayDaniel)
+            -   **架构哲学对齐与剔除慢端点粗暴降级**: 剔除对成功响应但耗时偏长的端点判定 `mark_failure` 与进入冷却期，避免健康端点被轮流误杀与震荡，将延迟与限速裁决权完全交由 QoSGuardian 调度器统御。(Ref #3720, PR #3714)
+            -   **全端点故障账号短时冷却与粘性解绑迁移**: 在 `TokenManager` 中提供 `mark_account_transient_failure`，当协议处理层发生全端点超时或网络错误时，立即对该账号施加 30s 短时冷却并原子清理其绑定的所有粘性会话，使后续请求无缝自动迁移至其他健康账号。(PR #3714)
+            -   **Claude 协议接入 FailureStatusTracker 消除 429 泄漏**: 在 `claude.rs` 重试循环中完整接入 `FailureStatusTracker`，网络/看门狗超时显式记录 `GATEWAY_TIMEOUT`，最终状态码仅在全量尝试均为 429 时才返回 429，一旦包含网络超时则降级返回 504 Gateway Timeout，彻底根除客户端 1 分钟退避冻结。(PR #3714)
+            -   **重构多账号跨天硬配额耗尽检测**: 将 `quotaResetDelay > 30min`（如 68 小时）且包含 `quota_exhausted` 的响应准确识别为账号级硬配额枯竭，在多账号环境下立即执行 50ms 闪电切号，避免 CPU 阻塞并快速恢复响应。(PR #3714)
+        -   **[流式巨型工具调用跃迁宽限期与 Claude 思考预算默认回退] (Fixes #3739, Ref #3735, PR #3740, PR #3742, Thanks to @cubelikeplayDaniel)**:
+            -   **流式巨型工具调用缓冲跃迁宽限期**: 放宽过渡断崖自动跃迁条件为 `matches!(phase, StreamPhase::Thinking | StreamPhase::Streaming)`，允许在 Streaming 阶段生成 10,000+ tokens 巨型 `functionCall` 缓冲静默时自动跃迁至 Transition 宽限期并赋予 180s 保护，彻底消除满 120s 滑动超时被误杀提前截断的问题。(Fixes #3739, PR #3740, Thanks to @cubelikeplayDaniel)
+            -   **Claude 思考预算缺省回退官方默认值**: 在 `src-tauri/src/proxy/model_specs.rs` 的 `resolve_custom_budget` 中，针对 Claude 思考模型当配置的预算 `<= 0` 时统一返回 `None`，使流水线正确回退并取回官方模型结构体权威默认值（如 1024），避免将 `-1` 误当下发配置。(Ref #3735, PR #3742, Thanks to @cubelikeplayDaniel)
+        -   **[Mini 桌面悬浮视窗 React Router 404 兜底与同步判定] (PR #3741, Thanks to @cubelikeplayDaniel)**:
+            -   **增强 Mini 悬浮窗同步判定机制**: 优先使用 `window.location.search` (`?mini=1`) 与 `__TAURI_INTERNALS__` 立即同步判定，消除 Tauri 异步 IPC 窗口 label 解析延迟引发页面路由重入的偶发白屏。(PR #3741, Thanks to @cubelikeplayDaniel)
+            -   **React Router 404 错误边界兜底**: 在 `createBrowserRouter` 中补充 `errorElement`、`index.html` 重定向以及通配符 `*` 重定向 fallback，彻底消除 React Router 默认 404 错误边界页。(PR #3741)
+
+    *   **v5.0.0-beta.0 (2026-10-23)**:
+        -   **[上游 fetchAvailableModels 缺少 quotaInfo 架构级解耦与全系模型保活自适应] (Fixes #3737, Thanks to @xiaozhi-xmu, @chenshin166-arch)**:
+            -   **模型可用性与额度解析解耦**: 彻底移除旧逻辑中 `if let Some(quota_info) = info.quota_info` 的强过滤门禁，以官方公开模型目录为基准，对 Google 上游不再为 Gemini 系（`gemini-3.8-flash-*`、`gemini-3.1-flash-lite` 等）下发 `quotaInfo` 的账号无损保留模型可用性，彻底消灭全系模型被误丢弃导致本地秒回 503 的严重缺陷。(Fixes #3737, Thanks to @xiaozhi-xmu, @chenshin166-arch)
+            -   **分组配额预拉取与短板木桶融合**: 先行获取 `retrieveUserQuotaSummary` 分组配额（5h 与周配额双窗口），当模型缺失 `quotaInfo` 时直接从对应的 Gemini 组或第三方模型组中继承配额；Argon 优先匹配独立分组，无独立分组时优雅降级至通用 Gemini 分组。(Fixes #3737)
+            -   **严格保护显式零额度与最晚重置时间**: 模型级明确为 0% 时绝不被正数分组额度覆盖；双窗口额度相同时优先采用较晚的重置时间以保护健康账号。(Fixes #3737)
+            -   **废弃内部代号 gemini-pro-agent 彻底清退**: 在 `variant_mapping.rs` 中将 `gemini-3.1-pro` 家族规范映射由已废弃的内部代号 `gemini-pro-agent` 升级为官方标准物理模型 `gemini-3.1-pro-high`，彻底杜绝请求 3.1 Pro 时因调度器寻找已被基准线过滤淘汰的 `gemini-pro-agent` 导致 503 `No accounts available with quota for model: gemini-pro-agent`。(Fixes #3737)
+            -   **Claude 协议补齐账号级动态模型自适应改写**: 选号后调用 `token_manager.resolve_dynamic_model_for_account`，实现与 OpenAI 及 Gemini 协议处理逻辑严格对称，支持根据具体命中账号的实际授权目录自适应匹配候选物理模型。(Fixes #3737)
+        -   **[Gemini 4 Argon 全系列完整调度闭环与独立配额防穿透隔离] (Fixes #3735)**:
+            -   **调度器高阶模型与专属配额组能力继承对齐**: 在 `TokenManager::get_token_internal`（候选池精炼）与 `find_fallback_account_in_same_family` 中，为候选账号过滤补齐 `token_supports_advanced_model` 与专属计费桶（`normalized_target != "claude" && token.model_quotas.contains_key(...)`）能力判定；彻底解决第一阶段收敛出具备 Argon 配额的账号后在第二阶段被 `available_models` 严格检查误杀、导致抛出 503 `No accounts available with quota for model` 的根本缺陷，同时严格保持 Claude 5.5 / 4.6 跨代隔离不串池。(Fixes #3735)
+            -   **全链路健壮识别配额组与能力持久化**: 在 `load_single_account`、`get_available_models_from_json`、`refresh_quota` 以及 `modules/quota.rs` 中全面支持 camelCase 与 snake_case 双字段形态，只要分组或桶的 `display_name` 或 `bucket_id` 包含 `argon` 均健壮捕获其计费配额；当账号已具备 `gemini-4-argon` 时，自动双向补齐内存中的 `available_models` 与限额定义。(Fixes #3735)
+            -   **优化账号表格邮箱列排版与徽章防溢出**: 重构 `AccountTable.tsx` 邮箱列布局为垂直弹性容器，将多徽章列表设为 `flex-wrap` 并移除 `shrink-0`，使 `Argon`、`Claude 5.5`、`GPT-120B` 等多标签在邮箱下方自然换行，杜绝横向穿透遮挡相邻“模型配额”列胶囊条。(Fixes #3735)
+        -   **[Mini 桌面悬浮视窗 macOS 原生真透明、双向毫秒级跨窗口同步与 Claude 拓扑防御增强] (Fixes #3733, Ref #3718, #3721, PR #3738, Thanks to @lbjlaq)**:
+            -   **Mini 桌面悬浮视窗 macOS 原生真透明与拖拽权限健全**: 引入 Tauri `macos-private-api` 特性与原生 `macOSPrivateApi: true` 配置，彻底消除 macOS WebKit 内核强制绘制底色导致的圆角黑边/白矩形；首帧注入透明脚本与 URL 标识，并在能力清单中补齐 mini 窗口拖拽及置顶操作权限。(Fixes #3733, Ref #3718, PR #3738, Thanks to @lbjlaq)
+            -   **深浅模式自适应与跨窗口多语言毫秒级同步**: Mini 悬浮窗自适应继承主控制台与操作系统的暗黑/浅色主题；接入 `app://theme-changed` 与 `app://language-changed` 跨窗口事件监听，保证主控制台与 Mini 悬浮窗无论切换语言还是主题均毫秒级双向无感同步，并补全全部 12 国语言字典。(Fixes #3733, PR #3738)
+            -   **Claude 出站门禁防御性哨兵清理与思考预算下限保护**: 对目标为 Claude 模型的请求执行严格的防御性哨兵清理（Purge），彻底剥离历史会话或跨模型切换遗留的任何哨兵；出站阶段增加 Claude 思考预算下限动态保护（`Clamp thinkingBudget >= 1024`），防止因客户端默认值触发 Anthropic 上游 400 校验异常。(Ref #3721, PR #3738)
+            -   **无签名孤儿思考块安全降级与配额卡片底部细线进度点缀**: 跨模型切换或历史无合法 Claude 签名时，安全丢弃思考块或平滑降级为普通正文；将 `GroupQuotaCard` 进度条融合为底部精致细线点缀，兼顾多徽章与动态标签展示，并保留满额度高对比度变色逻辑。(PR #3738)
+        -   **[官方权威模型全景升级、分级思考传输与大上下文自适应 QoS 调度] (Fixes #3735, Ref #3720)**:
+            -   **官方权威模型提取与过时模型全面下线**: 基于官方 `fetchAvailableModels`（`agentModelSorts` 推荐列表、`imageGenerationModelIds`、`tieredModelIds`）动态提取每个账号真实支持的旗舰模型；在代码库与配置文件（`model_specs.json`, `model_mapping.rs`, `cli_sync.rs`, `opencode_sync.rs`, `modelConfig.ts` 等）中彻底清除历史遗留的硬编码过时模型（如 `gemini-2.0/2.5`、`claude-3-5/3-7`、`chat_*`、`tab_*` 等），仅保留官方权威模型及后缀派生裸模型。(Fixes #3735)
+            -   **全协议端点上下文窗口与最大输出参数标准化**: 在 OpenAI（`/v1/models`）、Claude（`/v1/models`）与 Gemini（`/v1beta/models`）元数据端点中引入并标准化 `context_length`、`max_tokens`、`max_output_tokens` 等字段；严格依据官方规格动态返回真实限制（Gemini 4 Argon / 3.8 Flash 为 `1,048,576 / 65,536`，Claude 5.5 为 `1,000,000 / 128,000`，Claude 4.6 为 `200,000 / 64,000`，GPT-OSS 为 `131,072 / 32,768`）。(Fixes #3735)
+            -   **思考预算与思考等级分类模型传输 (Thinking Budget vs Thinking Level)**: 新一代分级模型（Gemini 4 Argon、Claude 5.5 系列）受控于 `thinkingLevel`（`"LOW"`, `"MEDIUM"`, `"HIGH"`），严格下发思考等级，严禁输出数字预算；传统预算模型（Gemini 3.8 Flash、Gemini 3.1 Pro、Claude 4.6 等）走 `thinkingBudget` 通道，杜绝双字段冲突 400 报错。(Fixes #3735)
+            -   **未缓存 Token 动态耗时补偿与冷启动隔离**: 在 `QoSGuardian` 中引入会话上下文水位跟踪，自动识别超长上下文（如 340k+ 零缓存）冷启动 Prefill 阶段，按每 100K 未缓存 Token 补偿 +7.0s 判定阈值，并放宽平反首字基准阈值至 18.5s。(Ref #3720)
+            -   **QoS 小黑屋一键解除与状态倒计时透明化**: 账号管理卡片与表格视图展示 QoS 小黑屋实时剩余时长，并提供一键解除小黑屋限制按钮及后台接口（`release_account_qos_jail`）。(Ref #3720)
+        -   **[多语言单语纯粹性治理与导航排版对齐]**:
+            -   **导航结构与多语言规范**: 将多协议支持更新为“模型大全与协议”并调换至第三个导航位，12 种系统语言全面对齐单语纯粹性，清除中英混杂。(Ref #3733)
+            -   **配额卡片与提示全量国际化**: `GroupQuotaCard` 悬浮提示卡片完整接入多语言字典，并清理能力徽章上的冗余悬停文案。
+
+    *   **v4.9.9-beta.10 (2026-10-23)**:
+        -   **[跨模型切换签名逆向重构：对齐官方 Antigravity 哨兵规范，根治 Claude 并发工具 400 签名崩溃]**:
+            -   **官方 Base64 哨兵全局对齐**: 逆向分析官方 Antigravity 客户端的 Proto3 JSON 报文规范，将全局哨兵常量从纯文本明文 `skip_thought_signature_validator` 升级为官方原生标准的 44 字节 Base64 密文 `c2tpcF90aG91Z2h0X3NpZ25hdHVyZV92YWxpZGF0b3I=`；同时保留旧明文哨兵兼容识别（`LEGACY_SENTINEL_SIGNATURE`），确保历史缓存零兼容性断裂。
+            -   **Claude 全链路 0 哨兵 + 并发工具严格留空**: 根据官方 Anthropic 验签引擎行为分析，彻底废除向 Claude 模型注入任何哨兵的逻辑；并发工具调用场景中，签名唯一落点为首个非思考部件（首个工具或首个正文），后续所有并发工具严格留空无 `thoughtSignature` 字段，彻底消除 `Invalid signature in thinking block` 400 拦截。
+            -   **Claude ➔ Gemini 切换异构工具免检通行证**: 当请求从 Claude 切回 Gemini 时，进站门禁（Gatekeeper）自动识别历史中携带 `toolu_` 前缀的异构 Claude 工具调用，为每一个异构 `functionCall`（含并发后续工具）统一赋予 Base64 哨兵通行证，让 Gemini 引擎完全绕过对异构工具的签名校验；正文文本部件严格保持纯净，绝对不附带哨兵。
+            -   **Gemini ➔ Claude 切换历史清洁**: 切换至 Claude 时，进站流水线彻底剥除历史轮次上的 Gemini 短签名与旧哨兵，历史工具与历史正文以纯净无签名形态发往 Anthropic，严禁异构签名污染 Claude 请求。
+            -   **哨兵零落库保护**: 贯彻“哨兵仅内存按需动态填入”原则，在 `normalize_and_heal_signature` 中增加两种哨兵形态的硬拦截门，确保任何形态的哨兵值均不会写入 SQLite 持久化存储，消除缓存污染风险。
+            -   **新增跨模型切换集成断言测试**: 新增 `test_gatekeeper_foreign_claude_tools_switched_to_gemini_get_base64_sentinel`，全面覆盖异构工具切回 Gemini 时的正文留空与工具全量 Base64 哨兵核心逻辑，防止未来回归。
+
+    *   **v4.9.9-beta.9 (2026-10-23)**:
+        -   **[Linux 窗口抢占置顶与自动拉起根治，并隔离 CLI 凭证同步] (Fixes #3728, Thanks to @bkspi)**:
+            -   **彻底禁止动态进程执行探测版本**: 在 Linux 环境下移除对外部可执行文件执行 `Command::new(exe_path).arg("--version")` 的兜底逻辑；针对 Electron 桌面应用在接收到 `--version` 参数时不会静默退出，而是触发 `single-instance` 机制向正在运行的主实例发送 IPC 消息导致主窗口每数秒被强制恢复并置于最前台抢占焦点、或在客户端关闭时意外启动新实例的致命缺陷，全面改为安全的静态文件与元数据检测。(Fixes #3728, Thanks to @bkspi)
+            -   **多路径符号链接穿透与 asar 内存解析**: 自动通过 `fs::canonicalize` 解析符号链接定位到可执行文件真实物理安装根目录，覆盖 Linux 标准安装路径（`/opt/Antigravity/`、`/usr/share/` 等）下的 `resources/app/package.json` 与 `product.json`；并针对打包于 asar 内的场景实现轻量内存解析器 `extract_version_from_asar_bytes`，探查失败时安全降级默认值，从物理层面杜绝任何外部进程唤醒。(Fixes #3728)
+            -   **版本探查 60 秒全局内存缓存**: 在 `get_antigravity_version_with_path` 引入带有 60 秒 TTL 的内存缓存（`VERSION_CACHE`），彻底消除前端轮询与窗口焦点切换时对磁盘版本文件的高频 I/O 探查损耗。(Fixes #3728)
+            -   **解除经典款切号对 CLI 专属凭证的覆写覆盖**: 为 `write_to_file_credentials` 引入 `sync_agy_cli` 显式控制开关；切换经典款应用时仅维护钥匙串与通用凭证，严禁盲目冲刷 `~/.gemini/antigravity-cli/antigravity-oauth-token`；仅在显式切换 CLI 时同步更新 CLI 凭证文件，杜绝切经典款冲掉 CLI 独立账号的冲突问题。(Fixes #3728)
+            -   **补全多端账号生效探测的回退隔离**: 优化 `detect_active_clients_status`，当某一客户端未在钥匙串直接匹配时，优先回退到该客户端专属记录的目标账号 ID（`current_classic_account_id` / `current_agy_account_id` / `current_ide_account_id`），杜绝因返回 `None` 导致前端错误回退到全局最后切换的账号而造成“一个变另一个也跟着变”的视觉联动。(Fixes #3728)
+        -   **[Gemini 协议 URL Query (?key=) 授权鉴权全面兼容] (Fixes #3729, Thanks to @Ran-Xing)**:
+            -   **支持标准 URL Query 传参提取 API Key**: 针对 Google Gemini 官方标准 REST 协议及第三方客户端（如 Cherry Studio 等）通过 URL Query 参数（例如 `?key=YOUR_API_KEY` 或 `?alt=sse&key=...`）传参调用代理时，因中间件仅检查 HTTP Header 而被误判拦截为 `401 Unauthorized` 的问题，重构 `extract_api_key` 鉴权凭证提取管道，完整覆盖 `Authorization: Bearer`、`x-api-key`、`x-goog-api-key` 及 URL Query `?key=`。(Fixes #3729, Thanks to @Ran-Xing)
+            -   **统一免鉴权模式下的 User Token 识别**: 在 `auth_mode = Off` 模式下同步接入通用凭证提取管道，确保无论通过 Header 还是 Gemini 标准 URL Query 传参，均能准确提取并记录 User Token 身份与其调用用量。(Fixes #3729)
+        -   **[Web/Headless 模式保存配置补全「仅暴露真实配额模型」等内存热更新] (Fixes #3730, Thanks to @Ran-Xing)**:
+            -   **补齐 Web 配置保存状态热更新**: 针对 Web 网页端 / Headless（无头 VPS）服务在管理接口 `admin_save_config` 保存配置时，因遗漏写锁同步 `only_raw_quota_models` 导致用户开关「仅暴露真实配额模型」后 `/v1/models` 等接口未能即时生效、必须重启进程的缺陷，完整补齐 `only_raw_quota_models` 内存写锁同步。(Fixes #3730, Thanks to @Ran-Xing)
+            -   **对齐桌面端全量热重载链路**: 同步补齐 Web 模式下对 `debug_logging`、`upstream.set_user_agent_override`、`monitor.set_capture_health_logs`、`hub_version` 指纹以及上游代理和代理池底层 HTTP 客户端缓存热失效逻辑，确保 Web/Headless 环境与桌面 GUI 环境享有 100% 相同的高水准动态热重载体验。(Fixes #3730)
+
+    *   **v4.9.9-beta.8 (2026-10-22)**:
+        -   **[本地状态快照水合机制彻底消除冷启动图2空状态闪烁] (Ref #3726)**:
+            -   **同步快照秒级水合**: 在 `useAccountStore` 初始状态中引入 `localStorage` 本地快照同步水合机制（`getInitialAccounts()` 与 `getInitialCurrentAccount()`）。(Ref #3726)
+            -   **首帧 0ms 满血直出**: 软件冷启动打开的第一帧，直接从本地快照读取并渲染上一次的全部账号列表、问候语、当前账号及配额矩阵卡片（图 1），彻底杜绝在等待后端 IPC 请求期间短暂闪现图 2（“你好，用户”、“0 总账号数”、“暂无账号”）的空态闪烁。(Ref #3726)
+            -   **静默后台校验**: 后台异步 IPC 请求保持静默对齐，若磁盘数据有变动无感平滑更新，兼顾极致的瞬时视觉体验与底层数据一致性。(Ref #3726)
+
+    *   **v4.9.9-beta.7 (2026-10-22)**:
+        -   **[冷启动账号秒级直出与批量导入满血配额落盘修复] (Fixes #3726)**:
+            -   **恢复批量导入满血配额落盘**: 在 6 路异步流式并发中，每个账号并行完成 Token 换取、UserInfo、Project ID 探测与详细 Quota 拉取，使账号在导入期 100% 具备完备的配额与等级数据落盘，保证导入完成后无论多少次冷启动重启，均无需在线重新补齐，彻底杜绝冷启动重启后账号从 0 递增与加载延迟。(Fixes #3726)
+            -   **冷启动锁彻底解耦（消灭 0 一会儿时间）**: 将 `commands::list_accounts` 中获取运行时 TokenManager 状态的读锁改为非阻塞 `try_read()`，在后台管理服务器（AxumServer）启动持写锁期间绝不阻塞前端账号列表向界面的毫秒级直出呈现。(Fixes #3726)
+            -   **索引读取优先直接反序列化**: 优化 `load_account_index_in_dir` 优先直接反序列化新版规范的 `AccountIndex`（0.5ms 瞬时命中），消除冷启动时不必要的旧版迁移格式探测与额外 I/O 放大。(Fixes #3726)
+
+    *   **v4.9.9-beta.6 (2026-10-22)**:
+        -   **[异步高性能批量导入与索引持久化重构（根治内存雪崩与 28 分钟导入延迟）] (Fixes #3726)**:
+            -   **异步流式并发与背压控制**: 新增 `batch_import_accounts` 高性能流式处理管道，基于 `buffer_unordered(6)` 严格控制在途活跃任务上限，将 494 个账号导入耗时由 28 分钟锐减至 15~20 秒（提速超 60 倍），彻底杜绝 `join_all` 造成的内存暴涨与 OOM 内核击毙。(Fixes #3726)
+            -   **科学防 Google 风控体系**: 注入 30ms ~ 90ms 动态散列微抖动（Jitter），打散并发时序杜绝同一毫秒齐射 Google 接口；集成 429 速率限制 1.5s 自动退避重试与轻量两阶段验证（导入期仅做 Token 验证与用户信息核验，延迟重量级配额探测），从根源杜绝 IP 被封控风险。(Fixes #3726)
+            -   **消除小文件爆炸遍历与前端重绘雪崩**: 优化 `detect_active_clients_status`，废除调用 `list_accounts()` 遍历磁盘数百个小文件及 SQLite 密集查询的缺陷，改为内存索引直接比对，并将前端 5 秒轮询优化为窗口焦点感知驱动；批量刷新与批量导入写盘由 N 次聚合为 1 次单次原子提交；前端导入仅刷新进度条，彻底消灭 494 次大 DOM 树全量重排重绘。(Fixes #3726)
+            -   **严格幂等性与孤儿文件自愈**: 确立小写邮箱与 Refresh Token 双重查重与原地复用（In-Place Upsert），无论重复添加多少次或先删后加均严格复用唯一 ID 并覆盖更新原文件；引入 `clean_duplicate_account_files` 磁盘自愈清理机制，物理级杜绝一个账号出现两个凭据文件。(Fixes #3726)
+            -   **旧版单文件自动兼容与 `-backup` 容灾保障**: 自动检测并无缝分片升级旧版单文件格式（如包含完整实体的 `accounts.json`），自动重命名保存为 `accounts.json-backup` 或 `<file>-backup`；当索引丢失或异常时优先从 `-backup` 自动重建，支持随时重新导入。(Fixes #3726)
+            -   **全端高性能批量导入导出适配**: 全面打通桌面端（Tauri 流式进度弹窗）、网页端（Axum `/accounts/batch-import` 端点）与命令行端（`at import <file>` / `at export` 命令），跨平台体验高度一致。(Fixes #3726)
+
+    *   **v4.9.9-beta.5 (2026-10-22)**:
+        -   **[基于纯净同侪校准与阶梯探针的自适应 QoS 调度系统] (Fixes #3720, PR #3725)**:
+            -   **真实首包延迟 (TTFT) 瞬态感知**: 以发出请求至收到上游首个有效 Chunk 的纯粹时间为核心指标，彻底排除输出代码量与流式传输的干扰，作为判定静默 QoS 分桶降级的权威物理依据。(Fixes #3720, PR #3725)
+            -   **五重纯净同侪基线比对与防误杀体系**: 同类账号基线严格排除自身、异构 Tier、本地禁用、429 限流/零配额、小黑屋(Jailed)、探测中(Probing)、瞬态可疑(Suspicious)以及缓刑(HalfOpen)账号，彻底杜绝劣币毒化基准；为深度思考模型提供 35s 动态时间补偿，杜绝推理耗时误杀；设置全局雪崩制动刹车（同行均值 >= 20s 时不滥杀）与 8s~20s 迟滞死区消除边界震荡。(Fixes #3720, PR #3725)
+            -   **瞬态打标与会话即刻解绑 (Session Handover)**: 首次超标打上 `Suspicious` 瞬态可疑标记（同行算均值瞬间排除它，调度器开启“只出不进”保护）；5 分钟滑动窗口内累计 2 次超标判定处于降级池，立即强制解绑粘性会话切断死锁灌水；由 P2C 调度器在纯健康号池中重新选号并立即焊死会话绑定，后续请求稳定享受 100% Prompt Cache 极速响应。(Fixes #3720, PR #3725)
+            -   **后台阶梯轻量自愈探针与半开防抖机制**: 阶梯冷却梯度为 2m -> 5m -> 10m -> 15m -> 20m -> 30m，每次升级等待时钟严格从 0 重新计时；到达节点后台发起纯文本“你好”极简探针（8 秒硬超时中止，消耗 < 5 tokens）；探针通过后进入 `Half-Open` 缓刑期，经受住连续 2 次真实请求考验（TTFT < 8s）才满血出狱；引入 30 分钟惩罚记忆，复发违规直接继承高阶梯防止高频进出。(Fixes #3720, PR #3725)
+            -   **多端状态透明化与 12 语种多语言支持**: 在账号管理（卡片、表格、移动行）动态展示黄色状态标签（疑似被限速、限速小黑屋中、解限探测中、观察缓刑中），恢复健康后自动消除；在调用记录/流量日志（ProxyMonitor）表格的账号列小巧注入黄色 QoS 状态徽章与多语言浮层提示；完整覆盖 12 种单语语言字典。(Fixes #3720, PR #3725)
+        -   **[CI 预览发布资产配额防爆仓治理]**:
+            -   **旧版预览资产自动清理**: 在 GitHub Actions 的 `Sync Preview Channel Release` 步骤中配置 `removeArtifacts: true`，解决历史预发布版本资产不断堆积导致触达单 Release 1000 个文件上限并引发发布失败的问题，确保每次发布预览版时 preview 镜像 Release 仅保留最新版本的资产与 `updater.json`。
+
     *   **v4.9.9-beta.4 (2026-10-21)**:
         -   **[系统托盘分层配额感知与迷你悬浮窗快捷联动] (Fixes #3719, Thanks to @Wiojelt)**:
             -   **全平台系统托盘悬停配额卡片 (Tooltip)**: 针对跨平台系统托盘底层差异（Windows 任务栏通知区物理不支持图标旁文字，而 macOS 状态栏原生支持），在系统托盘实现富文本悬停卡片；鼠标滑过托盘图标即可立即查看当前账号及 Claude、Gemini Pro、Gemini Flash、Gemini Image 各核心模型的剩余配额百分比；严格适配 Windows `NOTIFYICONDATAW.szTip` 128 字符硬限制，超长邮箱安全收敛，确保全平台零截断与极低交互干扰。(Fixes #3719, Thanks to @Wiojelt)
             -   **macOS 原生状态栏配额标题 (Title)**: 在 macOS 菜单栏图标旁原生常驻展示核心模型剩余百分比（如 `C:85% G:100%`），紧凑精炼且自适应屏幕刘海空间；异常与未登录态自适应清除或显示预警标识。(Fixes #3719)
             -   **核心模型智能两阶段匹配 (Pipeline First)**: 重构托盘模型匹配算法，废除过往针对特定版本的硬编码名称限制，优先精准匹配最新主力旗舰模型，并对衍生与未来迭代版本（`gemini-*-pro*`、`gemini-*-flash*`、`*image*`、`*claude*/*sonnet*`）提供弹性通配回退。(Fixes #3719)
             -   **迷你悬浮窗一键呼出与状态双向联动**: 在托盘右键菜单新增【迷你悬浮窗】快捷入口，打通 `tray://show-mini-view` 与 `tray://show-window` 双向事件；点击可由托盘一键无缝唤起/切换至桌面 Mini HUD 悬浮看板，点击显示主窗口时安全退出 Mini 模式恢复完整主界面；全量覆盖 12 种系统语言并维持单语纯粹性。(Fixes #3719)
-
-        -   **[Linux 重启自识别隔离、Wayland 断开保活与强制工具调用] (Fixes #3721, Thanks to @q514168795)**:
-            -   **全量重启不再把管理器当成 IDE**: `is_manager_or_tools_process` 覆盖 Linux 内核 15 字节进程名截断（`antigravity-too` / `antigravity_too`），避免重启时再拉起一份管理器。(Fixes #3721)
-            -   **Wayland 断开后 8045 反代继续服务**: 显示守护只结束 GUI 线程，代理保持运行。`antigravity-tools --headless` 可直接以无头模式启动。(Fixes #3721)
-            -   **Claude 强制 tool_choice 不再与思考配置冲突 400**: 进站流水线在 Claude 且 `tool_choice` 为 ANY 时剔除 `thinkingConfig`；若上游仍返回该冲突，则在当前账号上去掉思考参数再试一次。(Fixes #3721)
-        -   **[监控过滤第三方网关探活]**:
-            -   健康日志捕获关闭时，成功的 NewAPI / OneAPI 探活请求不再写入监控。4xx / 5xx 仍然记录。
 
     *   **v4.9.9-beta.3 (2026-10-21)**:
         -   **[多客户端身份归一化与提示词特征流控防御升级] (Ref #3720: antigravity 限速调查)**:

@@ -1,4 +1,12 @@
 {
+    "thinking_adaptive": {
+        "title": "مستوى التفكير: تكيّفي عبر البوابة (وفق الكتالوج الرسمي)",
+        "tag": "موصى به",
+        "desc": "تم إيقاف التحكم المباشر من العميل ومستويات الرموز المخصصة: النماذج التي توفر thinkingLevel تأخذ المستوى من فئتها (low / medium / high)، أما البقية فتتبع القيمة الافتراضية الرسمية thinkingBudget. جهد التفكير المرسل من العميل يُطبّق فقط على النماذج بدون لاحقة لاختيار طراز الفئة المحدد."
+    },
+    "hub_update": {
+        "available": "antigravity hub latest: {{version}} — تجاهل ذلك إذا كانت الطلبات تعمل بشكل طبيعي"
+    },
     "common": {
         "loading": "جاري التحميل...",
         "load_more": "تحميل المزيد",
@@ -143,6 +151,7 @@
         "disabled_accounts": "الحسابات المعطلة",
         "disabled_accounts_desc": "معطل يدوياً / البروكسي مغلق",
         "abnormal_accounts": "الحسابات غير الطبيعية",
+        "view_abnormal_accounts": "انقر لعرض تفاصيل الحسابات غير الطبيعية وإدارة المخاطر في قائمة الحسابات",
         "abnormal_accounts_has_risk": "⚠ يتطلب التحقق / محظور",
         "abnormal_accounts_no_risk": "✓ لا توجد حسابات محظورة أو معطلة",
         "quota_matrix_active": "مصفوفة حصص الحسابات المتاحة",
@@ -195,6 +204,13 @@
         "proxy_online_unit": "بروكسي متصل",
         "btn_proxy_online": "الوكيل المتصل ({{count}})",
         "btn_all_available": "المتاحة ({{count}})",
+        "qos_auto_jail": "عزل تلقائي",
+        "qos_auto_jail_badge_on": "تشغيل",
+        "qos_auto_jail_badge_off": "إيقاف",
+        "qos_auto_jail_on": "العزل: تشغيل",
+        "qos_auto_jail_off": "العزل: إيقاف",
+        "qos_auto_jail_enabled_tip": "الحالي: تم تفعيل العزل التلقائي للحسابات المقيدة وتفكيك الجلسات عند بطء الاستجابة (انقر للتعطيل)",
+        "qos_auto_jail_disabled_tip": "الحالي: تم تعطيل العزل التلقائي وتجاهل مدة التحقق دون عزل أو فك للجلسات (انقر للتفعيل)",
         "btn_title_proxy_online": "يتم احتساب الحسابات المشاركة في الوكيل فقط حاليًا",
         "btn_title_all_available": "يتم احتساب جميع الحسابات النشطة حاليًا",
         "proxy_joined_pool": "✓ {{count}} حساب في مجمع الوكيل",
@@ -232,11 +248,15 @@
         "ultra": "ULTRA",
         "pro": "PRO",
         "free": "FREE",
+        "filter_abnormal": "غير طبيعي",
         "edit_label": "تعديل التصنيف",
         "custom_label_placeholder": "أدخل تصنيفًا مخصصًا",
         "label_updated": "تم تحديث التصنيف",
         "add_account": "إضافة حساب",
         "refresh_all": "تحديث الكل",
+        "startup_refresh_short": "عند البدء",
+        "startup_refresh_off": "إيقاف",
+        "startup_refresh_tooltip": "تحديث جميع الحصص مرة واحدة في الخلفية بعد اكتمال تحميل الحسابات (وفق حد الحسابات).",
         "refresh_selected": "تحديث ({{count}})",
         "export_selected": "تصدير ({{count}})",
         "import_json": "استيراد",
@@ -257,6 +277,12 @@
         "disable_proxy_selected": "تعطيل ({{count}})",
         "proxy_disabled_reason_manual": "تم التعطيل يدويًا بواسطة المستخدم",
         "proxy_disabled_reason_batch": "تم التعطيل في الدفعة",
+        "banned": "Banned",
+        "banned_tooltip": "Account is banned by upstream (TOS violation). Please submit an appeal.",
+        "banned_msg": "Account banned by upstream; auto refresh stopped",
+        "refresh_quota_and_ban": "Refresh quota & ban status",
+        "appeal_url_copied": "Appeal link copied to clipboard",
+        "copy_failed": "Copy failed; please select and copy manually",
         "forbidden": "403",
         "forbidden_badge": "403",
         "forbidden_tooltip": "أعاد API الخطأ 403 Forbidden، الحساب ليس لديه إذن لخدمة Gemini Code Assist",
@@ -268,7 +294,8 @@
             "validation_required": "Verification Required",
             "risk_controlled": "Risk / Rate Limited",
             "oauth_reauth_required": "OAuth Re-auth Required",
-            "violation_blocked": "Blocked due to Violation"
+            "violation_blocked": "Blocked due to Violation",
+            "banned": "Account Banned"
         },
         "error_details": "تفاصيل الخطأ",
         "error_status": "حالة الخطأ",
@@ -357,6 +384,7 @@
                 "copied": "تم النسخ",
                 "link_label": "رابط المصادقة",
                 "link_click_to_copy": "انقر للنسخ",
+                "remote_hint": "💡 تلميح لـ Docker / الخادم البعيد: من الطبيعي أن يُظهر المتصفح رفض الاتصال عند إعادة التوجيه إلى localhost بعد تفويض Google. ما عليك سوى نسخ عنوان URL الكامل (الذي يحتوي على الكود) من شريط عنوان المتصفح ولصقه أدناه.",
                 "manual_hint": "لـم يععد التوجيه؟ الصق رابط الاستدعاء الكامل أو الكود الخام هنا:",
                 "manual_placeholder": "الصق رابط الاستدعاء أو الكود...",
                 "error_no_flow": "يرجى النقر على 'بدء OAuth' أولاً",
@@ -364,7 +392,9 @@
                 "error_no_url": "فشل في الحصول على عنوان URL لـ OAuth",
                 "popup_blocked": "تم حظر النافذة المنبثقة",
                 "manual_submitting": "جارٍ إرسال رمز التحقق...",
-                "manual_submitted": "تم إرسال رمز التحقق، جارٍ المعالجة في الخلفية..."
+                "manual_submitted": "تم إرسال رمز التحقق، جارٍ المعالجة في الخلفية...",
+                "enterprise_title": "تفويض مؤسسي لـ Google Cloud / Vertex AI",
+                "enterprise_desc": "التفويض عبر عميل GCP الرسمي للمؤسسات للاحتفاظ بحصة المؤسسة وربط مشروع Vertex AI"
             },
             "token": {
                 "label": "Refresh Token",
@@ -431,6 +461,7 @@
             "batch_warmup_msg": "هل أنت متأكد من إطلاق التنشيط لـ {{count}} حساب المحدد فورًا؟"
         },
         "switch_to_agy": "Switch to Antigravity CLI (agy)",
+        "switch_to_acp": "Switch to Antigravity IDE Plugin (ACP)",
         "drag_disabled_during_sort": "فرز الأعمدة مفعل؛ تم إيقاف السحب مؤقتًا",
         "copy_validation_url": "Copy Verification Link",
         "validation_url_copied": "Verification link copied to clipboard",
@@ -466,8 +497,22 @@
         "client_ide_tooltip": "حساب Antigravity IDE المسجل حالياً",
         "client_cli": "CLI",
         "client_cli_tooltip": "حساب Antigravity CLI (agy) المسجل حالياً",
+        "client_acp": "Plugin",
+        "client_acp_tooltip": "حساب إضافة Antigravity IDE (ACP) المسجل حالياً",
         "switch_next_short": "التالي",
-        "weekly_exhausted_tooltip": "تم استنفاد الحصة الأسبوعية، تم تفعيل الحماية التلقائية"
+        "weekly_exhausted_tooltip": "تم استنفاد الحصة الأسبوعية، تم تفعيل الحماية التلقائية",
+        "type": {
+            "personal": "حساب شخصي (Personal)",
+            "enterprise": "مؤسسي / GCP (Vertex AI)"
+        },
+        "project_id": "GCP Project ID",
+        "project_id_hint": "معرّف مشروع Google Cloud المرتبط بحساب المؤسسة/GCP. يقوم تطبيق Antigravity الأصلي بربطه تلقائياً أو استخدام الافتراضي عند تسجيل الدخول.",
+        "project_id_placeholder": "مثال: my-project-id",
+        "project_id_updated": "تم تحديث GCP Project ID بنجاح",
+        "auto_fetch_project_id": "جلب تلقائي",
+        "fetching_project_id": "جارٍ الجلب...",
+        "auto_fetch_success": "تم جلب Project ID بنجاح: {{projectId}}",
+        "auto_fetch_failed": "لم يتم العثور على Project ID مرتبط"
     },
     "settings": {
         "save": "حفظ الإعدادات",
@@ -520,6 +565,10 @@
             "title": "إعدادات الحساب",
             "auto_refresh": "تحديث تلقائي في الخلفية",
             "auto_refresh_desc": "تحديث جميع حصص الحسابات في الخلفية تلقائيًا. هذا مطلوب لحماية الحصة والتنشيط الذكي.",
+            "startup_refresh": "التحديث عند بدء التشغيل",
+            "startup_refresh_desc": "تحديث حصص جميع الحسابات مرة واحدة في الخلفية بعد بدء التطبيق واكتمال تحميل الحسابات.",
+            "startup_refresh_limit": "حد الحسابات لتحديث بدء التشغيل",
+            "startup_refresh_limit_hint": "تخطَّ تحديث بدء التشغيل عندما يتجاوز عدد الحسابات هذه القيمة. 0 يعني بلا حد. لا يؤثر على التحديث اليدوي للكل.",
             "always_on": "دائم التشغيل",
             "refresh_interval": "فاصل التحديث (دقائق)",
             "auto_sync": "مزامنة تلقائية للحساب الحالي",
@@ -976,6 +1025,20 @@
                 },
                 "max_wait": "الحد الأقصى للانتظار (ثانية)",
                 "max_wait_tooltip": "يستخدم فقط في وضع 'التخزين المؤقت أولاً': انتظر بدلاً من التبديل إذا كان وقت إعادة تعيين حد المعدل أقل من هذه القيمة.",
+                "max_spillover_accounts": "الحد الأقصى لحسابات الفائض",
+                "max_spillover_accounts_tooltip": "الحد الأقصى لعدد الحسابات المسموح بها لتجاوز حركة المرور المتزامنة. 0 لغير محدود؛ عدد صحيح موجب للحد من الحسابات النشطة.",
+                "spillover_unlimited": "غير محدود (الكل متاح)",
+                "spillover_count": "{{count}} حسابات",
+                "affinity_scope": "نطاق التقارب (Affinity Scope)",
+                "affinity_scope_tooltip": "الجلسة: ربط حسب معرف الجلسة (افتراضي، تسوية تلقائية للمهام الفرعية)؛ مفتاح API: قفل جميع الطلبات من نفس المفتاح في حساب واحد.",
+                "affinity_scopes": {
+                    "session": "معرف الجلسة",
+                    "api_key": "مفتاح API"
+                },
+                "affinity_scopes_desc": {
+                    "session": "يربط الحسابات حسب معرف الجلسة مع تسوية تلقائية لبادئات الوكلاء المتعددين (:step:N).",
+                    "api_key": "يقفل جميع الطلبات من نفس مفتاح API على حساب واحد لتعظيم كفاءة التخزين المؤقت."
+                },
                 "clear_bindings": "مسح ربط الجلسات",
                 "clear_bindings_tooltip": "إعادة تعيين صب لكل ارتباطات الجلسة بالحساب، مما يجبر الحسابات على إعادة التعيين في الطلب التالي.",
                 "circuit_breaker": {
@@ -1242,12 +1305,12 @@
         "upload_timeouts": {
             "adaptive_title": "مهلة الرفع: تُحدد تلقائياً حسب عرض النطاق",
             "min_speed_title": "عرض نطاق الرفع (Mbps)",
-            "min_speed_desc": "مستخدمو VPN عادةً لديهم تنزيل عالٍ ورفع منخفض؛ يُنصح بـ 1–5 Mbps.",
+            "min_speed_desc": "أدخل حدًا أدنى محافظًا لعرض النطاق الترددي للرفع؛ كلما كانت القيمة أصغر كان وقت الرفع المسموح أطول. عادةً ما يكون التنزيل مرتفعًا والرفع منخفضًا لدى مستخدمي VPN؛ يُوصى بـ 0.5–5 Mbps.",
             "extra_wait_title": "معامل الانتظار الإضافي",
             "extra_wait_desc": "يؤثر هذا المعامل في أقصى وقت انتظار للرفع.",
             "formula_title": "أقصى انتظار = حجم الجسم ÷ عرض نطاق الرفع × (1 + معامل الانتظار)",
             "stall_title": "مهلة التوقف (ثانية)",
-            "stall_desc": "مهلة توقف الشبكة الكامل أثناء الرفع؛ إذا كان أقصى انتظار أقصر يُستخدم الأقصر.",
+            "stall_desc": "مهلة انعدام التقدم أثناء مرحلة الرفع؛ يضمن النظام ألا تقل عن مهلة الاتصال لتجنب الإحباط المبكر أثناء المصافحة.",
             "header_wait_title": "مهلة أول ترويسة (ثانية)",
             "header_wait_desc": "0 = استخدام القيم المدمجة: 30 ثانية للنقطة الأساسية / 25 ثانية للاحتياطية؛ أي قيمة غير 0 ترفع الحد الأدنى فقط.",
             "large_body_desc": "الملفات التي تتجاوز الحد تُرسل مرة واحدة افتراضياً، لتجنب إعادة الإرسال التي تشبع الرفع.",
@@ -1259,7 +1322,7 @@
         },
         "timeouts": {
             "banner_title": "إعدادات المهل الزمنية",
-            "banner_desc": "سلسلة المهل الكاملة لطلب واحد: الاتصال → الرفع → أول ترويسة → أول رمز / إخراج مستمر.",
+            "banner_desc": "سلسلة المهل الكاملة للطلب الواحد: ① إنشاء اتصال نقطة النهاية ← ② رفع نص الطلب ← ③ استجابة أول رمز وتدفق مستمر.",
             "section_connect": "① اتصال نقطة النهاية (تبديل تلقائي)",
             "connect_label": "مهلة الاتصال (ثانية)",
             "connect_desc": "مهلة إنشاء اتصال TCP مع نقطة النهاية؛ عادةً سريعة جداً.",
@@ -1274,7 +1337,7 @@
             "first_byte_effective": "المطبق حاليًا: نص/كود {{text}} ث　صورة {{image}} ث　فيديو {{video}} ث　مساعد {{aux}} ث",
             "section_stream": "③ أول رمز والإخراج المستمر",
             "stream_desc": "تم دمج انتظار الترويسات وأول رمز في زمن تأخير واحد لأول بايت: يُسمح بتبديل نقطة النهاية قبل HTTP 200، وبعدها يتم الإنهاء الآمن فقط.",
-            "auto_summary": "مثال: أقصى انتظار = 47MB ÷ 2Mbps × 1.4 ≈ {{big}} ثانية;"
+            "auto_summary": "مثال: أقصى انتظار = 47MB ÷ {{mbps}}Mbps × 1.4 ≈ {{big}} ثانية;"
         },
         "cloudflared": {
             "title": "الوصول العام (Cloudflared)",
@@ -1752,10 +1815,47 @@
             "search_placeholder_with_shortcut": "Search payload... (Enter next, Shift+Enter prev)",
             "case_sensitive": "Match Case",
             "wrap_lines": "Wrap Lines",
-            "no_wrap": "Single Line",
+            "no_wrap": "بدون التفاف",
             "no_matches": "No matches",
             "no_upstream_payload": "No forwarded payload (direct forwarding or unrecorded)",
-            "headers": "Headers"
+            "headers": "Headers",
+            "layout_3col": "3 أعمدة",
+            "layout_3col_title": "عرض مقارنة أفقي من 3 أعمدة",
+            "layout_postman": "نمط Postman",
+            "layout_postman_title": "عرض مقسم بنمط Postman",
+            "export_menu": "تصدير / نسخ",
+            "export_menu_title": "تصدير بتنسيق HAR، نسخ كأمر cURL أو JSON تشخيصي",
+            "copy_har": "نسخ حمولة HAR",
+            "download_har": "تنزيل ملف .har",
+            "copy_curl": "نسخ كأمر cURL",
+            "copy_full_json": "نسخ JSON التشخيصي الكامل",
+            "copied_har": "تم نسخ HAR",
+            "exported_har": "تم تصدير .har",
+            "copied_curl": "تم نسخ cURL",
+            "copied_full_json": "تم نسخ JSON الكامل",
+            "collapse_metadata": "طي البيانات الوصفية",
+            "expand_metadata": "توسيع البيانات الوصفية",
+            "collapse_metadata_title": "طي البيانات الوصفية لتوسيع مساحة العرض",
+            "expand_metadata_title": "توسيع معلومات البيانات الوصفية",
+            "wrap": "التفاف",
+            "wrap_on_title": "الحالي: التفاف تلقائي (انقر للسطر الواحد)",
+            "wrap_off_title": "الحالي: سطر واحد (انقر للالتفاف التلقائي)",
+            "case_sensitive_on": "مطابقة حالة الأحرف مفعلة",
+            "case_sensitive_off": "انقر لتفعيل مطابقة حالة الأحرف",
+            "clear_search": "مسح البحث",
+            "no_match": "لا توجد تطابقات",
+            "prev_match": "السابق (Shift+Enter)",
+            "next_match": "التالي (Enter)",
+            "lines_count": "سطر",
+            "expand": "توسيع",
+            "collapse": "طي",
+            "req_headers": "ترويسات الطلب",
+            "upstream_headers": "ترويسات التوجيه",
+            "resp_headers": "ترويسات الاستجابة",
+            "param_key": "مفتاح المعلمة (Key)",
+            "param_value": "قيمة المعلمة (Value)",
+            "header_key": "الترويسة (Header)",
+            "header_value": "قيمة الترويسة (Value)"
         },
         "dialog": {
             "clear_title": "مسح سجلات الوكيل",
@@ -1791,7 +1891,12 @@
             "total": "Total Duration",
             "copy_timing": "Copy Timing",
             "copied_timing": "Copied",
-            "legacy_hint": "Micro-stage timing not recorded for historical logs"
+            "legacy_hint": "Micro-stage timing not recorded for historical logs",
+            "collapse": "طي تشخيص التوقيت",
+            "expand": "توسيع تشخيص التوقيت",
+            "endpoint_label": "نقطة النهاية",
+            "status_label": "الحالة",
+            "network_timeout_or_error": "مهلة الشبكة / خطأ"
         }
     },
     "update_notification": {
@@ -1813,6 +1918,7 @@
         "title": "تحكم وصول آمن",
         "desc": "قيد التشغيل في وضع الويب. يرجى إدخال كلمة مرور الإدارة أو مفتاح API للوصول.",
         "placeholder": "أدخل كلمة مرور الإدارة أو مفتاح API",
+        "remember_me": "تذكر بيانات الاعتماد لتسجيل الدخول",
         "btn_login": "تحقق ودخول",
         "note": "ملاحظة: إذا تم تعيين كلمة مرور إدارة منفصلة، يرجى إدخالها؛ وإلا، أدخل مفتاح API.",
         "lookup_hint": "إذا نسيت، قم بتشغيل docker logs antigravity-manager للعثور على مفتاح API الحالي أو كلمة مرور واجهة الويب",
@@ -1840,6 +1946,10 @@
         "by_account": "حسب الحساب",
         "by_model": "حسب النموذج",
         "by_account_view": "حسب الحساب",
+        "perspective_routed": "النموذج المُوجَّه",
+        "perspective_requested": "النموذج المطلوب",
+        "perspective_routed_tip": "تجميع الإحصائيات حسب النموذج المنفذ/الموجه فعليًا",
+        "perspective_requested_tip": "تجميع الإحصائيات حسب النموذج الأصلي المطلوب من العميل",
         "model_details": "تفصيل النموذج",
         "account_details": "تفصيل الحساب",
         "model": "النموذج",
@@ -1984,7 +2094,10 @@
         "cockpit_view_detail": "التفاصيل",
         "cockpit_tab_accounts": "الحسابات",
         "cockpit_tab_models": "النماذج",
-        "cockpit_tab_users": "المستخدمون"
+        "cockpit_tab_users": "المستخدمون",
+        "avg_ttft": "استجابة الحرف الأول",
+        "ttft": "زمن أول حرف",
+        "avg_ttft_tip": "متوسط وقت الوصول إلى أول رمز (TTFT)"
     },
     "errors": {
         "stream": {

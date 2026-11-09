@@ -174,15 +174,19 @@ impl UpstreamCallResult {
 
 /// 首字预算基准硬上限（秒）
 ///
-/// 必须显著小于下游客户端的首包看门狗（jeikcode 为 180s），
-/// 否则客户端先断开，网关白等一轮并留下一个“无日志的孤儿请求”。
-/// 预留 30s 给建连 + 上传 + 端点切换，故文字基准取 150s。
-pub const MAX_FIRST_BYTE_BUDGET_SECS: u64 = 150;
+/// 文字基准允许充分发挥初始宽限 (默认 180s，与前端契约 100% 对齐)，在超大上下文与高阶思考场景下给予首选端点充分时间生成首字。
+pub const MAX_FIRST_BYTE_BUDGET_SECS: u64 = 180;
 
-/// 叠加媒体增量后的最终上限（图片 +45 / 视频 +60）
+/// 叠加媒体增量后的首字最终上限（图片 +45 / 视频 +60）
 ///
-/// 仍须小于 `pipeline::budget::DEFAULT_GATEWAY_REQUEST_BUDGET_SECS`（默认 270s，可 env 覆盖）。
-pub const MAX_FIRST_BYTE_CEILING_SECS: u64 = MAX_FIRST_BYTE_BUDGET_SECS + 60;
+/// 允许带图/带视频请求在文字基准之上充分获得多模态宽限，仍受全局请求总预算约束 (270s)。
+pub const MAX_FIRST_BYTE_CEILING_SECS: u64 = 270;
+
+/// 全链路总超时安全上限（秒）
+///
+/// 对齐请求级全局预算 (270s)，彻底解除 160s 暴力硬截断导致的慢长请求反向 504 误杀。
+pub const MAX_CLIENT_SAFE_TOTAL_BUDGET_SECS: u64 =
+    crate::proxy::pipeline::budget::DEFAULT_GATEWAY_REQUEST_BUDGET_SECS;
 
 /// 由请求体体积粗估 token 规模（仅用于超时曲线分档，不参与计费/统计）
 ///
@@ -193,24 +197,19 @@ pub fn estimate_payload_tokens(body_len: usize) -> u32 {
 
 /// 按 token 规模给出 TTFT 下限（与大上下文 prefill 的真实耗时曲线对齐）
 ///
-/// 与 `handlers::common::calculate_adaptive_peek_timeout_full` 同源分档，
-/// 避免“预算 30s / 阈值 20s”这类跨层错配。
+/// 唯一实现在 `pipeline::stream_peek::adaptive_ttft_secs`：
+/// 握手首字节预算与「响应头之后等首 chunk」的 peek 预算必须使用同一张表，
+/// 否则会出现“预算 30s / 阈值 120s”这类跨层错配。
 fn adaptive_ttft_secs(estimated_tokens: u32) -> u64 {
-    match estimated_tokens {
-        t if t > 200_000 => 150,
-        t if t > 100_000 => 120,
-        t if t > 50_000 => 90,
-        t if t > 20_000 => 60,
-        _ => 30,
-    }
+    crate::proxy::pipeline::stream_peek::adaptive_ttft_secs(estimated_tokens)
 }
 
 /// 上传预算来源（诊断可观测性：明确本次预算是按体积自适应还是用户手填）
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UploadBudgetSource {
-    /// 按请求体大小 ÷ 上传带宽估算
+    /// 按配置的声明带宽（下限）估算：实测不慢于声明值时，声明值就是更慢、更宽松的一侧
     AdaptiveSize,
-    /// 按体积 ÷ 被动实测上行速度估算
+    /// 按体积 ÷ 被动实测上行速度估算：实测比声明下限还慢时才启用，用于放宽预算
     AdaptiveObserved,
 }
 
@@ -433,42 +432,34 @@ pub fn mask_email(email: &str) -> String {
     }
 }
 
-/// 大体积请求在上传阶段被中断且已按策略终止重传的错误标记。
-///
-/// 协议 Handler 通过 `is_upload_stage_failure` 判定后不再跨账号重发同一大 body，
-/// 避免“一个短上传看门狗导致同一大文件被反复从头重传”的放大效应。
-pub const UPLOAD_STAGE_TERMINAL_MARKER: &str = "[upstream_upload_stage_terminal]";
+// [Pipeline First] 终态标记与分类收敛到 `pipeline::terminal`：
+// 协议适配器不再各自 `contains` 字符串，也不再各自决定 504 / 502。
+// 这里保留同名导出，保证既有调用点（含单测）无需改动。
+pub use crate::proxy::pipeline::terminal::{
+    FIRST_BYTE_STAGE_TERMINAL_MARKER, GATEWAY_BUDGET_TERMINAL_MARKER, REPLAY_CAP_TERMINAL_MARKER,
+    UPLOAD_STAGE_TERMINAL_MARKER,
+};
 
 /// 判断上游错误是否为“大体积上传阶段终止、不应再跨账号重传”的终态失败
 pub fn is_upload_stage_failure(error_text: &str) -> bool {
-    error_text.contains(UPLOAD_STAGE_TERMINAL_MARKER)
+    crate::proxy::pipeline::terminal::classify(error_text)
+        == Some(crate::proxy::pipeline::terminal::UpstreamTerminal::Upload)
 }
-
-/// 首字节预算耗尽的终态标记。
-///
-/// 语义与 `UPLOAD_STAGE_TERMINAL_MARKER` 对称，但处置更严：
-/// 首字节超时的成因是上游排队 / 大上下文 prefill，**不是账号故障**。
-/// 若把它当成账号失败去轮换，每一次重试都会让上游从头 prefill 同一份大 body，
-/// 形成“越重试越慢”的活锁（实测 7 分钟 22 次、全在首字节阶段）。
-///
-/// 因此 Handler 见到本标记后：不标记账号失败、不跨账号重放，直接返回 504 交客户端决定。
-pub const FIRST_BYTE_STAGE_TERMINAL_MARKER: &str = "[upstream_first_byte_terminal]";
 
 /// 判断上游错误是否为“首字节预算耗尽、不应跨账号重放”的终态失败
 pub fn is_first_byte_stage_failure(error_text: &str) -> bool {
-    error_text.contains(FIRST_BYTE_STAGE_TERMINAL_MARKER)
+    crate::proxy::pipeline::terminal::classify(error_text)
+        == Some(crate::proxy::pipeline::terminal::UpstreamTerminal::FirstByte)
 }
 
-/// 任一终态重放抑制标记（上传阶段 / 首字节阶段）
+/// 任一终态（上传 / 首字节 / 全局预算 / 重放上限）：都不再跨账号重放
 pub fn is_terminal_replay_suppressed(error_text: &str) -> bool {
-    is_upload_stage_failure(error_text) || is_first_byte_stage_failure(error_text)
+    crate::proxy::pipeline::terminal::classify(error_text).is_some()
 }
 
 /// 剔除仅用于内部链路控制与诊断的标记，避免泄漏到客户端错误报文
 pub fn strip_internal_markers(error_text: &str) -> String {
-    error_text
-        .replace(UPLOAD_STAGE_TERMINAL_MARKER, "")
-        .replace(FIRST_BYTE_STAGE_TERMINAL_MARKER, "")
+    crate::proxy::pipeline::terminal::strip_markers(error_text)
 }
 
 /// [NEW] 错误日志脱敏：抹除报错信息中的 access_token, proxy_url 等敏感凭证
@@ -533,11 +524,24 @@ pub fn should_try_next_endpoint(status: StatusCode) -> bool {
     UpstreamClient::should_try_next_endpoint(status)
 }
 
+/// 判断端点或主机是否为 Google 内部沙箱备用端点（含 sandbox.googleapis.com）。
+/// 沙箱端点具有严格的地区准入限制（非美 IP 会返回 400 User location is not supported 或网络不可达），
+/// 在端点重排时绝不能抢占主端点 (Daily)，且在发生故障时须施加更长冷却观察期，防止高频踩坑与毒化。
+pub fn is_sandbox_endpoint(endpoint_or_host: &str) -> bool {
+    let host = extract_endpoint_host(endpoint_or_host);
+    host.contains("sandbox.googleapis.com")
+}
+
 /// 判断特定端点在特定状态码下是否可重试或回退。
 /// 特别针对 Sandbox 沙箱端点：非美 IP 会返回 400 Bad Request (FAILED_PRECONDITION: User location is not supported)，
-/// 此时必须标记该端点失败并快速回退到 Prod 生产端点。
+/// 此时必须标记该端点失败并快速回退到主端点。
 pub fn should_try_next_endpoint_for_url(status: StatusCode, endpoint_url: &str) -> bool {
-    UpstreamClient::should_try_next_endpoint_for_url(status, endpoint_url)
+    if status == StatusCode::BAD_REQUEST {
+        let host = extract_endpoint_host(endpoint_url);
+        is_sandbox_endpoint(host) || host.contains("sandbox")
+    } else {
+        should_try_next_endpoint(status)
+    }
 }
 
 /// 端点健康追踪器：记录故障端点与冷却期，动态优化上游端点 Fallback 顺序，避免无状态重复踩坑。
@@ -545,7 +549,7 @@ pub fn should_try_next_endpoint_for_url(status: StatusCode, endpoint_url: &str) 
 pub struct EndpointHealthTracker {
     /// 记录最近一次故障的时间戳 (host -> Instant)
     failures: Arc<DashMap<String, std::time::Instant>>,
-    /// 冷却观察期 (默认 60s)
+    /// 冷却观察期 (默认 30s)
     cooldown: std::time::Duration,
 }
 
@@ -566,14 +570,22 @@ impl EndpointHealthTracker {
     }
 
     /// 标记端点调用失败（记录当前时间戳，以 host 聚合）
+    /// 特别针对沙箱端点，施加更长的隔离冷却观察期（默认至少 300s），避免高频重试导致非美环境持续 400
     pub fn mark_failure(&self, endpoint: &str) {
         let host = extract_endpoint_host(endpoint);
         let now = std::time::Instant::now();
         self.failures.insert(host.to_string(), now);
+        let cd_secs = if is_sandbox_endpoint(host) {
+            self.cooldown
+                .max(std::time::Duration::from_secs(300))
+                .as_secs()
+        } else {
+            self.cooldown.as_secs()
+        };
         tracing::warn!(
             host = %host,
             endpoint = %endpoint,
-            cooldown_secs = ?self.cooldown.as_secs(),
+            cooldown_secs = cd_secs,
             "Marked upstream endpoint host as unhealthy (entering cooldown)"
         );
     }
@@ -594,9 +606,14 @@ impl EndpointHealthTracker {
     #[allow(dead_code)]
     pub fn is_healthy(&self, endpoint: &str) -> bool {
         let host = extract_endpoint_host(endpoint);
+        let cd = if is_sandbox_endpoint(host) {
+            self.cooldown.max(std::time::Duration::from_secs(300))
+        } else {
+            self.cooldown
+        };
         if let Some(entry) = self.failures.get(host) {
             let last_fail = *entry.value();
-            if last_fail.elapsed() >= self.cooldown {
+            if last_fail.elapsed() >= cd {
                 drop(entry);
                 self.failures.remove(host);
                 true
@@ -609,34 +626,54 @@ impl EndpointHealthTracker {
     }
 
     /// 根据各端点健康状况与冷却期，动态排列优先级顺序。
-    /// - 健康端点排在最前，保持原有的相对优先级；
-    /// - 处于冷却期内的端点排在后部，按故障发生时间由远及近（最早失败的相对排在前面，优先探活）；
+    /// - 健康主端点排在最前，保持原有的相对优先级；
+    /// - 处于冷却期内的主端点排在次前，按故障发生时间由远及近（优先探活恢复）；
+    /// - 沙箱备用端点 (sandbox.googleapis.com) 永远排在主端点之后，绝不因主端点偶发抖动而抢占首位导致非美用户大面积 400；
     /// - 永远保留所有端点，确保在全故障极端情况下仍能兜底尝试。
     pub fn get_ordered_endpoints<'a>(&self, default_endpoints: &[&'a str]) -> Vec<&'a str> {
-        let mut healthy = Vec::new();
-        let mut unhealthy = Vec::new();
+        let mut healthy_primary = Vec::new();
+        let mut unhealthy_primary = Vec::new();
+        let mut healthy_sandbox = Vec::new();
+        let mut unhealthy_sandbox = Vec::new();
 
         for &ep in default_endpoints {
             let host = extract_endpoint_host(ep);
+            let is_sandbox = is_sandbox_endpoint(host);
+            let cd = if is_sandbox {
+                self.cooldown.max(std::time::Duration::from_secs(300))
+            } else {
+                self.cooldown
+            };
+
+            let mut fail_time = None;
             if let Some(entry) = self.failures.get(host) {
                 let last_fail = *entry.value();
-                if last_fail.elapsed() >= self.cooldown {
+                if last_fail.elapsed() >= cd {
                     drop(entry);
                     self.failures.remove(host);
-                    healthy.push(ep);
                 } else {
-                    unhealthy.push((ep, last_fail));
+                    fail_time = Some(last_fail);
                 }
-            } else {
-                healthy.push(ep);
+            }
+
+            match (is_sandbox, fail_time) {
+                (false, None) => healthy_primary.push(ep),
+                (false, Some(t)) => unhealthy_primary.push((ep, t)),
+                (true, None) => healthy_sandbox.push(ep),
+                (true, Some(t)) => unhealthy_sandbox.push((ep, t)),
             }
         }
 
         // 不健康的端点：按照失败时间从早到晚排序（先失败的更早尝试探活）
-        unhealthy.sort_by_key(|&(_, time)| time);
+        unhealthy_primary.sort_by_key(|&(_, time)| time);
+        unhealthy_sandbox.sort_by_key(|&(_, time)| time);
 
-        let mut result = healthy;
-        for (ep, _) in unhealthy {
+        let mut result = healthy_primary;
+        for (ep, _) in unhealthy_primary {
+            result.push(ep);
+        }
+        result.extend(healthy_sandbox);
+        for (ep, _) in unhealthy_sandbox {
             result.push(ep);
         }
 
@@ -789,9 +826,9 @@ impl UpstreamClient {
     }
 
     fn apply_default_user_agent(builder: rquest::ClientBuilder) -> rquest::ClientBuilder {
-        let ua = crate::constants::USER_AGENT.as_str();
-        if header::HeaderValue::from_str(ua).is_ok() {
-            builder.user_agent(ua)
+        let ua = crate::constants::current_egress_user_agent();
+        if header::HeaderValue::from_str(&ua).is_ok() {
+            builder.user_agent(ua.as_str())
         } else {
             tracing::warn!(
                 user_agent = %ua,
@@ -808,12 +845,17 @@ impl UpstreamClient {
         tracing::debug!("UpstreamClient User-Agent override updated: {:?}", lock);
     }
 
+    /// Get current raw User-Agent override string if set
+    pub async fn get_user_agent_override(&self) -> Option<String> {
+        self.user_agent_override.read().await.clone()
+    }
+
     /// Get current User-Agent (sanitized with safety floor >= 4.3.0)
     pub async fn get_user_agent(&self) -> String {
         let ua_override = self.user_agent_override.read().await;
         match ua_override.as_ref() {
             Some(ua) => crate::constants::sanitize_egress_user_agent(ua),
-            None => crate::constants::USER_AGENT.clone(),
+            None => crate::constants::current_egress_user_agent(),
         }
     }
 
@@ -882,8 +924,7 @@ impl UpstreamClient {
     /// Specifically: Sandbox cluster rejects non-US IPs with 400 Bad Request (FAILED_PRECONDITION).
     /// When this occurs on a sandbox endpoint, we must rotate to Prod instead of returning 400 to the client.
     pub fn should_try_next_endpoint_for_url(status: StatusCode, endpoint_url: &str) -> bool {
-        Self::should_try_next_endpoint(status)
-            || (status == StatusCode::BAD_REQUEST && endpoint_url.contains("sandbox"))
+        should_try_next_endpoint_for_url(status, endpoint_url)
     }
 
     /// 判定上游错误是否为模型算力/集群容量耗尽 (MODEL_CAPACITY_EXHAUSTED / 503 / 504)
@@ -894,6 +935,14 @@ impl UpstreamClient {
     }
 
     /// 依据“请求体大小 ÷ 上传带宽 × (1 + 额外等待系数)”估算上传阶段最大等待时间（秒）
+    ///
+    /// 预算语义：`min_upload_mbps` 是用户声明的**最低**上行带宽，据此算出的是“传完这份 body
+    /// 最慢要多久”的上界；被动实测样本（EWMA）只允许在上界之外继续放宽，绝不允许收紧：
+    /// - `record()` 记的是“交给传输层”的字节，小请求体会被 socket/TLS 缓冲瞬间吞掉，样本显著虚高；
+    /// - EWMA 是跨账号 / 代理 / 端点的进程级全局值，快链路的一次样本会替慢链路缩短预算。
+    ///
+    /// 用虚高样本收紧预算，等于把仍在稳定上传的大包掐死在半途：现场 8.77MB 图片请求被估成 15s，
+    /// 实测仅 437KB/s（需要 20s+），于是在 6.55MB 处被中断，并误报为上游网络 504。
     pub fn calculate_upload_budget_secs(
         body_len: usize,
         cfg: &crate::proxy::config::UploadTimeoutConfig,
@@ -902,18 +951,21 @@ impl UpstreamClient {
         // Mbps（十进制）→ B/s：1 Mbps = 1_000_000 bit/s ÷ 8 = 125_000 B/s
         let floor_bps = ((cfg.min_upload_mbps.max(0.1)) * 125_000.0).round() as u64;
         let floor_bps = floor_bps.max(1);
-        let ceiling_bps = floor_bps.saturating_mul(4);
-        let (effective_bps, source) = match observed_bps {
-            Some(bps) if bps > floor_bps => {
-                (bps.min(ceiling_bps), UploadBudgetSource::AdaptiveObserved)
-            }
+        // 实测比声明下限还慢 → 声明值不可信，按实测放宽；实测更快 → 声明值仍是更慢一侧，永不收紧
+        let (effective_bps, source) = match observed_bps.filter(|bps| *bps > 0) {
+            Some(bps) if bps < floor_bps => (bps, UploadBudgetSource::AdaptiveObserved),
             _ => (floor_bps, UploadBudgetSource::AdaptiveSize),
         };
 
         // 最大等待时间 = 请求体大小 ÷ 上传带宽 × (1 + 额外等待系数)
         let transfer_secs = (body_len as f64) / (effective_bps as f64);
         let wait_secs = transfer_secs * (1.0 + cfg.extra_wait_ratio.max(0.0));
-        let budget = (wait_secs.ceil() as u64).max(5);
+        let min_floor = if body_len >= crate::proxy::pipeline::budget::REPLAY_GUARD_BODY_BYTES {
+            15
+        } else {
+            5
+        };
+        let budget = (wait_secs.ceil() as u64).max(min_floor);
         (budget, source)
     }
 
@@ -923,7 +975,7 @@ impl UpstreamClient {
     /// - 基准 = max(用户设置的首字响应宽限, 按 token 规模的 prefill 自适应下限)
     /// - 叠加媒体增量：常规 +0 / 图片 +45 / 视频 +60 / 辅助 -30
     /// - 备用端点增量减半，避免一个慢端点吃掉整条请求的预算
-    /// - 旧配置 `header_wait_secs` 降级为下限（灰度期兼容，不再是 30/25 硬编码）
+    /// - 旧配置 `header_wait_secs` 已废弃：不再作为下限参与预算（统一 TTFT 为唯一来源）
     pub fn calculate_first_byte_wait_secs(
         media_kind: PayloadMediaKind,
         attempt_idx: usize,
@@ -954,7 +1006,7 @@ impl UpstreamClient {
         };
         let value =
             (base as i64 + scaled_offset).clamp(15, MAX_FIRST_BYTE_CEILING_SECS as i64) as u64;
-        value.max(cfg.header_wait_secs)
+        value
     }
 
     /// 构造带进度回传的分块请求体
@@ -1108,12 +1160,15 @@ impl UpstreamClient {
                         }
                         if let Some(transfer_elapsed) = progress.elapsed_since_first_byte() {
                             if transfer_elapsed >= upload_budget {
+                                let secs = transfer_elapsed.as_secs_f64().max(0.001);
+                                let rate_kbps = (sent as f64 / secs / 1024.0) as u64;
                                 return PhasedSendOutcome {
                                     result: Err(format!(
-                                        "Upload budget exhausted after {}s of transfer (sent {}/{} bytes)",
+                                        "Upload budget exhausted after {}s of transfer (sent {}/{} bytes, rate={}KB/s)",
                                         upload_budget.as_secs(),
                                         sent,
-                                        body_len
+                                        body_len,
+                                        rate_kbps
                                     )),
                                     stage: SendStage::Upload,
                                     bytes_sent: sent,
@@ -1125,21 +1180,30 @@ impl UpstreamClient {
 
                     // 3. 全链总预算硬截止（优先保障用户可感知的上限）
                     if now >= hard_deadline {
-                        let stage = if upload_done_at.is_some() {
-                            SendStage::AwaitFirstByte
-                        } else {
-                            SendStage::Upload
-                        };
+                        let upload_elapsed = upload_done_at.map(|t| t.duration_since(attempt_start));
+                        if let Some(done_at) = upload_done_at {
+                            let waited_secs = now.duration_since(done_at).as_secs();
+                            return PhasedSendOutcome {
+                                result: Err(format!(
+                                    "First byte budget exhausted after {}s (upload completed: {}s, {} bytes, stage=await_first_byte)",
+                                    waited_secs,
+                                    upload_elapsed.map(|d| d.as_secs_f64()).unwrap_or_default(),
+                                    sent
+                                )),
+                                stage: SendStage::AwaitFirstByte,
+                                bytes_sent: sent,
+                                upload_elapsed,
+                            };
+                        }
                         return PhasedSendOutcome {
                             result: Err(format!(
-                                "Total upstream budget exhausted (sent {}/{} bytes, stage={})",
+                                "Total upstream budget exhausted (sent {}/{} bytes, stage=upload)",
                                 sent,
-                                body_len,
-                                stage.as_str()
+                                body_len
                             )),
-                            stage,
+                            stage: SendStage::Upload,
                             bytes_sent: sent,
-                            upload_elapsed: upload_done_at.map(|t| t.duration_since(attempt_start)),
+                            upload_elapsed: None,
                         };
                     }
                 }
@@ -1188,12 +1252,16 @@ impl UpstreamClient {
         let first_byte_total_secs = primary.max(fallback).min(MAX_FIRST_BYTE_CEILING_SECS);
 
         // 每个端点尝试都包含完整上传阶段；首字预算全链只计一份
+        // 关键防护：total_budget_secs 必须严格受客户端绝对安全上限约束，
+        // 彻底杜绝上传预算乘以多端点叠加首字超时后击穿 180s 看门狗！
         let total_budget_secs = upload_budget_secs
             .saturating_mul(endpoint_attempt_limit as u64)
-            .saturating_add(first_byte_total_secs);
+            .saturating_add(first_byte_total_secs)
+            .min(MAX_CLIENT_SAFE_TOTAL_BUDGET_SECS);
 
-        // 停滞超时：上传时因网络错误持续卡死的超时时间；若最大等待时间更短，则自动取最大等待时间
-        let stall_secs = cfg.stall_secs.min(upload_budget_secs).max(3);
+        // 停滞超时：上传阶段单次持续无进展超时。不随 body 体积估算结果被挤压到极小值，
+        // 至少给足建连与握手宽限（max connect_secs）。
+        let stall_secs = cfg.stall_secs.max(cfg.connect_secs);
 
         UpstreamTimeoutPlan {
             upload_budget_secs,
@@ -1234,7 +1302,61 @@ impl UpstreamClient {
 
     /// [FIX #765] 调用 v1internal API，支持透传额外的 Headers
     /// [ENHANCED] 返回 UpstreamCallResult，包含降级尝试记录，用于 debug 日志
+    ///
+    /// [Pipeline Budget] 这里是"请求级全局预算"的最终闸门：整次调用（含 403 降级重试、
+    /// 端点切换、分阶段上传与首字节等待）不得超过本请求的剩余全局预算。
+    /// 下沉到这里之后，四个协议适配器不再各自 `tokio::time::timeout` 包一层——
+    /// 历史上只有 Claude 包了，其余三条链路只能靠内部预算兜底。
     pub async fn call_v1_internal_with_headers(
+        &self,
+        method: &str,
+        access_token: &str,
+        body: Value,
+        query_string: Option<&str>,
+        extra_headers: std::collections::HashMap<String, String>,
+        account_id: Option<&str>,
+    ) -> Result<UpstreamCallResult, String> {
+        let Some(remaining_secs) = crate::proxy::pipeline::budget::remaining_secs() else {
+            // 无入口上下文（后台任务 / 辅助调用 / 单测）：行为不变
+            return self
+                .call_v1_internal_with_headers_inner(
+                    method,
+                    access_token,
+                    body,
+                    query_string,
+                    extra_headers,
+                    account_id,
+                )
+                .await;
+        };
+
+        let attempt_budget_secs =
+            remaining_secs.max(crate::proxy::pipeline::budget::MIN_ATTEMPT_BUDGET_SECS);
+        match tokio::time::timeout(
+            std::time::Duration::from_secs(attempt_budget_secs),
+            self.call_v1_internal_with_headers_inner(
+                method,
+                access_token,
+                body,
+                query_string,
+                extra_headers,
+                account_id,
+            ),
+        )
+        .await
+        {
+            Ok(result) => result,
+            Err(_) => Err(format!(
+                "{}Gateway global request budget ({}s) exhausted while awaiting upstream (method={})",
+                GATEWAY_BUDGET_TERMINAL_MARKER,
+                crate::proxy::pipeline::budget::gateway_request_budget_secs(),
+                method
+            )),
+        }
+    }
+
+    /// `call_v1_internal_with_headers` 的实际实现（已在外层完成请求级预算夹取）
+    async fn call_v1_internal_with_headers_inner(
         &self,
         method: &str,
         access_token: &str,
@@ -1292,8 +1414,10 @@ impl UpstreamClient {
             header::USER_AGENT,
             header::HeaderValue::from_str(&self.get_user_agent().await).unwrap_or_else(|e| {
                 tracing::warn!("Invalid User-Agent header value, using fallback: {}", e);
-                header::HeaderValue::from_str(crate::constants::USER_AGENT.as_str())
-                    .unwrap_or_else(|_| header::HeaderValue::from_static("antigravity"))
+                header::HeaderValue::from_str(
+                    crate::constants::current_egress_user_agent().as_str(),
+                )
+                .unwrap_or_else(|_| header::HeaderValue::from_static("antigravity"))
             }),
         );
 
@@ -1388,7 +1512,7 @@ impl UpstreamClient {
         {
             return Err(format!(
                 "{}Cross-account replay cap reached for large body (call #{}, limit={}, body_len={})",
-                FIRST_BYTE_STAGE_TERMINAL_MARKER,
+                REPLAY_CAP_TERMINAL_MARKER,
                 call_no,
                 crate::proxy::pipeline::budget::MAX_LARGE_BODY_UPSTREAM_CALLS,
                 body_bytes.len()
@@ -1405,7 +1529,7 @@ impl UpstreamClient {
         if crate::proxy::pipeline::budget::exhausted() {
             return Err(format!(
                 "{}Gateway global request budget exhausted before upstream call (method={}, body_len={})",
-                FIRST_BYTE_STAGE_TERMINAL_MARKER,
+                GATEWAY_BUDGET_TERMINAL_MARKER,
                 method,
                 body_bytes.len()
             ));
@@ -1498,6 +1622,21 @@ impl UpstreamClient {
 
                 let mut req_builder = client.post(&url).headers(headers.clone());
 
+                // [Pipeline Budget] 非流式请求必须把 body 读取也纳入请求预算：
+                // `RequestBuilder::timeout` 的作用域是“建连 → 响应体读完”，
+                // 否则全局预算只能约束到响应头，body 直读路径（Claude bytes /
+                // OpenAI json / 音频 / 生图 / countTokens）会退化到客户端 7200s 总超时。
+                // 流式方法不设：长回答由 stream_lifecycle 的空闲/过渡超时约束，
+                // 不能按整条流时长截断。
+                if method != "streamGenerateContent"
+                    && crate::proxy::pipeline::budget::current().is_some()
+                {
+                    req_builder = req_builder.timeout(Duration::from_secs(
+                        remaining_budget
+                            .max(crate::proxy::pipeline::budget::MIN_ATTEMPT_BUDGET_SECS),
+                    ));
+                }
+
                 // [FIX] 仅对流式接口 (streamGenerateContent) 使用分块传输仿真
                 // 对其他接口 (如 generateContent, loadCodeAssist) 发送正常的固定长度 Body
                 // 否则图像生成会因为缺少 Content-Length 而被 Google 服务端拒绝或限流 (429)
@@ -1519,9 +1658,9 @@ impl UpstreamClient {
 
                 // [WATCHDOG] 分阶段超时：上传阶段受体积/速度自适应预算与停滞检测约束，
                 // 上传完成后进入统一首字延迟（TTFB≡TTFT），不再用固定的 30/25s 提前截断大上下文 prefill。
-                // 预算在端点之间共享：首个端点先给后续端点预留 1/3，
-                // 避免主端点吃满预算后备用端点只剩残羹（也避免逐端点相乘的笛卡尔积）。
-                let reserve_for_fallback = if has_next_for_send_stage {
+                // 首选端点 (idx == 0) 应享有完整的首字节等待预算（初衷是给首选端点充分时间生成首字），
+                // 绝不在首选端点身上预扣 1/3 导致提前掐断；只有备用端点才按降级比例受限。
+                let reserve_for_fallback = if has_next_for_send_stage && idx > 0 {
                     timeout_plan.first_byte_total_secs / 3
                 } else {
                     0
@@ -1535,9 +1674,12 @@ impl UpstreamClient {
                     is_capacity_exhausted,
                 )
                 .min(remaining_budget.saturating_sub(reserve_for_fallback).max(5));
+                // [Fixes #3821] 上传阶段优先保证传输所需时间（按体积/实测速度自适应），
+                // 仅预留最小探活时间给首字节阶段，彻底避免首字预算（如 145s）倒挂倒扣导致大请求体（如 28.9MB）被掐死在 15s；
+                // 全链路总时间依然受 hard_deadline 刚性硬保护。
                 let upload_budget_secs = timeout_plan.upload_budget_secs.min(
                     remaining_budget
-                        .saturating_sub(first_byte_budget_secs)
+                        .saturating_sub(crate::proxy::pipeline::budget::MIN_ATTEMPT_BUDGET_SECS)
                         .max(10),
                 );
                 let hard_deadline =
@@ -1751,6 +1893,11 @@ impl UpstreamClient {
                         }
 
                         // 不可重试的错误或已是最后一个端点，直接返回
+                        if is_sandbox_endpoint(base_url)
+                            && (status == StatusCode::BAD_REQUEST || status.is_server_error())
+                        {
+                            self.endpoint_health.mark_failure(base_url);
+                        }
                         fallback_attempts.push(FallbackAttemptLog {
                             endpoint_name: parse_endpoint_name(base_url).to_string(),
                             endpoint_url: url.clone(),
@@ -1770,40 +1917,64 @@ impl UpstreamClient {
                         crate::proxy::debug_logger::log_upstream_result(None, None).await;
                         self.endpoint_health.mark_failure(base_url);
                         last_attempt_failed_at = Some(std::time::Instant::now());
+                        // 上传未完成时 upload_elapsed 为 None，退化成整段尝试耗时估算，
+                        // 否则诊断里会出现误导性的 effective_bps=0（现场实际有 437KB/s 在传）。
                         let effective_bps = upload_elapsed
-                            .map(|elapsed| {
-                                let secs = elapsed.as_secs_f64().max(0.001);
-                                (sent_bytes as f64 / secs) as u64
-                            })
-                            .unwrap_or(0);
+                            .map(|elapsed| elapsed.as_secs_f64())
+                            .unwrap_or_else(|| duration_s)
+                            .max(0.001);
+                        let effective_bps = (sent_bytes as f64 / effective_bps) as u64;
+                        let is_sandbox = is_sandbox_endpoint(base_url);
                         let terminal_large_body_failure =
                             timeout_plan.large_body && timeout_plan.endpoint_attempt_limit <= 1;
-                        // 首字节预算耗尽 / 全局预算耗尽，均属终态：不再跨账号重放
+                        // 终态判定统一交给 `pipeline::terminal` 分类：
+                        // - 全局预算耗尽：整条请求已到点
+                        // - 首字节耗尽且后面没有可尝试端点：上游只是慢，不是账号故障（沙箱端点除外，沙箱非美地区不连通绝非真实终态）
+                        // - 大体积单次尝试策略：继续 fallback 只会再次上传同一份大 body（但沙箱端点除外，沙箱故障不应毒化阻断账号轮换）
                         let global_exhausted = crate::proxy::pipeline::budget::exhausted();
-                        let first_byte_terminal = (send_stage == SendStage::AwaitFirstByte
-                            && !has_next_for_send_stage)
-                            || global_exhausted;
-                        let detail = format!(
-                            "Upstream send failed at {} (method={}, kind={}, body_len={}, stage={}, bytes_sent={}, effective_bps={}, budget_source={}, upload_budget={}s, first_byte_budget={}s, total_elapsed={:.1}s): {}",
-                            base_url,
-                            method,
-                            media_kind.as_str(),
-                            body_bytes.len(),
-                            send_stage.as_str(),
-                            sent_bytes,
-                            effective_bps,
-                            timeout_plan.budget_source.as_str(),
-                            upload_budget_secs,
-                            first_byte_budget_secs,
-                            call_overall_start.elapsed().as_secs_f64(),
-                            e
-                        );
-                        let msg = if first_byte_terminal {
-                            format!("{}{}", FIRST_BYTE_STAGE_TERMINAL_MARKER, detail)
-                        } else if terminal_large_body_failure {
-                            format!("{}{}", UPLOAD_STAGE_TERMINAL_MARKER, detail)
+                        let terminal = if global_exhausted {
+                            Some(crate::proxy::pipeline::terminal::UpstreamTerminal::GlobalBudget)
+                        } else if send_stage == SendStage::AwaitFirstByte
+                            && !has_next_for_send_stage
+                            && !is_sandbox
+                        {
+                            Some(crate::proxy::pipeline::terminal::UpstreamTerminal::FirstByte)
+                        } else if send_stage == SendStage::Upload
+                            && !is_sandbox
+                            && (!has_next_for_send_stage || terminal_large_body_failure)
+                        {
+                            Some(crate::proxy::pipeline::terminal::UpstreamTerminal::Upload)
                         } else {
-                            detail
+                            None
+                        };
+                        let detail = if !fallback_attempts.is_empty() {
+                            format!(
+                                "Upstream send failed at {} (fallback attempt {} after primary {}): {}",
+                                base_url,
+                                idx + 1,
+                                fallback_attempts[0].endpoint_name,
+                                e
+                            )
+                        } else {
+                            format!(
+                                "Upstream send failed at {} (method={}, kind={}, body_len={}, stage={}, bytes_sent={}, effective_bps={}, budget_source={}, upload_budget={}s, first_byte_budget={}s, total_elapsed={:.1}s): {}",
+                                base_url,
+                                method,
+                                media_kind.as_str(),
+                                body_bytes.len(),
+                                send_stage.as_str(),
+                                sent_bytes,
+                                effective_bps,
+                                timeout_plan.budget_source.as_str(),
+                                upload_budget_secs,
+                                first_byte_budget_secs,
+                                call_overall_start.elapsed().as_secs_f64(),
+                                e
+                            )
+                        };
+                        let msg = match terminal {
+                            Some(terminal) => format!("{}{}", terminal.marker(), detail),
+                            None => detail,
                         };
                         tracing::warn!(
                             %msg,
@@ -1832,23 +2003,16 @@ impl UpstreamClient {
                         });
                         last_err = Some(msg);
 
-                        // 首字节预算耗尽：上游只是慢，不是账号故障。
-                        // 不再尝试下一个端点/账号 —— 换端点只会让同一份大 body 从头 prefill。
-                        if first_byte_terminal {
+                        // 终态：不再换端点、也不再换账号重放同一份 body。
+                        // - 首字节耗尽：上游只是慢，换端点只会让同一份大 body 从头 prefill
+                        // - 全局预算耗尽：整条请求已到点
+                        // - 大体积单次尝试：重试只会从头上传同一大 body
+                        if let Some(terminal) = terminal {
                             tracing::warn!(
                                 body_len = body_bytes.len(),
                                 first_byte_budget_secs,
-                                "First-byte budget exhausted: suppressing cross-account replay to avoid prefill amplification"
-                            );
-                            break;
-                        }
-
-                        // [Fixes #3763] 大体积请求默认单次尝试：无论失败在“上传”还是“等首字节”阶段，
-                        // 继续 fallback / 跨账号重发都只会从头上传同一大 body，造成重传放大。
-                        if terminal_large_body_failure {
-                            tracing::warn!(
-                                body_len = body_bytes.len(),
-                                "Large-body request failed under single-attempt policy; suppressing endpoint fallback and cross-account retry to avoid re-upload amplification"
+                                terminal = terminal.as_str(),
+                                "Terminal upstream failure: suppressing endpoint fallback and cross-account replay"
                             );
                             break;
                         }
@@ -2258,6 +2422,71 @@ mod tests {
     }
 
     #[test]
+    fn test_is_sandbox_endpoint() {
+        assert!(is_sandbox_endpoint(
+            "https://daily-cloudcode-pa.sandbox.googleapis.com/v1internal"
+        ));
+        assert!(is_sandbox_endpoint(
+            "daily-cloudcode-pa.sandbox.googleapis.com"
+        ));
+        assert!(!is_sandbox_endpoint(
+            "https://daily-cloudcode-pa.googleapis.com/v1internal"
+        ));
+        assert!(!is_sandbox_endpoint("daily-cloudcode-pa.googleapis.com"));
+        assert!(!is_sandbox_endpoint(
+            "https://cloudcode-pa.googleapis.com/v1internal"
+        ));
+    }
+
+    #[test]
+    fn test_endpoint_health_sandbox_never_leapfrogs_primary_daily() {
+        let tracker = EndpointHealthTracker::new(Duration::from_secs(60));
+        let endpoints = [
+            "https://daily-cloudcode-pa.googleapis.com/v1internal",
+            "https://daily-cloudcode-pa.sandbox.googleapis.com/v1internal",
+        ];
+
+        // 场景 1: 两个端点均健康，Daily 始终在首位
+        assert_eq!(
+            tracker.get_ordered_endpoints(&endpoints),
+            vec![
+                "https://daily-cloudcode-pa.googleapis.com/v1internal",
+                "https://daily-cloudcode-pa.sandbox.googleapis.com/v1internal",
+            ]
+        );
+
+        // 场景 2: Daily 偶发抖动进入冷却期
+        // 核心铁律（非毒化恢复）：Daily 绝不能被降级到沙箱之后！
+        // 否则非美 IP 用户会在下一个请求中因沙箱 400 Location not supported 或网络阻断而全军覆没！
+        tracker.mark_failure("https://daily-cloudcode-pa.googleapis.com/v1internal");
+        assert_eq!(
+            tracker.get_ordered_endpoints(&endpoints),
+            vec![
+                "https://daily-cloudcode-pa.googleapis.com/v1internal",
+                "https://daily-cloudcode-pa.sandbox.googleapis.com/v1internal",
+            ],
+            "沙箱端点绝不能抢占 Daily 主端点首位！"
+        );
+
+        // 场景 3: Daily 恢复成功，标记健康
+        tracker.mark_success("https://daily-cloudcode-pa.googleapis.com/v1internal");
+        assert_eq!(
+            tracker.get_ordered_endpoints(&endpoints),
+            vec![
+                "https://daily-cloudcode-pa.googleapis.com/v1internal",
+                "https://daily-cloudcode-pa.sandbox.googleapis.com/v1internal",
+            ]
+        );
+
+        // 场景 4: Sandbox 发生故障时施加至少 300s 隔离观察期
+        tracker.mark_failure("https://daily-cloudcode-pa.sandbox.googleapis.com/v1internal");
+        assert!(
+            !tracker.is_healthy("https://daily-cloudcode-pa.sandbox.googleapis.com/v1internal"),
+            "沙箱端点在故障后必须进入冷却隔离期"
+        );
+    }
+
+    #[test]
     fn test_is_model_capacity_exhausted() {
         use rquest::StatusCode;
 
@@ -2298,25 +2527,50 @@ mod tests {
         assert_eq!(small, 5, "small body budget should clamp to minimum 5s");
 
         // 2) 47.4MB 大视频：公式 请求体大小 ÷ 上传带宽 × (1 + 额外等待系数)
-        // 47_374_672 / 250_000 ≈ 189.5s * 1.4 ≈ 265s
+        // 47_374_672 / 100_000 ≈ 473.7s * 1.4 ≈ 663s (min_upload_mbps=0.8)
         let big = 47_374_672usize;
         let (big_budget, _) = UpstreamClient::calculate_upload_budget_secs(big, &cfg, None);
         assert!(
-            big_budget >= 250 && big_budget <= 280,
-            "47MB body budget should be around 263-265s, got {big_budget}"
+            big_budget >= 650 && big_budget <= 680,
+            "47MB body budget should be around 660-670s with 0.8Mbps, got {big_budget}"
         );
 
-        // 3) 实测速度高于下限时参与估算：预算可收紧，仍受下限与停滞检测约束
+        // 3) 实测快于声明下限：只作参考，预算不得收紧（现场 8.77MB 被 15s 掐断的根因）
         let (fast_budget, fast_source) =
             UpstreamClient::calculate_upload_budget_secs(big, &cfg, Some(1000 * 1024));
-        assert_eq!(fast_source, UploadBudgetSource::AdaptiveObserved);
-        assert!(fast_budget < big_budget);
-        assert!(fast_budget >= 5);
+        assert_eq!(fast_source, UploadBudgetSource::AdaptiveSize);
+        assert_eq!(fast_budget, big_budget);
 
-        // 4) 低速实测样本（低于下限）回退到体积估算，避免把预算压得过紧
-        let (_, slow_source) =
+        // 4) 实测慢于声明下限：说明声明值不可信，按实测放宽而不是按声明值硬等
+        let (slow_budget, slow_source) =
             UpstreamClient::calculate_upload_budget_secs(big, &cfg, Some(8 * 1024));
-        assert_eq!(slow_source, UploadBudgetSource::AdaptiveSize);
+        assert_eq!(slow_source, UploadBudgetSource::AdaptiveObserved);
+        assert!(slow_budget > big_budget);
+    }
+
+    #[test]
+    fn test_upload_budget_never_shrinks_below_declared_floor() {
+        // 现场回归（8.77MB / kind=image / budget_source=adaptive_observed_speed）：
+        // 存量配置 min_upload_mbps=2.0，被动 EWMA 被测成 ~850KB/s，旧实现据此把预算收紧到 15s；
+        // 而这条请求真实上行只有 437KB/s、完整传输需要 20s+，于是在 6.55MB 处被掐断，
+        // 并被打包成 504 upstream_network_error（看起来像上游网络故障，实际是本地预算先到）。
+        let cfg = crate::proxy::config::UploadTimeoutConfig {
+            min_upload_mbps: 2.0,
+            ..Default::default()
+        };
+        let body = 8_772_751usize;
+
+        // 1) 实测比声明下限更快：预算取声明下限一侧（≈50s），8.77MB 才有完整传输窗口
+        let (budget, source) =
+            UpstreamClient::calculate_upload_budget_secs(body, &cfg, Some(850 * 1024));
+        assert!(budget >= 50, "budget={budget}s source={source:?}");
+        assert_eq!(source, UploadBudgetSource::AdaptiveSize);
+
+        // 2) 实测比声明下限更慢（如走慢代理）：按实测放宽到能传完
+        let (slow_budget, slow_source) =
+            UpstreamClient::calculate_upload_budget_secs(body, &cfg, Some(100 * 1024));
+        assert!(slow_budget >= 119, "slow budget={slow_budget}s");
+        assert_eq!(slow_source, UploadBudgetSource::AdaptiveObserved);
     }
 
     #[test]
@@ -2374,7 +2628,10 @@ mod tests {
             1024,
             false,
         );
-        assert_eq!(image_fallback, text + 45 / 2);
+        assert_eq!(
+            image_fallback,
+            (text + 45 / 2).min(MAX_FIRST_BYTE_CEILING_SECS)
+        );
         let other_fallback = UpstreamClient::calculate_first_byte_wait_secs(
             PayloadMediaKind::Other,
             1,
@@ -2410,7 +2667,7 @@ mod tests {
         );
         assert!(huge >= MAX_FIRST_BYTE_BUDGET_SECS);
 
-        // 旧配置 header_wait_secs 降级为下限
+        // header_wait_secs 已废弃：不再抬高统一 TTFT 预算
         let raised = crate::proxy::config::UploadTimeoutConfig {
             header_wait_secs: 200,
             ..cfg.clone()
@@ -2424,7 +2681,7 @@ mod tests {
                 1024,
                 false
             ),
-            200
+            text
         );
 
         // 端点预算共享：总预算 = 上传×端点数 + 一份首字预算，而非逐端点相乘
@@ -2442,9 +2699,32 @@ mod tests {
         assert_eq!(small_plan.first_byte_total_secs, text);
         assert_eq!(
             small_plan.total_budget_secs,
-            small_plan.upload_budget_secs * small_plan.endpoint_attempt_limit as u64
-                + small_plan.first_byte_total_secs
+            (small_plan.upload_budget_secs * small_plan.endpoint_attempt_limit as u64
+                + small_plan.first_byte_total_secs)
+                .min(MAX_CLIENT_SAFE_TOTAL_BUDGET_SECS)
         );
+        assert_eq!(
+            small_plan.stall_secs, 45,
+            "stall_secs must not be squeezed down by small body upload budget"
+        );
+
+        // 重放护栏阈值（4MB）以上的大请求体，即便声明带宽极高，上传预算也有 15s 保底，
+        // 且 stall_secs 不被上传预算挤压（停滞判定与传输预算解耦）
+        let very_fast_cfg = crate::proxy::config::UploadTimeoutConfig {
+            min_upload_mbps: 100.0,
+            ..cfg.clone()
+        };
+        let gated_plan = UpstreamClient::plan_upstream_timeouts_with_observed(
+            PayloadMediaKind::TextChat,
+            crate::proxy::pipeline::budget::REPLAY_GUARD_BODY_BYTES,
+            &very_fast_cfg,
+            None,
+        );
+        assert_eq!(
+            gated_plan.upload_budget_secs, 15,
+            ">=4MB bodies keep 15s floor"
+        );
+        assert_eq!(gated_plan.stall_secs, 45);
 
         // 大体积请求默认仅允许 1 个端点，抑制同一大 body 重传放大
         let big_plan = UpstreamClient::plan_upstream_timeouts_with_observed(

@@ -46,7 +46,28 @@ impl AccountService {
         let mut account =
             modules::upsert_account(user_info.email.clone(), user_info.get_display_name(), token)?;
 
-        // 6. [NEW] Automatically fetch quota information (used for sorting by refresh time)
+        // 5.1 权威封禁探测：被封禁账号直接落盘并跳过无意义的配额拉取。
+        match modules::quota::probe_account_ban(&token_res.access_token, Some(&account.id)).await {
+            modules::quota::BanProbeOutcome::Banned(info) => {
+                if let Err(e) = modules::account::mark_account_banned(&account.id, &info) {
+                    modules::logger::log_warn(&format!(
+                        "[Service] Failed to persist ban state for {}: {}",
+                        account.email, e
+                    ));
+                }
+                if let Ok(reloaded) = modules::account::load_account(&account.id) {
+                    account = reloaded;
+                }
+                modules::logger::log_warn(&format!(
+                    "[Service] Account {} is banned by upstream: {} - {}",
+                    account.email, info.code, info.message
+                ));
+                return Ok(account);
+            }
+            _ => {}
+        }
+
+        // 6. [NEW] 自动获取配额信息（用于刷新时间排序）
         let email_for_log = account.email.clone();
         let access_token = token_res.access_token.clone();
         match modules::quota::fetch_quota(&access_token, &email_for_log, Some(&account.id)).await {
@@ -151,11 +172,12 @@ impl AccountService {
         &self,
         code: String,
         state: Option<String>,
-    ) -> Result<(), String> {
-        modules::oauth_server::submit_oauth_code(code, state).await
+    ) -> Result<Account, String> {
+        let token_res = modules::oauth_server::submit_oauth_code(code, state).await?;
+        self.process_oauth_token(token_res).await
     }
 
-    pub(crate) async fn process_oauth_token(
+    pub async fn process_oauth_token(
         &self,
         token_res: modules::oauth::TokenResponse,
     ) -> Result<Account, String> {
