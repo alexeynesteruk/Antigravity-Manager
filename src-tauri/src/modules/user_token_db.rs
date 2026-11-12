@@ -5,7 +5,7 @@
 // User token storage; some interfaces are reserved for future extension
 
 use chrono::{FixedOffset, Timelike, Utc};
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use uuid::Uuid;
@@ -66,6 +66,8 @@ pub fn get_db_path() -> Result<PathBuf, String> {
 pub fn connect_db() -> Result<Connection, String> {
     let path = get_db_path()?;
     let conn = Connection::open(&path).map_err(|e| format!("Failed to open database: {}", e))?;
+    conn.busy_timeout(std::time::Duration::from_secs(5))
+        .map_err(|e| format!("Failed to configure database busy timeout: {}", e))?;
     Ok(conn)
 }
 
@@ -337,37 +339,37 @@ pub fn get_token_by_id(id: &str) -> Result<Option<UserToken>, String> {
     Ok(token)
 }
 
-/// Get token information based on the Token value
+fn user_token_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<UserToken> {
+    Ok(UserToken {
+        id: row.get("id")?,
+        token: row.get("token")?,
+        username: row.get("username")?,
+        description: row.get("description")?,
+        enabled: row.get("enabled")?,
+        expires_type: row.get("expires_type")?,
+        expires_at: row.get("expires_at")?,
+        max_ips: row.get("max_ips")?,
+        curfew_start: row.get("curfew_start")?,
+        curfew_end: row.get("curfew_end")?,
+        created_at: row.get("created_at")?,
+        updated_at: row.get("updated_at")?,
+        last_used_at: row.get("last_used_at")?,
+        total_requests: row.get("total_requests")?,
+        total_tokens_used: row.get("total_tokens_used")?,
+    })
+}
+
+/// Unrestricted lookup for administration and auth-off usage attribution.
+/// Network admission must use `admit_token`, which enforces policy and reserves IP capacity.
 pub fn get_token_by_value(token: &str) -> Result<Option<UserToken>, String> {
-    let conn = connect_db()?;
-    let mut stmt = conn
-        .prepare("SELECT * FROM user_tokens WHERE token = ?1")
-        .map_err(|e| format!("Failed to prepare query: {}", e))?;
-
-    let token = stmt
-        .query_row(params![token], |row| {
-            Ok(UserToken {
-                id: row.get("id")?,
-                token: row.get("token")?,
-                username: row.get("username")?,
-                description: row.get("description")?,
-                enabled: row.get("enabled")?,
-                expires_type: row.get("expires_type")?,
-                expires_at: row.get("expires_at")?,
-                max_ips: row.get("max_ips")?,
-                curfew_start: row.get("curfew_start").unwrap_or(None),
-                curfew_end: row.get("curfew_end").unwrap_or(None),
-                created_at: row.get("created_at")?,
-                updated_at: row.get("updated_at")?,
-                last_used_at: row.get("last_used_at")?,
-                total_requests: row.get("total_requests")?,
-                total_tokens_used: row.get("total_tokens_used")?,
-            })
-        })
+    connect_db()?
+        .query_row(
+            "SELECT * FROM user_tokens WHERE token = ?1",
+            params![token],
+            user_token_from_row,
+        )
         .optional()
-        .map_err(|e| format!("Failed to query token: {}", e))?;
-
-    Ok(token)
+        .map_err(|e| format!("Failed to query token: {}", e))
 }
 
 /// Update token status/notes, etc.
@@ -587,86 +589,123 @@ pub fn record_token_usage_and_ip(
     Ok(())
 }
 
-/// Check whether the Token is valid (includes expiry check and IP limit check)
-/// Returns: (whether valid, rejection reason)
-pub fn validate_token(token_str: &str, ip: &str) -> Result<(bool, Option<String>), String> {
-    let token_opt = get_token_by_value(token_str)?;
+/// The admitted identity comes from the same transaction that checks its policy.
+pub enum TokenAdmission {
+    Admitted(UserToken),
+    Rejected(String),
+}
 
-    if let Some(token) = token_opt {
-        // 1. Check the expiry time
-        if token.expires_type != "never" {
-            if let Some(expires_at) = token.expires_at {
-                if expires_at < Utc::now().timestamp() {
-                    return Ok((
-                        false,
-                        Some(
-                            "Your token has expired. Please contact the administrator to renew it."
-                                .to_string(),
-                        ),
-                    ));
-                }
+/// Admit a user token and reserve its IP before any downstream work can begin.
+///
+/// Reservations are durable bindings, including when the downstream request fails
+/// or is cancelled. They last until an administrator removes the binding or
+/// replaces the token; they are not concurrent-request permits. Admission creates
+/// a zero-usage row, while response accounting alone increments request/token totals.
+/// Run on a blocking worker when called from async request handling.
+pub fn admit_token(token_str: &str, ip: &str) -> Result<TokenAdmission, String> {
+    let mut conn = connect_db()?;
+    admit_token_on_connection(&mut conn, token_str, ip, Utc::now)
+}
+
+fn admit_token_on_connection(
+    conn: &mut Connection,
+    token_str: &str,
+    ip: &str,
+    clock: impl FnOnce() -> chrono::DateTime<Utc>,
+) -> Result<TokenAdmission, String> {
+    // Serialize policy reads and capacity reservation with token updates and with
+    // other admissions, across connections/processes rather than a process mutex.
+    let tx = conn
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(|e| format!("Failed to start token admission: {}", e))?;
+    let token = tx
+        .query_row(
+            "SELECT * FROM user_tokens WHERE token = ?1",
+            params![token_str],
+            user_token_from_row,
+        )
+        .optional()
+        .map_err(|e| format!("Failed to load token admission policy: {}", e))?;
+    let Some(token) = token else {
+        return Ok(TokenAdmission::Rejected(
+            "Invalid token. Please check your API key.".into(),
+        ));
+    };
+    if !token.enabled {
+        return Ok(TokenAdmission::Rejected(
+            "Your token is disabled. Please contact the administrator.".into(),
+        ));
+    }
+
+    // Read the clock after acquiring the write transaction, so lock contention
+    // cannot authorize a token using an expiry check performed before the wait.
+    let now = clock();
+    if token.expires_type != "never"
+        && token
+            .expires_at
+            .is_some_and(|expiry| expiry < now.timestamp())
+    {
+        return Ok(TokenAdmission::Rejected(
+            "Your token has expired. Please contact the administrator to renew it.".into(),
+        ));
+    }
+    if let (Some(start), Some(end)) = (&token.curfew_start, &token.curfew_end) {
+        if !start.is_empty() && !end.is_empty() {
+            let beijing = now.with_timezone(&FixedOffset::east_opt(8 * 3600).unwrap());
+            let current = format!("{:02}:{:02}", beijing.hour(), beijing.minute());
+            let in_curfew = if start > end {
+                current >= *start || current < *end
+            } else {
+                current >= *start && current < *end
+            };
+            if in_curfew {
+                return Ok(TokenAdmission::Rejected(format!(
+                    "Service is not available between {} and {} Beijing Time (Curfew enabled). Current Beijing time: {}",
+                    start, end, current,
+                )));
             }
         }
+    }
 
-        // 2. Check the IP limit
+    let is_bound: bool = tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM token_ip_bindings WHERE token_id = ?1 AND ip_address = ?2)",
+        params![token.id, ip], |row| row.get(0),
+    ).map_err(|e| format!("Failed to check token IP binding: {}", e))?;
+    if !is_bound {
         if token.max_ips > 0 {
-            let conn = connect_db()?;
-
-            // Check whether the current IP is already bound
-            let is_bound: bool = conn.query_row(
-                "SELECT EXISTS(SELECT 1 FROM token_ip_bindings WHERE token_id = ?1 AND ip_address = ?2)",
-                params![token.id, ip],
-                |row| row.get(0)
-            ).unwrap_or(false);
-
-            if !is_bound {
-                // If not bound, check whether the limit has been reached
-                let current_ip_count: i32 = conn
-                    .query_row(
-                        "SELECT COUNT(*) FROM token_ip_bindings WHERE token_id = ?1",
-                        params![token.id],
-                        |row| row.get(0),
-                    )
-                    .unwrap_or(0);
-
-                if current_ip_count >= token.max_ips {
-                    return Ok((false, Some(format!("IP limit reached ({}/{}). Please contact the administrator to increase the limit.", current_ip_count, token.max_ips))));
-                }
+            let count: i64 = tx
+                .query_row(
+                    "SELECT COUNT(*) FROM token_ip_bindings WHERE token_id = ?1",
+                    params![token.id],
+                    |row| row.get(0),
+                )
+                .map_err(|e| format!("Failed to check token IP capacity: {}", e))?;
+            if count >= i64::from(token.max_ips) {
+                return Ok(TokenAdmission::Rejected(format!(
+                    "IP limit reached ({}/{}). Please contact the administrator to increase the limit.",
+                    count, token.max_ips,
+                )));
             }
         }
+        tx.execute(
+            "INSERT INTO token_ip_bindings
+                (id, token_id, ip_address, first_seen_at, last_seen_at, request_count)
+             VALUES (?1, ?2, ?3, ?4, ?4, 0)",
+            params![Uuid::new_v4().to_string(), token.id, ip, now.timestamp()],
+        )
+        .map_err(|e| format!("Failed to reserve token IP capacity: {}", e))?;
+    }
+    tx.commit()
+        .map_err(|e| format!("Failed to commit token admission: {}", e))?;
+    Ok(TokenAdmission::Admitted(token))
+}
 
-        // 3. Check the curfew time
-        // Logic: reject if the current Beijing time falls between start and end
-        // Format: HH:MM
-        // Uses a fixed UTC+8 (Beijing time), independent of the server's local timezone
-        if let (Some(start_str), Some(end_str)) = (&token.curfew_start, &token.curfew_end) {
-            if !start_str.is_empty() && !end_str.is_empty() {
-                let beijing_offset = FixedOffset::east_opt(8 * 3600).unwrap();
-                let now_beijing = Utc::now().with_timezone(&beijing_offset);
-                let current_time_str =
-                    format!("{:02}:{:02}", now_beijing.hour(), now_beijing.minute());
-
-                // Handling crossing midnight: start > end (e.g. 23:00 to 06:00)
-                // Normal: start < end (e.g. 09:00 to 18:00)
-                let is_curfew = if start_str > end_str {
-                    current_time_str >= *start_str || current_time_str < *end_str
-                } else {
-                    current_time_str >= *start_str && current_time_str < *end_str
-                };
-
-                if is_curfew {
-                    return Ok((false, Some(format!("Service is not available between {} and {} Beijing Time (Curfew enabled). Current Beijing time: {}", start_str, end_str, current_time_str))));
-                }
-            }
-        }
-
-        // Everything is fine, the Token is valid
-        Ok((true, None))
-    } else {
-        Ok((
-            false,
-            Some("Invalid token. Please check your API key.".to_string()),
-        ))
+/// Compatibility entry point: validation also durably reserves the admitted IP.
+/// Prefer `admit_token` to obtain the identity without a second database lookup.
+pub fn validate_token(token_str: &str, ip: &str) -> Result<(bool, Option<String>), String> {
+    match admit_token(token_str, ip)? {
+        TokenAdmission::Admitted(_) => Ok((true, None)),
+        TokenAdmission::Rejected(reason) => Ok((false, Some(reason))),
     }
 }
 
@@ -998,9 +1037,264 @@ pub fn get_user_tokens_ranking(time_range: &str) -> Result<Vec<UserTokenRankItem
 mod tests {
     use super::*;
 
+    fn admission_fixture(max_ips: i32) -> UserToken {
+        create_token(
+            "admission-fixture".into(),
+            "never".into(),
+            None,
+            max_ips,
+            None,
+            None,
+            None,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn admission_revokes_disabled_tokens_without_hiding_admin_lookup() {
+        let _data = crate::proxy::monitor::prompt_log_tests::TestDataDir::new();
+        init_db().unwrap();
+        let token = admission_fixture(1);
+        assert!(matches!(
+            admit_token(&token.token, "192.0.2.1").unwrap(),
+            TokenAdmission::Admitted(_)
+        ));
+        update_token(&token.id, None, None, Some(false), None, None, None).unwrap();
+        assert!(
+            matches!(admit_token(&token.token, "192.0.2.1").unwrap(), TokenAdmission::Rejected(reason) if reason.contains("disabled"))
+        );
+        assert!(!get_token_by_value(&token.token).unwrap().unwrap().enabled);
+        assert_eq!(get_token_ips(&token.id).unwrap().len(), 1);
+        update_token(&token.id, None, None, Some(true), None, None, None).unwrap();
+        assert!(
+            matches!(admit_token(&token.token, "192.0.2.1").unwrap(), TokenAdmission::Admitted(identity) if identity.id == token.id)
+        );
+    }
+
+    #[test]
+    fn admission_concurrent_new_ips_cannot_overbook_capacity() {
+        let _data = crate::proxy::monitor::prompt_log_tests::TestDataDir::new();
+        init_db().unwrap();
+        let token = admission_fixture(1);
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(9));
+        let results = std::thread::scope(|scope| {
+            let workers: Vec<_> = (1..=8)
+                .map(|index| {
+                    let barrier = barrier.clone();
+                    let value = token.token.clone();
+                    scope.spawn(move || {
+                        barrier.wait();
+                        admit_token(&value, &format!("192.0.2.{index}"))
+                    })
+                })
+                .collect();
+            barrier.wait();
+            workers
+                .into_iter()
+                .map(|worker| worker.join().unwrap().unwrap())
+                .collect::<Vec<_>>()
+        });
+        assert_eq!(
+            results
+                .iter()
+                .filter(|result| matches!(result, TokenAdmission::Admitted(_)))
+                .count(),
+            1
+        );
+        assert_eq!(
+            results
+                .iter()
+                .filter(|result| matches!(result, TokenAdmission::Rejected(_)))
+                .count(),
+            7
+        );
+        let bindings = get_token_ips(&token.id).unwrap();
+        assert_eq!(bindings.len(), 1);
+        // No response was accounted: failed/cancelled calls retain their reserved slot.
+        assert_eq!(bindings[0].request_count, 0);
+        assert_eq!(
+            get_token_by_id(&token.id).unwrap().unwrap().total_requests,
+            0
+        );
+        assert!(matches!(
+            admit_token(&token.token, &bindings[0].ip_address).unwrap(),
+            TokenAdmission::Admitted(_)
+        ));
+    }
+
+    #[test]
+    fn admission_same_ip_is_idempotent_and_usage_is_accounted_separately() {
+        let _data = crate::proxy::monitor::prompt_log_tests::TestDataDir::new();
+        init_db().unwrap();
+        let token = admission_fixture(1);
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(7));
+        std::thread::scope(|scope| {
+            let workers: Vec<_> = (0..6)
+                .map(|_| {
+                    let barrier = barrier.clone();
+                    let value = token.token.clone();
+                    scope.spawn(move || {
+                        barrier.wait();
+                        assert!(matches!(
+                            admit_token(&value, "2001:db8::1").unwrap(),
+                            TokenAdmission::Admitted(_)
+                        ));
+                    })
+                })
+                .collect();
+            barrier.wait();
+            for worker in workers {
+                worker.join().unwrap();
+            }
+        });
+        let bindings = get_token_ips(&token.id).unwrap();
+        assert_eq!(bindings.len(), 1);
+        assert_eq!(bindings[0].request_count, 0);
+        record_token_usage_and_ip(
+            &token.id,
+            "2001:db8::1",
+            "fixture-model",
+            7,
+            5,
+            502,
+            Some("fixture-agent".into()),
+        )
+        .unwrap();
+        let saved = get_token_by_id(&token.id).unwrap().unwrap();
+        assert_eq!(saved.total_requests, 1);
+        assert_eq!(saved.total_tokens_used, 12);
+        let bindings = get_token_ips(&token.id).unwrap();
+        assert_eq!(bindings.len(), 1);
+        assert_eq!(bindings[0].request_count, 1);
+        assert_eq!(bindings[0].user_agent.as_deref(), Some("fixture-agent"));
+    }
+
+    #[test]
+    fn admission_preserves_existing_bindings_when_limit_is_lowered() {
+        let _data = crate::proxy::monitor::prompt_log_tests::TestDataDir::new();
+        init_db().unwrap();
+        let token = admission_fixture(2);
+        for ip in ["192.0.2.1", "192.0.2.2"] {
+            assert!(matches!(
+                admit_token(&token.token, ip).unwrap(),
+                TokenAdmission::Admitted(_)
+            ));
+        }
+        update_token(&token.id, None, None, None, Some(1), None, None).unwrap();
+        for ip in ["192.0.2.1", "192.0.2.2"] {
+            assert!(matches!(
+                admit_token(&token.token, ip).unwrap(),
+                TokenAdmission::Admitted(_)
+            ));
+        }
+        assert!(
+            matches!(admit_token(&token.token, "192.0.2.3").unwrap(), TokenAdmission::Rejected(reason) if reason.contains("IP limit"))
+        );
+    }
+
+    #[test]
+    fn admission_expiry_uses_transaction_clock_and_preserves_never_policy() {
+        use chrono::TimeZone;
+        let _data = crate::proxy::monitor::prompt_log_tests::TestDataDir::new();
+        init_db().unwrap();
+        let token = admission_fixture(1);
+        let now = Utc.with_ymd_and_hms(2026, 1, 2, 12, 0, 0).unwrap();
+        let mut conn = connect_db().unwrap();
+        conn.execute(
+            "UPDATE user_tokens SET expires_type = 'day', expires_at = ?1 WHERE id = ?2",
+            params![now.timestamp() - 1, token.id],
+        )
+        .unwrap();
+        assert!(
+            matches!(admit_token_on_connection(&mut conn, &token.token, "192.0.2.1", || now).unwrap(), TokenAdmission::Rejected(reason) if reason.contains("expired"))
+        );
+        assert!(get_token_ips(&token.id).unwrap().is_empty());
+        conn.execute(
+            "UPDATE user_tokens SET expires_at = ?1 WHERE id = ?2",
+            params![now.timestamp() + 60, token.id],
+        )
+        .unwrap();
+        assert!(matches!(
+            admit_token_on_connection(&mut conn, &token.token, "192.0.2.1", || now).unwrap(),
+            TokenAdmission::Admitted(_)
+        ));
+        conn.execute(
+            "UPDATE user_tokens SET expires_type = 'never', expires_at = 1 WHERE id = ?1",
+            params![token.id],
+        )
+        .unwrap();
+        assert!(matches!(
+            admit_token_on_connection(&mut conn, &token.token, "192.0.2.1", || now).unwrap(),
+            TokenAdmission::Admitted(_)
+        ));
+    }
+
+    #[test]
+    fn admission_curfew_uses_beijing_time_with_midnight_and_boundary_rules() {
+        use chrono::TimeZone;
+        let _data = crate::proxy::monitor::prompt_log_tests::TestDataDir::new();
+        init_db().unwrap();
+        for (start, end, utc_hour, blocked) in [
+            ("09:00", "17:00", 1, true),
+            ("09:00", "17:00", 9, false),
+            ("23:00", "06:00", 15, true),
+            ("23:00", "06:00", 21, true),
+            ("23:00", "06:00", 22, false),
+            ("09:00", "09:00", 1, false),
+        ] {
+            let token = create_token(
+                "curfew-fixture".into(),
+                "never".into(),
+                None,
+                1,
+                Some(start.into()),
+                Some(end.into()),
+                None,
+            )
+            .unwrap();
+            let now = Utc.with_ymd_and_hms(2026, 1, 2, utc_hour, 0, 0).unwrap();
+            let result = admit_token_on_connection(
+                &mut connect_db().unwrap(),
+                &token.token,
+                "192.0.2.1",
+                || now,
+            )
+            .unwrap();
+            assert_eq!(
+                matches!(result, TokenAdmission::Rejected(_)),
+                blocked,
+                "curfew {start}..{end}, UTC hour {utc_hour}"
+            );
+            assert_eq!(
+                get_token_ips(&token.id).unwrap().len(),
+                usize::from(!blocked)
+            );
+        }
+    }
+
+    #[test]
+    fn admission_fails_closed_on_binding_read_or_reservation_errors() {
+        let _data = crate::proxy::monitor::prompt_log_tests::TestDataDir::new();
+        init_db().unwrap();
+        let token = admission_fixture(1);
+        let conn = connect_db().unwrap();
+        conn.execute_batch("CREATE TRIGGER fail_reservation BEFORE INSERT ON token_ip_bindings BEGIN SELECT RAISE(ABORT, 'fixture reservation failed'); END;").unwrap();
+        assert!(admit_token(&token.token, "192.0.2.1").is_err());
+        assert!(get_token_ips(&token.id).unwrap().is_empty());
+        conn.execute_batch("DROP TRIGGER fail_reservation; DROP TABLE token_ip_bindings;")
+            .unwrap();
+        assert!(admit_token(&token.token, "192.0.2.1").is_err());
+        // An unknown token is rejected without reading or repairing binding state.
+        assert!(matches!(
+            admit_token("unrecognized", "192.0.2.1").unwrap(),
+            TokenAdmission::Rejected(_)
+        ));
+    }
+
     #[test]
     fn test_create_and_query_token() {
-        let _ = init_db(); // Ensure DB is initialized
+        let _data = crate::proxy::monitor::prompt_log_tests::TestDataDir::new();
+        init_db().unwrap();
 
         // Use a random username to avoid collisions in existing DB runs during dev
         let username = format!("TestUser_{}", Uuid::new_v4());
@@ -1026,7 +1320,8 @@ mod tests {
 
     #[test]
     fn test_never_expire_token_validation() {
-        let _ = init_db();
+        let _data = crate::proxy::monitor::prompt_log_tests::TestDataDir::new();
+        init_db().unwrap();
         let username = format!("NeverExpireUser_{}", Uuid::new_v4());
         let token_res = create_token(
             username.clone(),
@@ -1050,7 +1345,8 @@ mod tests {
 
     #[test]
     fn test_get_token_detailed_stats() {
-        let _ = init_db();
+        let _data = crate::proxy::monitor::prompt_log_tests::TestDataDir::new();
+        init_db().unwrap();
         let username = format!("StatsUser_{}", Uuid::new_v4());
         let token_res = create_token(
             username.clone(),

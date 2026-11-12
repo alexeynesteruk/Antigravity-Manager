@@ -269,38 +269,27 @@ async fn auth_middleware_internal(
         let client_ip = crate::proxy::middleware::ip_filter::extract_client_ip(&request)
             .unwrap_or_else(|| "127.0.0.1".to_string()); // Default fallback
 
-        // 验证 Token
-        match crate::modules::user_token_db::validate_token(token, &client_ip) {
-            Ok((true, _)) => {
-                // Token 有效，查询信息以便传递
-                if let Ok(Some(user_token)) =
-                    crate::modules::user_token_db::get_token_by_value(token)
-                {
-                    let identity = UserTokenIdentity {
-                        token_id: user_token.id,
-                        token: user_token.token,
-                        username: user_token.username,
-                    };
-
-                    // [FIX] 将身份信息注入到请求 extensions 中，而不是响应
-                    // 这样 monitor_middleware 在处理请求时就能获取到 identity
-                    // 因为中间件执行顺序：auth (外层) -> monitor (内层) -> handler
-                    // 响应返回时：handler -> monitor -> auth
-                    // 如果注入到 response，monitor 执行时 identity 还不存在
-                    let (mut parts, body) = request.into_parts();
-                    parts.extensions.insert(identity);
-                    let request = Request::from_parts(parts, body);
-
-                    // 执行请求
-                    let response = next.run(request).await;
-
-                    Ok(response)
-                } else {
-                    Err(StatusCode::UNAUTHORIZED)
-                }
+        // SQLite lock waits stay on the blocking pool. Admission returns the
+        // checked identity, avoiding a second lookup and its update/delete race.
+        let token_value = token.to_owned();
+        let admission = tokio::task::spawn_blocking(move || {
+            crate::modules::user_token_db::admit_token(&token_value, &client_ip)
+        })
+        .await
+        .map_err(|_| "User token admission worker failed".to_string())
+        .and_then(|result| result);
+        match admission {
+            Ok(crate::modules::user_token_db::TokenAdmission::Admitted(user_token)) => {
+                let identity = UserTokenIdentity {
+                    token_id: user_token.id,
+                    token: user_token.token,
+                    username: user_token.username,
+                };
+                let (mut parts, body) = request.into_parts();
+                parts.extensions.insert(identity);
+                Ok(next.run(Request::from_parts(parts, body)).await)
             }
-            Ok((false, reason)) => {
-                let reason_str = reason.unwrap_or_else(|| "Access denied".to_string());
+            Ok(crate::modules::user_token_db::TokenAdmission::Rejected(reason_str)) => {
                 tracing::warn!("UserToken rejected: {}", reason_str);
                 let body = serde_json::json!({
                     "error": {
@@ -644,11 +633,143 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn user_token_admission_enforces_policy_and_keeps_auth_off_attribution() {
+        use tower::ServiceExt;
+        let _data = crate::proxy::monitor::prompt_log_tests::TestDataDir::new();
+        crate::modules::user_token_db::init_db().unwrap();
+        let token = crate::modules::user_token_db::create_token(
+            "fixture-user".into(),
+            "never".into(),
+            None,
+            1,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        crate::modules::user_token_db::update_token(
+            &token.id,
+            None,
+            None,
+            Some(false),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        let security = strict_security();
+        let app = axum::Router::new()
+            .route(
+                "/v1/chat/completions",
+                axum::routing::get(|request: Request| async move {
+                    request
+                        .extensions()
+                        .get::<UserTokenIdentity>()
+                        .map(|identity| identity.username.clone())
+                        .unwrap_or_else(|| "primary".into())
+                }),
+            )
+            .layer(axum::middleware::from_fn_with_state(
+                security.clone(),
+                auth_middleware,
+            ));
+        let request = || {
+            Request::builder()
+                .uri("/v1/chat/completions")
+                .header("Authorization", format!("Bearer {}", token.token))
+                .body(axum::body::Body::empty())
+                .unwrap()
+        };
+        assert_eq!(
+            app.clone().oneshot(request()).await.unwrap().status(),
+            StatusCode::FORBIDDEN
+        );
+        assert!(crate::modules::user_token_db::get_token_ips(&token.id)
+            .unwrap()
+            .is_empty());
+        let primary = Request::builder()
+            .uri("/v1/chat/completions")
+            .header("Authorization", "Bearer valid+key")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        assert_eq!(
+            app.clone().oneshot(primary).await.unwrap().status(),
+            StatusCode::OK
+        );
+        crate::modules::user_token_db::update_token(
+            &token.id,
+            None,
+            None,
+            Some(true),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        let response = app.clone().oneshot(request()).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            axum::body::to_bytes(response.into_body(), 1024)
+                .await
+                .unwrap()
+                .as_ref(),
+            b"fixture-user"
+        );
+        let bindings = crate::modules::user_token_db::get_token_ips(&token.id).unwrap();
+        assert_eq!(bindings.len(), 1);
+        assert_eq!(bindings[0].request_count, 0);
+        let admin_app = axum::Router::new()
+            .route(
+                "/api/config",
+                axum::routing::get(|| async { StatusCode::OK }),
+            )
+            .layer(axum::middleware::from_fn_with_state(
+                security.clone(),
+                admin_auth_middleware,
+            ));
+        for (value, expected) in [
+            (token.token.as_str(), StatusCode::UNAUTHORIZED),
+            ("admin-password", StatusCode::OK),
+        ] {
+            let request = Request::builder()
+                .uri("/api/config")
+                .header("Authorization", format!("Bearer {value}"))
+                .body(axum::body::Body::empty())
+                .unwrap();
+            assert_eq!(
+                admin_app.clone().oneshot(request).await.unwrap().status(),
+                expected
+            );
+        }
+        crate::modules::user_token_db::update_token(
+            &token.id,
+            None,
+            None,
+            Some(false),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        security.write().await.auth_mode = ProxyAuthMode::Off;
+        let response = app.oneshot(request()).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            axum::body::to_bytes(response.into_body(), 1024)
+                .await
+                .unwrap()
+                .as_ref(),
+            b"fixture-user"
+        );
+    }
+
+    #[tokio::test]
     async fn test_auth_middleware_with_gemini_query_key() {
         use axum::routing::get;
         use tower::ServiceExt;
 
-        let _ = crate::modules::user_token_db::init_db();
+        let _data = crate::proxy::monitor::prompt_log_tests::TestDataDir::new();
+        crate::modules::user_token_db::init_db().unwrap();
 
         let security = Arc::new(RwLock::new(ProxySecurityConfig {
             auth_mode: ProxyAuthMode::Strict,
