@@ -58,85 +58,43 @@ fn mime_from_path(path: &str) -> String {
 
 /// 把 OpenAI 风格的音频引用转换为 Gemini part。
 ///
-/// 支持四种来源：
+/// Supports inline data URLs and HTTP(S) references.
 ///   * `data:audio/wav;base64,...`  -> inlineData
 ///   * `http(s)://...`              -> fileData (fileUri)
-///   * `file:///path` 或本地路径     -> 读盘后 inlineData
-///   * 裸 base64 (input_audio.data) -> inlineData (需要 declared_mime)
+/// Server-local paths are rejected without filesystem metadata or reads.
+/// Bare input_audio.data is handled by audio_part_from_inline_data.
 pub fn audio_part_from_source(src: &str, declared_mime: Option<&str>) -> Option<Value> {
+    use crate::proxy::pipeline::media_sources::{is_data_url, validate_media_reference};
+    validate_media_reference(src, false).ok()?;
     let declared = declared_mime.map(normalize_audio_mime);
-
-    // 1) data: URL
-    if src.starts_with("data:") {
-        let pos = src.find(',')?;
-        let meta = &src[5..pos];
-        let mime_part = meta.split(';').next().unwrap_or("");
+    if is_data_url(src) {
+        let (metadata, data) = src[5..].split_once(',')?;
+        let mime_part = metadata.split(';').next().unwrap_or("");
         let mime = if mime_part.contains('/') {
             normalize_audio_mime(mime_part)
         } else {
-            declared.clone().unwrap_or_else(|| "audio/mp3".to_string())
+            declared.unwrap_or_else(|| "audio/mp3".into())
         };
-        let data = &src[pos + 1..];
         warn_if_oversized(data.len(), &mime);
-        return Some(json!({ "inlineData": { "mimeType": mime, "data": data } }));
-    }
-
-    // 2) 远程 URL：交给 Gemini 侧拉取
-    if src.starts_with("http://") || src.starts_with("https://") {
+        Some(json!({"inlineData":{"mimeType":mime,"data":data}}))
+    } else {
         let mime = declared.unwrap_or_else(|| mime_from_path(src));
-        return Some(json!({ "fileData": { "fileUri": src, "mimeType": mime } }));
+        Some(json!({"fileData":{"fileUri":src,"mimeType":mime}}))
     }
+}
 
-    // 3) 本地文件 (file:// 或普通路径)
-    let looks_like_path =
-        src.starts_with("file://") || (src.len() < 4096 && Path::new(src).is_file());
-    if looks_like_path {
-        let file_path = if let Some(rest) = src.strip_prefix("file://") {
-            #[cfg(target_os = "windows")]
-            {
-                rest.trim_start_matches('/').replace('/', "\\")
-            }
-            #[cfg(not(target_os = "windows"))]
-            {
-                rest.to_string()
-            }
-        } else {
-            src.to_string()
-        };
-
-        match std::fs::read(&file_path) {
-            Ok(bytes) => {
-                if AudioProcessor::exceeds_size_limit(bytes.len()) {
-                    tracing::warn!(
-                        "[Audio] 本地音频超过 15MB ({} bytes)，仍会尝试上传: {}",
-                        bytes.len(),
-                        file_path
-                    );
-                }
-                let mime = declared.unwrap_or_else(|| mime_from_path(&file_path));
-                let b64 = AudioProcessor::encode_to_base64(&bytes);
-                tracing::debug!(
-                    "[Audio] 已加载本地音频 {} ({} bytes, {})",
-                    file_path,
-                    bytes.len(),
-                    mime
-                );
-                return Some(json!({ "inlineData": { "mimeType": mime, "data": b64 } }));
-            }
-            Err(e) => {
-                tracing::warn!("[Audio] 读取本地音频失败 {}: {}", file_path, e);
-                return None;
-            }
-        }
+/// Explicit inline input is distinct from a URL: bare bytes never become paths.
+pub fn audio_part_from_inline_data(src: &str, declared_mime: Option<&str>) -> Option<Value> {
+    use crate::proxy::pipeline::media_sources::{is_data_url, validate_inline_audio};
+    validate_inline_audio(src).ok()?;
+    if is_data_url(src) {
+        return audio_part_from_source(src, declared_mime);
     }
-
-    // 4) 裸 base64 (OpenAI input_audio.data)
-    if src.is_empty() {
-        return None;
-    }
-    let mime = declared.unwrap_or_else(|| "audio/mp3".to_string());
+    let mime = declared_mime
+        .map(normalize_audio_mime)
+        .unwrap_or_else(|| "audio/mp3".into());
     warn_if_oversized(src.len(), &mime);
-    Some(json!({ "inlineData": { "mimeType": mime, "data": src } }))
+    Some(json!({"inlineData":{"mimeType":mime,"data":src}}))
 }
 
 fn warn_if_oversized(base64_len: usize, mime: &str) {
@@ -163,7 +121,7 @@ mod part_tests {
 
     #[test]
     fn test_bare_base64_uses_declared_format() {
-        let part = audio_part_from_source("QUJD", Some("wav")).unwrap();
+        let part = audio_part_from_inline_data("QUJD", Some("wav")).unwrap();
         assert_eq!(part["inlineData"]["mimeType"], "audio/wav");
     }
 

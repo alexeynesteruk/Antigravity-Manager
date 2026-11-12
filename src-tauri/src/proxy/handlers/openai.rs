@@ -2159,6 +2159,8 @@ pub async fn handle_chat_completions(
     >,
     Json(mut body): Json<Value>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
+    crate::proxy::pipeline::media_sources::validate_request_media_sources(&body)
+        .map_err(|error| (StatusCode::BAD_REQUEST, error))?;
     let response_tenant = crate::proxy::thinking_store::tenant_component(
         &headers,
         user_identity
@@ -3797,6 +3799,10 @@ pub async fn handle_completions(
     >,
     Json(mut body): Json<Value>,
 ) -> Response {
+    if let Err(error) = crate::proxy::pipeline::media_sources::validate_request_media_sources(&body)
+    {
+        return (StatusCode::BAD_REQUEST, error).into_response();
+    }
     if body
         .get("input")
         .is_some_and(|value| !value.is_string() && !value.is_array())
@@ -3939,6 +3945,13 @@ pub async fn handle_completions(
         }
         if let Err(message) = validate_responses_input_image_limits(body.get("input")) {
             return (StatusCode::BAD_REQUEST, message).into_response();
+        }
+    }
+    if previous_response_id.is_some() {
+        if let Err(error) =
+            crate::proxy::pipeline::media_sources::validate_request_media_sources(&body)
+        {
+            return (StatusCode::BAD_REQUEST, error).into_response();
         }
     }
     let routing_session_id = responses_routing_session_id(
@@ -7828,6 +7841,14 @@ async fn handle_websocket_turn(
         }
     };
 
+    if let Err(error) =
+        crate::proxy::pipeline::media_sources::validate_request_media_sources(&normalized)
+    {
+        let event =
+            json!({"type":"error","error":{"type":"invalid_request_error","message":error}});
+        let _ = socket.send(Message::Text(event.to_string())).await;
+        return;
+    }
     let openai_body = convert_codex_to_openai_request(normalized);
     let structured_output = openai_body
         .get("response_format")
@@ -8074,6 +8095,7 @@ fn normalize_responses_websocket_request(
     mut payload: Value,
     state: &mut WebsocketSessionState,
 ) -> Result<Value, String> {
+    crate::proxy::pipeline::media_sources::validate_request_media_sources(&payload)?;
     crate::proxy::pipeline::schema_limits::validate_request_tool_schemas(&payload)?;
 
     let event_type = payload
@@ -9222,6 +9244,10 @@ pub async fn handle_videos_generations(
     _headers: HeaderMap,
     Json(req): Json<crate::proxy::video::VideoGenerationRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
+    if let Some(image) = req.image.as_deref() {
+        crate::proxy::pipeline::media_sources::validate_media_reference(image, false)
+            .map_err(|error| (StatusCode::BAD_REQUEST, error))?;
+    }
     if req.prompt.trim().is_empty() {
         return Err((
             StatusCode::BAD_REQUEST,
@@ -9517,5 +9543,26 @@ mod responses_input_normalization_tests {
             responses_input_items(expected.clone()),
             expected.as_array().unwrap().clone()
         );
+    }
+}
+
+#[cfg(test)]
+mod media_source_websocket_tests {
+    use super::*;
+
+    #[test]
+    fn responses_websocket_rejects_local_media_before_conversion() {
+        let mut state = WebsocketSessionState::default();
+        let result = normalize_responses_websocket_request(
+            json!({
+                "type":"response.create", "model":"fixture-model",
+                "input":[{"type":"message","role":"user","content":[{
+                    "type":"input_image","image_url":"file:///server/secret"
+                }]}]
+            }),
+            &mut state,
+        );
+        assert!(result.is_err_and(|error| error.contains("media source")));
+        assert!(state.last_request.is_none());
     }
 }

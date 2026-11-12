@@ -515,7 +515,7 @@ pub fn transform_openai_request_with_session(
                                         }
                                     }
                                 OpenAIContentBlock::ImageUrl { image_url } => {
-                                    if image_url.url.starts_with("data:") {
+                                    if crate::proxy::pipeline::media_sources::is_data_url(&image_url.url) {
                                         if let Some(pos) = image_url.url.find(",") {
                                             let mime_part = &image_url.url[5..pos];
                                             let mime_type = mime_part.split(';').next().unwrap_or("image/jpeg");
@@ -529,49 +529,11 @@ pub fn transform_openai_request_with_session(
                                         } else {
                                             parts.push(json!({"text": "[Image: invalid data URL omitted]"}));
                                         }
-                                    } else if image_url.url.starts_with("http") {
+                                    } else {
+                                        // URI admission happens before conversion; normalization performs no I/O.
                                         parts.push(json!({
                                             "fileData": { "fileUri": &image_url.url, "mimeType": "image/jpeg" }
                                         }));
-                                    } else {
-                                        // [NEW] 处理本地文件路径 (file:// 或 Windows/Unix 路径)
-                                        let file_path = if image_url.url.starts_with("file://") {
-                                            // 移除 file:// 前缀
-                                            #[cfg(target_os = "windows")]
-                                            { image_url.url.trim_start_matches("file:///").replace('/', "\\") }
-                                            #[cfg(not(target_os = "windows"))]
-                                            { image_url.url.trim_start_matches("file://").to_string() }
-                                        } else {
-                                            image_url.url.clone()
-                                        };
-
-                                        tracing::debug!("[OpenAI-Request] Reading local image: {}", file_path);
-
-                                        // 读取文件并转换为 base64
-                                        if let Ok(file_bytes) = std::fs::read(&file_path) {
-                                            use base64::Engine as _;
-                                            let b64 = base64::engine::general_purpose::STANDARD.encode(&file_bytes);
-
-                                            // 根据文件扩展名推断 MIME 类型
-                                            let mime_type = if file_path.to_lowercase().ends_with(".png") {
-                                                "image/png"
-                                            } else if file_path.to_lowercase().ends_with(".gif") {
-                                                "image/gif"
-                                            } else if file_path.to_lowercase().ends_with(".webp") {
-                                                "image/webp"
-                                            } else {
-                                                "image/jpeg"
-                                            };
-
-                                            parts.push(crate::proxy::mappers::common_utils::create_gemini_inline_part(
-                                                Some(mime_type),
-                                                &b64,
-                                                "Image",
-                                            ));
-                                            tracing::debug!("[OpenAI-Request] Successfully loaded image: {} ({} bytes)", file_path, file_bytes.len());
-                                        } else {
-                                            tracing::debug!("[OpenAI-Request] Failed to read local image: {}", file_path);
-                                        }
                                     }
                                 }
                                 OpenAIContentBlock::AudioUrl { audio_url } => {
@@ -592,7 +554,7 @@ pub fn transform_openai_request_with_session(
                                 OpenAIContentBlock::InputAudio { input_audio } => {
                                     // [NEW] OpenAI 官方 input_audio (base64 + format) -> Gemini inlineData
                                     let mime = input_audio.mime_type();
-                                    match crate::proxy::audio::audio_part_from_source(
+                                    match crate::proxy::audio::audio_part_from_inline_data(
                                         &input_audio.data,
                                         Some(&mime),
                                     ) {
@@ -761,7 +723,7 @@ pub fn transform_openai_request_with_session(
                             match block {
                                 OpenAIContentBlock::Text { text } => texts.push(text.clone()),
                                 OpenAIContentBlock::ImageUrl { image_url } => {
-                                    if image_url.url.starts_with("data:") {
+                                    if crate::proxy::pipeline::media_sources::is_data_url(&image_url.url) {
                                         if let Some(pos) = image_url.url.find(',') {
                                             let mime_part = &image_url.url[5..pos];
                                             let mime_type = mime_part.split(';').next().unwrap_or("image/jpeg");
@@ -788,7 +750,7 @@ pub fn transform_openai_request_with_session(
                                 }
                                 OpenAIContentBlock::InputAudio { input_audio } => {
                                     let mime = input_audio.mime_type();
-                                    match crate::proxy::audio::audio_part_from_source(
+                                    match crate::proxy::audio::audio_part_from_inline_data(
                                         &input_audio.data,
                                         Some(&mime),
                                     ) {

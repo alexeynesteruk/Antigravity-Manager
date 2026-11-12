@@ -13,6 +13,7 @@ pub mod errors;
 pub mod estimator;
 pub mod image;
 pub mod inbound;
+pub mod media_sources;
 #[cfg(test)]
 mod official_alignment_tests;
 pub mod policy;

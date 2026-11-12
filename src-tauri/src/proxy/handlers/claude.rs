@@ -924,6 +924,10 @@ pub async fn handle_messages(
     >,
     Json(body): Json<Value>,
 ) -> Response {
+    if let Err(error) = crate::proxy::pipeline::media_sources::validate_request_media_sources(&body)
+    {
+        return (StatusCode::BAD_REQUEST, error).into_response();
+    }
     if let Err(error) = crate::proxy::pipeline::schema_limits::validate_request_tool_schemas(&body)
     {
         return (StatusCode::BAD_REQUEST, error).into_response();

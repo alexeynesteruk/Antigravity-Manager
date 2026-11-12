@@ -41,6 +41,8 @@ pub async fn handle_generate(
     >,
     Json(mut body): Json<Value>, // 改为 mut 以支持修复提示词注入
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
+    crate::proxy::pipeline::media_sources::validate_request_media_sources(&body)
+        .map_err(|error| (StatusCode::BAD_REQUEST, error))?;
     crate::proxy::pipeline::schema_limits::validate_request_tool_schemas(&body)
         .map_err(|error| (StatusCode::BAD_REQUEST, error))?;
 
