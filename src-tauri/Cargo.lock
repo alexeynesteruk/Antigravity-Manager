@@ -127,6 +127,7 @@ dependencies = [
  "rquest",
  "rquest-util",
  "rusqlite",
+ "same-file",
  "serde",
  "serde_json",
  "sha2",

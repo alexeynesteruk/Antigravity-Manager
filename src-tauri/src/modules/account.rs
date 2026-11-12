@@ -2337,16 +2337,58 @@ pub fn format_data_dir_path(path: &Path) -> String {
     normalize_data_dir_path(path).to_string_lossy().into_owned()
 }
 
-fn resolve_existing_path(path: &Path) -> PathBuf {
+fn is_missing_path_error(error: &std::io::Error) -> bool {
+    matches!(
+        error.kind(),
+        std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+    )
+}
+
+/// Resolve the existing ancestor before appending any missing tail. Errors such
+/// as access denial cannot establish that a destination is outside the source.
+fn resolve_existing_path(path: &Path) -> Result<PathBuf, String> {
     let normalized = normalize_data_dir_path(path);
-    match normalized.canonicalize() {
-        Ok(canon) => normalize_data_dir_path(canon),
-        Err(_) => normalized,
+    let mut current = normalized.clone();
+    let mut tail = Vec::new();
+    loop {
+        match current.canonicalize() {
+            Ok(canonical) => {
+                let mut resolved = normalize_data_dir_path(canonical);
+                for component in tail.iter().rev() {
+                    resolved.push(component);
+                }
+                return Ok(resolved);
+            }
+            Err(error) if is_missing_path_error(&error) => {}
+            Err(error) => {
+                return Err(format!(
+                    "Failed to resolve data directory {}: {}",
+                    current.display(),
+                    error
+                ));
+            }
+        }
+        // Preserve parent components until an existing prefix is resolved:
+        // simplifying `link/../missing` lexically can change its real location.
+        let Some(component) = current.components().next_back() else {
+            return Err(format!(
+                "No existing ancestor for data directory {}",
+                normalized.display()
+            ));
+        };
+        let component = component.as_os_str().to_os_string();
+        if !current.pop() {
+            return Err(format!(
+                "No existing ancestor for data directory {}",
+                normalized.display()
+            ));
+        }
+        tail.push(component);
     }
 }
 
-fn path_compare_key(path: &Path) -> String {
-    let mut s = resolve_existing_path(path)
+fn path_compare_key(path: &Path) -> Result<String, String> {
+    let mut s = resolve_existing_path(path)?
         .to_string_lossy()
         .replace('\\', "/");
     while s.len() > 1 && s.ends_with('/') {
@@ -2356,17 +2398,80 @@ fn path_compare_key(path: &Path) -> String {
     {
         s = s.to_ascii_lowercase();
     }
-    s
+    Ok(s)
 }
 
-fn paths_equivalent(a: &Path, b: &Path) -> bool {
-    path_compare_key(a) == path_compare_key(b)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DataDirRelation {
+    Unrelated,
+    Same,
+    Inside,
 }
 
-fn is_nested_data_dir(inner: &Path, outer: &Path) -> bool {
-    let inner_key = path_compare_key(inner);
-    let outer_key = path_compare_key(outer);
-    inner_key != outer_key && inner_key.starts_with(&(outer_key + "/"))
+/// Keep identity handles open during comparisons. Windows needs only directory
+/// attributes, so traversable ancestors need not also grant listing access.
+fn open_dir_handle(path: &Path) -> std::io::Result<same_file::Handle> {
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        let file = fs::OpenOptions::new()
+            .access_mode(0x80) // FILE_READ_ATTRIBUTES
+            .custom_flags(0x0200_0000) // FILE_FLAG_BACKUP_SEMANTICS
+            .open(path)?;
+        same_file::Handle::from_file(file)
+    }
+    #[cfg(not(windows))]
+    {
+        same_file::Handle::from_path(path)
+    }
+}
+
+/// String comparisons alone miss aliases such as a Windows drive and its local
+/// UNC share. Unknown identity is an error before any copy or source deletion.
+fn relate_data_dirs(inner: &Path, outer: &Path) -> Result<DataDirRelation, String> {
+    let inner_key = path_compare_key(inner)?;
+    let outer_key = path_compare_key(outer)?;
+    if inner_key == outer_key {
+        return Ok(DataDirRelation::Same);
+    }
+    if inner_key.starts_with(&(outer_key + "/")) {
+        return Ok(DataDirRelation::Inside);
+    }
+
+    let resolved_inner = resolve_existing_path(inner)?;
+    let resolved_outer = resolve_existing_path(outer)?;
+    let source = open_dir_handle(&resolved_outer).map_err(|error| {
+        format!(
+            "Failed to identify source directory {}: {}",
+            resolved_outer.display(),
+            error
+        )
+    })?;
+    for (depth, ancestor) in resolved_inner.ancestors().enumerate() {
+        match open_dir_handle(ancestor) {
+            Ok(identity) if identity == source => {
+                return Ok(if depth == 0 {
+                    DataDirRelation::Same
+                } else {
+                    DataDirRelation::Inside
+                });
+            }
+            Ok(_) => {}
+            Err(error) if is_missing_path_error(&error) => {}
+            Err(error) => {
+                return Err(format!(
+                    "Failed to identify destination ancestor {}: {}",
+                    ancestor.display(),
+                    error
+                ));
+            }
+        }
+    }
+    Ok(DataDirRelation::Unrelated)
+}
+
+fn paths_equivalent(a: &Path, b: &Path) -> Result<bool, String> {
+    Ok(relate_data_dirs(a, b)? == DataDirRelation::Same)
 }
 
 fn persist_clean_env(dir: &Path) {
@@ -2394,30 +2499,274 @@ fn write_location_pointer(dir: &Path) -> Result<(), String> {
 }
 
 fn is_default_data_dir(dir: &Path) -> bool {
+    // If identity cannot be established, retain an explicit location pointer.
     default_data_dir()
-        .map(|d| paths_equivalent(&d, dir) || d == dir)
+        .map(|d| paths_equivalent(&d, dir).unwrap_or(false) || d == dir)
         .unwrap_or(false)
 }
 
 fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<(), String> {
-    fs::create_dir_all(dst).map_err(|e| format!("创建目标数据目录失败: {}", e))?;
-    for entry in fs::read_dir(src).map_err(|e| format!("读取原数据目录失败: {}", e))? {
-        let entry = entry.map_err(|e| format!("读取数据目录项失败: {}", e))?;
-        let from = entry.path();
-        let to = dst.join(entry.file_name());
-        let file_type = entry
-            .file_type()
-            .map_err(|e| format!("读取数据目录项类型失败: {}", e))?;
-        if file_type.is_dir() {
-            copy_dir_recursive(&from, &to)?;
-        } else {
-            if let Some(parent) = to.parent() {
-                fs::create_dir_all(parent).map_err(|e| format!("创建目标子目录失败: {}", e))?;
-            }
-            fs::copy(&from, &to).map_err(|e| format!("复制文件失败 {}: {}", from.display(), e))?;
+    match relate_data_dirs(dst, src)? {
+        DataDirRelation::Unrelated => {}
+        DataDirRelation::Same => return Err("Source and target are the same data directory".into()),
+        DataDirRelation::Inside => {
+            return Err("Cannot copy a data directory inside itself".into());
         }
     }
-    Ok(())
+    copy_dir_checked(src, dst, &mut Vec::new())
+}
+
+fn copy_dir_checked(
+    src: &Path,
+    dst: &Path,
+    source_chain: &mut Vec<same_file::Handle>,
+) -> Result<(), String> {
+    let source = open_dir_handle(src)
+        .map_err(|error| format!("Failed to identify source {}: {}", src.display(), error))?;
+    if source_chain.contains(&source) {
+        return Err("Source directory contains a copy loop".into());
+    }
+    let overlaps =
+        |identity: &same_file::Handle| identity == &source || source_chain.contains(identity);
+    // Validate an existing destination before creating or overwriting anything.
+    match open_dir_handle(dst) {
+        Ok(identity) if overlaps(&identity) => {
+            return Err("Copy destination overlaps a source directory".into());
+        }
+        Ok(_) => {}
+        Err(error) if is_missing_path_error(&error) => {}
+        Err(error) => {
+            return Err(format!(
+                "Failed to identify destination {}: {}",
+                dst.display(),
+                error
+            ));
+        }
+    }
+    fs::create_dir_all(dst).map_err(|e| format!("创建目标数据目录失败: {}", e))?;
+    let destination = open_dir_handle(dst).map_err(|error| {
+        format!(
+            "Failed to identify destination {}: {}",
+            dst.display(),
+            error
+        )
+    })?;
+    if overlaps(&destination) {
+        return Err("Copy destination overlaps a source directory".into());
+    }
+    source_chain.push(source);
+    let result = (|| {
+        for entry in fs::read_dir(src).map_err(|e| format!("读取原数据目录失败: {}", e))? {
+            let entry = entry.map_err(|e| format!("读取数据目录项失败: {}", e))?;
+            let from = entry.path();
+            let to = dst.join(entry.file_name());
+            let file_type = entry
+                .file_type()
+                .map_err(|e| format!("读取数据目录项类型失败: {}", e))?;
+            if file_type.is_dir() {
+                copy_dir_checked(&from, &to, source_chain)?;
+            } else {
+                if let Some(parent) = to.parent() {
+                    fs::create_dir_all(parent).map_err(|e| format!("创建目标子目录失败: {}", e))?;
+                }
+                fs::copy(&from, &to)
+                    .map_err(|e| format!("复制文件失败 {}: {}", from.display(), e))?;
+            }
+        }
+        Ok(())
+    })();
+    source_chain.pop();
+    result
+}
+
+#[cfg(test)]
+mod data_dir_identity_tests {
+    use super::*;
+
+    fn directory_alias(alias: &Path, target: &Path) -> bool {
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            let child = std::process::Command::new("cmd")
+                .args(["/C", "mklink", "/J"])
+                .arg(alias)
+                .arg(target)
+                .creation_flags(0x0800_0000) // CREATE_NO_WINDOW
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn();
+            if let Ok(mut child) = child {
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+                loop {
+                    match child.try_wait() {
+                        Ok(Some(status)) if status.success() => return true,
+                        Ok(Some(_)) => break,
+                        Ok(None) if std::time::Instant::now() < deadline => {
+                            std::thread::sleep(std::time::Duration::from_millis(10));
+                        }
+                        _ => {
+                            let _ = child.kill();
+                            let _ = child.wait();
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        #[cfg(unix)]
+        if std::os::unix::fs::symlink(target, alias).is_ok() {
+            return true;
+        }
+        eprintln!("SKIPPED directory alias scenario: cannot create a directory link");
+        false
+    }
+
+    #[test]
+    fn non_missing_resolution_errors_refuse_copy_without_writes() {
+        let root = tempfile::tempdir().unwrap();
+        fs::write(root.path().join("marker"), "source").unwrap();
+        let invalid = root.path().join("bad\0name").join("child");
+        assert!(resolve_existing_path(&invalid).is_err());
+        assert!(relate_data_dirs(&invalid, root.path()).is_err());
+        assert!(copy_dir_recursive(root.path(), &invalid).is_err());
+        assert_eq!(
+            fs::read_to_string(root.path().join("marker")).unwrap(),
+            "source"
+        );
+        assert_eq!(fs::read_dir(root.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn missing_nested_destination_is_refused_before_creation() {
+        let root = tempfile::tempdir().unwrap();
+        fs::write(root.path().join("marker"), "source").unwrap();
+        let destination = root.path().join("missing").join("..").join("child");
+        assert_eq!(
+            relate_data_dirs(&destination, root.path()).unwrap(),
+            DataDirRelation::Inside
+        );
+        assert!(copy_dir_recursive(root.path(), &destination).is_err());
+        assert!(!root.path().join("missing").exists());
+        assert!(!root.path().join("child").exists());
+    }
+
+    #[test]
+    fn self_copy_and_alias_copy_preserve_source() {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("source");
+        fs::create_dir(&source).unwrap();
+        fs::write(source.join("marker"), "source").unwrap();
+        assert!(copy_dir_recursive(&source, &source).is_err());
+        let alias = root.path().join("alias");
+        if directory_alias(&alias, &source) {
+            // open_dir_handle uses attribute-only directory handles on Windows.
+            assert_eq!(
+                open_dir_handle(&source).unwrap(),
+                open_dir_handle(&alias).unwrap()
+            );
+            assert_eq!(
+                relate_data_dirs(&alias, &source).unwrap(),
+                DataDirRelation::Same
+            );
+            assert!(copy_dir_recursive(&source, &alias).is_err());
+            assert!(copy_dir_recursive(&source, &alias.join("child")).is_err());
+            assert!(!source.join("child").exists());
+        }
+        assert_eq!(fs::read_to_string(source.join("marker")).unwrap(), "source");
+    }
+
+    #[test]
+    fn source_chain_rejects_alias_cycles_and_unwinds_after_failure() {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("source");
+        let other = root.path().join("other");
+        fs::create_dir(&source).unwrap();
+        fs::create_dir(&other).unwrap();
+        fs::write(source.join("marker"), "source").unwrap();
+        let mut chain = vec![open_dir_handle(&source).unwrap()];
+        // The destination is an ancestor already being copied: reject before writing.
+        assert!(copy_dir_checked(&other, &source, &mut chain).is_err());
+        assert_eq!(fs::read_dir(&source).unwrap().count(), 1);
+        let destination = root.path().join("never-created");
+        assert!(copy_dir_checked(&source, &destination, &mut chain).is_err());
+        assert!(!destination.exists());
+
+        // A failed recursive copy must release every identity it pushed.
+        let output = root.path().join("output");
+        fs::create_dir(&output).unwrap();
+        fs::create_dir(output.join("marker")).unwrap();
+        let mut chain = Vec::new();
+        assert!(copy_dir_checked(&source, &output, &mut chain).is_err());
+        assert!(chain.is_empty());
+    }
+
+    #[test]
+    fn unrelated_directory_copy_keeps_source_and_nested_content() {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("source");
+        let destination = root.path().join("destination");
+        fs::create_dir_all(source.join("accounts")).unwrap();
+        fs::write(source.join("accounts/marker"), "credential").unwrap();
+        copy_dir_recursive(&source, &destination).unwrap();
+        for directory in [&source, &destination] {
+            assert_eq!(
+                fs::read_to_string(directory.join("accounts/marker")).unwrap(),
+                "credential"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn missing_tail_resolves_parent_after_following_symlink() {
+        let root = tempfile::tempdir().unwrap();
+        let real = root.path().join("real");
+        fs::create_dir_all(real.join("deep")).unwrap();
+        let alias = root.path().join("alias");
+        std::os::unix::fs::symlink(real.join("deep"), &alias).unwrap();
+        assert_eq!(
+            resolve_existing_path(&alias.join("..").join("missing")).unwrap(),
+            real.canonicalize().unwrap().join("missing")
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn loopback_share_alias_is_refused_before_nested_copy() {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("source");
+        fs::create_dir(&source).unwrap();
+        let local = source.to_string_lossy();
+        let bytes = local.as_bytes();
+        if bytes.len() < 3 || bytes[1] != b':' || bytes[2] != b'\\' {
+            eprintln!("SKIPPED UNC identity scenario: temp directory has no drive letter");
+            return;
+        }
+        let alias = PathBuf::from(format!(
+            "\\\\localhost\\{}${}",
+            char::from(bytes[0]),
+            &local[2..]
+        ));
+        if !alias.is_dir() {
+            eprintln!("SKIPPED UNC identity scenario: local administrative share is unavailable");
+            return;
+        }
+        assert_ne!(
+            path_compare_key(&source).unwrap(),
+            path_compare_key(&alias).unwrap()
+        );
+        assert_eq!(
+            relate_data_dirs(&alias, &source).unwrap(),
+            DataDirRelation::Same
+        );
+        let destination = alias.join("nested");
+        assert_eq!(
+            relate_data_dirs(&destination, &source).unwrap(),
+            DataDirRelation::Inside
+        );
+        assert!(copy_dir_recursive(&source, &destination).is_err());
+        assert!(!source.join("nested").exists());
+    }
 }
 
 fn dir_is_empty(path: &Path) -> Result<bool, String> {
@@ -2525,14 +2874,14 @@ pub(crate) fn migrate_data_dir_with_cleanup(
             .join(new_dir)
     };
 
-    let old_dir = resolve_existing_path(&get_data_dir()?);
-    if paths_equivalent(&old_dir, &new_dir) {
-        apply_data_dir(&old_dir)?;
-        return Ok(resolve_existing_path(&old_dir));
-    }
-
-    if is_nested_data_dir(&new_dir, &old_dir) {
-        return Err("不能把数据目录迁移到自身内部".to_string());
+    let old_dir = resolve_existing_path(&get_data_dir()?)?;
+    match relate_data_dirs(&new_dir, &old_dir)? {
+        DataDirRelation::Same => {
+            apply_data_dir(&old_dir)?;
+            return Ok(old_dir);
+        }
+        DataDirRelation::Inside => return Err("不能把数据目录迁移到自身内部".to_string()),
+        DataDirRelation::Unrelated => {}
     }
 
     if new_dir.exists() && !new_dir.is_dir() {
@@ -2542,8 +2891,8 @@ pub(crate) fn migrate_data_dir_with_cleanup(
         .map_err(|e| format!("Failed to create target data directory: {}", e))?;
     // Resolve again after creation: a previously missing relative path or an
     // existing ancestor symlink can otherwise hide a target inside the source.
-    let resolved = resolve_existing_path(&new_dir);
-    if paths_equivalent(&old_dir, &resolved) || is_nested_data_dir(&resolved, &old_dir) {
+    let resolved = resolve_existing_path(&new_dir)?;
+    if relate_data_dirs(&resolved, &old_dir)? != DataDirRelation::Unrelated {
         return Err("Target data directory must stay outside the source".to_string());
     }
     if !dir_is_empty(&resolved)? {
