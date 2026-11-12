@@ -37,8 +37,20 @@ const DEFAULT_UPLOAD: DefaultUpload = {
     min_upload_mbps: 0.8,
     extra_wait_ratio: 0.4,
     stall_secs: 45,
+    fallback_first_byte_cap_secs: 45,
     large_body_threshold_mb: 8,
     large_body_endpoint_attempts: 1,
+};
+
+/// 与后端 UploadTimeoutConfig::normalized() 对齐的输入范围，失焦时夹取并回显。
+const UPLOAD_RANGES: Record<UploadField, [number, number]> = {
+    connect_secs: [3, 120],
+    min_upload_mbps: [0.1, 1000],
+    extra_wait_ratio: [0, 10],
+    stall_secs: [5, 600],
+    fallback_first_byte_cap_secs: [0, 600],
+    large_body_threshold_mb: [1, Number.MAX_SAFE_INTEGER],
+    large_body_endpoint_attempts: [1, Number.MAX_SAFE_INTEGER],
 };
 
 type UploadField =
@@ -46,6 +58,7 @@ type UploadField =
     | "min_upload_mbps"
     | "extra_wait_ratio"
     | "stall_secs"
+    | "fallback_first_byte_cap_secs"
     | "large_body_threshold_mb"
     | "large_body_endpoint_attempts";
 
@@ -61,12 +74,14 @@ export const TimeoutSettings: React.FC<TimeoutSettingsProps> = ({
     const { t } = useTranslation();
     const [isSaving, setIsSaving] = useState(false);
     const [savedSuccessfully, setSavedSuccessfully] = useState(false);
+    const [effectiveRevision, setEffectiveRevision] = useState(0);
 
     const [uploadRaw, setUploadRaw] = useState<Record<UploadField, string>>(() => ({
         connect_secs: String(uploadConfig?.connect_secs ?? DEFAULT_UPLOAD.connect_secs),
         min_upload_mbps: String(uploadConfig?.min_upload_mbps ?? DEFAULT_UPLOAD.min_upload_mbps),
         extra_wait_ratio: String(uploadConfig?.extra_wait_ratio ?? DEFAULT_UPLOAD.extra_wait_ratio),
         stall_secs: String(uploadConfig?.stall_secs ?? DEFAULT_UPLOAD.stall_secs),
+        fallback_first_byte_cap_secs: String(uploadConfig?.fallback_first_byte_cap_secs ?? DEFAULT_UPLOAD.fallback_first_byte_cap_secs),
         large_body_threshold_mb: String(uploadConfig?.large_body_threshold_mb ?? DEFAULT_UPLOAD.large_body_threshold_mb),
         large_body_endpoint_attempts: String(uploadConfig?.large_body_endpoint_attempts ?? DEFAULT_UPLOAD.large_body_endpoint_attempts),
     }));
@@ -83,6 +98,7 @@ export const TimeoutSettings: React.FC<TimeoutSettingsProps> = ({
             min_upload_mbps: String(uploadConfig?.min_upload_mbps ?? DEFAULT_UPLOAD.min_upload_mbps),
             extra_wait_ratio: String(uploadConfig?.extra_wait_ratio ?? DEFAULT_UPLOAD.extra_wait_ratio),
             stall_secs: String(uploadConfig?.stall_secs ?? DEFAULT_UPLOAD.stall_secs),
+            fallback_first_byte_cap_secs: String(uploadConfig?.fallback_first_byte_cap_secs ?? DEFAULT_UPLOAD.fallback_first_byte_cap_secs),
             large_body_threshold_mb: String(uploadConfig?.large_body_threshold_mb ?? DEFAULT_UPLOAD.large_body_threshold_mb),
             large_body_endpoint_attempts: String(uploadConfig?.large_body_endpoint_attempts ?? DEFAULT_UPLOAD.large_body_endpoint_attempts),
         });
@@ -91,6 +107,7 @@ export const TimeoutSettings: React.FC<TimeoutSettingsProps> = ({
         uploadConfig?.min_upload_mbps,
         uploadConfig?.extra_wait_ratio,
         uploadConfig?.stall_secs,
+        uploadConfig?.fallback_first_byte_cap_secs,
         uploadConfig?.large_body_threshold_mb,
         uploadConfig?.large_body_endpoint_attempts,
     ]);
@@ -122,8 +139,11 @@ export const TimeoutSettings: React.FC<TimeoutSettingsProps> = ({
         min_upload_mbps: parseUpload("min_upload_mbps"),
         extra_wait_ratio: parseUpload("extra_wait_ratio"),
         stall_secs: parseUpload("stall_secs"),
+        fallback_first_byte_cap_secs: parseUpload("fallback_first_byte_cap_secs"),
         large_body_threshold_mb: parseUpload("large_body_threshold_mb"),
         large_body_endpoint_attempts: parseUpload("large_body_endpoint_attempts"),
+        // 已废弃字段不展示，但保存时必须原样回传，避免 UI round-trip 把它重置为 0。
+        header_wait_secs: uploadConfig?.header_wait_secs ?? 0,
         ...overrides,
     });
 
@@ -157,7 +177,51 @@ export const TimeoutSettings: React.FC<TimeoutSettingsProps> = ({
         return () => {
             cancelled = true;
         };
-    }, [streamConfig?.initial_ttft_secs]);
+    }, [streamConfig?.initial_ttft_secs, effectiveRevision]);
+
+    type EffectiveTimeoutSample = {
+        label: string;
+        body_len: number;
+        upload_budget_secs: number;
+        large_body: boolean;
+        endpoint_attempt_limit: number;
+    };
+    type EffectiveTimeoutConfig = {
+        upload: UploadTimeoutConfig;
+        stream: StreamTimeoutConfig;
+        env_overridden: string[];
+        samples: EffectiveTimeoutSample[];
+        global_budget_secs: number;
+        replay_guard_threshold_mb: number;
+    };
+    const [effectiveTimeouts, setEffectiveTimeouts] = useState<EffectiveTimeoutConfig | null>(null);
+    useEffect(() => {
+        let cancelled = false;
+        invoke("get_effective_timeout_config")
+            .then((res: any) => {
+                if (!cancelled && res && res.upload) {
+                    setEffectiveTimeouts(res);
+                }
+            })
+            .catch(() => {
+                // Web / 非 Tauri 运行模式：不展示生效值面板
+            });
+        return () => {
+            cancelled = true;
+        };
+    }, [
+        uploadConfig?.connect_secs,
+        uploadConfig?.min_upload_mbps,
+        uploadConfig?.extra_wait_ratio,
+        uploadConfig?.stall_secs,
+        uploadConfig?.fallback_first_byte_cap_secs,
+        uploadConfig?.large_body_threshold_mb,
+        uploadConfig?.large_body_endpoint_attempts,
+        streamConfig?.initial_ttft_secs,
+        streamConfig?.transition_secs,
+        streamConfig?.streaming_sliding_secs,
+        effectiveRevision,
+    ]);
 
     const handleUploadInput = (field: UploadField, text: string) => {
         const isDecimal = field === "min_upload_mbps" || field === "extra_wait_ratio";
@@ -187,20 +251,20 @@ export const TimeoutSettings: React.FC<TimeoutSettingsProps> = ({
     };
 
     const handleUploadBlur = (field: UploadField) => {
-        if (field === "connect_secs") {
-            // 与后端 base_client_builder 的 3..120s 夹取对齐，避免前端显示值与生效值不一致
-            const parsed = parseInt(uploadRaw.connect_secs, 10);
-            const value = Number.isNaN(parsed)
-                ? DEFAULT_UPLOAD.connect_secs
-                : Math.min(Math.max(parsed, 3), 120);
-            setUploadRaw((prev) => ({ ...prev, connect_secs: String(value) }));
-            onUploadChange(mergedUpload({ connect_secs: value }));
-            return;
-        }
         if (uploadRaw[field] === "") {
             setUploadRaw((prev) => ({ ...prev, [field]: String(DEFAULT_UPLOAD[field]) }));
             onUploadChange(mergedUpload({ [field]: DEFAULT_UPLOAD[field] } as Partial<UploadTimeoutConfig>));
+            return;
         }
+        const isDecimal = field === "min_upload_mbps" || field === "extra_wait_ratio";
+        const parsed = isDecimal ? parseFloat(uploadRaw[field]) : parseInt(uploadRaw[field], 10);
+        const [min, max] = UPLOAD_RANGES[field];
+        const value = Number.isNaN(parsed)
+            ? DEFAULT_UPLOAD[field]
+            : Math.min(Math.max(parsed, min), max);
+        const display = isDecimal ? String(value) : String(Math.round(value));
+        setUploadRaw((prev) => ({ ...prev, [field]: display }));
+        onUploadChange(mergedUpload({ [field]: value } as Partial<UploadTimeoutConfig>));
     };
 
     const handleStreamBlur = (field: StreamField) => {
@@ -211,12 +275,19 @@ export const TimeoutSettings: React.FC<TimeoutSettingsProps> = ({
     };
 
     // 最大等待时间 = 请求体大小 ÷ 上传带宽 × (1 + 额外等待系数)
+    const currentExtraFactor = (): number => {
+        const parsed = parseFloat(uploadRaw.extra_wait_ratio);
+        const ratio = Number.isFinite(parsed)
+            ? Math.max(parsed, 0)
+            : DEFAULT_UPLOAD.extra_wait_ratio;
+        return 1 + ratio;
+    };
+
     const estimateUploadSecs = (mb: number): number => {
         const mbps = Math.max(parseFloat(uploadRaw.min_upload_mbps) || DEFAULT_UPLOAD.min_upload_mbps, 0.1);
-        const ratio = Math.max(parseFloat(uploadRaw.extra_wait_ratio) || DEFAULT_UPLOAD.extra_wait_ratio, 0);
         const bytesPerSec = (mbps * 1_000_000) / 8;
         const transferSecs = (mb * 1_000_000) / bytesPerSec;
-        return Math.round(transferSecs * (1 + ratio));
+        return Math.round(transferSecs * currentExtraFactor());
     };
 
     const handleResetDefaults = () => {
@@ -225,6 +296,7 @@ export const TimeoutSettings: React.FC<TimeoutSettingsProps> = ({
             min_upload_mbps: String(DEFAULT_UPLOAD.min_upload_mbps),
             extra_wait_ratio: String(DEFAULT_UPLOAD.extra_wait_ratio),
             stall_secs: String(DEFAULT_UPLOAD.stall_secs),
+            fallback_first_byte_cap_secs: String(DEFAULT_UPLOAD.fallback_first_byte_cap_secs),
             large_body_threshold_mb: String(DEFAULT_UPLOAD.large_body_threshold_mb),
             large_body_endpoint_attempts: String(DEFAULT_UPLOAD.large_body_endpoint_attempts),
         });
@@ -233,7 +305,7 @@ export const TimeoutSettings: React.FC<TimeoutSettingsProps> = ({
             transition_secs: String(DEFAULT_STREAM.transition_secs),
             streaming_sliding_secs: String(DEFAULT_STREAM.streaming_sliding_secs),
         });
-        onUploadChange({ ...DEFAULT_UPLOAD });
+        onUploadChange({ ...DEFAULT_UPLOAD, header_wait_secs: uploadConfig?.header_wait_secs ?? 0 });
         onStreamChange({ ...DEFAULT_STREAM });
         showToast(t("proxy.upload_timeouts.toast_reset", { defaultValue: "已恢复超时默认值" }), "info");
     };
@@ -244,6 +316,7 @@ export const TimeoutSettings: React.FC<TimeoutSettingsProps> = ({
             if (onSave) {
                 await onSave();
             }
+            setEffectiveRevision((revision) => revision + 1);
             setSavedSuccessfully(true);
             showToast(t("common.success", { defaultValue: "设置已保存" }), "success");
             setTimeout(() => setSavedSuccessfully(false), 2000);
@@ -382,6 +455,7 @@ export const TimeoutSettings: React.FC<TimeoutSettingsProps> = ({
                     <div className="font-mono">
                         {t("proxy.timeouts.auto_summary", {
                             mbps: parseUpload("min_upload_mbps"),
+                            factor: currentExtraFactor().toFixed(2),
                             big: estimateUploadSecs(47),
                         })}
                     </div>
@@ -412,7 +486,10 @@ export const TimeoutSettings: React.FC<TimeoutSettingsProps> = ({
                         {t("proxy.timeouts.section_large_body")}
                     </div>
                     <p className="text-[11px] text-gray-500 dark:text-gray-400 leading-normal pb-2">
-                        {t("proxy.upload_timeouts.large_body_desc")}
+                        {t("proxy.upload_timeouts.large_body_desc_v2", {
+                            defaultValue:
+                                "Bodies above this byte threshold use at most the configured endpoint attempts; account rotation is separate.",
+                        })}
                     </p>
                     <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
                         <div>
@@ -429,7 +506,9 @@ export const TimeoutSettings: React.FC<TimeoutSettingsProps> = ({
                         </div>
                         <div>
                             <div className="text-[11px] font-semibold text-gray-700 dark:text-gray-300 pb-1">
-                                {t("proxy.upload_timeouts.endpoint_attempts_title")}
+                                {t("proxy.upload_timeouts.endpoint_attempts_title_v2", {
+                                    defaultValue: "Max endpoint attempts",
+                                })}
                             </div>
                             {numberField(
                                 uploadRaw.large_body_endpoint_attempts,
@@ -439,7 +518,28 @@ export const TimeoutSettings: React.FC<TimeoutSettingsProps> = ({
                                 () => handleUploadBlur("large_body_endpoint_attempts"),
                             )}
                         </div>
+                        <div>
+                            <div className="text-[11px] font-semibold text-gray-700 dark:text-gray-300 pb-1">
+                                {t("proxy.upload_timeouts.fallback_first_byte_cap_title")}
+                            </div>
+                            {numberField(
+                                uploadRaw.fallback_first_byte_cap_secs,
+                                DEFAULT_UPLOAD.fallback_first_byte_cap_secs,
+                                "s",
+                                (text) => handleUploadInput("fallback_first_byte_cap_secs", text),
+                                () => handleUploadBlur("fallback_first_byte_cap_secs"),
+                            )}
+                            <p className="text-[10px] text-gray-500 pt-1">
+                                {t("proxy.upload_timeouts.fallback_first_byte_cap_desc")}
+                            </p>
+                        </div>
                     </div>
+                    <p className="text-[10px] text-amber-600 dark:text-amber-400 leading-normal pt-1">
+                        {t("proxy.upload_timeouts.account_retry_note", {
+                            defaultValue:
+                                "Account rotation is separate: 4–12 attempts depending on pool size; this field only limits endpoint attempts.",
+                        })}
+                    </p>
                 </div>
             </div>
 
@@ -510,6 +610,43 @@ export const TimeoutSettings: React.FC<TimeoutSettingsProps> = ({
                 </div>
                 )}
             </div>
+
+            {/* 配置值 vs 生效值：单一真源面板 */}
+            {effectiveTimeouts && (
+                <details className="p-3 bg-emerald-50/70 dark:bg-emerald-950/20 rounded-lg text-[11px] text-emerald-900 dark:text-emerald-300 space-y-1">
+                    <summary className="font-semibold cursor-pointer">
+                        {t("proxy.timeouts.effective_upload_title", {
+                            defaultValue: "Effective upload timeouts",
+                        })}
+                    </summary>
+                    <div className="grid grid-cols-2 gap-x-4 gap-y-0.5 text-gray-600 dark:text-gray-400 font-mono">
+                        <span>min_upload_mbps: {effectiveTimeouts.upload.min_upload_mbps}</span>
+                        <span>extra_wait_ratio: {effectiveTimeouts.upload.extra_wait_ratio}</span>
+                        <span>stall_secs: {effectiveTimeouts.upload.stall_secs}</span>
+                        <span>fallback_first_byte_cap_secs: {effectiveTimeouts.upload.fallback_first_byte_cap_secs}</span>
+                        <span>large_body_threshold_mb: {effectiveTimeouts.upload.large_body_threshold_mb}</span>
+                        <span>large_body_endpoint_attempts: {effectiveTimeouts.upload.large_body_endpoint_attempts}</span>
+                        <span>global_budget_secs: {effectiveTimeouts.global_budget_secs}</span>
+                        <span>replay_guard_threshold_mb: {effectiveTimeouts.replay_guard_threshold_mb}</span>
+                    </div>
+                    {effectiveTimeouts.env_overridden.length > 0 && (
+                        <div className="text-amber-600 dark:text-amber-400">
+                            {t("proxy.timeouts.effective_upload_env_overridden", {
+                                fields: effectiveTimeouts.env_overridden.join(", "),
+                                defaultValue: `Environment overrides: ${effectiveTimeouts.env_overridden.join(", ")}`,
+                            })}
+                        </div>
+                    )}
+                    <div className="font-mono text-gray-600 dark:text-gray-400">
+                        {effectiveTimeouts.samples
+                            .map(
+                                (s) =>
+                                    `${s.label}: ${s.upload_budget_secs}s${s.large_body ? " [large]" : ""} (endpoints ${s.endpoint_attempt_limit})`,
+                            )
+                            .join("  ")}
+                    </div>
+                </details>
+            )}
 
             {/* 底部操作栏 */}
             <div className="flex items-center justify-between pt-2 border-t border-gray-200/60 dark:border-base-300/60">

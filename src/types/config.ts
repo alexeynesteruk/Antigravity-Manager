@@ -45,6 +45,8 @@ export interface UploadTimeoutConfig {
     min_upload_mbps?: number;
     extra_wait_ratio?: number;
     stall_secs?: number;
+    /** Fallback endpoint first-byte cap in seconds; 0 keeps only the shared budgets. */
+    fallback_first_byte_cap_secs?: number;
     /** @deprecated 已合并进 StreamTimeoutConfig.initial_ttft_secs；新代码不要再读写。 */
     header_wait_secs?: number;
     large_body_threshold_mb?: number;

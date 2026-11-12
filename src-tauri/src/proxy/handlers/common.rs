@@ -15,7 +15,8 @@ pub use crate::proxy::pipeline::rotation::{
     apply_retry_strategy, calculate_max_retry_attempts, clamp_retry_after_for_claude,
     determine_retry_strategy, determine_retry_strategy_adaptive,
     determine_retry_strategy_with_grace, extract_retry_after_seconds, is_model_not_found_error,
-    next_rotation_attempt, should_rotate_account, RequestRetryState, RetryStrategy,
+    next_rotation_attempt, record_attempted_account, should_rotate_account, RequestRetryState,
+    RetryStrategy,
 };
 
 /// 请求内「结构化失败状态」聚合器已下沉到 `pipeline::terminal`（协议无关）。
@@ -401,6 +402,12 @@ pub fn check_outdated_user_agent_issue(
     )
 }
 
+/// 是否为可通过修正 UA 配置解决的 404/403（缺失 Hub 签名 / Hub 版本过低）。
+///
+/// 这类错误不是账号/模型故障：不应写入 900s 单模型熔断，也不应换号重放；
+/// 否则用户改好 UA 后仍会被旧熔断卡 15 分钟。
+pub use crate::proxy::pipeline::policy::is_outdated_user_agent_error;
+
 /// 支持指定语言环境的 User-Agent 门禁与熔断特征检测
 pub fn check_outdated_user_agent_issue_with_lang(
     model: &str,
@@ -430,21 +437,12 @@ pub fn check_outdated_user_agent_issue_with_lang(
             let active_baseline_ver = active_fp.version.as_str();
 
             // 判定是否缺少官方 Hub 签名，或 Hub 版本低于当前官方最新基准
-            let is_hub = trimmed_ua.starts_with("antigravity/hub/");
-            let (is_risk, reason) = if is_hub {
-                if let Some(caps) = crate::constants::parse_antigravity_version(trimmed_ua) {
-                    if crate::constants::compare_semver(&caps, active_baseline_ver)
-                        == std::cmp::Ordering::Less
-                    {
-                        (true, "outdated_version")
-                    } else {
-                        (false, "ok")
-                    }
-                } else {
-                    (false, "ok")
-                }
+            let is_risk =
+                is_outdated_user_agent_error(model, status_code, error_text, Some(trimmed_ua));
+            let reason = if trimmed_ua.starts_with("antigravity/hub/") {
+                "outdated_version"
             } else {
-                (true, "missing_hub_signature") // 纯 IDE 格式 (如 antigravity/4.3.0) 缺少 Hub 签名
+                "missing_hub_signature"
             };
 
             if is_risk {
@@ -1225,6 +1223,22 @@ mod retry_after_tests {
             .as_str()
             .unwrap()
             .contains("【上游指纹门禁异常】"));
+
+        // 模型-not-found 分支使用这个纯判定：UA 风险时不得写 900s 熔断/换号。
+        assert!(is_outdated_user_agent_error(
+            "gemini-4-argon-high",
+            404,
+            raw_404,
+            Some(legacy_ua)
+        ));
+        assert!(!is_outdated_user_agent_error(
+            "gemini-4-argon-high",
+            404,
+            raw_404,
+            Some(
+                "antigravity/hub/2.28.0 (aidev_client; os_type=windows; arch=amd64; cl=1008300195)"
+            )
+        ));
     }
 
     #[test]

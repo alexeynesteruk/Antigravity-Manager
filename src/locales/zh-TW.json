@@ -1350,12 +1350,14 @@
       "btn_save": "儲存逾時設定"
     },
     "upload_timeouts": {
-      "adaptive_title": "上傳逾時：自動依頻寬判定",
+      "fallback_first_byte_cap_title": "?????????????",
+      "fallback_first_byte_cap_desc": "0 ?????????????????????????????",
+      "adaptive_title": "????????????",
       "min_speed_title": "上傳頻寬 (Mbps)",
       "min_speed_desc": "請填寫保守的最低上行頻寬；數值越小，上傳允許時間越寬鬆。VPN 使用者通常高下行、低上行，建議填 0.5–5 Mbps。",
       "extra_wait_title": "額外等待係數",
-      "extra_wait_desc": "此參數影響上傳最大等待時間。",
-      "formula_title": "最大等待時間 = 請求內容大小 ÷ 上傳頻寬 × (1 + 額外等待係數)",
+      "extra_wait_desc": "???????????????????????????????????",
+      "formula_title": "?????? = 請求內容大小 ÷ 上傳頻寬 × (1 + 額外等待係數)",
       "stall_title": "停滯逾時 (秒)",
       "stall_desc": "上傳階段單次持續無傳輸進展的判定逾時；系統自動保底不低於連線逾時，避免建連握手誤判。",
       "header_wait_title": "首回應標頭逾時 (秒)",
@@ -1384,7 +1386,7 @@
       "first_byte_effective": "目前生效（基準上限 {{cap}}s）：常規 {{text}}s　圖片 {{image}}s　影片 {{video}}s　輔助 {{aux}}s",
       "section_stream": "③ 首字與連續輸出",
       "stream_desc": "首回應標頭與首個輸出 token 已合併為統一首字延遲：未收到 200 前可切換端點；收到 200 後僅安全收尾，不再切換。",
-      "auto_summary": "例：最大等待時間= 47MB ÷ {{mbps}}Mbps ×1.4 ≈ {{big}} 秒；"
+      "auto_summary": "例：最大等待時間= 47MB ÷ {{mbps}}Mbps ×{{factor}} ≈ {{big}} 秒；"
     },
     "example": {
       "title": "使用示例",

@@ -5,6 +5,7 @@ pub mod config;
 pub mod project_resolver;
 pub mod security;
 pub mod server;
+pub mod session_bindings;
 pub mod token_manager;
 
 // 新架构模块

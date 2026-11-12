@@ -1413,12 +1413,17 @@
       "btn_save": "Save Timeout Settings"
     },
     "upload_timeouts": {
-      "adaptive_title": "Upload timeout: determined automatically from bandwidth",
+      "fallback_first_byte_cap_title": "Fallback first-byte cap (seconds)",
+      "fallback_first_byte_cap_desc": "0 disables this cap. Shared first-byte and request deadlines still apply.",
+      "account_retry_note": "Account rotation is separate: 4–12 attempts depending on pool size; this field only limits endpoint attempts.",
+      "endpoint_attempts_title_v2": "Max endpoint attempts",
+      "large_body_desc_v2": "Bodies above this byte threshold use at most the configured endpoint attempts; account rotation is separate.",
+      "adaptive_title": "Upload estimate: calculated from bandwidth",
       "min_speed_title": "Upload bandwidth (Mbps)",
       "min_speed_desc": "Enter a conservative minimum upload bandwidth; lower values allow a longer upload budget. VPN users usually have high download and low upload; 0.5–5 Mbps is recommended.",
       "extra_wait_title": "Extra wait factor",
-      "extra_wait_desc": "This parameter affects the maximum upload wait time.",
-      "formula_title": "Max wait = request body size ÷ upload bandwidth × (1 + extra wait factor)",
+      "extra_wait_desc": "This factor changes the upload estimate; progressing transfers continue until the stall or request deadline.",
+      "formula_title": "Upload estimate = request body size ÷ upload bandwidth × (1 + extra wait factor)",
       "stall_title": "Stall timeout (seconds)",
       "stall_desc": "Timeout for sustained zero-progress stalls during upload; guaranteed not to fall below connect timeout to prevent premature aborts during handshakes.",
       "header_wait_title": "First header timeout (seconds)",
@@ -1431,6 +1436,8 @@
       "btn_save": "Save timeout settings"
     },
     "timeouts": {
+      "effective_upload_env_overridden": "Environment overrides: {{fields}}",
+      "effective_upload_title": "Effective values (after env overrides and normalization)",
       "banner_title": "Timeout Settings",
       "banner_desc": "The full timeout chain for one request: ① Endpoint Connection → ② Payload Upload → ③ First-Token Response & Continuous Stream.",
       "section_connect": "① Endpoint connection (auto failover)",
@@ -1447,7 +1454,7 @@
       "first_byte_effective": "Effective now (base cap {{cap}}s): text/code {{text}}s　image {{image}}s　video {{video}}s　auxiliary {{aux}}s",
       "section_stream": "③ First token and continuous output",
       "stream_desc": "Header wait and first token are merged into one first-byte delay: endpoint failover is allowed before HTTP 200, and only a safe finalize after it.",
-      "auto_summary": "e.g. max wait = 47MB ÷ {{mbps}}Mbps × 1.4 ≈ {{big}}s;"
+      "auto_summary": "e.g. max wait = 47MB ÷ {{mbps}}Mbps × {{factor}} ≈ {{big}}s;"
     },
     "cloudflared": {
       "title": "Public Access (Cloudflared)",

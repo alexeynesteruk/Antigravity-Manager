@@ -279,6 +279,10 @@ pub fn get_upload_timeout_config() -> UploadTimeoutConfig {
         .and_then(|s| s.trim().parse::<f64>().ok())
         .unwrap_or(base.extra_wait_ratio);
     let stall_secs = env_u64("ANTIGRAVITY_TIMEOUT_UPLOAD_STALL_SECS", base.stall_secs);
+    let fallback_first_byte_cap_secs = env_u64(
+        "ANTIGRAVITY_TIMEOUT_FALLBACK_FIRST_BYTE_CAP_SECS",
+        base.fallback_first_byte_cap_secs,
+    );
     let header_wait_secs = env_u64(
         "ANTIGRAVITY_TIMEOUT_HEADER_WAIT_SECS",
         base.header_wait_secs,
@@ -297,6 +301,7 @@ pub fn get_upload_timeout_config() -> UploadTimeoutConfig {
         min_upload_mbps,
         extra_wait_ratio,
         stall_secs,
+        fallback_first_byte_cap_secs,
         header_wait_secs,
         large_body_threshold_mb,
         large_body_endpoint_attempts,
@@ -874,9 +879,13 @@ pub struct UploadTimeoutConfig {
     #[serde(default = "default_extra_wait_ratio")]
     pub extra_wait_ratio: f64,
 
-    /// 停滞超时（秒，默认 45s）。完全没有字节进展超过该时长中断；若最大等待时间更短则取较短者
+    /// 停滞超时（秒，默认 45s）。上传持续无进展超过该时长中断；上传软预算不缩短它。
     #[serde(default = "default_upload_stall_secs")]
     pub stall_secs: u64,
+
+    /// 备用端点首字节等待上限（秒，默认 45s）；0 表示仅使用共享首字节及全局预算。
+    #[serde(default = "default_fallback_first_byte_cap_secs")]
+    pub fallback_first_byte_cap_secs: u64,
 
     /// 已废弃：仅为配置 round-trip 保留，不再参与首字预算。
     ///
@@ -912,6 +921,10 @@ fn default_upload_stall_secs() -> u64 {
     45
 }
 
+fn default_fallback_first_byte_cap_secs() -> u64 {
+    45
+}
+
 fn default_header_wait_secs() -> u64 {
     0
 }
@@ -931,6 +944,7 @@ impl Default for UploadTimeoutConfig {
             min_upload_mbps: default_min_upload_mbps(),
             extra_wait_ratio: default_extra_wait_ratio(),
             stall_secs: default_upload_stall_secs(),
+            fallback_first_byte_cap_secs: default_fallback_first_byte_cap_secs(),
             header_wait_secs: default_header_wait_secs(),
             large_body_threshold_mb: default_large_body_threshold_mb(),
             large_body_endpoint_attempts: default_large_body_endpoint_attempts(),
@@ -953,6 +967,7 @@ impl UploadTimeoutConfig {
             default_extra_wait_ratio()
         };
         self.stall_secs = self.stall_secs.clamp(5, 600);
+        self.fallback_first_byte_cap_secs = self.fallback_first_byte_cap_secs.min(600);
         self.header_wait_secs = self.header_wait_secs.min(600);
         self.large_body_threshold_mb = self.large_body_threshold_mb.max(1);
         self.large_body_endpoint_attempts = self.large_body_endpoint_attempts.max(1);
@@ -1555,5 +1570,38 @@ mod tests {
         // 测试边缘情况
         assert_eq!(normalize_proxy_url(""), "");
         assert_eq!(normalize_proxy_url("   "), "");
+    }
+
+    #[test]
+    fn upload_timeout_config_roundtrip_and_normalization() {
+        let cfg = UploadTimeoutConfig {
+            connect_secs: 0,
+            min_upload_mbps: 0.0,
+            extra_wait_ratio: 99.0,
+            stall_secs: 1,
+            fallback_first_byte_cap_secs: 999,
+            header_wait_secs: 999,
+            large_body_threshold_mb: 0,
+            large_body_endpoint_attempts: 0,
+        };
+        let normalized = cfg.clone().normalized();
+        assert_eq!(normalized.connect_secs, 3);
+        assert_eq!(normalized.min_upload_mbps, 0.1);
+        assert_eq!(normalized.extra_wait_ratio, 10.0);
+        assert_eq!(normalized.stall_secs, 5);
+        assert_eq!(normalized.fallback_first_byte_cap_secs, 600);
+        assert_eq!(normalized.header_wait_secs, 600);
+        assert_eq!(normalized.large_body_threshold_mb, 1);
+        assert_eq!(normalized.large_body_endpoint_attempts, 1);
+
+        // 配置必须完整 round-trip；缺失字段回退默认值，不得静默丢字段。
+        let json = serde_json::to_string(&cfg).unwrap();
+        let back: UploadTimeoutConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, cfg);
+        let partial: UploadTimeoutConfig = serde_json::from_str("{}").unwrap();
+        assert_eq!(partial, UploadTimeoutConfig::default());
+        let uncapped: UploadTimeoutConfig =
+            serde_json::from_str(r#"{"fallback_first_byte_cap_secs":0}"#).unwrap();
+        assert_eq!(uncapped.normalized().fallback_first_byte_cap_secs, 0);
     }
 }

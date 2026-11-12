@@ -26,13 +26,35 @@ pub enum AccountQoSState {
         current_wait: Duration, // 本级等待总时长
     },
     /// 探针执行中：后台轻量探针正在发出“你好”测速，防止并发重复探测
-    Probing { level: usize, started_at: Instant },
+    Probing {
+        level: usize,
+        started_at: Instant,
+        claim_id: uuid::Uuid,
+    },
     /// 缓刑观察期：探针通过，单路试探真实请求，连续 2 次真实请求通过才转 Healthy，再次失败从严惩罚
     HalfOpen {
         level: usize,
         consecutive_healthy: u8,
         entered_at: Instant,
     },
+}
+
+/// A probe may complete only the transition that it claimed, even if the account
+/// is reset and reaches the same jail level again before the request finishes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ProbeClaim {
+    pub level: usize,
+    claim_id: uuid::Uuid,
+}
+
+impl ProbeClaim {
+    fn matches(self, state: &AccountQoSState) -> bool {
+        matches!(
+            state,
+            AccountQoSState::Probing { level, claim_id, .. }
+                if *level == self.level && *claim_id == self.claim_id
+        )
+    }
 }
 
 /// 单次请求的 TTFT 观测记录
@@ -208,7 +230,8 @@ impl QoSGuardian {
             {
                 let elapsed = jailed_at.elapsed();
                 if elapsed < *current_wait {
-                    return Some((*current_wait - elapsed).as_secs());
+                    let remaining = *current_wait - elapsed;
+                    return Some(remaining.as_secs() + u64::from(remaining.subsec_nanos() > 0));
                 } else {
                     return Some(0);
                 }
@@ -723,56 +746,99 @@ impl QoSGuardian {
         entry.retain(|s| s.timestamp.elapsed() <= ttl);
     }
 
-    /// 手动或探针将账号置为 HalfOpen
-    pub fn mark_probe_passed(&self, account_id: &str, level: usize) {
-        self.states.insert(
-            account_id.to_string(),
-            AccountQoSState::HalfOpen {
-                level,
-                consecutive_healthy: 0,
-                entered_at: Instant::now(),
-            },
-        );
+    /// 只有仍持有本次探针领取权时，才将账号置为 HalfOpen。
+    pub(crate) fn mark_probe_passed(&self, account_id: &str, claim: ProbeClaim) -> bool {
+        let Some(mut state) = self.states.get_mut(account_id) else {
+            return false;
+        };
+        if !claim.matches(state.value()) {
+            return false;
+        }
+
+        *state = AccountQoSState::HalfOpen {
+            level: claim.level,
+            consecutive_healthy: 0,
+            entered_at: Instant::now(),
+        };
+        true
     }
 
-    /// 探针失败升级阶梯 (关键：从 0 开始重新计时)
-    pub fn mark_probe_failed(&self, account_id: &str, current_level: usize) -> (usize, Duration) {
-        let next_level = (current_level + 1).min(self.ladder_intervals.len() - 1);
+    /// 本次探针失败升级阶梯；已重置、移除或被新探针替换的结果不再回写。
+    pub(crate) fn mark_probe_failed(
+        &self,
+        account_id: &str,
+        claim: ProbeClaim,
+    ) -> Option<(usize, Duration)> {
+        let mut state = self.states.get_mut(account_id)?;
+        if !claim.matches(state.value()) {
+            return None;
+        }
+
+        let next_level = (claim.level + 1).min(self.ladder_intervals.len() - 1);
         let next_wait = self.ladder_intervals[next_level];
         let now = Instant::now();
 
         self.penalty_memory
             .insert(account_id.to_string(), (next_level, now));
 
-        self.states.insert(
-            account_id.to_string(),
+        *state = AccountQoSState::Jailed {
+            level: next_level,
+            jailed_at: now, // 从 0 开始重新计时
+            current_wait: next_wait,
+        };
+
+        Some((next_level, next_wait))
+    }
+
+    /// 原子领取已到期的隔离账号；候选快照中的状态可能已被重置或重新隔离。
+    pub(crate) fn try_mark_probing(&self, account_id: &str) -> Option<ProbeClaim> {
+        let mut state = self.states.get_mut(account_id)?;
+        let AccountQoSState::Jailed {
+            level,
+            jailed_at,
+            current_wait,
+        } = *state
+        else {
+            return None;
+        };
+        if jailed_at.elapsed() < current_wait {
+            return None;
+        }
+
+        let claim = ProbeClaim {
+            level,
+            claim_id: uuid::Uuid::new_v4(),
+        };
+        *state = AccountQoSState::Probing {
+            level,
+            started_at: Instant::now(),
+            claim_id: claim.claim_id,
+        };
+        Some(claim)
+    }
+
+    /// CacheFirst may resume an expired jail, but cannot steal a live probe claim.
+    pub fn promote_to_half_open(&self, account_id: &str) {
+        let Some(mut state) = self.states.get_mut(account_id) else {
+            return;
+        };
+        let level = match *state {
             AccountQoSState::Jailed {
-                level: next_level,
-                jailed_at: now, // 从 0 开始重新计时
-                current_wait: next_wait,
-            },
-        );
-
-        (next_level, next_wait)
-    }
-
-    /// 标记账号开始探测
-    pub fn mark_probing(&self, account_id: &str, level: usize) {
-        self.states.insert(
-            account_id.to_string(),
-            AccountQoSState::Probing {
                 level,
-                started_at: Instant::now(),
-            },
-        );
+                jailed_at,
+                current_wait,
+            } if jailed_at.elapsed() >= current_wait => level,
+            _ => return,
+        };
+        *state = AccountQoSState::HalfOpen {
+            level,
+            consecutive_healthy: 0,
+            entered_at: Instant::now(),
+        };
     }
 
-    /// 收集已到期的小黑屋账号并统一原子标记为探测中，返回 (account_id, level) 列表。
-    ///
-    /// 【防止 DashMap 读写自死锁 (Fixes #3749)】
-    /// 必须先收集快照并彻底结束 `states.iter()` 释放分片读锁，再对状态进行更新。
-    /// 在 DashMap 迭代器持有分片读锁时，若在循环内调用 `insert()` 或 `get_mut()` 写入同一分片，
-    /// 会引发同线程自死锁，导致后台巡检线程永久挂死并逐步卡死整个 HTTP 网关。
+    /// Exercise the original scan/recheck lock regressions without launching probes.
+    #[cfg(test)]
     pub fn take_expired_jails_for_probing(&self) -> Vec<(String, usize)> {
         // 阶段 1：收集到期账号，结束迭代器并释放所有分片读锁
         let candidates: Vec<(String, usize)> = self
@@ -792,6 +858,7 @@ impl QoSGuardian {
         self.mark_expired_jails_for_probing(candidates)
     }
 
+    #[cfg(test)]
     fn mark_expired_jails_for_probing(
         &self,
         candidates: Vec<(String, usize)>,
@@ -806,6 +873,7 @@ impl QoSGuardian {
                     *entry.value_mut() = AccountQoSState::Probing {
                         level,
                         started_at: Instant::now(),
+                        claim_id: uuid::Uuid::new_v4(),
                     };
                     expired.push((account_id, level));
                 }
@@ -834,6 +902,7 @@ mod tests {
     #[test]
     fn idle_suspicion_expires_before_scheduler_reuses_account() {
         let guardian = QoSGuardian::new();
+        guardian.set_auto_jail_enabled(true);
         guardian.states.insert(
             "idle".into(),
             AccountQoSState::Suspicious {
@@ -858,6 +927,7 @@ mod tests {
     #[test]
     fn stale_jail_snapshot_cannot_skip_a_renewed_cooldown() {
         let guardian = QoSGuardian::new();
+        guardian.set_auto_jail_enabled(true);
         // The scanner saw an expired level-0 jail before a concurrent failed
         // probe renewed it. Neither the same level nor an escalated jail may
         // use that stale scan result to bypass its new cooldown.
@@ -890,6 +960,259 @@ mod tests {
             vec![("expired".into(), 1)]
         );
         assert!(guardian.take_expired_jails_for_probing().is_empty());
+    }
+
+    #[test]
+    fn probe_claim_uses_current_expired_jail_level_once() {
+        let guardian = QoSGuardian::new();
+        guardian.set_auto_jail_enabled(true);
+        guardian.states.insert(
+            "account".into(),
+            AccountQoSState::Jailed {
+                level: 3,
+                jailed_at: Instant::now(),
+                current_wait: Duration::ZERO,
+            },
+        );
+
+        assert_eq!(guardian.try_mark_probing("account").unwrap().level, 3);
+        assert!(matches!(
+            guardian.get_state("account"),
+            AccountQoSState::Probing { level: 3, .. }
+        ));
+        assert_eq!(guardian.try_mark_probing("account"), None);
+    }
+
+    #[test]
+    fn probe_claim_preserves_states_changed_after_candidate_scan() {
+        let guardian = QoSGuardian::new();
+        guardian.set_auto_jail_enabled(true);
+        let now = Instant::now();
+        for current in [
+            AccountQoSState::Healthy,
+            AccountQoSState::Suspicious {
+                first_strike_at: now,
+                strike_count: 1,
+                consecutive_healthy: 0,
+            },
+            AccountQoSState::Jailed {
+                level: 2,
+                jailed_at: now,
+                current_wait: Duration::from_secs(120),
+            },
+            AccountQoSState::Probing {
+                level: 1,
+                started_at: now,
+                claim_id: uuid::Uuid::new_v4(),
+            },
+            AccountQoSState::HalfOpen {
+                level: 1,
+                consecutive_healthy: 0,
+                entered_at: now,
+            },
+        ] {
+            // A candidate ID alone must not authorize overwriting its current state.
+            guardian.states.insert("account".into(), current.clone());
+            assert_eq!(guardian.try_mark_probing("account"), None, "{current:?}");
+            assert_eq!(guardian.get_state("account"), current);
+        }
+    }
+
+    #[test]
+    fn probe_claim_does_not_recreate_a_removed_account() {
+        let guardian = QoSGuardian::new();
+        guardian.set_auto_jail_enabled(true);
+        assert_eq!(guardian.try_mark_probing("removed"), None);
+        assert!(!guardian.states.contains_key("removed"));
+    }
+
+    #[test]
+    fn probe_claim_has_one_winner_across_concurrent_scans() {
+        let guardian = QoSGuardian::new();
+        guardian.set_auto_jail_enabled(true);
+        guardian.states.insert(
+            "account".into(),
+            AccountQoSState::Jailed {
+                level: 0,
+                jailed_at: Instant::now(),
+                current_wait: Duration::ZERO,
+            },
+        );
+        let barrier = std::sync::Barrier::new(4);
+        let winners = std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..4)
+                .map(|_| {
+                    scope.spawn(|| {
+                        barrier.wait();
+                        guardian.try_mark_probing("account").is_some()
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|handle| usize::from(handle.join().unwrap()))
+                .sum::<usize>()
+        });
+        assert_eq!(winners, 1);
+    }
+
+    fn expire_jail_and_claim(guardian: &QoSGuardian, account_id: &str) -> ProbeClaim {
+        {
+            let mut state = guardian.states.get_mut(account_id).unwrap();
+            let AccountQoSState::Jailed {
+                jailed_at,
+                current_wait,
+                ..
+            } = state.value_mut()
+            else {
+                panic!("expected a jailed account before probing");
+            };
+            *jailed_at = Instant::now() - *current_wait;
+        }
+        guardian.try_mark_probing(account_id).unwrap()
+    }
+
+    fn jail_for_probe(guardian: &QoSGuardian, level: usize) -> ProbeClaim {
+        guardian.states.insert(
+            "account".into(),
+            AccountQoSState::Jailed {
+                level,
+                jailed_at: Instant::now(),
+                current_wait: Duration::ZERO,
+            },
+        );
+        guardian.try_mark_probing("account").unwrap()
+    }
+
+    #[test]
+    fn probe_completion_preserves_manual_reset_and_release() {
+        for reset in [QoSGuardian::reset_account, QoSGuardian::release_from_jail] {
+            let guardian = QoSGuardian::new();
+            guardian.set_auto_jail_enabled(true);
+            let claim = jail_for_probe(&guardian, 1);
+            guardian
+                .penalty_memory
+                .insert("account".into(), (1, Instant::now()));
+
+            reset(&guardian, "account");
+
+            assert!(!guardian.mark_probe_passed("account", claim));
+            assert_eq!(guardian.mark_probe_failed("account", claim), None);
+            assert_eq!(guardian.get_state("account"), AccountQoSState::Healthy);
+            assert!(!guardian.penalty_memory.contains_key("account"));
+        }
+    }
+
+    #[test]
+    fn probe_completion_does_not_recreate_a_removed_account() {
+        let guardian = QoSGuardian::new();
+        guardian.set_auto_jail_enabled(true);
+        let claim = jail_for_probe(&guardian, 1);
+        guardian.states.remove("account");
+
+        assert!(!guardian.mark_probe_passed("account", claim));
+        assert_eq!(guardian.mark_probe_failed("account", claim), None);
+        assert!(!guardian.states.contains_key("account"));
+        assert!(!guardian.penalty_memory.contains_key("account"));
+    }
+
+    #[test]
+    fn stale_probe_completion_preserves_a_new_claim_at_the_same_level() {
+        let guardian = QoSGuardian::new();
+        guardian.set_auto_jail_enabled(true);
+        let old_claim = jail_for_probe(&guardian, 1);
+        guardian.reset_account("account");
+        let new_claim = jail_for_probe(&guardian, 1);
+        let current = guardian.get_state("account");
+        assert_ne!(old_claim, new_claim);
+
+        assert!(!guardian.mark_probe_passed("account", old_claim));
+        assert_eq!(guardian.mark_probe_failed("account", old_claim), None);
+        assert_eq!(guardian.get_state("account"), current);
+        assert!(!guardian.penalty_memory.contains_key("account"));
+        assert!(guardian.mark_probe_passed("account", new_claim));
+        assert!(guardian.is_half_open("account"));
+    }
+
+    #[test]
+    fn stale_probe_completion_preserves_a_later_jail_and_penalty() {
+        let guardian = QoSGuardian::new();
+        guardian.set_auto_jail_enabled(true);
+        let claim = jail_for_probe(&guardian, 0);
+        let now = Instant::now();
+        let current = AccountQoSState::Jailed {
+            level: 3,
+            jailed_at: now,
+            current_wait: guardian.ladder_intervals[3],
+        };
+        guardian.states.insert("account".into(), current.clone());
+        guardian.penalty_memory.insert("account".into(), (3, now));
+
+        assert!(!guardian.mark_probe_passed("account", claim));
+        assert_eq!(guardian.mark_probe_failed("account", claim), None);
+        assert_eq!(guardian.get_state("account"), current);
+        assert_eq!(*guardian.penalty_memory.get("account").unwrap(), (3, now));
+    }
+
+    #[test]
+    fn probe_completion_applies_only_once() {
+        for passes in [true, false] {
+            let guardian = QoSGuardian::new();
+            guardian.set_auto_jail_enabled(true);
+            let claim = jail_for_probe(&guardian, 1);
+            if passes {
+                assert!(guardian.mark_probe_passed("account", claim));
+            } else {
+                assert_eq!(
+                    guardian.mark_probe_failed("account", claim),
+                    Some((2, Duration::from_secs(10 * 60)))
+                );
+            }
+            let current = guardian.get_state("account");
+            let penalty = guardian.penalty_memory.get("account").map(|entry| *entry);
+
+            assert!(!guardian.mark_probe_passed("account", claim));
+            assert_eq!(guardian.mark_probe_failed("account", claim), None);
+            assert_eq!(guardian.get_state("account"), current);
+            assert_eq!(
+                guardian.penalty_memory.get("account").map(|entry| *entry),
+                penalty
+            );
+        }
+    }
+
+    #[test]
+    fn cache_first_promotion_preserves_live_jails_and_probes() {
+        let guardian = QoSGuardian::new();
+        guardian.set_auto_jail_enabled(true);
+        let claim = jail_for_probe(&guardian, 1);
+        let probing = guardian.get_state("account");
+        guardian.promote_to_half_open("account");
+        assert_eq!(guardian.get_state("account"), probing);
+        assert!(guardian.mark_probe_passed("account", claim));
+
+        let jailed = AccountQoSState::Jailed {
+            level: 2,
+            jailed_at: Instant::now(),
+            current_wait: Duration::from_secs(600),
+        };
+        guardian.states.insert("account".into(), jailed.clone());
+        guardian.promote_to_half_open("account");
+        assert_eq!(guardian.get_state("account"), jailed);
+
+        guardian.states.insert(
+            "account".into(),
+            AccountQoSState::Jailed {
+                level: 2,
+                jailed_at: Instant::now(),
+                current_wait: Duration::ZERO,
+            },
+        );
+        guardian.promote_to_half_open("account");
+        assert!(guardian.is_half_open("account"));
+        guardian.states.remove("account");
+        guardian.promote_to_half_open("account");
+        assert!(!guardian.states.contains_key("account"));
     }
 
     fn create_test_token(account_id: &str, tier: &str) -> ProxyToken {
@@ -1091,12 +1414,14 @@ mod tests {
         assert!(guardian.is_jailed_or_probing("acc_a"));
 
         // 探针失败 -> 升级为 Level 1 (5m)，时间从 0 重新计时
-        let (next_lv, wait) = guardian.mark_probe_failed("acc_a", 0);
+        let failed_claim = expire_jail_and_claim(&guardian, "acc_a");
+        let (next_lv, wait) = guardian.mark_probe_failed("acc_a", failed_claim).unwrap();
         assert_eq!(next_lv, 1);
         assert_eq!(wait, Duration::from_secs(5 * 60));
 
         // 下一次探针成功 (<8s) -> 转移到 HalfOpen 缓刑期
-        guardian.mark_probe_passed("acc_a", 1);
+        let passed_claim = expire_jail_and_claim(&guardian, "acc_a");
+        assert!(guardian.mark_probe_passed("acc_a", passed_claim));
         assert!(guardian.is_half_open("acc_a"));
 
         // 缓刑期间真实业务请求连续 2 次通过 (<8s) -> 正式满血出狱

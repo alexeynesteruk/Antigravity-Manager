@@ -1398,12 +1398,17 @@
       "btn_save": "保存超时设置"
     },
     "upload_timeouts": {
-      "adaptive_title": "上传超时：自动根据带宽判定",
+      "fallback_first_byte_cap_title": "????????????",
+      "fallback_first_byte_cap_desc": "0 ????????????????????????????",
+      "account_retry_note": "账号轮换另计：按号池大小通常 4~12 次；本项只限制端点尝试次数。",
+      "endpoint_attempts_title_v2": "最多端点尝试次数",
+      "large_body_desc_v2": "超过该字节阈值的请求最多只尝试配置的端点数；账号轮换另计。",
+      "adaptive_title": "????????????",
       "min_speed_title": "上传带宽 (Mbps)",
       "min_speed_desc": "请填写保守的最低上行带宽；数值越小，上传允许时间越宽松。VPN 用户通常高下行、低上行，建议填 0.5–5 Mbps。",
       "extra_wait_title": "额外等待系数",
-      "extra_wait_desc": "该参数影响上传最大等待时间。",
-      "formula_title": "最大等待时间 = 请求体大小 ÷ 上传带宽 × (1 + 额外等待系数)",
+      "extra_wait_desc": "???????????????????????????????????",
+      "formula_title": "?????? = 请求体大小 ÷ 上传带宽 × (1 + 额外等待系数)",
       "stall_title": "停滞超时 (秒)",
       "stall_desc": "上传阶段单次持续无传输进展的判定超时；系统自动保底不低于连接超时，避免建连握手误判。",
       "header_wait_title": "首响应头超时 (秒)",
@@ -1416,6 +1421,8 @@
       "btn_save": "保存超时设置"
     },
     "timeouts": {
+      "effective_upload_env_overridden": "环境变量覆盖：{{fields}}",
+      "effective_upload_title": "当前生效值（含环境变量与归一化）",
       "banner_title": "超时设置",
       "banner_desc": "一次请求的完整超时链路：① 端点建立连接 → ② 上传请求体 → ③ 首字响应与连续输出。",
       "section_connect": "① 端点建立连接 （自动故障切换端点）",
@@ -1432,7 +1439,7 @@
       "first_byte_effective": "当前生效（基准上限 {{cap}}s）：常规 {{text}}s　图片 {{image}}s　视频 {{video}}s　辅助 {{aux}}s",
       "section_stream": "③ 首字与连续输出",
       "stream_desc": "首响应头与首个输出 token 已合并为统一首字延迟：未收到 200 前可切换端点；收到 200 后只安全收尾，不再切换。",
-      "auto_summary": "例：最大等待时间= 47MB ÷ {{mbps}}Mbps ×1.4 ≈ {{big}} 秒；"
+      "auto_summary": "例：最大等待时间= 47MB ÷ {{mbps}}Mbps ×{{factor}} ≈ {{big}} 秒；"
     },
     "cloudflared": {
       "title": "公网访问 (Cloudflared)",

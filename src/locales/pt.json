@@ -1316,12 +1316,14 @@
       "btn_save": "Salvar configurações de tempo limite"
     },
     "upload_timeouts": {
-      "adaptive_title": "Tempo de upload: determinado automaticamente pela banda",
+      "fallback_first_byte_cap_title": "Limite do primeiro byte alternativo (segundos)",
+      "fallback_first_byte_cap_desc": "0 desativa este limite. Os prazos compartilhados do primeiro byte e da solicita??o continuam v?lidos.",
+      "adaptive_title": "Estimativa de envio calculada pela largura de banda",
       "min_speed_title": "Banda de upload (Mbps)",
       "min_speed_desc": "Informe uma largura de banda de upload mínima conservadora; quanto menor o valor, maior será o orçamento de upload. Usuários de VPN costumam ter download alto e upload baixo; recomenda-se 0,5–5 Mbps.",
       "extra_wait_title": "Fator de espera extra",
-      "extra_wait_desc": "Este parâmetro afeta o tempo máximo de espera do upload.",
-      "formula_title": "Espera máxima = tamanho do corpo ÷ banda de upload × (1 + fator de espera)",
+      "extra_wait_desc": "Este fator altera a estimativa; transfer?ncias com progresso continuam at? o limite de inatividade ou da solicita??o.",
+      "formula_title": "Estimativa de envio = tamanho do corpo ÷ banda de upload × (1 + fator de espera)",
       "stall_title": "Tempo de travamento (segundos)",
       "stall_desc": "Tempo limite para estagnação contínua durante o upload; garantido para não ser menor que o tempo de conexão, evitando cancelamentos prematuros no handshake.",
       "header_wait_title": "Tempo do primeiro cabeçalho (segundos)",
@@ -1350,7 +1352,7 @@
       "first_byte_effective": "Em vigor agora: texto/código {{text}}s　imagem {{image}}s　vídeo {{video}}s　auxiliar {{aux}}s",
       "section_stream": "③ Primeiro token e saída contínua",
       "stream_desc": "A espera de cabeçalhos e o primeiro token foram unificados em uma única latência do primeiro byte: a troca de endpoint é permitida antes de HTTP 200 e, depois disso, apenas finalização segura.",
-      "auto_summary": "Ex.: espera máxima = 47MB ÷ {{mbps}}Mbps × 1.4 ≈ {{big}} s;"
+      "auto_summary": "Ex.: espera máxima = 47MB ÷ {{mbps}}Mbps × {{factor}} ≈ {{big}} s;"
     },
     "cloudflared": {
       "title": "Túnel Cloudflare (Cloudflared)",

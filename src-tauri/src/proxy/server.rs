@@ -601,6 +601,7 @@ impl AxumServer {
                 if user_agent_override.is_some() {
                     u.set_user_agent_override(user_agent_override).await;
                 }
+                token_manager.register_qos_upstream(&u);
                 u
             },
             monitor: monitor.clone(),
@@ -1050,6 +1051,10 @@ impl AxumServer {
             .route(
                 "/system/timeouts/effective-first-byte",
                 get(admin_get_effective_first_byte_timeouts),
+            )
+            .route(
+                "/system/timeouts/effective-upload",
+                get(admin_get_effective_upload_timeouts),
             )
             .route(
                 "/system/autostart/status",
@@ -3442,6 +3447,10 @@ async fn admin_detect_remote_hub_fingerprint(
 
 async fn admin_get_effective_first_byte_timeouts() -> impl IntoResponse {
     Json(crate::commands::proxy::get_effective_first_byte_timeouts())
+}
+
+async fn admin_get_effective_upload_timeouts() -> impl IntoResponse {
+    Json(crate::commands::proxy::get_effective_timeout_config())
 }
 
 async fn admin_toggle_auto_launch(Json(_payload): Json<serde_json::Value>) -> impl IntoResponse {

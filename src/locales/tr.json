@@ -1352,12 +1352,14 @@
             "btn_save": "Zaman Aşımı Ayarlarını Kaydet"
         },
         "upload_timeouts": {
-            "adaptive_title": "Yükleme zaman aşımı: bant genişliğinden otomatik belirlenir",
+            "fallback_first_byte_cap_title": "Yedek u? nokta ilk bayt s?n?r? (saniye)",
+            "fallback_first_byte_cap_desc": "0 bu s?n?r? kapat?r. Ortak ilk bayt ve istek s?re s?n?rlar? ge?erlili?ini korur.",
+            "adaptive_title": "Bant geni?li?ine g?re y?kleme tahmini",
             "min_speed_title": "Yükleme bant genişliği (Mbps)",
             "min_speed_desc": "Muhafazakâr bir minimum yükleme bant genişliği girin; değer küçüldükçe yükleme için ayrılan süre artar. VPN kullanıcılarında indirme yüksek, yükleme düşüktür; 0,5–5 Mbps önerilir.",
             "extra_wait_title": "Ek bekleme katsayısı",
-            "extra_wait_desc": "Bu parametre maksimum yükleme bekleme süresini etkiler.",
-            "formula_title": "Maks. bekleme = gövde boyutu ÷ yükleme hızı × (1 + ek bekleme katsayısı)",
+            "extra_wait_desc": "Bu katsay? tahmini de?i?tirir; ilerleyen aktar?mlar duraklama veya istek s?resi s?n?r?na kadar s?rer.",
+            "formula_title": "Y?kleme tahmini = gövde boyutu ÷ yükleme hızı × (1 + ek bekleme katsayısı)",
             "stall_title": "Takılma zaman aşımı (saniye)",
             "stall_desc": "Yükleme sırasında aktarım ilerlemesinin durması için zaman aşımı süresi; el sıkışma hatalarını önlemek için bağlantı zaman aşımının altına inmeyecek şekilde korunur.",
             "header_wait_title": "İlk başlık zaman aşımı (saniye)",
@@ -1386,7 +1388,7 @@
             "first_byte_effective": "Şu anda geçerli: metin/kod {{text}}s　görsel {{image}}s　video {{video}}s　yardımcı {{aux}}s",
             "section_stream": "③ İlk token ve sürekli çıktı",
             "stream_desc": "Başlık bekleme ve ilk token tek bir ilk-bayt gecikmesinde birleştirildi: HTTP 200 öncesi uç nokta değişimi serbest, sonrasında yalnızca güvenli kapatma yapılır.",
-            "auto_summary": "Örn.: maks. bekleme = 47MB ÷ {{mbps}}Mbps × 1.4 ≈ {{big}} sn;"
+            "auto_summary": "Örn.: maks. bekleme = 47MB ÷ {{mbps}}Mbps × {{factor}} ≈ {{big}} sn;"
         },
         "example": {
             "title": "Kullanım Örnekleri",

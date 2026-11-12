@@ -196,6 +196,60 @@ pub fn apply_model_not_found(attempt: usize, pool_size: usize, mut mark: impl Fn
     attempt < pool_size
 }
 
+/// Classify the shared upstream UA gate without loading GUI configuration or
+/// constructing a protocol-specific diagnostic response.
+pub fn is_outdated_user_agent_error(
+    _model: &str,
+    status_code: u16,
+    error_text: &str,
+    custom_ua: Option<&str>,
+) -> bool {
+    let lower = error_text.to_lowercase();
+    let relevant_error = super::rotation::is_model_not_found_error(status_code, error_text)
+        || lower.contains("temporarily suspended for model")
+        || status_code == 403
+        || lower.contains("permission_denied")
+        || lower.contains("forbidden");
+    if !relevant_error {
+        return false;
+    }
+    let Some(ua) = custom_ua.map(str::trim).filter(|ua| !ua.is_empty()) else {
+        return false;
+    };
+    if !ua.starts_with("antigravity/hub/") {
+        return true;
+    }
+    let baseline = crate::modules::hub_version::get_current_hub_fingerprint();
+    crate::constants::parse_antigravity_version(ua).is_some_and(|version| {
+        crate::constants::compare_semver(&version, &baseline.version) == std::cmp::Ordering::Less
+    })
+}
+
+/// 带 UA 门禁短路判定的 404/403「单模型不可用」统一处置（Pipeline First）
+///
+/// - 若属于可通过修正 UA 配置解决的 404/403（缺失 Hub 签名或 Hub 版本过低），
+///   绝不写入 900s 单模型熔断，也不换号重放（返回 `false`），让用户修正 UA 后立即恢复；
+/// - 否则写入单模型临时熔断，并在 `attempt < pool_size` 时返回 `true` 允许换号重试。
+pub fn apply_model_not_found_with_ua(
+    model: &str,
+    status_code: u16,
+    error_text: &str,
+    custom_ua: Option<&str>,
+    attempt: usize,
+    pool_size: usize,
+    mark: impl FnMut(),
+) -> bool {
+    if is_outdated_user_agent_error(model, status_code, error_text, custom_ua) {
+        tracing::warn!(
+            model = %model,
+            status_code,
+            "UA-gated model 404/403; skipping 900s model breaker and account rotation"
+        );
+        return false;
+    }
+    apply_model_not_found(attempt, pool_size, mark)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -302,5 +356,78 @@ mod tests {
         assert_eq!(no_quota, UpstreamClassification::InternalGatewayMessage);
         assert!(!no_quota.should_lock_account());
         assert!(!no_quota.abandons_sticky_account());
+    }
+
+    #[test]
+    fn ua_gate_requires_a_relevant_error_and_explicit_override() {
+        let legacy = Some("legacy-client/1.0");
+        assert!(!is_outdated_user_agent_error(
+            "model",
+            429,
+            "rate limited",
+            legacy
+        ));
+        assert!(!is_outdated_user_agent_error(
+            "model",
+            503,
+            "unavailable",
+            legacy
+        ));
+        assert!(!is_outdated_user_agent_error(
+            "model",
+            404,
+            "not found",
+            None
+        ));
+        assert!(!is_outdated_user_agent_error(
+            "model",
+            403,
+            "forbidden",
+            Some(" ")
+        ));
+        assert!(is_outdated_user_agent_error(
+            "model",
+            403,
+            "forbidden",
+            legacy
+        ));
+        let current = crate::modules::hub_version::get_current_hub_user_agent();
+        assert!(!is_outdated_user_agent_error(
+            "model",
+            404,
+            "not found",
+            Some(&current)
+        ));
+    }
+
+    #[test]
+    fn test_apply_model_not_found_with_ua_skips_breaker_on_outdated_ua() {
+        let raw_404 = r#"{"error":{"code":404,"message":"Requested entity was not found.","status":"NOT_FOUND"}}"#;
+        let mut marked = false;
+        let can_rotate = apply_model_not_found_with_ua(
+            "gemini-4-argon-high",
+            404,
+            raw_404,
+            Some("antigravity/1.19.6 darwin/arm64"),
+            0,
+            3,
+            || marked = true,
+        );
+        assert!(!can_rotate, "UA-gated 404 must not rotate accounts");
+        assert!(!marked, "UA-gated 404 must not write 900s model breaker");
+
+        let mut normal_marked = false;
+        let current_ua = crate::modules::hub_version::get_current_hub_user_agent();
+        let normal_rotate = apply_model_not_found_with_ua(
+            "gemini-4-argon-high",
+            404,
+            raw_404,
+            Some(&current_ua),
+            0,
+            3,
+            || normal_marked = true,
+        );
+        assert!(normal_rotate);
+        assert!(normal_marked);
     }
 }
