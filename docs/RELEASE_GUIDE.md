@@ -68,7 +68,7 @@ Actions → **Release** → **Run workflow**，选择目标通道分支（`main`
 ### 签名、完整性与失败处理
 
 - 原生公开发布要求 `TAURI_SIGNING_PRIVATE_KEY`，可同时配置 `TAURI_SIGNING_PRIVATE_KEY_PASSWORD`。没有密钥时只允许未签名的下载产物，不生成公开 updater manifest。
-- 签名必须与客户端内置公钥对应；工作流检查签名文件存在且非空、SHA-256 与产物来源 metadata 一致，**不替代客户端的密码学签名验证或安装验证**。
+- 签名必须与当前应用内置公钥对应；工作流检查 SHA-256 与产物来源 metadata 一致，并使用 Node.js 内置 Ed25519 / BLAKE2b 校验 updater 主产物及 trusted comment 的 minisign 签名、算法和 key ID，验证通过后才创建 Release。此检查不替代实际安装验证；有意轮换密钥时需另行安排可信旧公钥的过渡流程。
 - 六个目标必须全部成功，来源标签与 commit 必须一致。updater 中的五个架构 URL 从实际资产文件名生成；universal macOS 保留供人工下载。
 - 已签名安装包、AppImage 和 app archive 不做二次修改。macOS 归档仅改上传文件名，不改内容。
 - 先创建/复用未发布的 draft，上传完整资产和 `updater.json`，全部成功后再发布。已公开的同名 Release 拒绝覆盖；失败的上传保留 draft 供检查，不发布残缺集合。

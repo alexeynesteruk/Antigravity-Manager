@@ -1,5 +1,5 @@
 import { appendFileSync, copyFileSync, existsSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
-import { createHash } from 'node:crypto';
+import { createHash, createPublicKey, verify } from 'node:crypto';
 import { execFileSync } from 'node:child_process';
 import { basename, dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -10,6 +10,38 @@ const gh = (...args) => execFileSync('gh', ['release', ...args], { encoding: 'ut
 const json = (path) => JSON.parse(readFileSync(path, 'utf8'));
 const digest = (path) => createHash('sha256').update(readFileSync(path)).digest('hex');
 const enabled = (name) => process.env[name] === 'true';
+
+function decodeBase64(value) {
+  if (typeof value !== 'string' || !/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(value) || !value) throw new Error('Invalid updater base64 encoding');
+  const decoded = Buffer.from(value, 'base64');
+  if (decoded.toString('base64') !== value) throw new Error('Noncanonical updater base64 encoding');
+  return decoded;
+}
+
+// Tauri wraps minisign text in another base64 layer. Delegate Ed25519 and
+// BLAKE2b to Node/OpenSSL, following the upstream packet and comment formats:
+// https://github.com/jedisct1/rust-minisign/blob/master/src/lib.rs
+// https://github.com/tauri-apps/tauri/blob/tauri-cli-v2.10.0/crates/tauri-cli/src/helpers/updater_signature.rs
+export function verifyUpdaterSignature(path, encodedSignature, encodedPublicKey) {
+  const decoder = new TextDecoder('utf-8', { fatal: true });
+  const keyLines = decoder.decode(decodeBase64(encodedPublicKey.trim())).trimEnd().split(/\r?\n/);
+  const signatureLines = decoder.decode(decodeBase64(encodedSignature.trim())).trimEnd().split(/\r?\n/);
+  if (keyLines.length !== 2 || !keyLines[0].startsWith('untrusted comment: ') || signatureLines.length !== 4 || !signatureLines[0].startsWith('untrusted comment: ') || !signatureLines[2].startsWith('trusted comment: ')) throw new Error('Invalid updater minisign envelope');
+  const publicPacket = decodeBase64(keyLines[1].trim());
+  const signaturePacket = decodeBase64(signatureLines[1].trim());
+  const commentSignature = decodeBase64(signatureLines[3].trim());
+  if (publicPacket.length !== 42 || signaturePacket.length !== 74 || commentSignature.length !== 64) throw new Error('Invalid updater minisign packet length');
+  const algorithm = signaturePacket.subarray(0, 2).toString('latin1');
+  if (!publicPacket.subarray(0, 2).equals(Buffer.from('Ed')) || !['Ed', 'ED'].includes(algorithm)) throw new Error('Unsupported updater minisign algorithm');
+  if (!publicPacket.subarray(2, 10).equals(signaturePacket.subarray(2, 10))) throw new Error('Updater signature key ID does not match the embedded public key');
+  // RFC 8410 SubjectPublicKeyInfo prefix for a raw 32-byte Ed25519 public key.
+  const key = createPublicKey({ key: Buffer.concat([Buffer.from('302a300506032b6570032100', 'hex'), publicPacket.subarray(10)]), format: 'der', type: 'spki' });
+  const bytes = readFileSync(path);
+  const message = algorithm === 'ED' ? createHash('blake2b512').update(bytes).digest() : bytes;
+  if (!verify(null, message, key, signaturePacket.subarray(10))) throw new Error('Updater installer signature verification failed');
+  const trustedComment = signatureLines[2].slice('trusted comment: '.length).trim();
+  if (!verify(null, Buffer.concat([signaturePacket.subarray(10), Buffer.from(trustedComment)]), key, commentSignature)) throw new Error('Updater trusted-comment signature verification failed');
+}
 
 export function parseTag(tag) {
   const match = /^v((?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)(?:-([0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?)$/.exec(tag);
@@ -124,6 +156,10 @@ function stage() {
 function prepare() {
   const tag = process.env.RELEASE_TAG;
   const release = parseTag(tag);
+  const configuredKey = json('src-tauri/tauri.conf.json').plugins?.updater?.pubkey;
+  if (typeof configuredKey !== 'string' || !configuredKey.trim()) throw new Error('Missing embedded updater public key');
+  const keyPath = resolve('src-tauri', configuredKey);
+  const publicKey = existsSync(keyPath) ? readFileSync(keyPath, 'utf8') : configuredKey;
   const metadata = filesBelow('all-artifacts').filter((path) => targets.some((target) => basename(path) === `${target}.json`)).map((path) => ({ ...json(path), path }));
   if (metadata.length !== targets.length || targets.some((target) => metadata.filter((item) => item.target === target).length !== 1)) throw new Error('All six native targets are required before publication');
   mkdirSync('release-files', { recursive: true });
@@ -141,6 +177,7 @@ function prepare() {
     if (primaryAsset(item.target, Object.keys(item.assets)) !== item.primary || !item.assets[`${item.primary}.sig`]) throw new Error(`Missing updater signature: ${item.target}`);
     const signature = readFileSync(join('release-files', `${item.primary}.sig`), 'utf8').trim();
     if (!signature) throw new Error(`Empty updater signature: ${item.target}`);
+    verifyUpdaterSignature(join('release-files', item.primary), signature, publicKey);
     if (item.target !== 'darwin-universal') platforms[item.target] = { signature, url: `https://github.com/${process.env.GITHUB_REPOSITORY}/releases/download/${tag}/${encodeURIComponent(item.primary)}` };
   }
   const notes = releaseNotes(tag);

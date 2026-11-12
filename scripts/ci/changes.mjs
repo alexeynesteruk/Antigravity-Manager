@@ -32,7 +32,9 @@ function resolveChanges() {
   try {
     try { git('cat-file', '-e', `${base}^{commit}`); }
     catch { git('fetch', '--no-tags', '--depth=1', 'origin', base); }
-    return classify(git('diff', '--name-only', '--diff-filter=ACDMRTUXB', '-z', base, head).split('\0').filter(Boolean));
+    // Classify both sides of moves. With rename detection, --name-only only
+    // reports the destination and can hide a deleted source in a watched tree.
+    return classify(git('diff', '--no-renames', '--name-only', '--diff-filter=ACDMRTUXB', '-z', base, head).split('\0').filter(Boolean));
   } catch (error) {
     console.warn(`Cannot establish changed paths; running all validators: ${error.message}`);
     return { frontend: true, backend: true };
