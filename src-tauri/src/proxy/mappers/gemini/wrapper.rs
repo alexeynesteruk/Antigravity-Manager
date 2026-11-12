@@ -97,7 +97,8 @@ pub fn wrap_request_v2(
             original_model,
         ]);
     let is_preview = lower_model.contains("preview");
-    // 客户端直控模式已下线：思考开关仅通过路由层（降档）表达
+    // Routing chooses the model tier; the shared pipeline preserves explicit
+    // thought-output suppression within the model's supported channel.
     let should_inject = !is_under_v3
         && (force_server_thinking
             || lower_model.contains("thinking")
@@ -349,20 +350,6 @@ pub fn wrap_request_v2(
             gen_config.remove("thinkingConfig");
         }
 
-        if force_server_thinking {
-            let thinking_config = gen_config
-                .entry("thinkingConfig".to_string())
-                .or_insert(json!({}))
-                .as_object_mut()
-                .unwrap();
-            // 只表达“开启思考”；具体预算/等级由流水线按官方模型结构体决定
-            thinking_config.insert("includeThoughts".to_string(), json!(true));
-            tracing::debug!(
-                "[Gemini-Wrap] Forced includeThoughts=true for keyword model {}",
-                final_model_name
-            );
-        }
-
         // [AUTHORITATIVE RESOLUTION] 全协议统一由进站流水线节点解析思考预算
         let has_thinking_config = gen_config.contains_key("thinkingConfig");
         let client_level = gen_config
@@ -388,11 +375,10 @@ pub fn wrap_request_v2(
             })
             .and_then(|v| v.as_i64());
 
-        let client_switch = crate::proxy::pipeline::extract_client_thinking_switch(
-            None,
-            client_budget.map(|b| if b <= 0 { 0 } else { b as u64 }),
-            client_level.as_deref(),
-        );
+        let client_switch =
+            crate::proxy::pipeline::inbound::ClientThinkingSwitch::from_generation_config(
+                gen_config,
+            );
 
         let budget_opt = if should_inject || has_thinking_config {
             let mut gc_val = serde_json::Value::Object(std::mem::take(gen_config));
@@ -1131,6 +1117,51 @@ mod tests {
         let result = unwrap_response(&wrapped);
         assert!(result.get("candidates").is_some());
         assert!(result.get("response").is_none());
+    }
+
+    #[test]
+    fn explicit_thinking_disable_survives_final_wrapper() {
+        let body = json!({
+            "model": "gemini-3.8-flash-high",
+            "contents": [{ "role": "user", "parts": [{ "text": "hello" }] }],
+            "generationConfig": {
+                "thinkingConfig": { "includeThoughts": false, "thinkingLevel": "HIGH" },
+                "maxOutputTokens": 4096
+            }
+        });
+        let result = wrap_request(
+            &body,
+            "test-project",
+            "gemini-3.8-flash-high",
+            None,
+            None,
+            None,
+        );
+        let thinking = &result["request"]["generationConfig"]["thinkingConfig"];
+        assert_eq!(thinking["includeThoughts"], false);
+        assert_eq!(thinking["thinkingLevel"], "HIGH");
+        assert!(thinking.get("thinkingBudget").is_none());
+    }
+
+    #[test]
+    fn dynamic_thinking_budget_is_not_treated_as_disabled_by_wrapper() {
+        let body = json!({
+            "model": "gemini-3.8-flash-high",
+            "contents": [{ "role": "user", "parts": [{ "text": "hello" }] }],
+            "generationConfig": { "thinkingConfig": { "thinkingBudget": -1 } }
+        });
+        let result = wrap_request(
+            &body,
+            "test-project",
+            "gemini-3.8-flash-high",
+            None,
+            None,
+            None,
+        );
+        let thinking = &result["request"]["generationConfig"]["thinkingConfig"];
+        assert_eq!(thinking["includeThoughts"], true);
+        assert!(thinking.get("thinkingLevel").is_some());
+        assert!(thinking.get("thinkingBudget").is_none());
     }
 
     #[test]

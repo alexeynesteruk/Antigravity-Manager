@@ -22,6 +22,47 @@ impl ClientThinkingSwitch {
     pub fn is_disabled(self) -> bool {
         matches!(self, Self::Disabled)
     }
+
+    /// Recover intent from the canonical payload before an additional wrapper
+    /// pass. A dynamic budget (-1) is not an explicit zero-budget request.
+    pub fn from_generation_config(config: &serde_json::Map<String, Value>) -> Self {
+        let thinking = config
+            .get("thinkingConfig")
+            .or_else(|| config.get("thinking_config"));
+        let include = thinking
+            .and_then(|value| {
+                value
+                    .get("includeThoughts")
+                    .or_else(|| value.get("include_thoughts"))
+            })
+            .and_then(Value::as_bool);
+        let budget = thinking
+            .and_then(|value| {
+                value
+                    .get("thinkingBudget")
+                    .or_else(|| value.get("thinking_budget"))
+                    .or_else(|| value.get("budget_tokens"))
+                    .or_else(|| value.get("budgetTokens"))
+                    .or_else(|| value.get("max_tokens"))
+                    .or_else(|| value.get("maxTokens"))
+            })
+            .and_then(Value::as_u64);
+        let effort = thinking
+            .and_then(|value| {
+                value
+                    .get("thinkingLevel")
+                    .or_else(|| value.get("thinking_level"))
+                    .or_else(|| value.get("reasoning_effort"))
+                    .or_else(|| value.get("reasoningEffort"))
+                    .or_else(|| value.get("effort"))
+            })
+            .and_then(Value::as_str);
+        extract_client_thinking_switch(
+            include.map(|enabled| if enabled { "enabled" } else { "disabled" }),
+            budget,
+            effort,
+        )
+    }
 }
 
 /// 四协议统一抽象：把“显式关闭思考”归一为路由用的 `"none"`。
@@ -1665,7 +1706,7 @@ impl InboundThinkingPipeline {
     pub fn configure_inbound_thinking(
         target_model: &str,
         generation_config: &mut Value,
-        _client_switch: ClientThinkingSwitch,
+        client_switch: ClientThinkingSwitch,
         client_effort: Option<&str>,
         client_budget: Option<u64>,
         token: Option<&crate::proxy::token_manager::ProxyToken>,
@@ -1678,6 +1719,12 @@ impl InboundThinkingPipeline {
                 obj.remove("thinking_config");
             }
             return None;
+        }
+
+        // The switch/effort/budget were already extracted by the adapter. Keep
+        // only the canonical field when rebuilding the outgoing configuration.
+        if let Some(obj) = generation_config.as_object_mut() {
+            obj.remove("thinking_config");
         }
 
         // 统一从官方模型结构体中读取权威默认值
@@ -1776,27 +1823,44 @@ impl InboundThinkingPipeline {
             // 官方场上 thinkingLevel 与 thinkingBudget 只会生效其一，这里严格只发等级。
             let level = resolve_level_for_model(client_effort);
             generation_config["thinkingConfig"] = json!({
-                "includeThoughts": true,
+                "includeThoughts": !client_switch.is_disabled(),
                 "thinkingLevel": level
             });
         } else if let Some(budget) = official_budget {
             // 预算通道：官方结构体明确声明 thinkingBudget 的模型
             // （今日仅 gemini-2.5-pro=1024、gpt-oss-120b=8192，以及部分未升级账号的 claude-4.6=1024）。
+            let budget = if client_switch.is_disabled()
+                && official_info
+                    .as_ref()
+                    .and_then(|info| info.min_thinking_budget)
+                    .is_some_and(|minimum| minimum == 0)
+            {
+                0
+            } else {
+                budget
+            };
             generation_config["thinkingConfig"] = if budget == 0 {
                 json!({ "includeThoughts": false, "thinkingBudget": 0 })
             } else {
-                json!({ "includeThoughts": true, "thinkingBudget": budget })
+                json!({ "includeThoughts": !client_switch.is_disabled(), "thinkingBudget": budget })
             };
         } else if official_info.is_none() {
             // 官方目录未收录的模型（如历史 *-thinking-exp 实验模型）：
             // 保留旧的预算解析作为兼容兜底，避免静默丢掉现有的思考能力。
-            match crate::proxy::model_specs::resolve_custom_budget(
-                target_model,
-                client_effort,
-                client_budget,
-                &tb_config,
-                token,
-            ) {
+            // Unknown experimental models retain explicit-off support. Keep
+            // going through the shared output-limit reconciliation below.
+            let budget = if client_switch.is_disabled() {
+                Some(0)
+            } else {
+                crate::proxy::model_specs::resolve_custom_budget(
+                    target_model,
+                    client_effort,
+                    client_budget,
+                    &tb_config,
+                    token,
+                )
+            };
+            match budget {
                 Some(0) => {
                     generation_config["thinkingConfig"] = json!({
                         "includeThoughts": false,
@@ -3425,13 +3489,116 @@ mod tests {
     }
 
     #[test]
+    fn canonical_thinking_switch_distinguishes_dynamic_budget_from_disable() {
+        for thinking in [
+            json!({ "thinkingBudget": -1 }),
+            json!({ "thinking_budget": -1 }),
+        ] {
+            let config = json!({ "thinkingConfig": thinking });
+            assert!(
+                !ClientThinkingSwitch::from_generation_config(config.as_object().unwrap())
+                    .is_disabled()
+            );
+        }
+        for config in [
+            json!({ "thinkingConfig": { "includeThoughts": false, "thinkingLevel": "HIGH" } }),
+            json!({ "thinking_config": { "include_thoughts": false, "thinking_budget": -1 } }),
+            json!({ "thinkingConfig": { "budget_tokens": 0 } }),
+            json!({ "thinkingConfig": { "reasoning_effort": "none" } }),
+        ] {
+            assert!(
+                ClientThinkingSwitch::from_generation_config(config.as_object().unwrap())
+                    .is_disabled()
+            );
+        }
+    }
+
+    #[test]
+    fn explicit_thinking_disable_preserves_catalog_channels() {
+        for model in ["gemini-3.8-flash-high", "gpt-oss-120b-medium"] {
+            let info = crate::models::OfficialModelCatalog::get(model).unwrap();
+            let mut config = json!({
+                "thinkingConfig": { "includeThoughts": true, "thinkingBudget": 32768 },
+                "thinking_config": { "include_thoughts": true, "thinking_budget": 16384 },
+                "maxOutputTokens": 65536
+            });
+            InboundThinkingPipeline::configure_inbound_thinking(
+                model,
+                &mut config,
+                ClientThinkingSwitch::Disabled,
+                None,
+                Some(0),
+                None,
+            );
+            let thinking = &config["thinkingConfig"];
+            assert_eq!(thinking["includeThoughts"], false, "{model}");
+            assert!(config.get("thinking_config").is_none(), "{model}");
+            if info.thinking_level.is_some() {
+                assert!(thinking.get("thinkingLevel").is_some(), "{model}");
+                assert!(thinking.get("thinkingBudget").is_none(), "{model}");
+            } else {
+                assert_eq!(
+                    thinking["thinkingBudget"].as_i64(),
+                    info.thinking_budget,
+                    "mandatory budget remains catalog-authoritative for {model}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn explicit_thinking_disable_keeps_image_payloads_clean() {
+        let mut config = json!({
+            "thinkingConfig": { "includeThoughts": true },
+            "thinking_config": { "include_thoughts": true }
+        });
+        assert!(crate::models::OfficialModelCatalog::get("gemini-3.1-flash-image").is_some());
+        InboundThinkingPipeline::configure_inbound_thinking(
+            "gemini-3.1-flash-image",
+            &mut config,
+            ClientThinkingSwitch::Disabled,
+            None,
+            Some(0),
+            None,
+        );
+        assert!(config.get("thinkingConfig").is_none());
+        assert!(config.get("thinking_config").is_none());
+    }
+
+    #[test]
+    fn explicit_thinking_disable_supports_unknown_experimental_models() {
+        let mut config = json!({
+            "thinkingConfig": { "includeThoughts": true, "thinkingLevel": "HIGH" },
+            "thinking_config": { "include_thoughts": true },
+            "maxOutputTokens": 1_000_000
+        });
+        let budget = InboundThinkingPipeline::configure_inbound_thinking(
+            "experimental-thinking-model",
+            &mut config,
+            ClientThinkingSwitch::Disabled,
+            Some("high"),
+            Some(8192),
+            None,
+        );
+        assert_eq!(budget, Some(0));
+        assert_eq!(
+            config["thinkingConfig"],
+            json!({
+                "includeThoughts": false,
+                "thinkingBudget": 0
+            })
+        );
+        assert!(config.get("thinking_config").is_none());
+        assert_eq!(config["maxOutputTokens"], 65536);
+    }
+
+    #[test]
     fn test_configure_inbound_thinking_gateway_level_routing() {
         use crate::proxy::config::{
             update_thinking_budget_config, ThinkingBudgetConfig, ThinkingControlSource,
         };
 
-        // 客户端直控模式已下线：无论 client_switch 传入什么，传输通道与等级
-        // 都只能由官方模型结构体 + 路由层决定。
+        // 通道与等级由官方模型结构体和路由决定；显式关闭只按模型能力处理。
         let mut config = ThinkingBudgetConfig::default();
         config.control_source = ThinkingControlSource::Gateway;
         update_thinking_budget_config(config);

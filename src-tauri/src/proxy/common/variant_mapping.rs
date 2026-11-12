@@ -166,11 +166,12 @@ pub fn tier_from_effort(effort: Option<&str>) -> Option<VariantTier> {
     }
 }
 
-/// Resolve a canonical model + tier to the real model + params.
-///
-/// Returns None for models that have no variant split (use
-/// [`resolve_non_variant_model`] for those).
+/// Resolve a canonical model and tier through registered and dynamic variants.
 pub fn resolve_real_model(canonical: &str, tier: VariantTier) -> Option<RealModelSpec> {
+    resolve_with_tier(canonical, Some(tier), None)
+}
+
+fn resolve_from_static_families(canonical: &str, tier: VariantTier) -> Option<RealModelSpec> {
     // Normalize: lowercase, trim a trailing variant-like suffix the client may have appended.
     let key = canonical.to_lowercase();
     // 强制防御：凡是以 -high / -medium / -low 结尾的模型名，档位具有绝对优先级，绝不接受任何降级
@@ -287,7 +288,7 @@ pub fn resolve_with_tier(
     };
 
     // 2. 尝试从已知家族注册表中匹配
-    if let Some(spec) = resolve_real_model(canonical, tier) {
+    if let Some(spec) = resolve_from_static_families(canonical, tier) {
         return Some(spec);
     }
 
@@ -644,6 +645,27 @@ mod tests {
         assert!(high.supports_thinking());
         assert_eq!(high.budget_tokens_option(None), None);
         assert_eq!(high.max_output_tokens, 65536);
+    }
+
+    #[test]
+    fn public_tier_resolver_supports_dynamic_models() {
+        for tier in [VariantTier::Low, VariantTier::Medium, VariantTier::High] {
+            let resolved = resolve_real_model("gemini-3.8-flash", tier)
+                .expect("catalogued dynamic Flash family");
+            let expected = resolve_with_tier("gemini-3.8-flash", Some(tier), None).unwrap();
+            assert_eq!(resolved.id, expected.id);
+            assert_eq!(resolved.thinking_budget, expected.thinking_budget);
+            assert_eq!(resolved.max_output_tokens, expected.max_output_tokens);
+        }
+
+        let named = resolve_real_model("gemini-3.8-flash-high", VariantTier::Low).unwrap();
+        assert_eq!(named.id, "gemini-3.8-flash-high");
+        assert_eq!(
+            resolve_real_model("gemini-3.5-flash", VariantTier::Low)
+                .unwrap()
+                .id,
+            "gemini-3.5-flash-extra-low"
+        );
     }
 
     #[test]
