@@ -1366,11 +1366,31 @@ pub fn enforce_uppercase_types(value: &mut Value) {
 mod tests {
     use super::*;
 
+    struct ThinkingConfigReset;
+
+    impl ThinkingConfigReset {
+        fn new() -> Self {
+            crate::proxy::config::update_thinking_budget_config(
+                crate::proxy::config::ThinkingBudgetConfig::default(),
+            );
+            Self
+        }
+    }
+
+    impl Drop for ThinkingConfigReset {
+        fn drop(&mut self) {
+            crate::proxy::config::update_thinking_budget_config(
+                crate::proxy::config::ThinkingBudgetConfig::default(),
+            );
+        }
+    }
+
     #[test]
     fn test_openai_aliases_max_completion_tokens_and_reasoning_max_tokens() {
         let _lock = crate::proxy::config::TEST_CONFIG_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
+        let _thinking_config_reset = ThinkingConfigReset::new();
         // 1. max_completion_tokens 及 max_output_tokens 别名支持
         let req1: OpenAIRequest = serde_json::from_value(json!({
             "model": "o3-mini",
@@ -1422,7 +1442,8 @@ mod tests {
             Some(10240)
         );
 
-        // 4. 客户端控制模式下从 reasoning.max_tokens 提取 client_budget
+        // 4. Legacy Client mode still normalizes reasoning.max_tokens, but
+        // the official catalog remains authoritative for the upstream budget.
         crate::proxy::config::update_thinking_budget_config(
             crate::proxy::config::ThinkingBudgetConfig {
                 control_source: crate::proxy::config::ThinkingControlSource::Client,
@@ -1433,10 +1454,15 @@ mod tests {
         crate::proxy::config::update_thinking_budget_config(
             crate::proxy::config::ThinkingBudgetConfig::default(),
         );
-        assert_eq!(
-            body["request"]["generationConfig"]["thinkingConfig"]["thinkingBudget"],
-            8000
-        );
+        // Aliases are accepted; client numeric budgets cannot replace the
+        // catalog's selected transport budget, even with legacy Client mode.
+        let catalog = crate::models::OfficialModelCatalog::get("gemini-3.7-flash")
+            .expect("known Flash catalog fixture");
+        let thinking = &body["request"]["generationConfig"]["thinkingConfig"];
+        assert_eq!(thinking["includeThoughts"], true);
+        assert_eq!(thinking["thinkingBudget"].as_i64(), catalog.thinking_budget);
+        assert_ne!(thinking["thinkingBudget"], 8000);
+        assert!(thinking.get("thinkingLevel").is_none());
     }
 
     #[test]
@@ -1532,19 +1558,28 @@ mod tests {
     }
 
     #[test]
-    fn reasoning_effort_does_not_select_levels_for_pro_or_ordinary_flash() {
+    fn reasoning_effort_preserves_catalog_budget_and_non_thinking_admission() {
         let _lock = crate::proxy::config::TEST_CONFIG_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        for model in ["gemini-3.1-pro-high", "gemini-2.5-pro"] {
-            assert!(!is_tiered_flash_model(model));
-            let body = tiered_request_body(model, Some("low"));
-            let thinking = &body["request"]["generationConfig"]["thinkingConfig"];
+        let _thinking_config_reset = ThinkingConfigReset::new();
+        let model = "gemini-3.1-pro-high";
+        let body = tiered_request_body(model, Some("low"));
+        let thinking = &body["request"]["generationConfig"]["thinkingConfig"];
+        let catalog = crate::models::OfficialModelCatalog::get(model).unwrap();
+        assert!(catalog.thinking_level.is_none());
+        assert!(catalog.thinking_budget.is_some_and(|budget| budget > 0));
+        assert_eq!(body["model"], model);
+        assert_eq!(thinking["includeThoughts"], true);
+        assert_eq!(thinking["thinkingBudget"].as_i64(), catalog.thinking_budget);
+        assert!(thinking.get("thinkingLevel").is_none());
 
-            assert_eq!(body["model"], model);
-            assert!(thinking.get("thinkingLevel").is_none());
-            assert!(thinking.get("thinkingBudget").is_some());
-        }
+        // Direct legacy <3 targets do not pass thinking admission. Normal
+        // handler routing upgrades retired aliases before reaching this mapper.
+        let legacy = tiered_request_body("gemini-2.5-pro", Some("low"));
+        assert!(legacy["request"]["generationConfig"]
+            .get("thinkingConfig")
+            .is_none());
         assert!(!is_tiered_flash_model("gemini-3.8-flash-tiered-image"));
     }
 
@@ -1553,6 +1588,7 @@ mod tests {
         let _lock = crate::proxy::config::TEST_CONFIG_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
+        let _thinking_config_reset = ThinkingConfigReset::new();
         // 1. 启发式模型忽略客户端 reasoning_effort
         let req_high: OpenAIRequest = serde_json::from_value(json!({
             "model": "gemini-3.7-flash-high",
@@ -1597,7 +1633,8 @@ mod tests {
             "LOW"
         );
 
-        // 3. 裸模型客户端未填或试图关闭：网关权威模式不关闭思考，回落官方等级（3 → HIGH）
+        // 3. No effort uses the catalog level; explicit off maps a bare model
+        // to LOW and suppresses returned thoughts.
         let req_flash_none: OpenAIRequest = serde_json::from_value(json!({
             "model": "gemini-3-flash",
             "messages": [{"role": "user", "content": "hi"}]
@@ -1618,10 +1655,11 @@ mod tests {
         .unwrap();
         let (body, _, _, _) =
             transform_openai_request(&req_flash_disabled, "test-p", "gemini-3-flash", None);
-        assert_eq!(
-            body["request"]["generationConfig"]["thinkingConfig"]["thinkingLevel"],
-            "HIGH"
-        );
+        // Explicit off on a bare level model maps to LOW and suppresses thoughts.
+        let disabled = &body["request"]["generationConfig"]["thinkingConfig"];
+        assert_eq!(disabled["thinkingLevel"], "LOW");
+        assert_eq!(disabled["includeThoughts"], false);
+        assert!(disabled.get("thinkingBudget").is_none());
 
         // 4. 等级通道模型：客户端传自定义 budget_tokens 也被忽略，仍发官方等级
         let req_flash_custom_budget: OpenAIRequest = serde_json::from_value(json!({
@@ -1854,29 +1892,23 @@ mod tests {
     }
 
     #[test]
-    fn test_issue_1602_custom_mode_gemini_capping() {
+    fn test_unknown_experimental_custom_budget_respects_output_ceiling() {
         let _lock = crate::proxy::config::TEST_CONFIG_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        // [FIX #1602] Regression test for custom mode capping
+        let _thinking_config_reset = ThinkingConfigReset::new();
+        // Unknown experimental models retain explicit gateway Custom budgets.
         use crate::proxy::config::{
             update_thinking_budget_config, ThinkingBudgetConfig, ThinkingBudgetMode,
         };
 
-        // 设置自定义模式，且数值超过 24k
+        // A configured budget above the historical 24k cap remains valid.
         update_thinking_budget_config(ThinkingBudgetConfig {
             mode: ThinkingBudgetMode::Custom,
             custom_value: 32000,
             effort: None,
             ..Default::default()
         });
-        struct ResetGuard;
-        impl Drop for ResetGuard {
-            fn drop(&mut self) {
-                update_thinking_budget_config(ThinkingBudgetConfig::default());
-            }
-        }
-        let _guard = ResetGuard;
 
         let req = OpenAIRequest {
             model: "gemini-2.0-flash-thinking".to_string(),
@@ -1898,30 +1930,29 @@ mod tests {
             ..Default::default()
         };
 
-        // 验证针对 Gemini 模型即使是 Custom 模式也会被修正为 24576
+        // No series-specific 24k cap: only the shared output ceiling applies.
         let (result, _sid, _msg_count, _) =
             transform_openai_request(&req, "test-v", "gemini-2.0-flash-thinking", None);
         let budget = result["request"]["generationConfig"]["thinkingConfig"]["thinkingBudget"]
             .as_i64()
             .unwrap();
-        assert_eq!(
-            budget, 24576,
-            "Gemini custom budget must be capped to 24576"
-        );
+        assert_eq!(budget, 32000, "explicit gateway Custom budget is preserved");
+        let generation = &result["request"]["generationConfig"];
+        assert_eq!(generation["thinkingConfig"]["includeThoughts"], true);
+        assert!(generation["thinkingConfig"].get("thinkingLevel").is_none());
+        assert!(generation["maxOutputTokens"].as_i64().unwrap() > budget);
 
-        // 验证非 Gemini 模型（如 Claude 原生路径，假设映射后名不含 gemini）则不应截断
-        // 注意：这里的 transform_openai_request 第三个参数是 mapped_model
-        let (result_claude, _, _, _) =
-            transform_openai_request(&req, "test-v", "claude-3-7-sonnet", None);
-        let _budget_claude = result_claude["request"]["generationConfig"]["thinkingConfig"]
-            ["thinkingBudget"]
-            .as_i64();
-        // 如果不是 gemini模型且协议中没带 thinking 配置，可能会是 None 或 32000
-        // 在该测试环境下，由于模拟的是 OpenAI 格式转 Gemini 路径，如果没有 gemini 关键词通常不进入 thinking 逻辑
-        // 我们只需确保 gemini 路径正确受限即可。
-
-        // 恢复默认配置
-        update_thinking_budget_config(ThinkingBudgetConfig::default());
+        update_thinking_budget_config(ThinkingBudgetConfig {
+            mode: ThinkingBudgetMode::Custom,
+            custom_value: 70000,
+            ..Default::default()
+        });
+        let (oversized, _, _, _) =
+            transform_openai_request(&req, "test-v", "gemini-2.0-flash-thinking", None);
+        // Unknown model ceiling is 65536; reserve 1024 output tokens.
+        let generation = &oversized["request"]["generationConfig"];
+        assert_eq!(generation["maxOutputTokens"], 65536);
+        assert_eq!(generation["thinkingConfig"]["thinkingBudget"], 65536 - 1024);
     }
 
     #[test]
@@ -2107,6 +2138,7 @@ mod tests {
         let _lock = crate::proxy::config::TEST_CONFIG_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
+        let _thinking_config_reset = ThinkingConfigReset::new();
         let req = OpenAIRequest {
             model: "gpt-4".to_string(),
             messages: vec![OpenAIMessage {
@@ -2128,28 +2160,27 @@ mod tests {
         };
 
         let (result, _sid, _msg_count, _) =
-            transform_openai_request(&req, "test-p", "gemini-3-pro-high-thinking", None);
+            transform_openai_request(&req, "test-p", "gemini-3.1-pro-high", None);
         let gen_config = &result["request"]["generationConfig"];
         let max_output_tokens = gen_config["maxOutputTokens"].as_i64().unwrap();
-        // budget(10001) + overhead(32768) = 42769
-        assert_eq!(max_output_tokens, 42769);
-
-        // Verify thinkingBudget
+        let catalog = crate::models::OfficialModelCatalog::get("gemini-3.1-pro-high")
+            .expect("known Pro catalog fixture");
+        assert_eq!(Some(max_output_tokens), catalog.max_output_tokens);
         let budget = gen_config["thinkingConfig"]["thinkingBudget"]
             .as_i64()
             .unwrap();
-        // actual(10001) for high-thinking pro
-        assert_eq!(budget, 10001);
+        assert_eq!(Some(budget), catalog.thinking_budget);
+        assert!(budget > 0 && max_output_tokens > budget);
+        assert_eq!(gen_config["thinkingConfig"]["includeThoughts"], true);
+        assert!(gen_config["thinkingConfig"].get("thinkingLevel").is_none());
     }
 
     #[test]
-    fn test_flash_thinking_budget_capping() {
+    fn test_unknown_experimental_default_ignores_client_numeric_budget() {
         let _lock = crate::proxy::config::TEST_CONFIG_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        crate::proxy::config::update_thinking_budget_config(
-            crate::proxy::config::ThinkingBudgetConfig::default(),
-        );
+        let _thinking_config_reset = ThinkingConfigReset::new();
 
         let req = OpenAIRequest {
             model: "gpt-4".to_string(),
@@ -2182,17 +2213,23 @@ mod tests {
             transform_openai_request(&req, "test-p", "gemini-2.0-flash-thinking-exp", None);
         let gen_config = &result["request"]["generationConfig"];
 
-        // Should be capped at 24576
-        let budget = gen_config["thinkingConfig"]["thinkingBudget"]
-            .as_i64()
-            .unwrap();
-        assert_eq!(budget, 24576);
-
-        // Max output tokens should be adjusted based on capped budget (24576 + 8192)
-        // budget(24576) + overhead(32768) = 57344
+        assert!(
+            crate::models::OfficialModelCatalog::get("gemini-2.0-flash-thinking-exp").is_none()
+        );
+        let thinking = &gen_config["thinkingConfig"];
+        assert_eq!(thinking["includeThoughts"], true);
+        assert!(
+            thinking.get("thinkingBudget").is_none(),
+            "default unknown models stay adaptive instead of accepting the client's 32768 budget"
+        );
+        assert!(thinking.get("thinkingLevel").is_none());
         let max_output_tokens = gen_config["maxOutputTokens"].as_i64().unwrap();
-        assert_eq!(max_output_tokens, 57344);
+        assert_eq!(
+            max_output_tokens, 65535,
+            "unknown model default output limit is preserved without fabricated thinking overhead"
+        );
     }
+
     #[test]
     fn test_vertex_ai_unsigned_tool_uses_protocol_skip_marker() {
         // [FIX #1650] Verify sentinel signature injection for Vertex AI models
@@ -2597,10 +2634,11 @@ mod tests {
     }
 
     #[test]
-    fn test_issue_3515_client_direct_control_disable_thinking() {
+    fn test_legacy_client_mode_preserves_explicit_off_on_named_level_model() {
         let _lock = crate::proxy::config::TEST_CONFIG_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
+        let _thinking_config_reset = ThinkingConfigReset::new();
         use crate::proxy::config::{
             update_thinking_budget_config, ThinkingBudgetConfig, ThinkingControlSource,
         };
@@ -2608,14 +2646,6 @@ mod tests {
         let mut config = ThinkingBudgetConfig::default();
         config.control_source = ThinkingControlSource::Client;
         update_thinking_budget_config(config);
-
-        struct ResetGuard;
-        impl Drop for ResetGuard {
-            fn drop(&mut self) {
-                crate::proxy::config::update_thinking_budget_config(ThinkingBudgetConfig::default());
-            }
-        }
-        let _guard = ResetGuard;
 
         let req = OpenAIRequest {
             model: "gemini-3.8-flash-medium".to_string(),
@@ -2639,8 +2669,11 @@ mod tests {
             .as_object()
             .expect("Should have generationConfig in request payload");
 
-        // 客户端直接控制模式显式关闭思考：彻底不填任何转出报文的谷歌思考块字段和预算
-        assert!(gen_config.get("thinkingConfig").is_none());
+        // Retain the explicit-off marker while preserving the named tier.
+        let thinking = &gen_config["thinkingConfig"];
+        assert_eq!(thinking["includeThoughts"], false);
+        assert_eq!(thinking["thinkingLevel"], "MEDIUM");
+        assert!(thinking.get("thinkingBudget").is_none());
     }
 
     #[test]
@@ -2732,10 +2765,11 @@ mod tests {
     }
 
     #[test]
-    fn test_issue_3515_gateway_control_preserves_medium_budget_when_client_budget_zero() {
+    fn test_gateway_mode_preserves_named_level_and_explicit_off() {
         let _lock = crate::proxy::config::TEST_CONFIG_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
+        let _thinking_config_reset = ThinkingConfigReset::new();
         use crate::proxy::config::{
             update_thinking_budget_config, ThinkingBudgetConfig, ThinkingControlSource,
         };
@@ -2743,14 +2777,6 @@ mod tests {
         let mut config = ThinkingBudgetConfig::default();
         config.control_source = ThinkingControlSource::Gateway;
         update_thinking_budget_config(config);
-
-        struct ResetGuard;
-        impl Drop for ResetGuard {
-            fn drop(&mut self) {
-                crate::proxy::config::update_thinking_budget_config(ThinkingBudgetConfig::default());
-            }
-        }
-        let _guard = ResetGuard;
 
         let req = OpenAIRequest {
             model: "gemini-3.8-flash-medium".to_string(),
@@ -2777,7 +2803,7 @@ mod tests {
 
         // 网关权威控制模式下，具名档位模型的等级由模型档位决定（medium → MEDIUM）
         assert_eq!(thinking_config.get("thinkingLevel"), Some(&json!("MEDIUM")));
-        assert_eq!(thinking_config.get("includeThoughts"), Some(&json!(true)));
+        assert_eq!(thinking_config.get("includeThoughts"), Some(&json!(false)));
         assert!(thinking_config.get("thinkingBudget").is_none());
     }
 
