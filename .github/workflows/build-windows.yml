@@ -1,146 +1,126 @@
-name: Build Windows Executable
+name: Build Windows Executable (manual)
 
 on:
-  push:
-    branches:
-      - beta
-      - main
   workflow_dispatch:
     inputs:
       create_release:
-        description: 'Publish as a GitHub Release on this repository'
-        required: false
+        description: 'Attach installer to a DRAFT release only; full public releases use Release workflow'
         type: boolean
-        default: true
+        default: false
       release_tag:
-        description: 'Release Tag (leave empty to auto-detect from package.json)'
-        required: false
+        description: 'Existing version tag (required for a release draft); otherwise build selected branch'
+        type: string
         default: ''
 
-env:
-  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ inputs.create_release && 'release-publication' || format('windows-{0}', inputs.release_tag || github.ref) }}
+  cancel-in-progress: ${{ !inputs.create_release }}
 
 jobs:
-  build-windows:
-    name: Build Windows Installer (.exe)
+  windows:
+    name: Build Windows NSIS installer
     runs-on: windows-2025
-    permissions:
-      contents: write
-
+    timeout-minutes: 60
+    outputs:
+      commit: ${{ steps.version.outputs.commit }}
+      release_tag: ${{ steps.version.outputs.release_tag }}
+    defaults:
+      run:
+        shell: bash
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
+          ref: ${{ inputs.release_tag || github.ref }}
           fetch-depth: 0
-
-      - name: Resolve Version and Tag
-        id: version_info
-        shell: pwsh
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '24'
+          cache: npm
+          cache-dependency-path: package-lock.json
+      - name: Resolve artifact version; gate optional release draft
+        id: version
+        env:
+          RELEASE_TAG: ${{ inputs.release_tag }}
+          CREATE_RELEASE: ${{ inputs.create_release }}
         run: |
-          $pkgVersion = (Get-Content package.json | ConvertFrom-Json).version
-          $inputTag = "${{ github.event.inputs.release_tag }}"
-          if (-not [string]::IsNullOrWhiteSpace($inputTag)) {
-            $tagName = $inputTag
-          } elseif ("${{ github.ref }}" -like "refs/tags/*") {
-            $tagName = "${{ github.ref_name }}"
-          } else {
-            $tagName = "v$pkgVersion"
-          }
-          Write-Host "Resolved Version: $pkgVersion"
-          Write-Host "Resolved Tag: $tagName"
-          "version=$pkgVersion" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
-          "tag_name=$tagName" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
-
-      - name: Rust setup
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Cache Rust dependencies
-        uses: Swatinem/rust-cache@v2
+          test -f scripts/ci/release.mjs || { echo '::error::Selected ref predates the manual build helpers. Select a ref containing this CI update.'; exit 1; }
+          if [[ "$CREATE_RELEASE" == true ]]; then
+            if [[ -z "$RELEASE_TAG" ]]; then echo 'A release draft requires an existing release_tag'; exit 1; fi
+            node scripts/ci/release.mjs gate
+          else
+            node --input-type=module <<'NODE'
+          import { appendFileSync, readFileSync } from 'node:fs';
+          import { execFileSync } from 'node:child_process';
+          const version = JSON.parse(readFileSync('package.json', 'utf8')).version;
+          const commit = execFileSync('git', ['rev-parse', 'HEAD'], { encoding: 'utf8' }).trim();
+          appendFileSync(process.env.GITHUB_OUTPUT, `release_tag=v${version}\ncommit=${commit}\n`);
+          NODE
+          fi
+      - uses: dtolnay/rust-toolchain@stable
         with:
-          workspaces: "src-tauri"
-
-      - name: Node.js setup
-        uses: actions/setup-node@v4
+          targets: x86_64-pc-windows-msvc
+      - uses: Swatinem/rust-cache@v2
         with:
-          node-version: 20
-          cache: "npm"
-
-      - name: Install frontend dependencies
-        run: npm install --legacy-peer-deps
-
-      - name: Disable updater artifacts without signing key
-        shell: pwsh
+          workspaces: src-tauri
+          shared-key: package-windows-x86_64
+      - name: Install locked frontend dependencies
+        run: npm ci --legacy-peer-deps --prefer-offline --no-audit --no-fund
+      - name: Configure artifact signing and build frontend once
         env:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
         run: |
-          if (-not [string]::IsNullOrWhiteSpace($env:TAURI_SIGNING_PRIVATE_KEY)) {
-            Write-Host "Updater signing key is configured; keeping updater artifacts enabled."
-            exit 0
-          }
-          $configPath = "src-tauri/tauri.conf.json"
-          $config = Get-Content -Raw $configPath | ConvertFrom-Json
-          $config.bundle.createUpdaterArtifacts = $false
-          $config | ConvertTo-Json -Depth 32 | Set-Content -Path $configPath -Encoding UTF8
-          Write-Host "No updater signing key configured; disabled updater artifacts for unsigned build."
-
-      - name: Build frontend
-        run: npm run build
-
-      - name: Build Tauri Windows NSIS Installer
-        run: npm run tauri build -- --bundles nsis
+          node --input-type=module <<'NODE'
+          import { writeFileSync } from 'node:fs';
+          writeFileSync(`${process.env.RUNNER_TEMP}/tauri-ci.json`, JSON.stringify({ build: { beforeBuildCommand: '' }, bundle: { createUpdaterArtifacts: Boolean(process.env.TAURI_SIGNING_PRIVATE_KEY?.trim()) } }));
+          NODE
+          npm run build
+      - name: Build Windows installer with locked Rust dependencies
         env:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
-
-      - name: Collect and Rename Installable Executables
-        id: collect_artifacts
-        shell: pwsh
         run: |
-          New-Item -ItemType Directory -Force -Path dist-artifacts
-          $nsisExes = Get-ChildItem -Path "src-tauri/target/release/bundle/nsis/*.exe"
-          if ($nsisExes.Count -eq 0) {
-            $nsisExes = Get-ChildItem -Path "src-tauri/target/*/release/bundle/nsis/*.exe"
-          }
-          Write-Host "Found NSIS Installers:"
-          foreach ($f in $nsisExes) {
-            Write-Host " - $($f.FullName)"
-            Copy-Item -Path $f.FullName -Destination "dist-artifacts/"
-            Copy-Item -Path $f.FullName -Destination "dist-artifacts/Antigravity-Manager-Setup.exe"
-          }
-          $files = Get-ChildItem -Path "dist-artifacts"
-          Write-Host "Staged dist-artifacts:"
-          $files | ForEach-Object { Write-Host " - $($_.Name) ($($_.Length) bytes)" }
-
-      - name: Upload Windows Executable Artifact
-        uses: actions/upload-artifact@v4
+          RUST_TARGET=x86_64-pc-windows-msvc node scripts/ci/release.mjs clean-bundle
+          npm run tauri build -- --ci --config "$RUNNER_TEMP/tauri-ci.json" --target x86_64-pc-windows-msvc --bundles nsis -- --locked
+      - name: Stage installer without changing signed bytes
+        env:
+          ARTIFACT_TARGET: windows-x86_64
+          RUST_TARGET: x86_64-pc-windows-msvc
+          RELEASE_TAG: ${{ steps.version.outputs.release_tag }}
+          RELEASE_COMMIT: ${{ steps.version.outputs.commit }}
+        run: node scripts/ci/release.mjs stage
+      - uses: actions/upload-artifact@v7
         with:
-          name: Antigravity-Manager-Windows-Installer
-          path: dist-artifacts/*
-          retention-days: 30
+          name: windows-installer
+          path: release-assets/*
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0
 
-      - name: Publish or Update GitHub Release
-        if: github.event_name == 'workflow_dispatch' && github.event.inputs.create_release != 'false'
-        uses: ncipollo/release-action@v1
+  draft:
+    name: Attach Windows installer to unpublished draft
+    needs: windows
+    if: inputs.create_release
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
         with:
-          allowUpdates: true
-          tag: ${{ steps.version_info.outputs.tag_name }}
-          name: "Antigravity Tools ${{ steps.version_info.outputs.tag_name }}"
-          body: |
-            ## Automated Build (${{ steps.version_info.outputs.tag_name }})
-            
-            This release contains all consolidated upstream and custom improvements:
-            - **Cross-Model Lockout Isolation** (PR #3640 / Fixes #3627)
-            - **Imagen 3 Micro-gap Grace Retry & Queue Cooldown Rescue** (PR #3641 / Fixes #3329, #3409)
-            - **In-Session Quota Auto-Failover & Sticky Zero-Quota Handover** (PR #3642 / Fixes #3639, Ref #3509)
-            - **Google Veo 3.1 Video Generation Pipeline** (PR #3643 / Resolves #253)
-            - **Claude Cowork Deep Compact State Machine Hardening** (PR #3644 / Ref #3576)
-            - **Earliest Deadline First (EDF) Weekly Quota Reset Scheduling** (PR #3645 / Fixes #549, Ref #900)
-            
-            ### Download Windows Installer:
-            Download `Antigravity-Manager-Setup.exe` below and run to install or update directly!
-          token: ${{ secrets.GITHUB_TOKEN }}
-          artifacts: "dist-artifacts/*"
-          artifactErrorsFailBuild: false
-          replacesArtifacts: true
-          prerelease: true
-          makeLatest: true
+          ref: ${{ needs.windows.outputs.commit }}
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '24'
+          package-manager-cache: false
+      - uses: actions/download-artifact@v8
+        with:
+          name: windows-installer
+          path: windows-artifacts
+      - name: Create or update draft with current changelog; never publish partial release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_TAG: ${{ needs.windows.outputs.release_tag }}
+        run: node scripts/ci/release.mjs windows-draft

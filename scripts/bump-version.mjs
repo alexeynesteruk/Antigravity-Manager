@@ -212,6 +212,10 @@ log(`启动版本号同步: ${colors.yellow}${currentVersion}${colors.reset} -> 
 const now = new Date();
 const today = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-${String(now.getDate()).padStart(2, '0')}`;
 
+// Resolve the bilingual layout without creating or renaming changelog files.
+const chineseChangelog = fs.existsSync(path.join(ROOT_DIR, 'CHANGELOG_ZH.md')) ? 'CHANGELOG_ZH.md' : 'CHANGELOG.md';
+const englishChangelog = fs.existsSync(path.join(ROOT_DIR, 'CHANGELOG_EN.md')) ? 'CHANGELOG_EN.md' : (chineseChangelog === 'CHANGELOG_ZH.md' ? 'CHANGELOG.md' : 'CHANGELOG_EN.md');
+
 const TARGET_FILES = [
     {
         name: 'package.json',
@@ -305,8 +309,8 @@ const TARGET_FILES = [
         ),
     },
     {
-        name: 'CHANGELOG.md (自动插入新版本骨架)',
-        relPath: 'CHANGELOG.md',
+        name: `${chineseChangelog} (Chinese changelog)`,
+        relPath: chineseChangelog,
         replace: (content) => {
             const escaped = newVersion.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
             const headingRegex = new RegExp(`\\*\\*v${escaped}\\s*\\(`);
@@ -323,8 +327,8 @@ const TARGET_FILES = [
         },
     },
     {
-        name: 'CHANGELOG_EN.md (自动插入英文版本骨架)',
-        relPath: 'CHANGELOG_EN.md',
+        name: `${englishChangelog} (English changelog)`,
+        relPath: englishChangelog,
         replace: (content) => {
             const escaped = newVersion.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
             const headingRegex = new RegExp(`\\*\\*v${escaped}\\s*\\(`);
