@@ -1,0 +1,104 @@
+{
+  "title": "Antigravity Manager integration and Google observability review",
+  "snapshot_date": "2026-11-12",
+  "exported_at_utc": "2026-11-12T12:58:49.666442+00:00",
+  "baseline": {
+    "repository": "alexeynesteruk/Antigravity-Manager",
+    "branch": "main",
+    "sha": "1e6e90b6a613e26cb2b4b06a6ebd29588fa92b85",
+    "manifest_version": "5.0.4-beta.5",
+    "parent_and_source": "lbjlaq/Antigravity-Manager",
+    "upstream_main_sha": "9b82fb7ef51c42e9d1662a14bd5b718da0525cd8",
+    "upstream_beta_sha": "3f759ae9a36fb0b33427fe4f8a4acded4a862372",
+    "divergence_with_upstream_main": {
+      "local_only": 139,
+      "upstream_only": 0
+    },
+    "divergence_with_upstream_beta": {
+      "local_only": 74,
+      "upstream_only": 26
+    }
+  },
+  "forks": {
+    "listing_pages": 36,
+    "listed_unique": 3574,
+    "displayed_repository_fork_count": 3536,
+    "readable_default_heads": 3473,
+    "unavailable_explicit_not_found": 101,
+    "distinct_head_shas": 452,
+    "ancestor_heads": 1619,
+    "nonancestor_heads": 1854,
+    "distinct_nonancestor_shas": 291,
+    "readable_repositories_with_prs": 81,
+    "readable_repositories_without_prs": 3392,
+    "changed_or_new_readable_default_heads_since_previous_snapshot": 54,
+    "distinct_changed_or_new_head_shas": 16
+  },
+  "pull_requests": {
+    "total": 1848,
+    "upstream": {
+      "total": 583,
+      "open": 1,
+      "merged": 386,
+      "closed_unmerged": 196
+    },
+    "origin": {
+      "total": 0,
+      "open": 0,
+      "merged": 0,
+      "closed_unmerged": 0
+    },
+    "forks": {
+      "total": 1265,
+      "open": 62,
+      "merged": 1180,
+      "closed_unmerged": 23
+    },
+    "enumeration_errors": 0
+  },
+  "verification": {
+    "metadata_enumeration_complete_for_readable_listed_repositories": true,
+    "selected_code_patches_reviewed": true,
+    "every_fork_code_audited": false,
+    "every_nondefault_branch_enumerated": false,
+    "application_tests_run": false,
+    "application_builds_run": false,
+    "exploit_executed": false,
+    "authenticated_google_requests_made": false,
+    "packet_capture_made": false,
+    "user_credentials_accessed": false,
+    "source_code_changed": false,
+    "new_local_reports_and_inventories_created": true,
+    "existing_november_5_report_modified": false,
+    "upstream_remote_refs_refreshed": true,
+    "commits_or_merges_created": false,
+    "remote_comments_posted": false
+  },
+  "provenance": {
+    "fork_listing": "Authenticated paginated GitHub REST fork listing via gh CLI; connector fetch rejects the forks endpoint.",
+    "repository_census": "Batched authenticated GitHub GraphQL repository/default-head/PR-count queries via gh CLI.",
+    "pull_requests": "Complete GraphQL PR pagination for 81 nonzero-count listed forks plus parent and origin.",
+    "candidate_review": "Connected GitHub tools, local code and git history; three parallel specialist agents with primary-agent cross-check and report peer review.",
+    "ancestry": "Membership of pinned default-head SHA in git rev-list of local HEAD.",
+    "google_sources": "Current official Google Antigravity terms, privacy policy, OAuth documentation, API terms; no private detection algorithm established."
+  },
+  "csv_formula_prefix_escaping": "Strings beginning with = + - @ after optional whitespace receive a leading apostrophe.",
+  "artifacts": {
+    "report.md": {
+      "bytes": 27186,
+      "sha256": "7551138c4806acd7b54afc5cfd0529970bae55bd0e9381a23f547dfcd830d7fa"
+    },
+    "google-proxy-observability.md": {
+      "bytes": 9654,
+      "sha256": "b32211bed5e71a3f78833d7e01672d6bdd0c3c54b0ec1c392cecad302cd104c1"
+    },
+    "forks.csv": {
+      "bytes": 917107,
+      "sha256": "9de49baf8caa218761e6d326313bd1a8617c3fcf58642f099446cf3a54c25f81"
+    },
+    "pull-requests.csv": {
+      "bytes": 574195,
+      "sha256": "a9b1784b6aff0ed52a9b5012bc8044d6d13df52b5d73aa857919f0418f184ce5"
+    }
+  }
+}

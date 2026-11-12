@@ -1,0 +1,104 @@
+{
+  "title": "Antigravity Manager investigation results",
+  "snapshot_date": "2026-11-05",
+  "baseline": {
+    "repository": "alexeynesteruk/Antigravity-Manager",
+    "branch": "main",
+    "sha": "87fd5464e80e84b2f7e19b64fa4dba0f76afc902",
+    "upstream_repository": "lbjlaq/Antigravity-Manager",
+    "upstream_main_sha": "0067fe045ddd77f4462ea8e2c25384839d869f32",
+    "upstream_beta_sha": "ee4c643705e6b9139b965e75139c4e0db2fb4a24",
+    "headless_branch_sha": "90bac68d3b68acbac363aac9c642fdc9f9d2e391",
+    "divergence_with_upstream_main": {
+      "local_only": 134,
+      "upstream_only": 0
+    },
+    "divergence_with_upstream_beta": {
+      "local_only": 69,
+      "upstream_only": 72
+    }
+  },
+  "forks": {
+    "listing_pages": 36,
+    "listed_unique": 3554,
+    "displayed_repository_fork_count": 3517,
+    "readable_default_heads": 3453,
+    "unavailable_explicit_not_found": 101,
+    "representative_rest_404_retries": 3,
+    "distinct_head_shas": 449,
+    "ancestor_heads": 1599,
+    "nonancestor_heads": 1854,
+    "distinct_nonancestor_shas": 289,
+    "unfamiliar_nonancestor_heads": 197,
+    "distinct_unfamiliar_nonancestor_shas": 195,
+    "locally_known_nonancestor_heads": 1657,
+    "distinct_locally_known_nonancestor_shas": 94,
+    "readable_repositories_with_prs": 80,
+    "readable_repositories_without_prs": 3373
+  },
+  "pull_requests": {
+    "total": 1814,
+    "upstream": {
+      "total": 550,
+      "merged": 356,
+      "closed_unmerged": 194,
+      "open": 0
+    },
+    "forks": {
+      "total": 1264,
+      "merged": 1180,
+      "closed_unmerged": 23,
+      "open": 61,
+      "upstream_sync_titles": 1080
+    },
+    "origin": {
+      "total": 0,
+      "open": 0
+    }
+  },
+  "verification": {
+    "metadata_enumeration_complete_for_readable_listed_repositories": true,
+    "selected_code_patches_reviewed": true,
+    "every_fork_code_audited": false,
+    "every_nondefault_branch_enumerated": false,
+    "application_tests_run": false,
+    "application_builds_run": false,
+    "exploit_executed": false,
+    "live_google_requests_made": false,
+    "production_behavior_reproduced": false,
+    "source_code_changed": false
+  },
+  "csv_encoding": "UTF-8",
+  "csv_formula_prefix_escaping": "String cells starting with formula prefixes, including after leading whitespace, receive a leading apostrophe.",
+  "provenance": {
+    "fork_listing": "Paginated public GitHub forks API",
+    "default_heads": "Batched authenticated GitHub GraphQL default-branch queries",
+    "ancestry": "git merge-base --is-ancestor against pinned local baseline; object existence alone was not used as proof of integration",
+    "fork_prs": "Authenticated GraphQL count census followed by complete pagination of nonzero PR collections",
+    "upstream_prs": "Paginated upstream GitHub PR metadata",
+    "availability": "101 explicit GraphQL NOT_FOUND responses; three representative REST retries returned 404"
+  },
+  "artifacts": {
+    "report.md": {
+      "bytes": 42679,
+      "sha256": "33fbfcb351066f1f81dc9a6281434cf2a00627c05427f9ae0b6e19e93e702a5c"
+    },
+    "forks.csv": {
+      "bytes": 625126,
+      "sha256": "b143ae9d3ae6676423b88af8de1409efbfa30c7dc0e36c16649cc7d36b5d2c74"
+    },
+    "pull-requests.csv": {
+      "bytes": 416842,
+      "sha256": "71fab6aacbf0662edb3d9801b89b493ccc1270213447cc23f79f03bbea164278"
+    }
+  },
+  "document_verification": {
+    "inventory_counts_reconciled": true,
+    "csv_rows_unique": true,
+    "local_document_links_resolve": true,
+    "pinned_code_paths_and_line_bounds_validated": true,
+    "artifact_hashes_verified": true,
+    "local_authentication_headless_and_census_sections_peer_reviewed": true,
+    "remote_links_rechecked_live_for_report_creation": false
+  }
+}
