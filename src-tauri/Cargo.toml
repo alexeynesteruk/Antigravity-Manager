@@ -35,6 +35,7 @@ yaml-rt = { version = "0.3.1", default-features = false }
 uuid = { version = "1.10", features = ["v4", "serde"] }
 chrono = "0.4"
 dirs = "5.0"
+same-file = "1.0.6"
 reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "socks", "blocking", "rustls-tls"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "time"] }
