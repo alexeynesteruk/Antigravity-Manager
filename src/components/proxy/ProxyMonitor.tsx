@@ -47,6 +47,16 @@ interface ProxyMonitorProps {
     className?: string;
 }
 
+interface MonitorQuery {
+    page: number;
+    pageSize: number;
+    filter: string;
+    accountFilter: string;
+    revision: number;
+    refreshConfig: boolean;
+    configRevision: number;
+}
+
 // Log Table Component
 interface LogTableProps {
     logs: ProxyRequestLog[];
@@ -684,6 +694,21 @@ export const ProxyMonitor: React.FC<ProxyMonitorProps> = ({ className }) => {
     const [totalCount, setTotalCount] = useState(0);
     const [loading, setLoading] = useState(false);
     const [loadingDetail, setLoadingDetail] = useState(false);
+    const pageSizeRef = useRef(pageSize);
+    const isMountedRef = useRef(true);
+    const queryRevisionRef = useRef(0);
+    const latestQueryKeyRef = useRef('');
+    const pendingQueryRef = useRef<MonitorQuery | null>(null);
+    const loadInFlightRef = useRef(false);
+    const accountRefreshRef = useRef<Promise<void> | null>(null);
+    const configRevisionRef = useRef(0);
+    const configWritesRef = useRef(0);
+    const showLogSettingsRef = useRef(showLogSettings);
+
+    pageSizeRef.current = pageSize;
+    filterRef.current = filter;
+    accountFilterRef.current = accountFilter;
+    showLogSettingsRef.current = showLogSettings;
 
     const uniqueAccounts = useMemo(() => {
         const emailSet = new Set<string>();
@@ -698,81 +723,99 @@ export const ProxyMonitor: React.FC<ProxyMonitorProps> = ({ className }) => {
         return Array.from(emailSet).sort();
     }, [logs, accounts]);
 
-    const loadData = async (page = 1, searchFilter = filter, accountEmailFilter = accountFilter) => {
-        if (loading) return;
-        setLoading(true);
+    const refreshMonitorAccounts = useCallback(() => {
+        if (accountRefreshRef.current) return accountRefreshRef.current;
+        const refresh = fetchAccounts().finally(() => {
+            if (accountRefreshRef.current === refresh) accountRefreshRef.current = null;
+        });
+        accountRefreshRef.current = refresh;
+        return refresh;
+    }, [fetchAccounts]);
 
+    // One active query and one replaceable pending query. New filters/pages do
+    // not get dropped by a stale loading closure or overwritten by older data.
+    const loadData = useCallback(async (
+        page = currentPageRef.current,
+        searchFilter = filterRef.current,
+        accountEmailFilter = accountFilterRef.current,
+        refreshConfig = true,
+    ) => {
+        if (!isMountedRef.current) return;
+        const pageLimit = pageSizeRef.current;
+        const key = JSON.stringify([page, pageLimit, searchFilter, accountEmailFilter]);
+        if (key !== latestQueryKeyRef.current) {
+            latestQueryKeyRef.current = key;
+            queryRevisionRef.current += 1;
+        }
+        const pending = pendingQueryRef.current;
+        pendingQueryRef.current = {
+            page,
+            pageSize: pageLimit,
+            filter: searchFilter,
+            accountFilter: accountEmailFilter,
+            revision: queryRevisionRef.current,
+            refreshConfig: refreshConfig || (pending?.revision === queryRevisionRef.current && pending.refreshConfig),
+            configRevision: configRevisionRef.current,
+        };
+        if (refreshConfig) setLoading(true);
+        if (loadInFlightRef.current) return;
+        loadInFlightRef.current = true;
         try {
-            // Add timeout control (10 seconds)
-            const timeoutPromise = new Promise((_, reject) =>
-                setTimeout(() => reject(new Error('Request timeout')), 10000)
-            );
-
-            const config = await Promise.race([
-                invoke<AppConfig>('load_config'),
-                timeoutPromise
-            ]) as AppConfig;
-
-            if (config && config.proxy) {
-                setAppConfig(config);
-                setIsLoggingEnabled(config.proxy.enable_logging);
-                const healthLogsEnabled = !!config.proxy.capture_health_logs;
-                setCaptureHealthLogs(healthLogsEnabled);
-                await invoke('set_proxy_monitor_enabled', { enabled: config.proxy.enable_logging });
-                await invoke('set_proxy_capture_health_logs', { enabled: healthLogsEnabled });
-            }
-
-            const errorsOnly = searchFilter === '__ERROR__';
-            const baseFilter = errorsOnly ? '' : searchFilter;
-            const actualFilter = accountEmailFilter
-                ? (baseFilter ? `${baseFilter} ${accountEmailFilter}` : accountEmailFilter)
-                : baseFilter;
-
-            // Get count with filter
-            const count = await Promise.race([
-                invoke<number>('get_proxy_logs_count_filtered', {
-                    filter: actualFilter,
-                    errorsOnly: errorsOnly
-                }),
-                timeoutPromise
-            ]) as number;
-            setTotalCount(count);
-
-            // Use filtered paginated query
-            const offset = (page - 1) * pageSize;
-            const history = await Promise.race([
-                invoke<ProxyRequestLog[]>('get_proxy_logs_filtered', {
-                    filter: actualFilter,
-                    errorsOnly: errorsOnly,
-                    limit: pageSize,
-                    offset: offset
-                }),
-                timeoutPromise
-            ]) as ProxyRequestLog[];
-
-            if (Array.isArray(history)) {
-                setLogs(history);
-                // Clear pending logs to avoid duplicates (database data is authoritative)
-                pendingLogsRef.current = [];
-            }
-
-            const currentStats = await Promise.race([
-                invoke<ProxyStats>('get_proxy_stats'),
-                timeoutPromise
-            ]) as ProxyStats;
-
-            if (currentStats) setStats(currentStats);
-            fetchAccounts();
-        } catch (e: any) {
-            console.error("Failed to load proxy data", e);
-            if (e.message === 'Request timeout') {
-                // Show timeout error to user
-                console.error('Loading monitor data timeout, please try again later');
+            while (isMountedRef.current && pendingQueryRef.current) {
+                const query = pendingQueryRef.current;
+                pendingQueryRef.current = null;
+                let timeoutId: ReturnType<typeof setTimeout> | undefined;
+                try {
+                    const errorsOnly = query.filter === '__ERROR__';
+                    const baseFilter = errorsOnly ? '' : query.filter;
+                    const actualFilter = query.accountFilter
+                        ? (baseFilter ? `${baseFilter} ${query.accountFilter}` : query.accountFilter)
+                        : baseFilter;
+                    const timeout = new Promise<never>((_, reject) => {
+                        timeoutId = setTimeout(() => reject(new Error('Request timeout')), 10000);
+                    });
+                    const [config, count, history, currentStats] = await Promise.race([
+                        Promise.all([
+                            query.refreshConfig ? invoke<AppConfig>('load_config') : Promise.resolve(null),
+                            invoke<number>('get_proxy_logs_count_filtered', { filter: actualFilter, errorsOnly }),
+                            invoke<ProxyRequestLog[]>('get_proxy_logs_filtered', {
+                                filter: actualFilter,
+                                errorsOnly,
+                                limit: query.pageSize,
+                                offset: (query.page - 1) * query.pageSize,
+                            }),
+                            invoke<ProxyStats>('get_proxy_stats'),
+                        ]),
+                        timeout,
+                    ]);
+                    if (!isMountedRef.current || query.revision !== queryRevisionRef.current) continue;
+                    if (config?.proxy && query.configRevision === configRevisionRef.current && configWritesRef.current === 0) {
+                        // Live traffic must not replace an unsaved settings draft.
+                        if (!showLogSettingsRef.current) setAppConfig(config);
+                        setIsLoggingEnabled(config.proxy.enable_logging);
+                        setCaptureHealthLogs(!!config.proxy.capture_health_logs);
+                    }
+                    setTotalCount(count);
+                    if (Array.isArray(history)) setLogs(history);
+                    if (currentStats) setStats(currentStats);
+                } catch (error) {
+                    if (isMountedRef.current && query.revision === queryRevisionRef.current) {
+                        console.error('Failed to load proxy data', error);
+                    }
+                } finally {
+                    if (timeoutId !== undefined) clearTimeout(timeoutId);
+                    // Another event may have replaced this ref while the query awaited I/O.
+                    const pendingQuery = pendingQueryRef.current as MonitorQuery | null;
+                    if (isMountedRef.current && query.revision === queryRevisionRef.current && !pendingQuery?.refreshConfig) {
+                        setLoading(false);
+                    }
+                }
             }
         } finally {
-            setLoading(false);
+            loadInFlightRef.current = false;
+            if (isMountedRef.current) setLoading(false);
         }
-    };
+    }, []);
 
     const totalPages = Math.ceil(totalCount / pageSize);
     const pageStart = totalCount === 0 ? 0 : (currentPage - 1) * pageSize + 1;
@@ -788,6 +831,8 @@ export const ProxyMonitor: React.FC<ProxyMonitorProps> = ({ className }) => {
 
     const toggleLogging = async () => {
         const newState = !isLoggingEnabled;
+        configWritesRef.current += 1;
+        configRevisionRef.current += 1;
         try {
             const config = await invoke<AppConfig>('load_config');
             if (config && config.proxy) {
@@ -795,14 +840,22 @@ export const ProxyMonitor: React.FC<ProxyMonitorProps> = ({ className }) => {
                 await invoke('save_config', { config });
                 await invoke('set_proxy_monitor_enabled', { enabled: newState });
                 setIsLoggingEnabled(newState);
+                setAppConfig(current => current
+                    ? { ...current, proxy: { ...current.proxy, enable_logging: newState } }
+                    : config);
             }
         } catch (e) {
             console.error("Failed to toggle logging", e);
+        } finally {
+            configWritesRef.current -= 1;
+            configRevisionRef.current += 1;
         }
     };
 
     const toggleCaptureHealthLogs = async () => {
         const newState = !captureHealthLogs;
+        configWritesRef.current += 1;
+        configRevisionRef.current += 1;
         try {
             const config = await invoke<AppConfig>('load_config');
             if (config && config.proxy) {
@@ -810,132 +863,80 @@ export const ProxyMonitor: React.FC<ProxyMonitorProps> = ({ className }) => {
                 await invoke('save_config', { config });
                 await invoke('set_proxy_capture_health_logs', { enabled: newState });
                 setCaptureHealthLogs(newState);
+                setAppConfig(current => current
+                    ? { ...current, proxy: { ...current.proxy, capture_health_logs: newState } }
+                    : config);
+                setCurrentPage(1);
+                currentPageRef.current = 1;
                 loadData(1, filter, accountFilter);
             }
         } catch (e) {
             console.error("Failed to toggle capture health logs", e);
+        } finally {
+            configWritesRef.current -= 1;
+            configRevisionRef.current += 1;
         }
     };
 
-    const pendingLogsRef = useRef<ProxyRequestLog[]>([]);
-    const listenerSetupRef = useRef(false);
-    const isMountedRef = useRef(true);
-
     useEffect(() => {
         isMountedRef.current = true;
-        loadData();
-        fetchAccounts();
+        refreshMonitorAccounts();
 
+        let disposed = false;
         let unlistenFn: (() => void) | null = null;
         let updateTimeout: number | null = null;
 
         const setupListener = async () => {
             if (!isTauri()) return;
-            // Prevent duplicate listener registration (React 18 StrictMode)
-            if (listenerSetupRef.current) {
-                console.debug('[ProxyMonitor] Listener already set up, skipping...');
-                return;
+            try {
+                const unlisten = await listen<ProxyRequestLog>('proxy://request', () => {
+                    if (disposed || updateTimeout !== null) return;
+                    // Events invalidate the current database view. A fixed batch
+                    // window cannot starve under sustained traffic, retains no
+                    // payloads, and preserves filters, pagination and page size.
+                    updateTimeout = window.setTimeout(() => {
+                        updateTimeout = null;
+                        if (disposed) return;
+                        void loadData(undefined, undefined, undefined, false);
+                    }, 500);
+                });
+                // Registration may finish after StrictMode cleanup/unmount.
+                if (disposed) unlisten();
+                else unlistenFn = unlisten;
+            } catch (error) {
+                if (!disposed) console.error('Failed to listen for proxy requests', error);
             }
-            listenerSetupRef.current = true;
-
-            console.debug('[ProxyMonitor] Setting up event listener for proxy://request');
-            unlistenFn = await listen<ProxyRequestLog>('proxy://request', (event) => {
-                if (!isMountedRef.current) return;
-
-                const newLog = event.payload;
-
-                // 移除 body 以减少内存占用
-                const logSummary = {
-                    ...newLog,
-                    request_body: undefined,
-                    upstream_request_body: undefined,
-                    response_body: undefined
-                };
-
-                // Check if this log already exists (deduplicate at event level)
-                const alreadyExists = pendingLogsRef.current.some(log => log.id === newLog.id);
-                if (alreadyExists) {
-                    console.debug('[ProxyMonitor] Duplicate event ignored:', newLog.id);
-                    return;
-                }
-
-                pendingLogsRef.current.push(logSummary);
-
-                // 防抖:每 500ms 批量更新一次
-                if (updateTimeout) clearTimeout(updateTimeout);
-                updateTimeout = window.setTimeout(async () => {
-                    if (!isMountedRef.current) return;
-
-                    const currentPending = pendingLogsRef.current;
-                    if (currentPending.length > 0) {
-                        setLogs(prev => {
-                            // Deduplicate by id
-                            const existingIds = new Set(prev.map(log => log.id));
-                            const uniqueNewLogs = currentPending.filter(log => !existingIds.has(log.id));
-                            // Merge and sort by timestamp descending (newest first)
-                            const merged = [...uniqueNewLogs, ...prev];
-                            merged.sort((a, b) => b.timestamp - a.timestamp);
-                            return merged.slice(0, 100);
-                        });
-
-                        // Fetch stats, total count and latest account QoS states from backend
-                        try {
-                            const [currentStats, count] = await Promise.all([
-                                invoke<ProxyStats>('get_proxy_stats'),
-                                invoke<number>('get_proxy_logs_count_filtered', { filter: '', errorsOnly: false }),
-                                fetchAccounts()
-                            ]);
-                            if (isMountedRef.current) {
-                                if (currentStats) setStats(currentStats);
-                                setTotalCount(count);
-                            }
-                        } catch (e) {
-                            console.error('Failed to fetch stats:', e);
-                        }
-
-                        pendingLogsRef.current = [];
-                    }
-                }, 500);
-            });
         };
-        setupListener();
+        void setupListener();
 
-        // Web 模式補強：如果不是 Tauri 環境，則啟用定時輪詢
-        let pollInterval: number | null = null;
-        if (!isTauri()) {
+        // Client/account discovery is independent of request volume. CRUD
+        // already updates the store; this also catches external/QoS changes.
+        const webMode = !isTauri();
+        if (webMode) {
             console.debug('[ProxyMonitor] Web mode detected, starting auto-poll (10s)');
-            pollInterval = window.setInterval(() => {
-                if (isMountedRef.current && !loading) {
-                    // [FIX] 使用 ref.current 获取最新的筛选条件
-                    loadData(currentPageRef.current, filterRef.current, accountFilterRef.current);
-                }
-            }, 10000);
         }
+        const pollInterval = window.setInterval(() => {
+            if (webMode) void loadData();
+            void refreshMonitorAccounts();
+        }, 10000);
 
         return () => {
+            disposed = true;
             isMountedRef.current = false;
-            listenerSetupRef.current = false;
+            queryRevisionRef.current += 1;
+            pendingQueryRef.current = null;
             if (unlistenFn) unlistenFn();
-            if (updateTimeout) clearTimeout(updateTimeout);
-            if (pollInterval) clearInterval(pollInterval);
+            if (updateTimeout !== null) clearTimeout(updateTimeout);
+            clearInterval(pollInterval);
         };
-    }, []);
+    }, [loadData, refreshMonitorAccounts]);
 
-    // Reload when pageSize changes
+    // One initial load; new filters/page sizes reset to a consistent first page.
     useEffect(() => {
         setCurrentPage(1);
-        loadData(1, filter, accountFilter);
-    }, [pageSize]);
-
-    // Reload when filter changes (search based on all logs)
-    useEffect(() => {
-        setCurrentPage(1);
-        loadData(1, filter, accountFilter);
-        // [FIX] 同步 ref 值，供 setInterval 使用
-        filterRef.current = filter;
-        accountFilterRef.current = accountFilter;
         currentPageRef.current = 1;
-    }, [filter, accountFilter]);
+        void loadData(1, filter, accountFilter);
+    }, [filter, accountFilter, pageSize, loadData]);
 
     // Logs are already filtered and sorted by backend
     // Apply account filter and noise filter on frontend (与后端 should_skip_request_log 语义保持一致)
@@ -973,6 +974,8 @@ export const ProxyMonitor: React.FC<ProxyMonitorProps> = ({ className }) => {
 
     const executeClearLogs = async () => {
         setIsClearConfirmOpen(false);
+        queryRevisionRef.current += 1;
+        pendingQueryRef.current = null;
         try {
             await invoke('clear_proxy_logs');
             setLogs([]);
@@ -981,6 +984,11 @@ export const ProxyMonitor: React.FC<ProxyMonitorProps> = ({ className }) => {
             fetchDbDiskSize();
         } catch (e) {
             console.error("Failed to clear logs", e);
+        } finally {
+            // Invalidate reads started before or during the destructive action.
+            queryRevisionRef.current += 1;
+            pendingQueryRef.current = null;
+            void loadData();
         }
     };
 
@@ -1047,6 +1055,8 @@ export const ProxyMonitor: React.FC<ProxyMonitorProps> = ({ className }) => {
     const handleSaveLogSettings = async () => {
         if (!appConfig) return;
         setIsSavingConfig(true);
+        configWritesRef.current += 1;
+        configRevisionRef.current += 1;
         try {
             await invoke('save_config', { config: appConfig });
             setSaveSuccess(true);
@@ -1056,6 +1066,8 @@ export const ProxyMonitor: React.FC<ProxyMonitorProps> = ({ className }) => {
         } catch (e) {
             console.error('Failed to save log settings', e);
         } finally {
+            configWritesRef.current -= 1;
+            configRevisionRef.current += 1;
             setIsSavingConfig(false);
         }
     };

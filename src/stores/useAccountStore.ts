@@ -2,6 +2,16 @@ import { create } from 'zustand';
 import { Account, ActiveClientsStatus, ModelPriorities } from '../types/account';
 import * as accountService from '../services/accountService';
 
+// List/current-account views often refresh together. Share the client discovery
+// request, which otherwise repeats the same filesystem/process work three times.
+let activeClientsRefresh: Promise<void> | null = null;
+let activeClientsGeneration = 0;
+
+function invalidateActiveClientsRefresh() {
+    activeClientsGeneration += 1;
+    activeClientsRefresh = null;
+}
+
 interface AccountState {
     accounts: Account[];
     currentAccount: Account | null;
@@ -57,11 +67,11 @@ export const useAccountStore = create<AccountState>((set, get) => ({
         set({ loading: true, error: null });
         try {
             console.log('[Store] Fetching accounts...');
-            const [accounts, activeClients] = await Promise.all([
+            const [accounts] = await Promise.all([
                 accountService.listAccounts(),
-                accountService.getActiveClientsStatus().catch(() => ({} as ActiveClientsStatus))
+                get().fetchActiveClients()
             ]);
-            set({ accounts, activeClients, loading: false });
+            set({ accounts, loading: false });
         } catch (error) {
             console.error('[Store] Fetch accounts failed:', error);
             set({ error: String(error), loading: false });
@@ -71,29 +81,44 @@ export const useAccountStore = create<AccountState>((set, get) => ({
     fetchCurrentAccount: async () => {
         set({ loading: true, error: null });
         try {
-            const [account, activeClients] = await Promise.all([
+            const [account] = await Promise.all([
                 accountService.getCurrentAccount(),
-                accountService.getActiveClientsStatus().catch(() => ({} as ActiveClientsStatus))
+                get().fetchActiveClients()
             ]);
-            set({ currentAccount: account, activeClients, loading: false });
+            set({ currentAccount: account, loading: false });
         } catch (error) {
             set({ error: String(error), loading: false });
         }
     },
 
-    fetchActiveClients: async () => {
-        try {
-            const activeClients = await accountService.getActiveClientsStatus();
-            set({ activeClients });
-        } catch (error) {
-            console.error('[Store] Fetch active clients failed:', error);
-        }
+    fetchActiveClients: () => {
+        if (activeClientsRefresh) return activeClientsRefresh;
+        const generation = activeClientsGeneration;
+        let timeoutId: ReturnType<typeof setTimeout> | undefined;
+        const timeout = new Promise<never>((_, reject) => {
+            timeoutId = setTimeout(() => reject(new Error('Client discovery timeout')), 10000);
+        });
+        const refresh = Promise.race([accountService.getActiveClientsStatus(), timeout])
+            .then(activeClients => {
+                if (generation === activeClientsGeneration) set({ activeClients });
+            })
+            .catch(error => {
+                // Keep the last known clients when discovery temporarily fails.
+                console.error('[Store] Fetch active clients failed:', error);
+            })
+            .finally(() => {
+                if (timeoutId !== undefined) clearTimeout(timeoutId);
+                if (activeClientsRefresh === refresh) activeClientsRefresh = null;
+            });
+        activeClientsRefresh = refresh;
+        return refresh;
     },
 
     addAccount: async (email: string, refreshToken: string) => {
         set({ loading: true, error: null });
         try {
             await accountService.addAccount(email, refreshToken);
+            invalidateActiveClientsRefresh();
             await get().fetchAccounts();
             set({ loading: false });
         } catch (error) {
@@ -106,6 +131,7 @@ export const useAccountStore = create<AccountState>((set, get) => ({
         set({ loading: true, error: null });
         try {
             await accountService.deleteAccount(accountId);
+            invalidateActiveClientsRefresh();
             await Promise.all([
                 get().fetchAccounts(),
                 get().fetchCurrentAccount()
@@ -121,6 +147,7 @@ export const useAccountStore = create<AccountState>((set, get) => ({
         set({ loading: true, error: null });
         try {
             await accountService.deleteAccounts(accountIds);
+            invalidateActiveClientsRefresh();
             await Promise.all([
                 get().fetchAccounts(),
                 get().fetchCurrentAccount()
@@ -136,10 +163,12 @@ export const useAccountStore = create<AccountState>((set, get) => ({
         set({ loading: true, error: null });
         try {
             await accountService.switchAccount(accountId, targetIde);
+            // An earlier discovery may describe the client before the switch.
+            // Do not let its eventual completion replace the new client state.
+            invalidateActiveClientsRefresh();
             await Promise.all([
                 get().fetchCurrentAccount(),
                 get().fetchAccounts(),
-                get().fetchActiveClients(),
             ]);
 
             set({ loading: false });
@@ -148,11 +177,13 @@ export const useAccountStore = create<AccountState>((set, get) => ({
             // NOTE: We call the service directly instead of get().refreshQuota() to avoid
             // re-setting loading=true after we just set loading=false.
             accountService.fetchAccountQuota(accountId)
-                .then(() => Promise.all([
-                    get().fetchAccounts(),
-                    get().fetchCurrentAccount(),
-                    get().fetchActiveClients(),
-                ]))
+                .then(() => {
+                    invalidateActiveClientsRefresh();
+                    return Promise.all([
+                        get().fetchAccounts(),
+                        get().fetchCurrentAccount(),
+                    ]);
+                })
                 .catch(e => {
                     console.error('[Store] Background quota refresh failed after switch:', e);
                 });
