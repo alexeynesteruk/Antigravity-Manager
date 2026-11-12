@@ -901,6 +901,8 @@ fn openai_chat_error_frame(
         "choices": [],
         "error": {
             "type": report.classified.error_type,
+            "retry_after": report.admission_error().map(|error| error.retry_after),
+            "gateway_code": report.admission_error().map(|error| error.code),
             "message": report.client_message(),
             "code": "stream_error",
             "i18n_key": report.classified.i18n_key,
@@ -1038,6 +1040,8 @@ impl CodexResponsesStreamHandler {
         let err_ev = json!({
             "type": "error",
             "code": error_report.classified.error_type,
+            "retry_after": error_report.admission_error().map(|error| error.retry_after),
+            "gateway_code": error_report.admission_error().map(|error| error.code),
             "message": error_report.client_message(),
             "function": error_report.function,
             "call_site": error_report.call_site(),
@@ -1435,9 +1439,10 @@ impl CodexResponsesStreamHandler {
         }
 
         if self.structured_output && self.message_item_emitted {
-            self.accumulated_text =
-                crate::proxy::pipeline::structured_output::normalize_json_text(&self.accumulated_text)
-                    .into_owned();
+            self.accumulated_text = crate::proxy::pipeline::structured_output::normalize_json_text(
+                &self.accumulated_text,
+            )
+            .into_owned();
             let delta_ev = json!({
                 "type": "response.output_text.delta",
                 "item_id": &self.message_item_id,
@@ -1556,6 +1561,8 @@ impl CodexResponsesStreamHandler {
             incomplete_details = Value::Null;
             terminal_error = json!({
                 "code": report.classified.error_type,
+                "retry_after": report.admission_error().map(|error| error.retry_after),
+                "gateway_code": report.admission_error().map(|error| error.code),
                 "message": report.client_message(),
                 "function": report.function,
                 "call_site": report.call_site(),

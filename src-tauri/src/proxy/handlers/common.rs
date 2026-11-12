@@ -38,6 +38,13 @@ pub use crate::proxy::pipeline::budget::{
 pub use crate::proxy::pipeline::errors::{is_transient_token_error, parse_raw_upstream_error};
 pub use crate::proxy::pipeline::qos::report_qos_ttft;
 
+// Compatibility exports; generic account safety executes in the pipeline.
+pub use crate::proxy::pipeline::account_safety::{
+    account_attention_error_response, account_attention_stream_response,
+    guard_upstream_account_stream, handle_upstream_account_safety, is_account_attention_error,
+    AccountSafetyAction, AccountSafetyStop,
+};
+
 /// [Issue #3634, #3693] 统一自适应计算流预读（Peek）阶段的超时时间。
 /// - Compaction 摘要请求：大 Prompt 处理，默认 180s；
 /// - 图像生成请求：图像生成耗时较长（特别是 4K 高分辨率渲染），默认 90s；

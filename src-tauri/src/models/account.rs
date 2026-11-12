@@ -696,6 +696,13 @@ impl Account {
         if !self.validation_blocked {
             return false;
         }
+        if self
+            .validation_blocked_reason
+            .as_deref()
+            .is_some_and(|reason| reason.starts_with("manual_attention_required:"))
+        {
+            return true;
+        }
         match self.validation_blocked_until {
             Some(0) | None => {
                 let age = now.saturating_sub(self.last_used);
@@ -1678,5 +1685,12 @@ mod tests {
 
         account.validation_blocked_until = Some(0);
         assert!(account.is_validation_block_active(999));
+        let old = account.last_used.saturating_add(2 * 86400);
+        assert!(!account.is_validation_block_active(old));
+        account.validation_blocked_reason =
+            Some("manual_attention_required: AUTHENTICATION_CHALLENGE".into());
+        assert!(account.is_validation_block_active(old));
+        account.validation_blocked = false;
+        assert!(!account.is_validation_block_active(old));
     }
 }

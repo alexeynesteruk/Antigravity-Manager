@@ -23,6 +23,21 @@ pub async fn try_handle_cli(args: &[String]) -> Result<bool, String> {
     }
 
     match subcmd {
+        "credentials-migrate" => {
+            if args.len() != 2 {
+                return Err("credentials-migrate accepts no arguments; select the application data directory before starting the command".into());
+            }
+            let migrated = tokio::task::spawn_blocking(migrate_credentials_offline)
+                .await
+                .map_err(|_| "Offline credential migration worker failed")??;
+            println!("Offline credential migration complete. Legacy account files migrated: {migrated}. Configuration and device keys checked.");
+            Ok(true)
+        }
+        "tls-import" => {
+            crate::proxy::tls::import_cli(&args[2..])?;
+            println!("HTTPS identity imported into the OS credential store. Restart the gateway to apply.");
+            Ok(true)
+        }
         "switch" | "s" => {
             handle_switch_command(&args[2..]).await?;
             Ok(true)
@@ -66,6 +81,8 @@ fn print_cli_help() {
           list, ls           List all accounts with active status and quota\n  \
           current, whoami    Show currently active accounts across clients (IDE / agy CLI)\n  \
           sync [app]         One-click sync proxy URL and API key to Agent tools (dsh, claude, codex, etc.)\n  \
+          tls-import --cert <PEM> --key <PEM> [--advertise <SAN>] [--port 8443]  Import HTTPS identity into native storage\n\n\
+          credentials-migrate  Protect local credentials offline; close the app first\n  \
           help               Show this help message\n\n\
         Flags:\n  \
           --headless         Run as a background headless proxy daemon (no GUI / Wayland display required)\n\n\
@@ -85,6 +102,15 @@ fn print_cli_help() {
           antigravity-tools sync all                   # Sync to all detected Agent tools\n  \
           antigravity-tools --headless                 # Start headless proxy server (systemd friendly)\n"
     );
+}
+
+/// Maintenance only: no listener, client detection, switching or provider calls.
+fn migrate_credentials_offline() -> Result<usize, String> {
+    crate::modules::config::load_app_config()?;
+    let directory = account::get_data_dir()?;
+    let migrated = account::migrate_managed_credentials_in_dir(&directory)?;
+    crate::modules::user_token_db::init_db()?;
+    Ok(migrated)
 }
 
 async fn handle_switch_command(args: &[String]) -> Result<(), String> {
@@ -507,6 +533,108 @@ async fn handle_export_command(args: &[String]) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn offline_credentials_migration_protects_synthetic_config_accounts_and_device_keys() {
+        let _data = crate::proxy::monitor::prompt_log_tests::TestDataDir::new();
+        let directory = account::get_data_dir().unwrap();
+        let mut config = crate::models::AppConfig::new();
+        config.proxy.api_key = "offline-config-synthetic-secret".into();
+        std::fs::write(
+            directory.join("gui_config.json"),
+            serde_json::to_vec(&config).unwrap(),
+        )
+        .unwrap();
+        let mut index = crate::models::AccountIndex::new();
+        let record = crate::models::Account::new(
+            "offline-credential-fixture".into(),
+            "offline@example.invalid".into(),
+            crate::models::TokenData::new(
+                "offline-access-secret".into(),
+                "offline-refresh-secret".into(),
+                3600,
+                None,
+                None,
+                None,
+                false,
+                Some("offline-id-secret".into()),
+            ),
+        );
+        index.accounts.push(crate::models::AccountSummary {
+            id: record.id.clone(),
+            email: record.email.clone(),
+            name: None,
+            disabled: false,
+            proxy_disabled: false,
+            protected_models: Default::default(),
+            created_at: record.created_at,
+            last_used: record.last_used,
+        });
+        account::save_account_index(&index).unwrap();
+        let path = account::get_accounts_dir()
+            .unwrap()
+            .join(format!("{}.json", record.id));
+        std::fs::write(&path, serde_json::to_vec(&record).unwrap()).unwrap();
+        crate::modules::user_token_db::init_db().unwrap();
+        crate::modules::user_token_db::connect_db().unwrap().execute(
+            "INSERT INTO user_tokens (id,token,username,expires_type,created_at,updated_at) VALUES (?1,?2,?3,'never',0,0)",
+            rusqlite::params!["offline-device-fixture","offline-device-synthetic-secret","fixture"],
+        ).unwrap();
+
+        assert_eq!(migrate_credentials_offline().unwrap(), 1);
+        assert_eq!(migrate_credentials_offline().unwrap(), 0);
+        let raw_config = std::fs::read_to_string(directory.join("gui_config.json")).unwrap();
+        assert!(!raw_config.contains("offline-config-synthetic-secret"));
+        assert_eq!(
+            crate::modules::config::load_app_config()
+                .unwrap()
+                .proxy
+                .api_key,
+            "offline-config-synthetic-secret"
+        );
+        let raw_account = std::fs::read_to_string(&path).unwrap();
+        for secret in [
+            "offline-access-secret",
+            "offline-refresh-secret",
+            "offline-id-secret",
+        ] {
+            assert!(!raw_account.contains(secret));
+        }
+        assert_eq!(
+            account::load_account(&record.id)
+                .unwrap()
+                .token
+                .refresh_token,
+            "offline-refresh-secret"
+        );
+        assert_eq!(
+            crate::modules::user_token_db::reveal_token("offline-device-fixture").unwrap(),
+            "offline-device-synthetic-secret"
+        );
+        let stored: String = crate::modules::user_token_db::connect_db()
+            .unwrap()
+            .query_row(
+                "SELECT token FROM user_tokens WHERE id='offline-device-fixture'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(stored.starts_with("sha256:"));
+        assert_ne!(stored, "offline-device-synthetic-secret");
+    }
+
+    #[tokio::test]
+    async fn offline_credentials_migration_rejects_unrecognized_arguments_before_io() {
+        let args = vec![
+            "antigravity-tools".into(),
+            "credentials-migrate".into(),
+            "--unknown".into(),
+        ];
+        assert!(try_handle_cli(&args)
+            .await
+            .unwrap_err()
+            .contains("accepts no arguments"));
+    }
 
     #[test]
     fn test_truncate_str() {

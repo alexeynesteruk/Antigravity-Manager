@@ -50,6 +50,7 @@ task_local! {
 
 /// 一条客户端请求在网关内部的运行期上下文
 pub struct RequestContext {
+    safety: OnceLock<Arc<super::admission::SafetyPermit>>,
     deadline: std::time::Instant,
     upstream_calls: AtomicUsize,
     estimated_tokens: AtomicU32,
@@ -58,6 +59,7 @@ pub struct RequestContext {
 impl RequestContext {
     pub fn new(deadline: std::time::Instant) -> Arc<Self> {
         Arc::new(Self {
+            safety: OnceLock::new(),
             deadline,
             upstream_calls: AtomicUsize::new(0),
             estimated_tokens: AtomicU32::new(0),
@@ -77,10 +79,19 @@ impl RequestContext {
     /// 否则正常的并行会被误判成“重放放大”，第 3 张图就会被护栏拦下。
     pub fn fork(&self) -> Arc<Self> {
         Arc::new(Self {
+            safety: self.safety.clone(),
             deadline: self.deadline,
             upstream_calls: AtomicUsize::new(0),
             estimated_tokens: AtomicU32::new(self.estimated_tokens.load(Ordering::Relaxed)),
         })
+    }
+
+    pub fn set_safety(&self, permit: Arc<super::admission::SafetyPermit>) {
+        let _ = self.safety.set(permit);
+    }
+
+    pub fn safety(&self) -> Option<Arc<super::admission::SafetyPermit>> {
+        self.safety.get().cloned()
     }
 
     /// 记录一次上游调用并返回其序号（1-based）
@@ -118,6 +129,14 @@ pub fn deadline_now() -> std::time::Instant {
 /// 在给定 future 上挂载请求上下文
 pub async fn scope<F: std::future::Future>(ctx: Arc<RequestContext>, fut: F) -> F::Output {
     REQUEST_CONTEXT.scope(ctx, fut).await
+}
+
+/// Restore the same request limits while a lazy HTTP body is polled or dropped.
+pub(crate) fn sync_scope<R>(ctx: Option<Arc<RequestContext>>, work: impl FnOnce() -> R) -> R {
+    match ctx {
+        Some(ctx) => REQUEST_CONTEXT.sync_scope(ctx, work),
+        None => work(),
+    }
 }
 
 /// 在「可选」上下文上挂载请求预算（`None` 时直接执行）
@@ -267,13 +286,14 @@ mod tests {
 
     #[tokio::test]
     async fn large_body_replay_is_capped_but_small_body_is_not() {
+        let threshold = replay_guard_threshold_bytes();
         scope(RequestContext::new(deadline_now()), async {
             // 大 body：前 MAX_LARGE_BODY_UPSTREAM_CALLS 次放行，超额则拒绝
             for _ in 0..MAX_LARGE_BODY_UPSTREAM_CALLS {
-                assert!(register_upstream_call(REPLAY_GUARD_BODY_BYTES).is_ok());
+                assert!(register_upstream_call(threshold).is_ok());
             }
             assert_eq!(
-                register_upstream_call(REPLAY_GUARD_BODY_BYTES),
+                register_upstream_call(threshold),
                 Err(MAX_LARGE_BODY_UPSTREAM_CALLS + 1),
                 "large-body upstream call beyond limit must be blocked"
             );
@@ -283,7 +303,7 @@ mod tests {
         scope(RequestContext::new(deadline_now()), async {
             // 小 body（如低于 4MB 的常规请求）：不设次数上限
             for _ in 0..20 {
-                assert!(register_upstream_call(1024).is_ok());
+                assert!(register_upstream_call(threshold.saturating_sub(1)).is_ok());
             }
         })
         .await;
@@ -291,6 +311,7 @@ mod tests {
 
     #[tokio::test]
     async fn fork_shares_deadline_but_resets_replay_counter() {
+        let threshold = replay_guard_threshold_bytes();
         // 并行子任务（如一次生成 n 张图）共享同一个截止时刻，但重放计数必须各算各的：
         // 否则第 4 张图就会被“大 body 重放上限”误拦。
         let parent = RequestContext::new(deadline_now());
@@ -299,13 +320,13 @@ mod tests {
 
         scope(parent, async move {
             for _ in 0..MAX_LARGE_BODY_UPSTREAM_CALLS {
-                assert!(register_upstream_call(REPLAY_GUARD_BODY_BYTES).is_ok());
+                assert!(register_upstream_call(threshold).is_ok());
             }
-            assert!(register_upstream_call(REPLAY_GUARD_BODY_BYTES).is_err());
+            assert!(register_upstream_call(threshold).is_err());
 
             scope(child, async {
                 for _ in 0..MAX_LARGE_BODY_UPSTREAM_CALLS {
-                    assert!(register_upstream_call(REPLAY_GUARD_BODY_BYTES).is_ok());
+                    assert!(register_upstream_call(threshold).is_ok());
                 }
             })
             .await;

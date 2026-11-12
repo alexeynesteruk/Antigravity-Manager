@@ -166,50 +166,51 @@ pub async fn import_from_v1() -> Result<Vec<Account>, String> {
                             "Importing account: {}",
                             email_placeholder
                         ));
-                        let (email, access_token, expires_in, oauth_client_key) =
-                            match oauth::refresh_access_token(&refresh_token, None).await {
-                                Ok(token_resp) => {
-                                    let oauth_client_key = token_resp.oauth_client_key.clone();
-                                    match oauth::get_user_info(&token_resp.access_token, None).await
-                                    {
-                                        Ok(user_info) => (
-                                            user_info.email,
-                                            token_resp.access_token,
-                                            token_resp.expires_in,
-                                            oauth_client_key,
-                                        ),
-                                        Err(_) => (
-                                            email_placeholder.clone(),
-                                            token_resp.access_token,
-                                            token_resp.expires_in,
-                                            oauth_client_key,
-                                        ),
-                                    }
-                                }
-                                Err(e) => {
-                                    crate::modules::logger::log_warn(&format!(
-                                        "Token refresh failed (likely expired): {}",
-                                        e
-                                    ));
-                                    (
-                                        email_placeholder.clone(),
-                                        "imported_access_token".to_string(),
-                                        0,
-                                        None,
-                                    )
-                                }
-                            };
-                        let token_data = TokenData::new(
-                            access_token,
-                            refresh_token,
-                            expires_in,
-                            Some(email.clone()),
-                            None, // project_id will be fetched on demand
-                            None, // session_id
-                            true, // V1 tokens are Antigravity Google OAuth tokens
-                            None, // V1 doesn't have id_token saved
+                        let token_data = match oauth::refresh_access_token_for_import(
+                            &refresh_token,
+                            None,
                         )
-                        .with_oauth_client_key(oauth_client_key);
+                        .await
+                        {
+                            Ok(token_resp) => {
+                                let email = match oauth::get_user_info(
+                                    &token_resp.access_token,
+                                    None,
+                                )
+                                .await
+                                {
+                                    Ok(info) => info.email,
+                                    Err(_) => email_placeholder.clone(),
+                                };
+                                oauth::token_data_for_import(
+                                    &token_resp,
+                                    &refresh_token,
+                                    Some(email),
+                                    None,
+                                    true,
+                                )
+                            }
+                            Err(error) => {
+                                crate::modules::logger::log_warn(&format!(
+                                    "Token refresh failed (likely expired): {}",
+                                    error
+                                ));
+                                TokenData::new(
+                                    "imported_access_token".into(),
+                                    refresh_token,
+                                    0,
+                                    Some(email_placeholder.clone()),
+                                    None,
+                                    None,
+                                    true,
+                                    None,
+                                )
+                            }
+                        };
+                        let email = token_data
+                            .email
+                            .clone()
+                            .unwrap_or_else(|| email_placeholder.clone());
                         // Name already fetched in get_user_info at line 153, but outside match scope, use None to be safe
                         match account::upsert_account(email.clone(), None, token_data) {
                             Ok(acc) => {
@@ -259,24 +260,20 @@ pub async fn import_from_custom_db_file(path: PathBuf) -> Result<Account, String
 
     // 3. Use Refresh Token to get latest Access Token and user info
     crate::modules::logger::log_info("Getting user info using Refresh Token...");
-    let token_resp = oauth::refresh_access_token(&refresh_token, None).await?;
+    let token_resp = oauth::refresh_access_token_for_import(&refresh_token, None).await?;
     let user_info = oauth::get_user_info(&token_resp.access_token, None).await?;
 
     let email = user_info.email;
 
     crate::modules::logger::log_info(&format!("Successfully retrieved account info: {}", email));
 
-    let token_data = TokenData::new(
-        token_resp.access_token,
-        refresh_token,
-        token_resp.expires_in,
+    let token_data = oauth::token_data_for_import(
+        &token_resp,
+        &refresh_token,
         Some(email.clone()),
         oauth_state.project_id,
-        None, // session_id will be generated in token_manager
         oauth_state.is_gcp_tos,
-        token_resp.id_token,
-    )
-    .with_oauth_client_key(token_resp.oauth_client_key);
+    );
     // 4. Add or update account
     account::upsert_account(email.clone(), user_info.name, token_data)
 }
@@ -296,22 +293,20 @@ pub async fn import_all_local_accounts(target_ide: Option<&str>) -> Result<Vec<A
                 crate::modules::logger::log_info(
                     "Discovered OAuth state in System Keyring/Keychain",
                 );
-                if let Ok(token_resp) = oauth::refresh_access_token(&refresh_token, None).await {
+                if let Ok(token_resp) =
+                    oauth::refresh_access_token_for_import(&refresh_token, None).await
+                {
                     let email = match oauth::get_user_info(&token_resp.access_token, None).await {
                         Ok(info) => info.email,
                         Err(_) => "Unknown".to_string(),
                     };
-                    let token_data = TokenData::new(
-                        token_resp.access_token,
-                        refresh_token,
-                        token_resp.expires_in,
+                    let token_data = oauth::token_data_for_import(
+                        &token_resp,
+                        &refresh_token,
                         Some(email.clone()),
                         oauth_state.project_id,
-                        None,
                         oauth_state.is_gcp_tos,
-                        token_resp.id_token,
-                    )
-                    .with_oauth_client_key(token_resp.oauth_client_key);
+                    );
 
                     if let Ok(acc) = account::upsert_account(email, None, token_data) {
                         imported_accounts.push(acc);
@@ -328,22 +323,20 @@ pub async fn import_all_local_accounts(target_ide: Option<&str>) -> Result<Vec<A
             crate::modules::logger::log_info(
                 "Discovered OAuth state in Antigravity CLI credentials",
             );
-            if let Ok(token_resp) = oauth::refresh_access_token(&refresh_token, None).await {
+            if let Ok(token_resp) =
+                oauth::refresh_access_token_for_import(&refresh_token, None).await
+            {
                 let email = match oauth::get_user_info(&token_resp.access_token, None).await {
                     Ok(info) => info.email,
                     Err(_) => "Unknown".to_string(),
                 };
-                let token_data = TokenData::new(
-                    token_resp.access_token,
-                    refresh_token,
-                    token_resp.expires_in,
+                let token_data = oauth::token_data_for_import(
+                    &token_resp,
+                    &refresh_token,
                     Some(email.clone()),
                     oauth_state.project_id,
-                    None,
                     oauth_state.is_gcp_tos,
-                    token_resp.id_token,
-                )
-                .with_oauth_client_key(token_resp.oauth_client_key);
+                );
 
                 if let Ok(acc) = account::upsert_account(email, None, token_data) {
                     imported_accounts.push(acc);
@@ -359,22 +352,20 @@ pub async fn import_all_local_accounts(target_ide: Option<&str>) -> Result<Vec<A
             crate::modules::logger::log_info(
                 "Discovered OAuth state in Antigravity ACP IDE Plugin credentials",
             );
-            if let Ok(token_resp) = oauth::refresh_access_token(&refresh_token, None).await {
+            if let Ok(token_resp) =
+                oauth::refresh_access_token_for_import(&refresh_token, None).await
+            {
                 let email = match oauth::get_user_info(&token_resp.access_token, None).await {
                     Ok(info) => info.email,
                     Err(_) => "Unknown".to_string(),
                 };
-                let token_data = TokenData::new(
-                    token_resp.access_token,
-                    refresh_token,
-                    token_resp.expires_in,
+                let token_data = oauth::token_data_for_import(
+                    &token_resp,
+                    &refresh_token,
                     Some(email.clone()),
                     oauth_state.project_id,
-                    None,
                     oauth_state.is_gcp_tos,
-                    token_resp.id_token,
-                )
-                .with_oauth_client_key(token_resp.oauth_client_key);
+                );
 
                 if let Ok(acc) = account::upsert_account(email, None, token_data) {
                     imported_accounts.push(acc);
@@ -399,24 +390,21 @@ pub async fn import_all_local_accounts(target_ide: Option<&str>) -> Result<Vec<A
                         "Discovered OAuth state in Antigravity DB path: {:?}",
                         db_path
                     ));
-                    if let Ok(token_resp) = oauth::refresh_access_token(&refresh_token, None).await
+                    if let Ok(token_resp) =
+                        oauth::refresh_access_token_for_import(&refresh_token, None).await
                     {
                         let email = match oauth::get_user_info(&token_resp.access_token, None).await
                         {
                             Ok(info) => info.email,
                             Err(_) => "Unknown".to_string(),
                         };
-                        let token_data = TokenData::new(
-                            token_resp.access_token,
-                            refresh_token,
-                            token_resp.expires_in,
+                        let token_data = oauth::token_data_for_import(
+                            &token_resp,
+                            &refresh_token,
                             Some(email.clone()),
                             oauth_state.project_id,
-                            None,
                             oauth_state.is_gcp_tos,
-                            token_resp.id_token,
-                        )
-                        .with_oauth_client_key(token_resp.oauth_client_key);
+                        );
 
                         if let Ok(acc) = account::upsert_account(email, None, token_data) {
                             imported_accounts.push(acc);

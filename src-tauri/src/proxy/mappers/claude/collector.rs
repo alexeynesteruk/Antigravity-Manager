@@ -274,6 +274,11 @@ where
 
             "error" => {
                 // 错误事件
+                if let Some(error) =
+                    crate::proxy::pipeline::account_safety::account_attention_payload(&event.data)
+                {
+                    return Err(error.to_string());
+                }
                 let error_data = event.data.get("error").unwrap_or(&event.data);
                 let message = error_data
                     .get("message")

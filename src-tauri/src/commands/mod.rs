@@ -412,6 +412,24 @@ pub async fn refresh_all_quotas(
 ) -> Result<RefreshStats, String> {
     refresh_all_quotas_internal(&proxy_state, Some(app_handle)).await
 }
+
+#[tauri::command]
+pub async fn refresh_all_quotas_automatically(
+    proxy_state: tauri::State<'_,crate::commands::proxy::ProxyServiceState>,
+    app_handle: tauri::AppHandle,
+) -> Result<RefreshStats,String> {
+    crate::proxy::pipeline::admission::run_automatic(refresh_all_quotas_internal(&proxy_state,Some(app_handle))).await
+}
+
+#[tauri::command]
+pub async fn fetch_account_quota_automatically(
+    app: tauri::AppHandle,
+    proxy_state: tauri::State<'_,crate::commands::proxy::ProxyServiceState>,
+    account_id: String,
+) -> crate::error::AppResult<QuotaData> {
+    let context=crate::proxy::pipeline::admission::automatic_context().await.map_err(crate::error::AppError::Account)?;
+    crate::proxy::pipeline::budget::scope(context,fetch_account_quota(app,proxy_state,account_id)).await
+}
 /// 获取设备指纹（当前 storage.json + 账号绑定）
 #[tauri::command]
 pub async fn get_device_profiles(

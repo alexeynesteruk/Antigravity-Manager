@@ -6,6 +6,18 @@ import * as accountService from '../services/accountService';
 // request, which otherwise repeats the same filesystem/process work three times.
 let activeClientsRefresh: Promise<void> | null = null;
 let activeClientsGeneration = 0;
+let accountsGeneration = 0;
+let currentAccountGeneration = 0;
+let currentAccountReadInFlight: number | null = null;
+
+function invalidateAccountSnapshots() {
+    // A true result requires a replacement current read: invalidation alone
+    // could discard a concurrent switch's authoritative account identity.
+    const needsCurrentAccountRefresh = currentAccountReadInFlight !== null;
+    accountsGeneration += 1;
+    currentAccountGeneration += 1;
+    return needsCurrentAccountRefresh;
+}
 
 function invalidateActiveClientsRefresh() {
     activeClientsGeneration += 1;
@@ -27,8 +39,8 @@ interface AccountState {
     deleteAccount: (accountId: string) => Promise<void>;
     deleteAccounts: (accountIds: string[]) => Promise<void>;
     switchAccount: (accountId: string, targetIde?: string) => Promise<void>;
-    refreshQuota: (accountId: string) => Promise<void>;
-    refreshAllQuotas: () => Promise<accountService.RefreshStats>;
+    refreshQuota: (accountId: string, automatic?: boolean) => Promise<void>;
+    refreshAllQuotas: (automatic?: boolean) => Promise<accountService.RefreshStats>;
     reorderAccounts: (accountIds: string[]) => Promise<void>;
 
     // New actions
@@ -64,6 +76,7 @@ export const useAccountStore = create<AccountState>((set, get) => ({
     error: null,
 
     fetchAccounts: async () => {
+        const generation = ++accountsGeneration;
         set({ loading: true, error: null });
         try {
             console.log('[Store] Fetching accounts...');
@@ -71,23 +84,27 @@ export const useAccountStore = create<AccountState>((set, get) => ({
                 accountService.listAccounts(),
                 get().fetchActiveClients()
             ]);
-            set({ accounts, loading: false });
+            if (generation === accountsGeneration) set({ accounts, loading: false });
         } catch (error) {
             console.error('[Store] Fetch accounts failed:', error);
-            set({ error: String(error), loading: false });
+            if (generation === accountsGeneration) set({ error: String(error), loading: false });
         }
     },
 
     fetchCurrentAccount: async () => {
+        const generation = ++currentAccountGeneration;
+        currentAccountReadInFlight = generation;
         set({ loading: true, error: null });
         try {
             const [account] = await Promise.all([
                 accountService.getCurrentAccount(),
                 get().fetchActiveClients()
             ]);
-            set({ currentAccount: account, loading: false });
+            if (generation === currentAccountGeneration) set({ currentAccount: account, loading: false });
         } catch (error) {
-            set({ error: String(error), loading: false });
+            if (generation === currentAccountGeneration) set({ error: String(error), loading: false });
+        } finally {
+            if (currentAccountReadInFlight === generation) currentAccountReadInFlight = null;
         }
     },
 
@@ -118,8 +135,12 @@ export const useAccountStore = create<AccountState>((set, get) => ({
         set({ loading: true, error: null });
         try {
             await accountService.addAccount(email, refreshToken);
+            const refreshCurrentAccount = invalidateAccountSnapshots();
             invalidateActiveClientsRefresh();
-            await get().fetchAccounts();
+            await Promise.all([
+                get().fetchAccounts(),
+                refreshCurrentAccount ? get().fetchCurrentAccount() : Promise.resolve(),
+            ]);
             set({ loading: false });
         } catch (error) {
             set({ error: String(error), loading: false });
@@ -131,6 +152,7 @@ export const useAccountStore = create<AccountState>((set, get) => ({
         set({ loading: true, error: null });
         try {
             await accountService.deleteAccount(accountId);
+            invalidateAccountSnapshots();
             invalidateActiveClientsRefresh();
             await Promise.all([
                 get().fetchAccounts(),
@@ -147,6 +169,7 @@ export const useAccountStore = create<AccountState>((set, get) => ({
         set({ loading: true, error: null });
         try {
             await accountService.deleteAccounts(accountIds);
+            invalidateAccountSnapshots();
             invalidateActiveClientsRefresh();
             await Promise.all([
                 get().fetchAccounts(),
@@ -154,6 +177,11 @@ export const useAccountStore = create<AccountState>((set, get) => ({
             ]);
             set({ loading: false });
         } catch (error) {
+            // The index may already be committed when credential cleanup fails.
+            // Refresh the durable state while preserving the original error.
+            invalidateAccountSnapshots();
+            invalidateActiveClientsRefresh();
+            await Promise.all([get().fetchAccounts(), get().fetchCurrentAccount()]);
             set({ error: String(error), loading: false });
             throw error;
         }
@@ -163,6 +191,7 @@ export const useAccountStore = create<AccountState>((set, get) => ({
         set({ loading: true, error: null });
         try {
             await accountService.switchAccount(accountId, targetIde);
+            invalidateAccountSnapshots();
             // An earlier discovery may describe the client before the switch.
             // Do not let its eventual completion replace the new client state.
             invalidateActiveClientsRefresh();
@@ -176,7 +205,7 @@ export const useAccountStore = create<AccountState>((set, get) => ({
             // Asynchronously refresh quota to update the dashboard, do not block the UI
             // NOTE: We call the service directly instead of get().refreshQuota() to avoid
             // re-setting loading=true after we just set loading=false.
-            accountService.fetchAccountQuota(accountId)
+            accountService.fetchAccountQuota(accountId, true)
                 .then(() => {
                     invalidateActiveClientsRefresh();
                     return Promise.all([
@@ -193,10 +222,10 @@ export const useAccountStore = create<AccountState>((set, get) => ({
         }
     },
 
-    refreshQuota: async (accountId: string) => {
+    refreshQuota: async (accountId: string, automatic = false) => {
         set({ loading: true, error: null });
         try {
-            await accountService.fetchAccountQuota(accountId);
+            await accountService.fetchAccountQuota(accountId, automatic);
             await get().fetchAccounts();
             
             const { currentAccount } = get();
@@ -211,10 +240,10 @@ export const useAccountStore = create<AccountState>((set, get) => ({
         }
     },
 
-    refreshAllQuotas: async () => {
+    refreshAllQuotas: async (automatic = false) => {
         set({ loading: true, error: null });
         try {
-            const stats = await accountService.refreshAllQuotas();
+            const stats = await accountService.refreshAllQuotas(automatic);
             await get().fetchAccounts();
             set({ loading: false });
             return stats;
@@ -229,6 +258,7 @@ export const useAccountStore = create<AccountState>((set, get) => ({
      * Uses an optimistic update strategy: update local state first, then call the backend to persist, for a smooth drag experience
      */
     reorderAccounts: async (accountIds: string[]) => {
+        const generation = ++accountsGeneration;
         const { accounts } = get();
 
         // Create an ID-to-account map
@@ -244,14 +274,14 @@ export const useAccountStore = create<AccountState>((set, get) => ({
         const finalAccounts = [...reorderedAccounts, ...remainingAccounts];
 
         // Optimistically update local state
-        set({ accounts: finalAccounts });
+        set({ accounts: finalAccounts, loading: false });
 
         try {
             await accountService.reorderAccounts(accountIds);
         } catch (error) {
             // Roll back to the original order if the backend call fails
             console.error('[AccountStore] Reorder accounts failed:', error);
-            set({ accounts });
+            if (generation === accountsGeneration) set({ accounts });
             throw error;
         }
     },
@@ -345,15 +375,18 @@ export const useAccountStore = create<AccountState>((set, get) => ({
     },
 
     syncAccountFromDb: async () => {
+        const generation = ++currentAccountGeneration;
         try {
             const syncedAccount = await accountService.syncAccountFromDb();
             if (syncedAccount) {
                 console.log('[AccountStore] Account synced from DB:', syncedAccount.email);
                 await get().fetchAccounts();
-                set({ currentAccount: syncedAccount });
+                if (generation === currentAccountGeneration) set({ currentAccount: syncedAccount, loading: false });
             }
         } catch (error) {
             console.error('[AccountStore] Sync from DB failed:', error);
+        } finally {
+            if (generation === currentAccountGeneration) set({ loading: false });
         }
     },
 
@@ -397,6 +430,7 @@ export const useAccountStore = create<AccountState>((set, get) => ({
 
     updateAccountPriority: async (accountId, priority, modelPriorities) => {
         await accountService.updateAccountPriority(accountId, priority, modelPriorities);
+        const refreshCurrentAccount = invalidateAccountSnapshots();
         const cleanModelPriorities =
             modelPriorities !== undefined
                 ? Object.fromEntries(
@@ -406,6 +440,7 @@ export const useAccountStore = create<AccountState>((set, get) => ({
                   )
                 : undefined;
         set(state => ({
+            loading: false,
             accounts: state.accounts.map(account =>
                 account.id === accountId
                     ? {
@@ -438,11 +473,16 @@ export const useAccountStore = create<AccountState>((set, get) => ({
                       }
                     : state.currentAccount,
         }));
+        // An invalidated read may describe a concurrent account switch. Replace
+        // it so a field edit cannot leave the previous account identity visible.
+        if (refreshCurrentAccount) void get().fetchCurrentAccount();
     },
 
     updateAccountProjectId: async (accountId, projectId) => {
         await accountService.updateAccountProjectId(accountId, projectId);
+        const refreshCurrentAccount = invalidateAccountSnapshots();
         set(state => ({
+            loading: false,
             accounts: state.accounts.map(account =>
                 account.id === accountId
                     ? { ...account, token: { ...account.token, project_id: projectId.trim() || undefined } }
@@ -453,11 +493,14 @@ export const useAccountStore = create<AccountState>((set, get) => ({
                     ? { ...state.currentAccount, token: { ...state.currentAccount.token, project_id: projectId.trim() || undefined } }
                     : state.currentAccount,
         }));
+        if (refreshCurrentAccount) void get().fetchCurrentAccount();
     },
 
     autoFetchAccountProjectId: async (accountId) => {
         const projectId = await accountService.autoFetchAccountProjectId(accountId);
+        const refreshCurrentAccount = invalidateAccountSnapshots();
         set(state => ({
+            loading: false,
             accounts: state.accounts.map(account =>
                 account.id === accountId
                     ? { ...account, token: { ...account.token, project_id: projectId.trim() || undefined } }
@@ -468,18 +511,20 @@ export const useAccountStore = create<AccountState>((set, get) => ({
                     ? { ...state.currentAccount, token: { ...state.currentAccount.token, project_id: projectId.trim() || undefined } }
                     : state.currentAccount,
         }));
+        if (refreshCurrentAccount) void get().fetchCurrentAccount();
         return projectId;
     },
 
     updateAccountLabel: async (accountId: string, label: string) => {
         try {
             await accountService.updateAccountLabel(accountId, label);
+            accountsGeneration += 1;
             // Optimistically update local state
             const { accounts } = get();
             const updatedAccounts = accounts.map(acc =>
                 acc.id === accountId ? { ...acc, custom_label: label || undefined } : acc
             );
-            set({ accounts: updatedAccounts });
+            set({ accounts: updatedAccounts, loading: false });
         } catch (error) {
             console.error('[AccountStore] Update label failed:', error);
             throw error;

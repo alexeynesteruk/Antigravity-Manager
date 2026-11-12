@@ -69,6 +69,13 @@ fn app_with_limit(capture: Capture, body_limit: usize) -> Router {
         api_key: TEST_KEY.to_string(),
         admin_password: None,
         allow_lan_access: false,
+        tls_network_exposed: false,
+        listener_authorities: crate::proxy::middleware::cors::listener_authorities(
+            "127.0.0.1",
+            8045,
+            None,
+        )
+        .unwrap(),
         port: 8045,
         security_monitor: Default::default(),
     }));

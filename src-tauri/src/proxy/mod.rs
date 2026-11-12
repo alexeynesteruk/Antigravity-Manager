@@ -4,6 +4,7 @@
 pub mod config;
 pub mod project_resolver;
 pub mod security;
+pub mod tls;
 pub mod server;
 pub mod session_bindings;
 pub mod token_manager;

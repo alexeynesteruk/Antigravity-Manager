@@ -99,7 +99,11 @@ pub fn spawn_startup_quota_refresh(
             account_count, app_config.startup_refresh_max_accounts
         ));
 
-        match crate::commands::refresh_all_quotas_internal(&proxy_state, app_handle).await {
+        match crate::proxy::pipeline::admission::run_automatic(
+            crate::commands::refresh_all_quotas_internal(&proxy_state, app_handle),
+        )
+        .await
+        {
             Ok(stats) => logger::log_info(&format!(
                 "[StartupRefresh] Startup quota refresh completed: {}/{} success, {} failed",
                 stats.success, stats.total, stats.failed

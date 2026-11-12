@@ -76,6 +76,13 @@ fn router(running: bool, auth_mode: ProxyAuthMode, observed: Observations) -> Ro
         api_key: PROXY_KEY.to_string(),
         admin_password: Some(ADMIN_PASSWORD.to_string()),
         allow_lan_access: true,
+        tls_network_exposed: false,
+        listener_authorities: crate::proxy::middleware::cors::listener_authorities(
+            "127.0.0.1",
+            8045,
+            None,
+        )
+        .unwrap(),
         port: 8045,
         security_monitor: crate::proxy::config::SecurityMonitorConfig {
             cors_allowed_origins: vec![BROWSER_ORIGIN.to_string()],
@@ -125,6 +132,7 @@ fn request(
     body: Body,
 ) -> Request {
     let mut builder = Request::builder()
+        .header(header::HOST, "127.0.0.1:8045")
         .method(Method::POST)
         .uri(path)
         .header(header::CONTENT_TYPE, "application/json")
@@ -182,7 +190,11 @@ async fn paused_ai_service_keeps_static_ui_admin_and_callback_accessible() {
         ("/", "<html>Account management</html>"),
         ("/assets/app.js", "window.managementReady = true;"),
     ] {
-        let request = Request::builder().uri(path).body(Body::empty()).unwrap();
+        let request = Request::builder()
+            .header(header::HOST, "127.0.0.1:8045")
+            .uri(path)
+            .body(Body::empty())
+            .unwrap();
         let response = app.clone().oneshot(request).await.unwrap();
         assert_eq!(response.status(), StatusCode::OK, "{path}");
         let body = axum::body::to_bytes(response.into_body(), 4096)
@@ -191,7 +203,11 @@ async fn paused_ai_service_keeps_static_ui_admin_and_callback_accessible() {
         assert_eq!(body.as_ref(), content.as_bytes());
     }
     for path in ["/health", "/api/health", "/auth/callback"] {
-        let request = Request::builder().uri(path).body(Body::empty()).unwrap();
+        let request = Request::builder()
+            .header(header::HOST, "127.0.0.1:8045")
+            .uri(path)
+            .body(Body::empty())
+            .unwrap();
         assert_eq!(
             app.clone().oneshot(request).await.unwrap().status(),
             StatusCode::NO_CONTENT,
@@ -422,6 +438,7 @@ async fn normal_preflight_and_health_remain_available_while_service_is_stopped()
     assert_eq!(observed.monitored.load(Ordering::SeqCst), 0);
     assert_eq!(observed.mutations.load(Ordering::SeqCst), 0);
     let health = Request::builder()
+        .header(header::HOST, "127.0.0.1:8045")
         .uri("/health")
         .body(Body::empty())
         .unwrap();
@@ -471,18 +488,15 @@ async fn real_loopback_transport_preserves_internal_auth_and_stopped_service_bou
     let app = router(false, ProxyAuthMode::Strict, observed.clone());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
-    let (shutdown, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
-    let server = tokio::spawn(async move {
-        axum::serve(
-            listener,
-            app.into_make_service_with_connect_info::<SocketAddr>(),
-        )
-        .with_graceful_shutdown(async {
-            let _ = shutdown_rx.await;
-        })
-        .await
-        .unwrap();
-    });
+    // Exercise the production transport: the authority gate uses the accepted
+    // socket's actual destination address and ephemeral port, as well as peer.
+    let shutdown = tokio_util::sync::CancellationToken::new();
+    let server = tokio::spawn(crate::proxy::tls::serve_listener(
+        listener,
+        None,
+        app,
+        shutdown.clone(),
+    ));
     let client = reqwest::Client::builder()
         .no_proxy()
         .timeout(std::time::Duration::from_secs(5))
@@ -539,7 +553,7 @@ async fn real_loopback_transport_preserves_internal_auth_and_stopped_service_bou
 
     drop(response);
     drop(client);
-    shutdown.send(()).unwrap();
+    shutdown.cancel();
     tokio::time::timeout(std::time::Duration::from_secs(3), server)
         .await
         .unwrap()

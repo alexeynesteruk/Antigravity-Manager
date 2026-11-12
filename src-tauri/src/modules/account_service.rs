@@ -18,7 +18,8 @@ impl AccountService {
 
         // 1. Get the Token (use the temporary ID to ensure proxy selection has a clear context)
         let token_res =
-            modules::oauth::refresh_access_token(refresh_token, Some(&temp_account_id)).await?;
+            modules::oauth::refresh_access_token_for_import(refresh_token, Some(&temp_account_id))
+                .await?;
 
         // 2. Get user information
         let user_info =
@@ -30,17 +31,13 @@ impl AccountService {
             .ok();
 
         // 4. Construct TokenData
-        let token = TokenData::new(
-            token_res.access_token.clone(),
-            refresh_token.to_string(),
-            token_res.expires_in,
+        let token = modules::oauth::token_data_for_import(
+            &token_res,
+            refresh_token,
             Some(user_info.email.clone()),
             project_id,
-            None,
-            false, // Personal accounts don't enable GCP TOS by default
-            token_res.id_token.clone(),
-        )
-        .with_oauth_client_key(token_res.oauth_client_key.clone());
+            false,
+        );
 
         // 5. Persist
         let mut account =

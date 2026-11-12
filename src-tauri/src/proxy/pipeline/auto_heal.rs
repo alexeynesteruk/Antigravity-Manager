@@ -320,7 +320,7 @@ fn inspect_gemini_candidate_parts(
 pub fn wrap_stream_with_empty_thinking_auto_heal<S, E>(
     stream: Pin<Box<S>>,
     ctx: ThinkingAutoHealContext,
-) -> Pin<Box<dyn Stream<Item = Result<Bytes, E>> + Send>>
+) -> Pin<Box<dyn Stream<Item = Result<Bytes, String>> + Send>>
 where
     S: Stream<Item = Result<Bytes, E>> + Send + 'static,
     E: std::fmt::Display + Send + 'static,
@@ -433,7 +433,7 @@ where
                     }
                 }
                 Err(e) => {
-                    yield Err(e);
+                    yield Err(e.to_string());
                     return;
                 }
             }
@@ -554,6 +554,21 @@ where
                 }
                 Ok(call_fail) => {
                     let status = call_fail.response.status();
+                    let body = tokio::time::timeout(
+                        std::time::Duration::from_secs(crate::proxy::pipeline::budget::clamp_secs(15)),
+                        call_fail.response.text(),
+                    ).await.ok().and_then(Result::ok).unwrap_or_default();
+                    if crate::proxy::pipeline::account_safety::AccountAttention::classify(status.as_u16(), &body).is_some() {
+                        // Preserve a provider challenge instead of turning it into
+                        // synthetic success. The shared raw-stream guard pauses
+                        // the account and emits the terminal attention error.
+                        let (_, parsed) = crate::proxy::pipeline::errors::parse_raw_upstream_error(&body);
+                        let error = if parsed.get("error").is_some() { parsed } else {
+                            json!({"error": {"code": status.as_u16(), "message": body}})
+                        };
+                        yield Ok(Bytes::from(format!("data: {}\n\n", error)));
+                        return;
+                    }
                     tracing::error!(
                         "[{}] [Stream-AutoHeal] Continuation request returned HTTP {}. Injecting fallback message.",
                         ctx.trace_id, status
@@ -574,6 +589,7 @@ where
                     yield Ok(Bytes::from(fallback_chunk));
                 }
                 Err(e) => {
+                    if crate::proxy::pipeline::admission::error_from_encoded(&e).is_some() { yield Err(e); return; }
                     tracing::error!(
                         "[{}] [Stream-AutoHeal] Continuation request failed: {}. Injecting fallback message.",
                         ctx.trace_id, e

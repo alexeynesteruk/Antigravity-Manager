@@ -1,3 +1,4 @@
+use crate::proxy::handlers::common::{handle_upstream_account_safety, AccountSafetyAction};
 // Gemini Handler
 use axum::{
     body::Body,
@@ -490,6 +491,7 @@ pub async fn handle_generate(
         {
             Ok(r) => r,
             Err(e) => {
+                if let Some(response) = crate::proxy::pipeline::admission::response_from_encoded(&e) { return Ok(response); }
                 last_error = e.clone();
                 drop(image_permit.take());
                 // 终态（首字节 / 上传 / 全局预算 / 重放上限）都不是账号故障：
@@ -686,6 +688,11 @@ pub async fn handle_generate(
                         Box::pin(response_stream),
                         auto_heal_ctx,
                     );
+                let response_stream = crate::proxy::handlers::common::guard_upstream_account_stream(
+                    Box::pin(response_stream),
+                    token_manager.clone(),
+                    account_id.clone(),
+                );
                 let s_id = session_id.clone(); // Clone for stream closure
 
                 // [对齐其他协议] 上游已返回 200：立即向客户端返回响应头，
@@ -1012,6 +1019,34 @@ pub async fn handle_generate(
             .await
             .unwrap_or_else(|_| format!("HTTP {}", status_code));
         last_error = format!("HTTP {}: {}", status_code, error_text);
+        match handle_upstream_account_safety(
+            &token_manager,
+            &mut retry_state,
+            &account_id,
+            &access_token,
+            status_code,
+            &error_text,
+        )
+        .await
+        {
+            AccountSafetyAction::Continue => {}
+            AccountSafetyAction::RetrySame(refreshed) => {
+                retry_credentials = Some((
+                    refreshed,
+                    project_id.clone(),
+                    email.clone(),
+                    account_id.clone(),
+                    0,
+                    session_lease.clone(),
+                ));
+                force_rotate = false;
+                continue;
+            }
+            AccountSafetyAction::Stop(failure) => {
+                return Ok(failure.response());
+            }
+        }
+
         if debug_logger::is_payload_enabled(&debug_cfg) {
             let payload = json!({
                 "kind": "upstream_response_error",

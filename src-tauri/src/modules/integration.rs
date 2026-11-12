@@ -1,8 +1,8 @@
 use crate::models::Account;
 use crate::modules::{db, device, process, version};
 use std::fs;
-// Command 仅用于 macos/Linux 分支（security / secret-tool / kill），Windows 裁剪不导入以免 unused
-#[cfg(not(windows))]
+// Legacy ACP macOS compatibility and its tests still use the security utility.
+#[cfg(target_os = "macos")]
 use std::process::Command;
 
 pub trait SystemIntegration: Send + Sync {
@@ -90,10 +90,9 @@ fn apply_account_credentials(
     let mut use_keyring = false;
 
     // 硬防护（issue #3762、issue #3770、issue #3778）：
-    // 目标一旦确认为 IDE，执行全链路双写与权威对齐：
-    // 1. 注入 SQLite state.vscdb（供 VS Code 界面及扩展前端快速恢复会话与显示）
-    // 2. 写入系统 Keyring（服务 gemini:antigravity，供 IDE 2.6.0+ 后台核心 agy 语言服务作为首要真理源读取）
-    // 3. 同步写入文件级凭据回退 (~/.gemini/jetski-standalone-oauth-token 与 oauth_creds.json)
+    // IDE credentials must first be verified in the native store. Its existing
+    // client-owned SQLite format remains a compatibility boundary; JSON token
+    // fallbacks are never written for this target.
     let is_target_ide = is_ide
         || effective_target == Some("ide")
         || (effective_target != Some("classic")
@@ -103,8 +102,9 @@ fn apply_account_credentials(
 
     if is_target_ide {
         crate::modules::logger::log_info(
-            "[Desktop] Target is Antigravity IDE (VS Code architecture); performing dual write (SQLite state.vscdb + system Keyring + file fallback).",
+            "[Desktop] Target is Antigravity IDE; writing verified OS credentials and native client database metadata.",
         );
+        write_to_system_keyring_for_target(account, CredentialFiles::Ide)?;
 
         // 1.1 获取存储路径并写入设备 Profile
         if let Ok(storage_path) = device::get_storage_path(effective_target) {
@@ -138,20 +138,8 @@ fn apply_account_credentials(
         }
 
         // 1.3 同步写入系统 Keyring (针对 IDE 2.6.0+ agy 后台语言服务鉴权真理源)
-        if let Err(keyring_err) = write_to_system_keyring(account) {
-            crate::modules::logger::log_warn(&format!(
-                "[Desktop] Warning: Failed to write system Keyring for IDE: {}",
-                keyring_err
-            ));
-        }
-
-        // 1.4 IDE 2.6 file fallback (jetski + oauth_creds). A failed private
-        // fallback aborts the switch instead of leaving the previous account in place.
-        let home = dirs::home_dir()
-            .ok_or_else(|| "Failed to resolve user home directory".to_string())?;
-        write_file_credentials_in_dir(account, &home.join(".gemini"), CredentialFiles::Ide)?;
-        write_to_file_credentials(account, false)?;
-
+        // The native IDE database remains an explicit client-format boundary;
+        // no manager-created JSON fallback is written for this target.
         return Ok(());
     }
 
@@ -573,6 +561,18 @@ enum CredentialFiles {
     AntigravityCli,
 }
 
+fn publish_native_client_credentials(
+    target: CredentialFiles,
+    payload: &[u8],
+    file_compatibility: impl FnOnce() -> Result<(), String>,
+) -> Result<(), String> {
+    crate::modules::credential_store::store_client_secret("gemini", "antigravity", payload)?;
+    if target == CredentialFiles::Gemini {
+        file_compatibility()?;
+    }
+    Ok(())
+}
+
 fn write_to_system_keyring_for_target(
     account: &crate::models::Account,
     target: CredentialFiles,
@@ -628,246 +628,27 @@ fn write_to_system_keyring_for_target(
 
     // 2. 跨平台凭据注入
     #[cfg(target_os = "macos")]
-    {
+    let native_payload = {
         use base64::{engine::general_purpose::STANDARD, Engine as _};
-        let encoded_payload = STANDARD.encode(&payload_json);
-        let full_keyring_value = format!("go-keyring-base64:{}", encoded_payload);
-
-        // 2.1 macOS Keychain Access
-        // 删除旧的
-        let _ = Command::new("security")
-            .args([
-                "delete-generic-password",
-                "-s",
-                "gemini",
-                "-a",
-                "antigravity",
-            ])
-            .output();
-
-        // 写入新的 (-A 参数允许所有本地应用免密码、无感直接读取凭据)
-        let output = Command::new("security")
-            .args([
-                "add-generic-password",
-                "-s",
-                "gemini",
-                "-a",
-                "antigravity",
-                "-w",
-                &full_keyring_value,
-                "-A",
-            ])
-            .output()
-            .map_err(|e| format!("Failed to execute security command: {}", e))?;
-
-        if !output.status.success() {
-            let err_msg = String::from_utf8_lossy(&output.stderr);
-            return Err(format!("macOS security command failed: {}", err_msg.trim()));
-        }
-    }
-
-    #[cfg(target_os = "windows")]
-    {
-        // 2.2 Windows Credential Manager direct Win32 API calls to write raw UTF-8 bytes
-        use std::os::windows::ffi::OsStrExt;
-        use std::ptr;
-
-        #[repr(C)]
-        struct FILETIME {
-            dw_low_date_time: u32,
-            dw_high_date_time: u32,
-        }
-
-        #[repr(C)]
-        struct CREDENTIALW {
-            flags: u32,
-            cred_type: u32,
-            target_name: *const u16,
-            comment: *const u16,
-            last_written: FILETIME,
-            credential_blob_size: u32,
-            credential_blob: *const u8,
-            persist: u32,
-            attribute_count: u32,
-            attributes: *const std::ffi::c_void,
-            target_alias: *const u16,
-            user_name: *const u16,
-        }
-
-        #[link(name = "advapi32")]
-        extern "system" {
-            fn CredWriteW(credential: *const CREDENTIALW, flags: u32) -> i32;
-            fn CredDeleteW(target_name: *const u16, type_: u32, flags: u32) -> i32;
-        }
-
-        let target = "gemini:antigravity";
-        let user = "antigravity";
-        let secret = payload_json.as_bytes();
-
-        let target_wide: Vec<u16> = std::ffi::OsStr::new(target)
-            .encode_wide()
-            .chain(std::iter::once(0))
-            .collect();
-
-        let user_wide: Vec<u16> = std::ffi::OsStr::new(user)
-            .encode_wide()
-            .chain(std::iter::once(0))
-            .collect();
-
-        let cred = CREDENTIALW {
-            flags: 0,
-            cred_type: 1, // CRED_TYPE_GENERIC
-            target_name: target_wide.as_ptr(),
-            comment: ptr::null(),
-            last_written: FILETIME {
-                dw_low_date_time: 0,
-                dw_high_date_time: 0,
-            },
-            credential_blob_size: secret.len() as u32,
-            credential_blob: secret.as_ptr(),
-            persist: 2, // CRED_PERSIST_LOCAL_MACHINE
-            attribute_count: 0,
-            attributes: ptr::null(),
-            target_alias: ptr::null(),
-            user_name: user_wide.as_ptr(),
-        };
-
-        unsafe {
-            // Delete first to ensure we write clean
-            let _ = CredDeleteW(target_wide.as_ptr(), 1, 0);
-
-            let res = CredWriteW(&cred, 0);
-            if res == 0 {
-                let err = std::io::Error::last_os_error();
-                return Err(format!("Windows CredWriteW failed: {}", err));
-            }
-        }
-    }
-
-    #[cfg(target_os = "linux")]
-    {
-        // 2.3 Linux Secret Service API
-        // [FIX #3418] 在 Linux GNOME 环境下，Secret Service 往往同时存在 'login' 集合与 'default' 集合。
-        // agy CLI 读取凭据时严格从 'login' 集合检索。若未指定 --collection，secret-tool 会写入 default 集合，
-        // 导致两个集合内容分叉，agy 持续读取到 login 集合中的旧账号。
-        // 此处封装辅助函数：优先写入 login 集合，同时确保与 default 集合同步。
-        use std::io::Write;
-        use std::sync::mpsc;
-
-        let store_to_collection = |collection_opt: Option<&str>,
-                                   payload: &[u8]|
-         -> Result<(), String> {
-            let mut cmd = Command::new("secret-tool");
-            cmd.arg("store");
-            if let Some(col) = collection_opt {
-                cmd.arg(format!("--collection={}", col));
-                cmd.arg("--label=Password for 'antigravity' on 'gemini'");
-            } else {
-                cmd.arg("--label=gemini");
-            }
-            cmd.args(["service", "gemini", "username", "antigravity"]);
-            cmd.stdin(std::process::Stdio::piped())
-                .stdout(std::process::Stdio::piped())
-                .stderr(std::process::Stdio::piped());
-
-            let mut child = match cmd.spawn() {
-                Ok(child) => child,
-                Err(e) => {
-                    if e.kind() == std::io::ErrorKind::NotFound {
-                        return Err(
-                            "Linux Secret Service utility 'secret-tool' not found (未检测到 secret-tool 工具)。\n\
-                             Please install libsecret-tools to enable Keyring credential storage:\n\
-                             • Ubuntu / Debian: sudo apt install -y libsecret-tools\n\
-                             • Fedora / RHEL: sudo dnf install -y libsecret\n\
-                             • Arch Linux: sudo pacman -S libsecret"
-                                .to_string(),
-                        );
-                    }
-                    return Err(format!("Failed to spawn secret-tool: {}", e));
-                }
-            };
-
-            if let Some(mut stdin) = child.stdin.take() {
-                stdin
-                    .write_all(payload)
-                    .map_err(|e| format!("Failed to write to secret-tool stdin: {}", e))?;
-            }
-
-            let child_pid = child.id();
-            let (tx, rx) = mpsc::channel::<Result<std::process::Output, std::io::Error>>();
-            std::thread::spawn(move || {
-                let _ = tx.send(child.wait_with_output());
-            });
-
-            let output = match rx.recv_timeout(std::time::Duration::from_secs(10)) {
-                Ok(result) => {
-                    result.map_err(|e| format!("Failed to wait for secret-tool: {}", e))?
-                }
-                Err(_) => {
-                    let _ = Command::new("kill")
-                        .args(["-9", &child_pid.to_string()])
-                        .output();
-                    crate::modules::logger::log_error(
-                        "[Desktop] secret-tool store blocked for >10s — D-Bus session bus unreachable.",
-                    );
-                    return Err(
-                        "Keyring write timed out (10s). The D-Bus session bus is not reachable from this process."
-                            .to_string(),
-                    );
-                }
-            };
-
-            if !output.status.success() {
-                let err_msg = String::from_utf8_lossy(&output.stderr);
-                return Err(format!("Linux secret-tool failed: {}", err_msg.trim()));
-            }
-
-            Ok(())
-        };
-
-        // 1. 优先尝试写入 'login' 集合（agy CLI 所需）
-        let login_res = store_to_collection(
-            Some("/org/freedesktop/secrets/collection/login"),
-            payload_json.as_bytes(),
-        );
-
-        // 2. 同时写入默认集合（保证其他依赖 default collection 的系统工具也能读取）
-        let default_res = store_to_collection(None, payload_json.as_bytes());
-
-        // 尝试优先同步写入本地文件凭据 (~/.gemini/oauth_creds.json)
-        let _ = write_targeted_home_credentials(account, target);
-
-        // 若两者均失败，则返回错误；若至少一个成功，则记录并继续
-        if login_res.is_err() && default_res.is_err() {
-            return Err(login_res.unwrap_err());
-        } else if let Err(e) = login_res {
+        format!(
+            "go-keyring-base64:{}",
+            STANDARD.encode(payload_json.as_bytes())
+        )
+        .into_bytes()
+    };
+    #[cfg(not(target_os = "macos"))]
+    let native_payload = payload_json.into_bytes();
+    publish_native_client_credentials(target, &native_payload, || {
+        // Only the Gemini/native-classic official format retains file sync.
+        if let Err(error) = write_targeted_home_credentials(account, target) {
             crate::modules::logger::log_warn(&format!(
-                "[Desktop] Failed to write token to 'login' collection, falling back to default collection: {}",
-                e
+                "Native client file credential compatibility sync failed: {error}"
             ));
-        } else {
-            crate::modules::logger::log_info(
-                "[Desktop] Successfully synced credential to Secret Service 'login' collection.",
-            );
         }
-    }
-
-    crate::modules::logger::log_info(
-        "[Desktop] Successfully wrote token to system credential store.",
-    );
-
-    // 同步写入 ~/.gemini/ 目录下的文件凭据，兼容 SSH 会话、容器环境和无 Keyring/D-Bus 场景
-    if let Err(e) = write_targeted_home_credentials(account, target) {
-        if target != CredentialFiles::Gemini {
-            return Err(e);
-        }
-        crate::modules::logger::log_warn(&format!("[Desktop] File credential sync warning: {}", e));
-    }
-
-    Ok(())
+        Ok(())
+    })
 }
 
-/// 辅助方法：向指定目录同步写入本地文件凭据
 fn write_to_file_credentials_to_dir(
     gemini_dir: &std::path::Path,
     account: &crate::models::Account,
@@ -1088,8 +869,8 @@ fn write_targeted_home_credentials(
     account: &crate::models::Account,
     target: CredentialFiles,
 ) -> Result<(), String> {
-    let home = dirs::home_dir()
-        .ok_or_else(|| "Failed to resolve user home directory".to_string())?;
+    let home =
+        dirs::home_dir().ok_or_else(|| "Failed to resolve user home directory".to_string())?;
     write_file_credentials_in_dir(account, &home.join(".gemini"), target)
 }
 
@@ -1322,155 +1103,30 @@ fn verify_agy_credentials(expected: &str, stored: &str) -> Result<(), String> {
 fn read_system_credentials(
     allow_file_fallback: bool,
 ) -> Result<crate::modules::migration::ImportedOAuthState, String> {
-    #[cfg(target_os = "macos")]
+    let bytes = match crate::modules::credential_store::read_client_secret("gemini", "antigravity")
     {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            if allow_file_fallback {
+                if let Ok(imported) = read_from_file_credentials() {
+                    return Ok(imported);
+                }
+            }
+            return Err(error);
+        }
+    };
+    let text =
+        String::from_utf8(bytes).map_err(|_| "Native client credentials are not valid UTF-8")?;
+    if let Some(encoded) = text.strip_prefix("go-keyring-base64:") {
         use base64::{engine::general_purpose::STANDARD, Engine as _};
-        let output = Command::new("security")
-            .args([
-                "find-generic-password",
-                "-s",
-                "gemini",
-                "-a",
-                "antigravity",
-                "-w",
-            ])
-            .output()
-            .map_err(|e| format!("Failed to execute security command: {}", e))?;
-
-        if !output.status.success() {
-            if allow_file_fallback {
-                if let Ok(file_state) = read_from_file_credentials() {
-                    return Ok(file_state);
-                }
-            }
-            return Err("No credential found in macOS Keychain".to_string());
-        }
-
-        let secret_str = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        let payload_str = if secret_str.starts_with("go-keyring-base64:") {
-            let b64_part = &secret_str["go-keyring-base64:".len()..];
-            let decoded = STANDARD
-                .decode(b64_part)
-                .map_err(|e| format!("Base64 decode failed: {}", e))?;
-            String::from_utf8(decoded).map_err(|e| format!("UTF-8 decode failed: {}", e))?
-        } else {
-            secret_str
-        };
-
-        return parse_keyring_payload(&payload_str);
-    }
-
-    #[cfg(target_os = "windows")]
-    {
-        use std::os::windows::ffi::OsStrExt;
-        use std::ptr;
-
-        #[repr(C)]
-        struct FILETIME {
-            dw_low_date_time: u32,
-            dw_high_date_time: u32,
-        }
-
-        #[repr(C)]
-        struct CREDENTIALW {
-            flags: u32,
-            cred_type: u32,
-            target_name: *const u16,
-            comment: *const u16,
-            last_written: FILETIME,
-            credential_blob_size: u32,
-            credential_blob: *mut u8,
-            persist: u32,
-            attribute_count: u32,
-            attributes: *const std::ffi::c_void,
-            target_alias: *const u16,
-            user_name: *const u16,
-        }
-
-        #[link(name = "advapi32")]
-        extern "system" {
-            fn CredReadW(
-                target_name: *const u16,
-                type_: u32,
-                flags: u32,
-                credential: *mut *mut CREDENTIALW,
-            ) -> i32;
-            fn CredFree(buffer: *mut std::ffi::c_void);
-        }
-
-        let target = "gemini:antigravity";
-        let target_wide: Vec<u16> = std::ffi::OsStr::new(target)
-            .encode_wide()
-            .chain(std::iter::once(0))
-            .collect();
-
-        let mut cred_ptr: *mut CREDENTIALW = ptr::null_mut();
-        unsafe {
-            let res = CredReadW(target_wide.as_ptr(), 1, 0, &mut cred_ptr);
-            if res == 0 || cred_ptr.is_null() {
-                if allow_file_fallback {
-                    if let Ok(file_state) = read_from_file_credentials() {
-                        return Ok(file_state);
-                    }
-                }
-                return Err("No credential found in Windows Credential Manager".to_string());
-            }
-
-            let cred = &*cred_ptr;
-            let blob = std::slice::from_raw_parts(
-                cred.credential_blob,
-                cred.credential_blob_size as usize,
-            );
-            let payload_str = String::from_utf8_lossy(blob).to_string();
-            CredFree(cred_ptr as *mut std::ffi::c_void);
-
-            return parse_keyring_payload(&payload_str);
-        }
-    }
-
-    #[cfg(target_os = "linux")]
-    {
-        let output = match Command::new("secret-tool")
-            .args(["lookup", "service", "gemini", "username", "antigravity"])
-            .output()
-        {
-            Ok(out) => out,
-            Err(e) => {
-                if allow_file_fallback {
-                    if let Ok(file_state) = read_from_file_credentials() {
-                        return Ok(file_state);
-                    }
-                }
-                if e.kind() == std::io::ErrorKind::NotFound {
-                    return Err(
-                        "Linux Secret Service utility 'secret-tool' not found (未检测到 secret-tool 工具)。\n\
-                         Please install libsecret-tools to enable Keyring storage:\n\
-                         • Ubuntu / Debian: sudo apt install -y libsecret-tools\n\
-                         • Fedora / RHEL: sudo dnf install -y libsecret\n\
-                         • Arch Linux: sudo pacman -S libsecret"
-                            .to_string(),
-                    );
-                }
-                return Err(format!("Failed to execute secret-tool: {}", e));
-            }
-        };
-
-        if !output.status.success() {
-            if allow_file_fallback {
-                if let Ok(file_state) = read_from_file_credentials() {
-                    return Ok(file_state);
-                }
-            }
-            return Err("No credential found in Linux secret-tool".to_string());
-        }
-
-        let payload_str = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        return parse_keyring_payload(&payload_str);
-    }
-
-    #[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
-    {
-        Err("Keyring not supported on this operating system".to_string())
+        let bytes = STANDARD
+            .decode(encoded)
+            .map_err(|_| "Native client credential encoding is invalid")?;
+        let text = String::from_utf8(bytes)
+            .map_err(|_| "Native client credentials are not valid UTF-8")?;
+        parse_keyring_payload(&text)
+    } else {
+        parse_keyring_payload(&text)
     }
 }
 
@@ -1988,6 +1644,62 @@ impl SystemIntegration for SystemManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn protected_client_targets_never_invoke_file_fallback_even_on_native_failure() {
+        let _data = crate::proxy::monitor::prompt_log_tests::TestDataDir::new();
+        for target in [CredentialFiles::AntigravityCli, CredentialFiles::Ide] {
+            publish_native_client_credentials(target, b"synthetic-client-payload", || {
+                panic!("protected target wrote a file fallback")
+            })
+            .unwrap();
+            assert_eq!(
+                crate::modules::credential_store::read_client_secret("gemini", "antigravity")
+                    .unwrap(),
+                b"synthetic-client-payload"
+            );
+            assert!(publish_native_client_credentials(target, b"", || panic!(
+                "native failure fell back to a file"
+            ))
+            .is_err());
+        }
+    }
+
+    #[test]
+    fn protected_client_payload_roundtrips_through_native_store_legacy_reader() {
+        let _data = crate::proxy::monitor::prompt_log_tests::TestDataDir::new();
+        let account = Account::new(
+            "native-client-fixture".into(),
+            "native@example.invalid".into(),
+            crate::models::TokenData::new(
+                "synthetic-access".into(),
+                "synthetic-refresh".into(),
+                3600,
+                None,
+                None,
+                None,
+                false,
+                Some("synthetic-id".into()),
+            ),
+        );
+        for target in [CredentialFiles::AntigravityCli, CredentialFiles::Ide] {
+            write_to_system_keyring_for_target(&account, target).unwrap();
+            let read = read_from_system_keyring_only().unwrap();
+            let stored =
+                crate::modules::credential_store::read_client_secret("gemini", "antigravity")
+                    .unwrap();
+            let stored = String::from_utf8(stored).unwrap();
+            let json = if let Some(encoded) = stored.strip_prefix("go-keyring-base64:") {
+                use base64::{engine::general_purpose::STANDARD, Engine as _};
+                String::from_utf8(STANDARD.decode(encoded).unwrap()).unwrap()
+            } else {
+                stored
+            };
+            let payload: serde_json::Value = serde_json::from_str(&json).unwrap();
+            assert_eq!(payload["token"]["access_token"], "synthetic-access");
+            assert_eq!(read.refresh_token, "synthetic-refresh");
+        }
+    }
 
     #[test]
     fn credential_file_targets_preserve_other_clients_accounts() {

@@ -763,6 +763,27 @@ impl QoSGuardian {
         true
     }
 
+    /// Local admission policy is not evidence of provider latency or account health.
+    pub(crate) fn defer_probe(
+        &self,
+        account_id: &str,
+        claim: ProbeClaim,
+        retry_after: u64,
+    ) -> bool {
+        let Some(mut state) = self.states.get_mut(account_id) else {
+            return false;
+        };
+        if !claim.matches(state.value()) {
+            return false;
+        }
+        *state = AccountQoSState::Jailed {
+            level: claim.level,
+            jailed_at: Instant::now(),
+            current_wait: Duration::from_secs(retry_after.max(5)),
+        };
+        true
+    }
+
     /// 本次探针失败升级阶梯；已重置、移除或被新探针替换的结果不再回写。
     pub(crate) fn mark_probe_failed(
         &self,
@@ -1082,6 +1103,23 @@ mod tests {
             },
         );
         guardian.try_mark_probing("account").unwrap()
+    }
+
+    #[test]
+    fn local_admission_defers_owned_probe_without_health_penalty() {
+        let guardian = QoSGuardian::new();
+        guardian.set_auto_jail_enabled(true);
+        let claim = jail_for_probe(&guardian, 1);
+        assert!(guardian.defer_probe("account", claim, 321));
+        assert!(
+            matches!(guardian.get_state("account"),AccountQoSState::Jailed {level:1,current_wait,..} if current_wait==Duration::from_secs(321))
+        );
+        assert!(!guardian.penalty_memory.contains_key("account"));
+        assert!(!guardian.mark_probe_passed("account", claim));
+        assert!(!guardian.defer_probe("account", claim, 5));
+        let newer = jail_for_probe(&guardian, 2);
+        assert!(!guardian.defer_probe("account", claim, 5));
+        assert!(guardian.mark_probe_passed("account", newer));
     }
 
     #[test]

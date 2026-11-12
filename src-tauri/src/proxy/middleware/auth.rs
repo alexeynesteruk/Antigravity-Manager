@@ -200,7 +200,6 @@ async fn auth_middleware_internal(
                 {
                     let identity = UserTokenIdentity {
                         token_id: user_token.id,
-                        token: user_token.token,
                         username: user_token.username,
                     };
                     // 注入 identity 到请求
@@ -282,7 +281,6 @@ async fn auth_middleware_internal(
             Ok(crate::modules::user_token_db::TokenAdmission::Admitted(user_token)) => {
                 let identity = UserTokenIdentity {
                     token_id: user_token.id,
-                    token: user_token.token,
                     username: user_token.username,
                 };
                 let (mut parts, body) = request.into_parts();
@@ -321,8 +319,6 @@ async fn auth_middleware_internal(
 #[derive(Clone, Debug)]
 pub struct UserTokenIdentity {
     pub token_id: String,
-    #[allow(dead_code)] // 保留原始 token 便于审计/调试
-    pub token: String,
     pub username: String,
 }
 
@@ -337,6 +333,8 @@ mod tests {
             api_key: "valid+key".into(),
             admin_password: Some("admin-password".into()),
             allow_lan_access: false,
+            tls_network_exposed: false,
+            listener_authorities: crate::proxy::middleware::cors::listener_authorities("127.0.0.1", 8045, None).unwrap(),
             port: 8045,
             security_monitor: Default::default(),
         }))
@@ -429,6 +427,8 @@ mod tests {
             api_key: "sk-api".to_string(),
             admin_password: Some("admin123".to_string()),
             allow_lan_access: true,
+            tls_network_exposed: false,
+            listener_authorities: crate::proxy::middleware::cors::listener_authorities("127.0.0.1", 8045, None).unwrap(),
             port: 8045,
             security_monitor: crate::proxy::config::SecurityMonitorConfig::default(),
         }));
@@ -459,6 +459,8 @@ mod tests {
             api_key: "valid-key".to_string(),
             admin_password: None,
             allow_lan_access: true,
+            tls_network_exposed: false,
+            listener_authorities: crate::proxy::middleware::cors::listener_authorities("127.0.0.1", 8045, None).unwrap(),
             port: 8045,
             security_monitor: crate::proxy::config::SecurityMonitorConfig::default(),
         }));
@@ -776,6 +778,8 @@ mod tests {
             api_key: "valid-gemini-key".to_string(),
             admin_password: None,
             allow_lan_access: true,
+            tls_network_exposed: false,
+            listener_authorities: crate::proxy::middleware::cors::listener_authorities("127.0.0.1", 8045, None).unwrap(),
             port: 8045,
             security_monitor: crate::proxy::config::SecurityMonitorConfig::default(),
         }));

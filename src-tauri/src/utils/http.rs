@@ -108,6 +108,21 @@ pub fn get_long_standard_client() -> Client {
     acquire(ClientKey::new(60, false))
 }
 
+/// Internal requests carry credentials and must never follow redirects or proxy env vars.
+pub fn internal_loopback_client(timeout: std::time::Duration) -> Result<Client, String> {
+    Client::builder()
+        .timeout(timeout)
+        .no_proxy()
+        .redirect(rquest::redirect::Policy::none())
+        .build()
+        .map_err(|error| {
+            format!(
+                "Unable to build internal HTTP client: {}",
+                crate::utils::redact::text(&error.to_string())
+            )
+        })
+}
+
 /// 应用当前上游代理配置到 builder 上。
 fn apply_upstream_proxy(builder: rquest::ClientBuilder, label: &str) -> rquest::ClientBuilder {
     if let Ok(config) = load_app_config() {
@@ -115,11 +130,19 @@ fn apply_upstream_proxy(builder: rquest::ClientBuilder, label: &str) -> rquest::
         if proxy_config.enabled && !proxy_config.url.is_empty() {
             match Proxy::all(&proxy_config.url) {
                 Ok(proxy) => {
-                    tracing::info!("{} enabled upstream proxy: {}", label, proxy_config.url);
+                    tracing::info!(
+                        "{} enabled upstream proxy: {}",
+                        label,
+                        crate::utils::redact::text(&proxy_config.url)
+                    );
                     return builder.proxy(proxy);
                 }
                 Err(e) => {
-                    tracing::error!("invalid_proxy_url: {}, error: {}", proxy_config.url, e);
+                    tracing::error!(
+                        "invalid_proxy_url: {}, error: {}",
+                        crate::utils::redact::text(&proxy_config.url),
+                        crate::utils::redact::text(&e.to_string())
+                    );
                 }
             }
         }
@@ -156,6 +179,62 @@ fn create_standard_client(timeout_secs: u64) -> Client {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn internal_client_does_not_replay_credentials_across_redirects() {
+        use axum::{routing::post, Router};
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        };
+        let received = Arc::new(AtomicUsize::new(0));
+        let destination = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let destination_addr = destination.local_addr().unwrap();
+        let counted = received.clone();
+        let sink = Router::new().route(
+            "/capture",
+            post(move || {
+                let counted = counted.clone();
+                async move {
+                    counted.fetch_add(1, Ordering::SeqCst);
+                    "unexpected credential replay"
+                }
+            }),
+        );
+        let sink_task = tokio::spawn(async move {
+            axum::serve(destination, sink).await.unwrap();
+        });
+        let source = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let source_addr = source.local_addr().unwrap();
+        let redirect_url = format!("http://{destination_addr}/capture");
+        let redirect = Router::new().route(
+            "/warmup",
+            post(move || {
+                let redirect_url = redirect_url.clone();
+                async move {
+                    (
+                        axum::http::StatusCode::TEMPORARY_REDIRECT,
+                        [(axum::http::header::LOCATION, redirect_url)],
+                        "redirect",
+                    )
+                }
+            }),
+        );
+        let source_task = tokio::spawn(async move {
+            axum::serve(source, redirect).await.unwrap();
+        });
+        let result = internal_loopback_client(std::time::Duration::from_secs(2))
+            .unwrap()
+            .post(format!("http://{source_addr}/warmup"))
+            .header("x-internal-credential", "synthetic-only")
+            .json(&serde_json::json!({"access_token":"synthetic-oauth-only"}))
+            .send()
+            .await;
+        source_task.abort();
+        sink_task.abort();
+        assert_eq!(result.unwrap().status().as_u16(), 307);
+        assert_eq!(received.load(Ordering::SeqCst), 0);
+    }
 
     fn emulated_15_key() -> ClientKey {
         ClientKey::new(15, true)

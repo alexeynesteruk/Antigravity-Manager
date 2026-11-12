@@ -129,12 +129,14 @@ async fn update_account_json(
         if content.get("id").and_then(|value| value.as_str()) != Some(account_id) {
             return Err("Account update cannot change its managed ID".to_string());
         }
-        let serialized = serde_json::to_string_pretty(&content)
-            .map_err(|e| format!("序列化 JSON 失败: {}", e))?;
-        std::fs::write(&path, serialized).map_err(|e| format!("写入文件失败: {}", e))
+        crate::modules::credential_store::persist_account_document(&path, content)
     })
     .await
     .map_err(|e| format!("spawn_blocking panicked: {}", e))?
+}
+
+fn token_is_fresh_at(expiry_timestamp: i64, now: i64, buffer_secs: i64) -> bool {
+    now < expiry_timestamp.saturating_sub(buffer_secs)
 }
 
 fn unix_timestamp_ceil(time: std::time::SystemTime) -> Option<i64> {
@@ -359,8 +361,19 @@ impl Drop for InFlightGuard {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct AttentionHold {
+    generation: usize,
+    persisted: bool,
+}
+
 pub struct TokenManager {
     tokens: Arc<DashMap<String, ProxyToken>>, // account_id -> ProxyToken
+    attention_holds: std::sync::Mutex<HashMap<String, AttentionHold>>,
+    attention_hold_sequence: AtomicUsize,
+    safety_controller: std::sync::OnceLock<
+        Result<Arc<crate::proxy::pipeline::admission::SafetyController>, String>,
+    >,
     current_index: Arc<AtomicUsize>,
     last_used_account: Arc<tokio::sync::Mutex<Option<(String, std::time::Instant)>>>,
     data_dir: PathBuf,
@@ -412,6 +425,18 @@ pub struct TokenManager {
 }
 
 impl TokenManager {
+    pub fn safety_controller(
+        &self,
+    ) -> Result<Arc<crate::proxy::pipeline::admission::SafetyController>, String> {
+        self.safety_controller
+            .get_or_init(|| {
+                crate::proxy::pipeline::admission::SafetyController::for_dir(
+                    &self.resolved_data_dir(),
+                )
+            })
+            .clone()
+    }
+
     fn resolved_data_dir(&self) -> PathBuf {
         #[cfg(test)]
         {
@@ -441,6 +466,9 @@ impl TokenManager {
     pub fn new(data_dir: PathBuf) -> Self {
         Self {
             tokens: Arc::new(DashMap::new()),
+            attention_holds: std::sync::Mutex::new(HashMap::new()),
+            attention_hold_sequence: AtomicUsize::new(0),
+            safety_controller: std::sync::OnceLock::new(),
             current_index: Arc::new(AtomicUsize::new(0)),
             last_used_account: Arc::new(tokio::sync::Mutex::new(None)),
             data_dir,
@@ -665,6 +693,13 @@ impl TokenManager {
 
     /// 执行一次主动预刷新检查轮次
     async fn run_proactive_token_refresh_tick(&self) {
+        let permit = match self
+            .safety_controller()
+            .and_then(|controller| controller.permit().map_err(|error| error.encoded()))
+        {
+            Ok(permit) => permit,
+            Err(_) => return,
+        };
         let now = chrono::Utc::now().timestamp();
         const PROACTIVE_REFRESH_BUFFER_SECS: i64 = 600; // 提前10分钟预刷新
 
@@ -692,14 +727,23 @@ impl TokenManager {
         );
 
         for (account_id, email) in candidates {
+            if permit.check().is_err() {
+                return;
+            }
             let timeout = std::time::Duration::from_secs(10);
-            match self
-                .refresh_account_token_with_timeout(
+            let context = crate::proxy::pipeline::budget::RequestContext::new(
+                std::time::Instant::now() + timeout,
+            );
+            context.set_safety(permit.clone());
+            match crate::proxy::pipeline::budget::scope(
+                context,
+                self.refresh_account_token_with_timeout(
                     &account_id,
                     PROACTIVE_REFRESH_BUFFER_SECS,
                     timeout,
-                )
-                .await
+                ),
+            )
+            .await
             {
                 Ok(_) => {
                     tracing::info!(
@@ -730,6 +774,40 @@ impl TokenManager {
         buffer_secs: i64,
         timeout_duration: std::time::Duration,
     ) -> Result<ProxyToken, String> {
+        self.refresh_account_token_with_intent(
+            account_id,
+            buffer_secs,
+            timeout_duration,
+            crate::modules::oauth::RefreshIntent::Expiring,
+        )
+        .await
+    }
+
+    pub async fn refresh_account_token_after_rejection(
+        &self,
+        account_id: &str,
+        rejected_access_token: &str,
+        timeout_duration: std::time::Duration,
+    ) -> Result<ProxyToken, String> {
+        self.refresh_account_token_with_intent(
+            account_id,
+            i64::MAX,
+            timeout_duration,
+            crate::modules::oauth::RefreshIntent::RejectedAccessToken(rejected_access_token),
+        )
+        .await
+    }
+
+    async fn refresh_account_token_with_intent(
+        &self,
+        account_id: &str,
+        buffer_secs: i64,
+        timeout_duration: std::time::Duration,
+        intent: crate::modules::oauth::RefreshIntent<'_>,
+    ) -> Result<ProxyToken, String> {
+        if self.is_account_attention_held(account_id) {
+            return Err("Account requires manual attention before credentials can be used".into());
+        }
         let (token_email, refresh_token, account_path) = {
             let entry = self
                 .tokens
@@ -749,7 +827,9 @@ impl TokenManager {
         let now = chrono::Utc::now().timestamp();
         // 快速前置检查：若未达到缓冲刷新线，直接返回现有 token
         if let Some(entry) = self.tokens.get(account_id) {
-            if now < entry.timestamp - buffer_secs {
+            if now < entry.timestamp.saturating_sub(buffer_secs)
+                && matches!(intent, crate::modules::oauth::RefreshIntent::Expiring)
+            {
                 return Ok(entry.clone());
             }
         }
@@ -763,10 +843,17 @@ impl TokenManager {
 
         let refresh_op = async {
             let _guard = refresh_mu.lock().await;
+            if self.is_account_attention_held(account_id) {
+                return Err(
+                    "Account requires manual attention before credentials can be used".into(),
+                );
+            }
 
             let now = chrono::Utc::now().timestamp();
             if let Some(latest) = self.tokens.get(account_id) {
-                if now < latest.timestamp - buffer_secs {
+                if now < latest.timestamp.saturating_sub(buffer_secs)
+                    && matches!(intent, crate::modules::oauth::RefreshIntent::Expiring)
+                {
                     tracing::debug!(
                         "账号 {} 在等待刷新锁期间已完成刷新，复用最新 Token",
                         token_email
@@ -781,66 +868,27 @@ impl TokenManager {
                 timeout_duration
             );
 
-            let refresh_future =
-                crate::modules::oauth::refresh_access_token(&refresh_token, Some(account_id));
+            let refresh_future = crate::modules::oauth::refresh_access_token_with_client_and_intent(
+                &refresh_token,
+                Some(account_id),
+                None,
+                intent,
+            );
 
             match refresh_future.await {
                 Ok(token_response) => {
-                    tracing::debug!("账号 {} Token 刷新成功！", token_email);
-                    self.invalid_grant_failures.remove(account_id);
-
-                    let updated_token = if let Some(mut entry) = self.tokens.get_mut(account_id) {
-                        entry.access_token = token_response.access_token.clone();
-                        entry.expires_in = token_response.expires_in;
-                        entry.timestamp = now + token_response.expires_in;
-                        entry.clone()
-                    } else {
-                        return Err(format!("账号 {} 在刷新过程中被移除", account_id));
-                    };
-
-                    // 写盘操作后台化：内存已更新，磁盘持久化 spawn 到 blocking 线程池
-                    // 避免因磁盘 I/O 或锁争抢阻塞当前请求
-                    {
-                        let write_path = account_path;
-                        let access_token = token_response.access_token;
-                        let expires_in = token_response.expires_in;
-                        let id_token = token_response.id_token;
-                        let new_rt = token_response.refresh_token;
-                        let write_ts = now + expires_in;
-                        let client_key = token_response.oauth_client_key;
-                        tokio::task::spawn_blocking(move || {
-                            let Ok(_lk) = crate::modules::account::lock_account_file_updates()
-                            else {
-                                return;
-                            };
-                            let Ok(raw) = std::fs::read_to_string(&write_path) else {
-                                return;
-                            };
-                            let Ok(mut val) = serde_json::from_str::<serde_json::Value>(&raw)
-                            else {
-                                return;
-                            };
-                            val["token"]["access_token"] = access_token.into();
-                            val["token"]["expires_in"] = expires_in.into();
-                            val["token"]["expiry_timestamp"] = write_ts.into();
-                            if let Some(it) = id_token {
-                                val["token"]["id_token"] = it.into();
-                            }
-                            if let Some(rt) = new_rt {
-                                val["token"]["refresh_token"] = rt.into();
-                            }
-                            if let Some(ck) = client_key {
-                                if crate::modules::oauth::is_gcp_enterprise_client(Some(&ck)) {
-                                    val["token"]["is_gcp_tos"] = serde_json::Value::Bool(true);
-                                }
-                                val["token"]["oauth_client_key"] = ck.into();
-                            }
-                            if let Ok(s) = serde_json::to_string_pretty(&val) {
-                                let _ = std::fs::write(&write_path, s);
-                            }
-                        });
+                    // Verify the protected generation and commit metadata before
+                    // publishing new credentials to the in-memory account pool.
+                    let updated_token = self
+                        .publish_refreshed_token(account_id, &token_response)
+                        .await?;
+                    if self.is_account_attention_held(account_id) {
+                        return Err(
+                            "Account requires manual attention before credentials can be used"
+                                .into(),
+                        );
                     }
-
+                    self.invalid_grant_failures.remove(account_id);
                     Ok(updated_token)
                 }
                 Err(e) => {
@@ -972,8 +1020,13 @@ impl TokenManager {
                             return;
                         };
                         val["token"]["project_id"] = pid_clone.into();
-                        if let Ok(s) = serde_json::to_string_pretty(&val) {
-                            let _ = std::fs::write(&write_path, s);
+                        if let Err(error) =
+                            crate::modules::credential_store::persist_account_document(
+                                &write_path,
+                                val,
+                            )
+                        {
+                            tracing::warn!("Could not persist account project metadata: {error}");
                         }
                     });
                     trimmed
@@ -1020,6 +1073,13 @@ impl TokenManager {
 
     /// 从主应用账号目录加载所有账号
     pub async fn load_accounts(&self) -> Result<usize, String> {
+        let migration_dir = self.resolved_data_dir();
+        tokio::task::spawn_blocking(move || {
+            crate::modules::account::migrate_managed_credentials_in_dir(&migration_dir)
+        })
+        .await
+        .map_err(|_| "Credential migration worker failed".to_string())??;
+
         let accounts_dir = self.resolved_data_dir().join("accounts");
 
         if !accounts_dir.exists() {
@@ -1211,7 +1271,7 @@ impl TokenManager {
         }
         // 更新或插入新载入的有效账号
         for (k, v) in new_tokens {
-            self.tokens.insert(k, v);
+            self.publish_token_unless_held(k, v);
         }
         self.account_concurrency_limits
             .retain(|id, _| self.tokens.contains_key(id));
@@ -1301,7 +1361,7 @@ impl TokenManager {
                 // 再按模型粒度释放已恢复的 QuotaExhausted，严格保留 429 速率限制退避与 0 配额模型的锁 (Ref #3840, #3845)
                 self.clear_unsupported_models_for_account(account_id);
                 self.reconcile_recovered_quota_locks(account_id, &token);
-                self.tokens.insert(account_id.to_string(), token);
+                self.publish_token_unless_held(account_id.to_string(), token);
 
                 self.sync_image_scheduler_accounts();
                 Ok(())
@@ -1488,6 +1548,66 @@ impl TokenManager {
     /// writes). Failures are reported as `Unknown` so callers can skip without purging the in-memory
     /// token pool.
     async fn get_account_state_on_disk(&self, account_id: &str) -> OnDiskAccountState {
+        let before = self
+            .attention_holds
+            .lock()
+            .ok()
+            .and_then(|holds| holds.get(account_id).copied());
+        if before.is_some_and(|hold| !hold.persisted) {
+            return OnDiskAccountState::Disabled;
+        }
+        let state = self.read_account_state_on_disk(account_id).await;
+        self.finish_attention_disk_read(account_id, before, state)
+    }
+
+    fn finish_attention_disk_read(
+        &self,
+        account_id: &str,
+        before: Option<AttentionHold>,
+        state: OnDiskAccountState,
+    ) -> OnDiskAccountState {
+        let Ok(mut holds) = self.attention_holds.lock() else {
+            return OnDiskAccountState::Disabled;
+        };
+        if let Some(current) = holds.get(account_id).copied() {
+            if before == Some(current)
+                && current.persisted
+                && matches!(state, OnDiskAccountState::Enabled)
+            {
+                holds.remove(account_id);
+            } else {
+                return OnDiskAccountState::Disabled;
+            }
+        }
+        state
+    }
+
+    pub(crate) fn is_account_attention_held(&self, account_id: &str) -> bool {
+        self.attention_holds
+            .lock()
+            .map(|holds| holds.contains_key(account_id))
+            .unwrap_or(true)
+    }
+
+    pub(crate) async fn allows_automatic_account_use(&self, account_id: &str) -> bool {
+        matches!(
+            self.get_account_state_on_disk(account_id).await,
+            OnDiskAccountState::Enabled
+        )
+    }
+
+    fn publish_token_unless_held(&self, account_id: String, token: ProxyToken) -> bool {
+        let Ok(holds) = self.attention_holds.lock() else {
+            return false;
+        };
+        if holds.contains_key(&account_id) {
+            return false;
+        }
+        self.tokens.insert(account_id, token);
+        true
+    }
+
+    async fn read_account_state_on_disk(&self, account_id: &str) -> OnDiskAccountState {
         const MAX_RETRIES: usize = 2;
         const RETRY_DELAY_MS: u64 = 5;
 
@@ -1756,8 +1876,12 @@ impl TokenManager {
                 .get("last_used")
                 .and_then(|v| v.as_i64())
                 .unwrap_or(now);
+            let requires_manual_attention = account
+                .get("validation_blocked_reason")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|reason| reason.starts_with("manual_attention_required:"));
             let is_val_active = if block_until == 0 {
-                now.saturating_sub(last_used) < 86400
+                requires_manual_attention || now.saturating_sub(last_used) < 86400
             } else {
                 now < block_until
             };
@@ -2221,6 +2345,20 @@ impl TokenManager {
             .as_str()
             .ok_or("缺少 email 字段")?
             .to_string();
+
+        let credential_path = path.to_path_buf();
+        account = tokio::task::spawn_blocking(move || {
+            crate::modules::credential_store::hydrate_current_account_document(
+                &credential_path,
+                &mut account,
+            )?;
+            Ok::<_, String>(account)
+        })
+        .await
+        .map_err(|_| "Credential loading worker failed".to_string())??;
+        if self.get_account_state_on_disk(filename_id).await == OnDiskAccountState::Disabled {
+            return Ok(None);
+        }
 
         let token_obj = account["token"].as_object().ok_or("缺少 token 字段")?;
 
@@ -5302,46 +5440,38 @@ impl TokenManager {
     }
 
     /// 保存刷新后的 token 到账号文件
-    async fn save_refreshed_token(
+    async fn publish_refreshed_token(
         &self,
         account_id: &str,
         token_response: &crate::modules::oauth::TokenResponse,
-    ) -> Result<(), String> {
+    ) -> Result<ProxyToken, String> {
         let path = self.resolve_managed_account_path(account_id)?;
-        let now = chrono::Utc::now().timestamp();
-        let access_token = token_response.access_token.clone();
-        let expires_in = token_response.expires_in;
-        let id_token = token_response.id_token.clone();
-        let refresh_token = token_response.refresh_token.clone();
-        let oauth_client_key = token_response.oauth_client_key.clone();
-        let expiry_timestamp = now + expires_in;
-        update_account_json(&path, move |content| {
-            content["token"]["access_token"] = serde_json::Value::String(access_token);
-            content["token"]["expires_in"] = serde_json::Value::Number(expires_in.into());
-            content["token"]["expiry_timestamp"] =
-                serde_json::Value::Number(expiry_timestamp.into());
-
-            // 如果获取到了新的 id_token，则保存它
-            if let Some(it) = id_token {
-                content["token"]["id_token"] = serde_json::Value::String(it);
-            }
-
-            // 如果获取到了新的 refresh_token（Token 轮转），也一并保存
-            if let Some(rt) = refresh_token {
-                content["token"]["refresh_token"] = serde_json::Value::String(rt);
-            }
-
-            if let Some(ck) = oauth_client_key {
-                if crate::modules::oauth::is_gcp_enterprise_client(Some(&ck)) {
-                    content["token"]["is_gcp_tos"] = serde_json::Value::Bool(true);
-                }
-                content["token"]["oauth_client_key"] = serde_json::Value::String(ck);
-            }
+        let committed = token_response
+            .persisted_token
+            .as_ref()
+            .ok_or("OAuth refresh did not publish a managed credential revision")?
+            .clone();
+        let expected = committed
+            .credential_revision
+            .as_ref()
+            .ok_or("OAuth refresh has no observed managed credential revision")?
+            .clone();
+        let tokens = self.tokens.clone();
+        let account_id = account_id.to_string();
+        tokio::task::spawn_blocking(move || {
+            crate::modules::credential_store::with_credential_revision(&path, &expected, || {
+                let mut entry = tokens
+                    .get_mut(&account_id)
+                    .ok_or("Account was removed or held while credentials refreshed")?;
+                entry.access_token = committed.access_token;
+                entry.refresh_token = committed.refresh_token;
+                entry.expires_in = committed.expires_in;
+                entry.timestamp = committed.expiry_timestamp;
+                Ok(entry.clone())
+            })
         })
-        .await?;
-
-        tracing::debug!("已保存刷新后的 token 到账号 {}", account_id);
-        Ok(())
+        .await
+        .map_err(|_| "Credential verification worker failed")?
     }
 
     pub fn len(&self) -> usize {
@@ -5365,7 +5495,6 @@ impl TokenManager {
                         token.access_token.clone(),
                         token.refresh_token.clone(),
                         token.timestamp,
-                        token.expires_in,
                         chrono::Utc::now().timestamp(),
                         token.project_id.clone(),
                     ));
@@ -5375,25 +5504,22 @@ impl TokenManager {
             found
         };
 
-        let (
-            account_id,
-            current_access_token,
-            refresh_token,
-            timestamp,
-            expires_in,
-            now,
-            project_id_opt,
-        ) = match token_info {
-            Some(info) => info,
-            None => return Err(format!("未找到账号: {}", email)),
-        };
+        let (account_id, current_access_token, refresh_token, timestamp, now, project_id_opt) =
+            match token_info {
+                Some(info) => info,
+                None => return Err(format!("未找到账号: {}", email)),
+            };
+
+        if self.is_account_attention_held(&account_id) {
+            return Err("Account requires manual attention before credentials can be used".into());
+        }
 
         let project_id = project_id_opt
             .filter(|s| !s.is_empty())
             .unwrap_or_else(|| "bamboo-precept-lgxtn".to_string());
 
         // 检查是否过期 (提前5分钟)
-        if now < timestamp + expires_in - 300 {
+        if token_is_fresh_at(timestamp, now, 300) {
             return Ok((
                 current_access_token,
                 project_id,
@@ -5409,22 +5535,16 @@ impl TokenManager {
         match crate::modules::oauth::refresh_access_token(&refresh_token, Some(&account_id)).await {
             Ok(token_response) => {
                 tracing::info!("[Warmup] Token refresh successful for {}", email);
-                let new_now = chrono::Utc::now().timestamp();
-
-                // 更新缓存
-                if let Some(mut entry) = self.tokens.get_mut(&account_id) {
-                    entry.access_token = token_response.access_token.clone();
-                    entry.expires_in = token_response.expires_in;
-                    entry.timestamp = new_now;
+                let refreshed = self
+                    .publish_refreshed_token(&account_id, &token_response)
+                    .await?;
+                if self.is_account_attention_held(&account_id) {
+                    return Err(
+                        "Account requires manual attention before credentials can be used".into(),
+                    );
                 }
-
-                // 保存到磁盘
-                let _ = self
-                    .save_refreshed_token(&account_id, &token_response)
-                    .await;
-
                 Ok((
-                    token_response.access_token,
+                    refreshed.access_token,
                     project_id,
                     email.to_string(),
                     account_id,
@@ -5649,10 +5769,7 @@ impl TokenManager {
             return false;
         }
         live_limits.clear();
-        let Ok(serialized) = serde_json::to_string_pretty(&content) else {
-            return false;
-        };
-        std::fs::write(path, serialized).is_ok()
+        crate::modules::credential_store::persist_account_document(&path, content).is_ok()
     }
 
     /// 标记账号请求成功，重置连续失败计数
@@ -6278,9 +6395,7 @@ impl TokenManager {
                     // Preserve credentials, validation/protection flags and all live limits.
                     account["quota"] =
                         serde_json::to_value(&quota).map_err(|error| error.to_string())?;
-                    let serialized =
-                        serde_json::to_vec_pretty(&account).map_err(|error| error.to_string())?;
-                    crate::utils::fs::write_atomic(&path, &serialized)?;
+                    crate::modules::credential_store::persist_account_document(&path, account)?;
                 }
                 if let Some(mut token) = tokens.get_mut(&account_id) {
                     Self::replace_cached_model_snapshot(&mut token, &quota);
@@ -7235,10 +7350,7 @@ impl TokenManager {
             ),
         });
 
-        let Ok(serialized) = serde_json::to_string_pretty(&content) else {
-            return;
-        };
-        if let Err(e) = std::fs::write(&path, serialized) {
+        if let Err(e) = crate::modules::credential_store::persist_account_document(&path, content) {
             tracing::debug!("Failed to persist live limit for {}: {}", account_id, e);
         }
     }
@@ -7291,10 +7403,9 @@ impl TokenManager {
         }
 
         if changed {
-            let Ok(serialized) = serde_json::to_string_pretty(&content) else {
-                return;
-            };
-            if let Err(error) = std::fs::write(&path, serialized) {
+            if let Err(error) =
+                crate::modules::credential_store::persist_account_document(&path, content)
+            {
                 tracing::debug!("Failed to clear live limit for {}: {}", account_id, error);
                 return;
             }
@@ -7470,7 +7581,7 @@ impl TokenManager {
         refresh_token: &str,
     ) -> Result<crate::modules::oauth::UserInfo, String> {
         // 先获取 Access Token
-        let token = crate::modules::oauth::refresh_access_token(refresh_token, None)
+        let token = crate::modules::oauth::refresh_access_token_for_import(refresh_token, None)
             .await
             .map_err(|e| format!("刷新 Access Token 失败: {}", e))?;
 
@@ -7480,9 +7591,10 @@ impl TokenManager {
     /// 添加新账号 (纯后端实现，不依赖 Tauri AppHandle)
     pub async fn add_account(&self, email: &str, refresh_token: &str) -> Result<(), String> {
         // 1. 获取 Access Token (验证 refresh_token 有效性)
-        let token_info = crate::modules::oauth::refresh_access_token(refresh_token, None)
-            .await
-            .map_err(|e| format!("Invalid refresh token: {}", e))?;
+        let token_info =
+            crate::modules::oauth::refresh_access_token_for_import(refresh_token, None)
+                .await
+                .map_err(|e| format!("Invalid refresh token: {}", e))?;
 
         // 2. 获取项目 ID (Project ID)
         let project_id = crate::proxy::project_resolver::fetch_project_id(&token_info.access_token)
@@ -7498,17 +7610,13 @@ impl TokenManager {
                 token_info.oauth_client_key.as_deref(),
             );
 
-            let token_data = crate::models::TokenData::new(
-                token_info.access_token,
-                refresh_token_clone,
-                token_info.expires_in,
+            let token_data = crate::modules::oauth::token_data_for_import(
+                &token_info,
+                &refresh_token_clone,
                 Some(email_clone.clone()),
                 Some(project_id),
-                None,       // session_id
-                is_gcp_tos, // 企业或 GCP 客户端自适应开启
-                token_info.id_token,
-            )
-            .with_oauth_client_key(token_info.oauth_client_key.clone());
+                is_gcp_tos,
+            );
 
             crate::modules::account::upsert_account(email_clone, None, token_data)
         })
@@ -7729,53 +7837,71 @@ impl TokenManager {
         let Some(upstream) = upstream else {
             return;
         };
+        let Ok(context) = upstream.dispatch_context().await else {
+            return;
+        };
         for (token, claim) in self.claim_due_qos_probes() {
             let guardian = self.qos_guardian.clone();
             let upstream = upstream.clone();
-            tokio::spawn(async move {
-                let account_id = &token.account_id;
-                tracing::info!(
+            tokio::spawn(crate::proxy::pipeline::budget::scope(
+                context.clone(),
+                async move {
+                    let account_id = &token.account_id;
+                    tracing::info!(
                     "🔍 [QoS Probe] Sending synthetic 'Hello' probe to account {} (Level {})...",
                     account_id,
                     claim.level
                 );
-                let probe_res = Self::send_pure_hello_probe_internal(&token, &upstream).await;
-                match probe_res {
-                    Ok(ttft_ms) if ttft_ms < 8000.0 => {
-                        if guardian.mark_probe_passed(account_id, claim) {
-                            tracing::info!(
+                    let probe_res = Self::send_pure_hello_probe_internal(&token, &upstream).await;
+                    if crate::proxy::pipeline::admission::check_current_activity().is_err() {
+                        guardian.defer_probe(account_id, claim, 5);
+                        return;
+                    }
+                    match probe_res {
+                        Ok(ttft_ms) if ttft_ms < 8000.0 => {
+                            if guardian.mark_probe_passed(account_id, claim) {
+                                tracing::info!(
                                 "🎉 [QoS Probe] Account {} PASSED probe ({:.2}s < 8s)! Moving to Half-Open probation.",
                                 account_id,
                                 ttft_ms / 1000.0
                             );
+                            }
                         }
-                    }
-                    Ok(ttft_ms) => {
-                        if let Some((next_lv, wait)) = guardian.mark_probe_failed(account_id, claim)
-                        {
-                            tracing::warn!(
+                        Ok(ttft_ms) => {
+                            if let Some((next_lv, wait)) =
+                                guardian.mark_probe_failed(account_id, claim)
+                            {
+                                tracing::warn!(
                                 "⏳ [QoS Probe] Account {} probe TTFT was {:.2}s >= 8s. Escalated to Level {} (wait {:?})",
                                 account_id,
                                 ttft_ms / 1000.0,
                                 next_lv,
                                 wait
                             );
+                            }
                         }
-                    }
-                    Err(err) => {
-                        if let Some((next_lv, wait)) = guardian.mark_probe_failed(account_id, claim)
-                        {
-                            tracing::warn!(
+                        Err(err) => {
+                            if let Some(error) =
+                                crate::proxy::pipeline::admission::error_from_encoded(&err)
+                            {
+                                guardian.defer_probe(account_id, claim, error.retry_after);
+                                return;
+                            }
+                            if let Some((next_lv, wait)) =
+                                guardian.mark_probe_failed(account_id, claim)
+                            {
+                                tracing::warn!(
                                 "⏳ [QoS Probe] Account {} probe failed: {}. Escalated to Level {} (wait {:?})",
                                 account_id,
                                 err,
                                 next_lv,
                                 wait
                             );
+                            }
                         }
                     }
-                }
-            });
+                },
+            ));
         }
     }
 
@@ -7905,54 +8031,76 @@ impl TokenManager {
         upstream: &crate::proxy::upstream::client::UpstreamClient,
     ) -> Result<f64, String> {
         let started = std::time::Instant::now();
-        tokio::time::timeout(std::time::Duration::from_secs(8), async {
-            if token.timestamp <= chrono::Utc::now().timestamp() + 8 {
-                return Err("QoS probe is waiting for refreshed credentials".to_string());
-            }
-            let model = Self::select_probe_model(token)
-                .ok_or_else(|| "QoS probe has no authorized Gemini text model".to_string())?;
-            let body = Self::build_probe_envelope(token, &model);
-            let client = upstream.get_client(Some(&token.account_id)).await;
-            let user_agent = upstream.get_user_agent().await;
-            let mut last_error = "Probe attempted no endpoint".to_string();
-            for base in crate::proxy::upstream::client::V1_INTERNAL_BASE_URL_FALLBACKS {
-                let endpoint = format!("{}:streamGenerateContent?alt=sse", base);
-                let body_bytes = serde_json::to_vec(&body).map_err(|e| e.to_string())?;
-                let response = match client
-                    .post(&endpoint)
-                    .bearer_auth(&token.access_token)
-                    .header("User-Agent", &user_agent)
-                    .header("Content-Type", "application/json")
-                    .body(rquest::Body::wrap_stream(futures::stream::once(
-                        async move { Ok::<_, std::io::Error>(body_bytes) },
-                    )))
-                    .send()
-                    .await
-                {
-                    Ok(response) => response,
-                    Err(error) => {
-                        last_error = format!("{endpoint}: {error}");
-                        continue;
-                    }
-                };
-                let status = response.status().as_u16();
-                if !(200..300).contains(&status) {
-                    last_error = format!("{endpoint}: HTTP {status}");
-                    if status == 404 || status == 408 || (500..600).contains(&status) {
-                        continue;
-                    }
-                    return Err(last_error);
+        let context = upstream.dispatch_context().await?;
+        crate::proxy::pipeline::budget::scope(
+            context,
+            tokio::time::timeout(std::time::Duration::from_secs(8), async {
+                if token.timestamp <= chrono::Utc::now().timestamp() + 8 {
+                    return Err("QoS probe is waiting for refreshed credentials".to_string());
                 }
-                Self::wait_for_qos_probe_generation(response).await?;
-                return Ok(started.elapsed().as_secs_f64() * 1000.0);
-            }
-            Err(last_error)
-        })
+                let model = Self::select_probe_model(token)
+                    .ok_or_else(|| "QoS probe has no authorized Gemini text model".to_string())?;
+                let body = Self::build_probe_envelope(token, &model);
+                let client = upstream.get_client(Some(&token.account_id)).await;
+                let user_agent = upstream.get_user_agent().await;
+                let mut last_error = "Probe attempted no endpoint".to_string();
+                for base in crate::proxy::upstream::client::V1_INTERNAL_BASE_URL_FALLBACKS {
+                    upstream.admit_dispatch("streamGenerateContent").await?;
+                    let endpoint = format!("{}:streamGenerateContent?alt=sse", base);
+                    let body_bytes = serde_json::to_vec(&body).map_err(|e| e.to_string())?;
+                    let response = match client
+                        .post(&endpoint)
+                        .bearer_auth(&token.access_token)
+                        .header("User-Agent", &user_agent)
+                        .header("Content-Type", "application/json")
+                        .body(rquest::Body::wrap_stream(futures::stream::once(
+                            async move { Ok::<_, std::io::Error>(body_bytes) },
+                        )))
+                        .send()
+                        .await
+                    {
+                        Ok(response) => response,
+                        Err(error) => {
+                            last_error = format!("{endpoint}: {error}");
+                            continue;
+                        }
+                    };
+                    let status = response.status().as_u16();
+                    if !(200..300).contains(&status) {
+                        if matches!(status, 401 | 403) {
+                            let (_, body) =
+                                crate::proxy::upstream::client::buffer_project_header_failure(
+                                    response,
+                                )
+                                .await?;
+                            if let Some(attention) =
+                                crate::proxy::pipeline::account_safety::AccountAttention::classify(
+                                    status, &body,
+                                )
+                            {
+                                upstream.observe_account_attention(attention).await?;
+                            }
+                        }
+                        last_error = format!("{endpoint}: HTTP {status}");
+                        if status == 404 || status == 408 || (500..600).contains(&status) {
+                            continue;
+                        }
+                        return Err(last_error);
+                    }
+                    Self::wait_for_qos_probe_generation(response, upstream).await?;
+                    return Ok(started.elapsed().as_secs_f64() * 1000.0);
+                }
+                Err(last_error)
+            }),
+        )
         .await
         .map_err(|_| "QoS probe exceeded its 8s deadline".to_string())?
     }
 
-    async fn wait_for_qos_probe_generation(resp: rquest::Response) -> Result<(), String> {
+    async fn wait_for_qos_probe_generation(
+        resp: rquest::Response,
+        upstream: &crate::proxy::upstream::client::UpstreamClient,
+    ) -> Result<(), String> {
         use futures::StreamExt;
         let mut stream = resp.bytes_stream();
         let mut pending = bytes::BytesMut::new();
@@ -7970,6 +8118,7 @@ impl TokenManager {
                     .map_err(|_| "QoS probe received invalid UTF-8".to_string())?
                     .trim_end_matches(['\r', '\n']);
                 if line.is_empty() {
+                    if let Some((attention,_)) = crate::proxy::pipeline::account_safety::AccountAttention::classify_stream_event(event_data.as_bytes()) { upstream.observe_account_attention(attention).await?; }
                     if Self::qos_probe_event_has_generation(&event_data)? {
                         return Ok(());
                     }
@@ -8446,6 +8595,99 @@ impl TokenManager {
         None
     }
 
+    /// Persist a manual-recovery hold before another request can select the account.
+    pub async fn hold_account_for_attention(
+        &self,
+        account_id: &str,
+        attention: crate::proxy::pipeline::account_safety::AccountAttention,
+        upstream_reason: &str,
+    ) -> Result<(), String> {
+        // Raise the shared stop before waiting on account persistence or vault IO.
+        // Keep the per-account hold even if global-state persistence fails.
+        if let Err(error) = self
+            .safety_controller()
+            .and_then(|safety| safety.observe_attention(attention))
+        {
+            tracing::error!(error = %error, "Global safety stop could not be persisted");
+        }
+        let generation = self.attention_hold_sequence.fetch_add(1, Ordering::AcqRel);
+        self.attention_holds
+            .lock()
+            .map_err(|_| "Account attention state is unavailable".to_string())?
+            .insert(
+                account_id.to_string(),
+                AttentionHold {
+                    generation,
+                    persisted: false,
+                },
+            );
+        self.remove_account(account_id);
+        let path = self.resolve_managed_account_path(account_id)?;
+        // Restriction evidence and its manual marker are one metadata-only
+        // update; they must not require vault hydration or a second stale save.
+        let restriction = if attention
+            == crate::proxy::pipeline::account_safety::AccountAttention::AccountRestricted
+        {
+            crate::models::account::AccountBanInfo::classify_upstream(
+                403,
+                &crate::utils::redact::text(upstream_reason),
+            )
+        } else {
+            None
+        };
+        let action_url =
+            crate::models::account::AccountBanInfo::extract_url_from_text(upstream_reason)
+                .filter(|url| url.starts_with("https://"));
+        update_account_json(&path, move |account| {
+            if let Some(info) = restriction {
+                let reason = format!("banned: {}: {}", info.code, info.message);
+                account["banned"] = serde_json::json!(true);
+                account["banned_code"] = serde_json::json!(info.code);
+                account["banned_reason"] = serde_json::json!(info.message);
+                account["banned_at"] = serde_json::json!(chrono::Utc::now().timestamp());
+                if let Some(url) = action_url.clone().or(info.appeal_url) {
+                    account["ban_appeal_url"] = serde_json::json!(url);
+                }
+                account["proxy_disabled_reason"] = serde_json::json!(reason.clone());
+                if !account.get("quota").is_some_and(serde_json::Value::is_object) {
+                    account["quota"] = serde_json::json!({"models":[],"last_updated":chrono::Utc::now().timestamp()});
+                }
+                account["quota"]["is_forbidden"] = serde_json::json!(true);
+                account["quota"]["forbidden_reason"] = serde_json::json!(reason);
+            }
+            apply_attention_hold_metadata(account, attention, action_url);
+        })
+        .await?;
+        self.mark_attention_hold_persisted(account_id, generation);
+        // Sync only the index summary; toggling the entity a second time could
+        // overwrite a concurrently established hard restriction or vault state.
+        {
+            let _account_write = crate::modules::account::lock_account_file_updates()?;
+            let mut index = crate::modules::account::load_account_index()?;
+            if let Some(summary) = index
+                .accounts
+                .iter_mut()
+                .find(|account| account.id == account_id)
+            {
+                summary.proxy_disabled = true;
+                crate::modules::account::save_account_index(&index)?;
+            }
+        }
+        crate::modules::log_bridge::emit_accounts_refreshed();
+        Ok(())
+    }
+
+    fn mark_attention_hold_persisted(&self, account_id: &str, generation: usize) {
+        if let Ok(mut holds) = self.attention_holds.lock() {
+            if let Some(hold) = holds
+                .get_mut(account_id)
+                .filter(|hold| hold.generation == generation)
+            {
+                hold.persisted = true;
+            }
+        }
+    }
+
     /// Set validation blocked status for an account (internal)
     pub async fn set_validation_block(
         &self,
@@ -8625,6 +8867,36 @@ impl TokenManager {
     }
 }
 
+fn apply_attention_hold_metadata(
+    account: &mut serde_json::Value,
+    attention: crate::proxy::pipeline::account_safety::AccountAttention,
+    action_url: Option<String>,
+) {
+    let reason = format!(
+        "manual_attention_required: {}: {}",
+        attention.code(),
+        attention.message()
+    );
+    account["validation_blocked"] = serde_json::json!(true);
+    account["validation_blocked_until"] = serde_json::json!(0);
+    account["validation_blocked_reason"] = serde_json::json!(reason);
+    account["proxy_disabled"] = serde_json::json!(true);
+    let existing = account
+        .get("proxy_disabled_reason")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
+    if !matches!(
+        classify_lock_reason(existing),
+        AccountLockKind::Banned | AccountLockKind::HardForbidden
+    ) {
+        account["proxy_disabled_reason"] = serde_json::json!("validation_required");
+        account["proxy_disabled_at"] = serde_json::json!(chrono::Utc::now().timestamp());
+    }
+    if let Some(url) = action_url {
+        account["validation_url"] = serde_json::json!(url);
+    }
+}
+
 /// 截断过长的原因字符串
 fn truncate_reason(reason: &str, max_len: usize) -> String {
     if reason.len() <= max_len {
@@ -8639,8 +8911,205 @@ fn truncate_reason(reason: &str, max_len: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn token_expiry_is_absolute_including_warmup_reuse() {
+        let now = 1_800_000_000;
+        assert!(token_is_fresh_at(now + 3600, now, 300));
+        assert!(!token_is_fresh_at(now + 300, now, 300));
+        assert!(!token_is_fresh_at(now - 1, now, 300));
+        assert!(!token_is_fresh_at(now, now, 300));
+        assert!(!token_is_fresh_at(i64::MIN, now, 300));
+    }
+
+    #[tokio::test]
+    async fn protected_credentials_load_and_rotated_refresh_stay_out_of_account_json() {
+        let _data = crate::proxy::monitor::prompt_log_tests::TestDataDir::new();
+        let account = crate::modules::account::upsert_account(
+            "vault-manager@example.invalid".into(),
+            None,
+            crate::models::TokenData::new(
+                "fixture-access".into(),
+                "fixture-refresh".into(),
+                3600,
+                None,
+                Some("fixture-project".into()),
+                None,
+                false,
+                Some("fixture-id".into()),
+            ),
+        )
+        .unwrap();
+        let manager = TokenManager::new(crate::modules::account::get_data_dir().unwrap());
+        assert_eq!(manager.load_accounts().await.unwrap(), 1);
+        assert_eq!(
+            manager.tokens.get(&account.id).unwrap().refresh_token,
+            "fixture-refresh"
+        );
+        let mut refreshed = account.token.clone();
+        refreshed.access_token = "rotated-access-fixture".into();
+        refreshed.refresh_token = "rotated-refresh-fixture".into();
+        refreshed.id_token = Some("rotated-id-fixture".into());
+        let persisted =
+            crate::modules::account::persist_refreshed_credentials(&account.id, &refreshed)
+                .unwrap();
+        let response = crate::modules::oauth::TokenResponse {
+            access_token: "rotated-access-fixture".into(),
+            refresh_token: Some("rotated-refresh-fixture".into()),
+            id_token: Some("rotated-id-fixture".into()),
+            expires_in: 3600,
+            token_type: "Bearer".into(),
+            oauth_client_key: None,
+            persisted_token: Some(persisted),
+        };
+        manager
+            .publish_refreshed_token(&account.id, &response)
+            .await
+            .unwrap();
+        manager.reload_account(&account.id).await.unwrap();
+        assert_eq!(
+            manager.tokens.get(&account.id).unwrap().refresh_token,
+            "rotated-refresh-fixture"
+        );
+        let path = manager.resolve_managed_account_path(&account.id).unwrap();
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert!(!raw.contains("rotated-access-fixture"));
+        assert!(!raw.contains("rotated-refresh-fixture"));
+        assert!(!raw.contains("rotated-id-fixture"));
+        let mut newer = crate::modules::account::load_account(&account.id).unwrap();
+        newer.token.access_token = "newest-access-fixture".into();
+        newer.token.refresh_token = "newest-refresh-fixture".into();
+        crate::modules::account::save_account(&newer).unwrap();
+        manager.reload_account(&account.id).await.unwrap();
+        assert!(manager
+            .publish_refreshed_token(&account.id, &response)
+            .await
+            .unwrap_err()
+            .contains("changed concurrently"));
+        assert_eq!(
+            manager.tokens.get(&account.id).unwrap().refresh_token,
+            "newest-refresh-fixture"
+        );
+        update_account_json(&path, |document| {
+            document["proxy_disabled"] = serde_json::json!(true);
+        })
+        .await
+        .unwrap();
+        let loaded = crate::modules::account::load_account(&account.id).unwrap();
+        assert!(loaded.proxy_disabled);
+        assert_eq!(loaded.token.id_token.as_deref(), Some("rotated-id-fixture"));
+    }
+
     use std::cmp::Ordering;
     use std::time::Duration;
+
+    #[tokio::test]
+    async fn manual_attention_denies_stale_publication_and_requires_durable_recovery() {
+        let root = tempfile::tempdir().unwrap();
+        let accounts = root.path().join("accounts");
+        std::fs::create_dir(&accounts).unwrap();
+        let path = accounts.join("attention-test.json");
+        std::fs::write(&path, r#"{"id":"attention-test","proxy_disabled":false}"#).unwrap();
+        let manager = TokenManager::new(root.path().to_path_buf());
+        let hold = AttentionHold {
+            generation: 1,
+            persisted: false,
+        };
+        manager
+            .attention_holds
+            .lock()
+            .unwrap()
+            .insert("attention-test".into(), hold);
+        assert_eq!(
+            manager.finish_attention_disk_read("attention-test", None, OnDiskAccountState::Enabled),
+            OnDiskAccountState::Disabled
+        );
+        assert!(!manager.publish_token_unless_held(
+            "attention-test".into(),
+            create_test_token("attention-test", Some("PRO"), 1.0, None, Some(90))
+        ));
+        assert_eq!(
+            manager.get_account_state_on_disk("attention-test").await,
+            OnDiskAccountState::Disabled
+        );
+        std::fs::write(
+            &path,
+            r#"{"id":"attention-test","proxy_disabled":true,"validation_blocked":true}"#,
+        )
+        .unwrap();
+        manager.mark_attention_hold_persisted("attention-test", 1);
+        assert_eq!(
+            manager.get_account_state_on_disk("attention-test").await,
+            OnDiskAccountState::Disabled
+        );
+        std::fs::write(
+            &path,
+            r#"{"id":"attention-test","proxy_disabled":false,"validation_blocked":false}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            manager.get_account_state_on_disk("attention-test").await,
+            OnDiskAccountState::Enabled
+        );
+        assert!(!manager.is_account_attention_held("attention-test"));
+        assert!(manager.publish_token_unless_held(
+            "attention-test".into(),
+            create_test_token("attention-test", Some("PRO"), 1.0, None, Some(90))
+        ));
+        manager.attention_holds.lock().unwrap().insert(
+            "attention-test".into(),
+            AttentionHold {
+                generation: 2,
+                persisted: false,
+            },
+        );
+        manager.mark_attention_hold_persisted("attention-test", 1);
+        assert!(!manager.attention_holds.lock().unwrap()["attention-test"].persisted);
+        assert_eq!(
+            manager.finish_attention_disk_read(
+                "attention-test",
+                Some(AttentionHold {
+                    generation: 1,
+                    persisted: true
+                }),
+                OnDiskAccountState::Enabled
+            ),
+            OnDiskAccountState::Disabled
+        );
+    }
+
+    #[test]
+    fn manual_attention_hold_preserves_credentials_user_intent_and_harder_evidence() {
+        for hard_reason in [
+            "Forbidden (403): hard restriction",
+            "banned: ACCOUNT_BANNED",
+            "manual",
+        ] {
+            let mut account = serde_json::json!({
+                "token": {"credential_ref":"opaque-reference"}, "manual_proxy_disabled":true,
+                "proxy_disabled_reason":hard_reason,
+            });
+            apply_attention_hold_metadata(
+                &mut account,
+                crate::proxy::pipeline::account_safety::AccountAttention::AuthenticationChallenge,
+                Some("https://accounts.example.test/verify".to_string()),
+            );
+            assert_eq!(account["token"]["credential_ref"], "opaque-reference");
+            assert_eq!(account["manual_proxy_disabled"], true);
+            assert_eq!(account["validation_blocked"], true);
+            assert_eq!(account["validation_blocked_until"], 0);
+            assert!(account["validation_blocked_reason"]
+                .as_str()
+                .unwrap()
+                .starts_with("manual_attention_required:"));
+            let expected = if hard_reason == "manual" {
+                "validation_required"
+            } else {
+                hard_reason
+            };
+            assert_eq!(account["proxy_disabled_reason"], expected);
+        }
+    }
 
     #[tokio::test]
     async fn refreshed_model_snapshot_returns_accepted_quota_for_lock_decisions() {

@@ -41,12 +41,17 @@ pub enum RetryStrategy {
 
 #[derive(Debug, Default)]
 pub struct RequestRetryState {
+    auth_refresh_attempted: bool,
     grace_retried_accounts: HashSet<String>,
     /// 已在本次请求内因上游终态原地重放过的账号（每账号每请求至多一次）
     terminal_retried_accounts: HashSet<String>,
 }
 
 impl RequestRetryState {
+    /// An upstream 401 may refresh/replay once, always on the same account.
+    pub fn begin_auth_refresh(&mut self) -> bool {
+        !std::mem::replace(&mut self.auth_refresh_attempted, true)
+    }
     /// 上游终态（首字节 / 上传 / 传输层断连 / 全局预算 / 重放上限）后的统一裁决
     ///
     /// 四个协议适配器共用：调度模式只在这里参与决策，适配器只执行返回的计划。
@@ -252,6 +257,11 @@ pub fn determine_retry_strategy_adaptive(
     attempt: usize,
     pool_size: usize,
 ) -> RetryStrategy {
+    if crate::proxy::pipeline::account_safety::AccountAttention::classify(status_code, error_text)
+        .is_some()
+    {
+        return RetryStrategy::NoRetry;
+    }
     // [DEFENSE] 若错误已明确为模型不存在，绝对禁止无效轮换或退避重试！
     if is_model_not_found_error(status_code, error_text) {
         return RetryStrategy::NoRetry;
@@ -575,6 +585,9 @@ pub fn decide_rotation(
 /// `enforce_model_gate` 在选号之前就返回，且 `UpstreamClassification::classify` 优先把它们
 /// 归为 `InternalGatewayMessage`（既不锁号也不解绑粘性会话）。此注释用于防止后续重构破防。
 pub fn should_rotate_account(status_code: u16, strategy: Option<&RetryStrategy>) -> bool {
+    if matches!(strategy, Some(RetryStrategy::NoRetry)) {
+        return false;
+    }
     // [NEW] 如果识别为 Grace Retry，则显式要求不轮换账号
     if let Some(RetryStrategy::GraceRetry(_)) = strategy {
         return false;

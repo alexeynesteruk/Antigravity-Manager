@@ -9,6 +9,231 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 use tower_http::cors::{Any, CorsLayer};
 
+/// Supplied by our TCP transport, never by a request or forwarded header.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ListenerAuthority {
+    pub local_addr: std::net::SocketAddr,
+    pub tls: bool,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct Authority {
+    host: String,
+    port: u16,
+}
+
+fn canonical_ip(ip: std::net::IpAddr) -> std::net::IpAddr {
+    match ip {
+        std::net::IpAddr::V6(ip) => ip
+            .to_ipv4_mapped()
+            .map(std::net::IpAddr::V4)
+            .unwrap_or(ip.into()),
+        ip => ip,
+    }
+}
+
+fn parse_authority(value: &str, default_port: u16) -> Option<Authority> {
+    if value.is_empty()
+        || value.len() > 512
+        || !value.is_ascii()
+        || value.bytes().any(|c| {
+            c.is_ascii_whitespace()
+                || c.is_ascii_control()
+                || matches!(c, b'@' | b'/' | b'\\' | b'?' | b'#' | b'%' | b',' | b'*')
+        })
+    {
+        return None;
+    }
+    let authority: axum::http::uri::Authority = value.parse().ok()?;
+    if authority.host().starts_with('[')
+        && authority
+            .host()
+            .strip_prefix('[')?
+            .strip_suffix(']')?
+            .parse::<std::net::Ipv6Addr>()
+            .is_err()
+    {
+        return None;
+    }
+    // http::Authority::port() returns None for malformed/overflowing ports too.
+    // Inspect the suffix so those cannot silently become a default port.
+    let suffix = value.strip_prefix(authority.host())?;
+    let port = if suffix.is_empty() {
+        default_port
+    } else {
+        let digits = suffix.strip_prefix(':')?;
+        if digits.is_empty() || !digits.bytes().all(|c| c.is_ascii_digit()) {
+            return None;
+        }
+        digits.parse::<u16>().ok().filter(|port| *port != 0)?
+    };
+    let host = authority
+        .host()
+        .trim_start_matches('[')
+        .trim_end_matches(']');
+    let host = if let Ok(ip) = host.parse::<std::net::IpAddr>() {
+        canonical_ip(ip).to_string()
+    } else {
+        let host = host.strip_suffix('.').unwrap_or(host);
+        if host.is_empty()
+            || host.len() > 253
+            || host.split('.').any(|label| {
+                label.is_empty()
+                    || label.len() > 63
+                    || label.starts_with('-')
+                    || label.ends_with('-')
+                    || !label
+                        .bytes()
+                        .all(|c| c.is_ascii_alphanumeric() || c == b'-')
+            })
+        {
+            return None;
+        }
+        host.to_ascii_lowercase()
+    };
+    Some(Authority { host, port })
+}
+
+fn display_authority(authority: &Authority) -> String {
+    if authority.host.contains(':') {
+        format!("[{}]:{}", authority.host, authority.port)
+    } else {
+        format!("{}:{}", authority.host, authority.port)
+    }
+}
+
+/// Entries are exact authorities. A bare host permits only HTTP/HTTPS default
+/// ports; nonstandard listener/reverse-proxy ports must be explicit.
+pub fn normalize_trusted_hosts(entries: &[String]) -> Result<Vec<String>, String> {
+    if entries.len() > 256 {
+        return Err("Invalid trusted host configuration".into());
+    }
+    let mut normalized = Vec::new();
+    for entry in entries {
+        let entry = entry.trim();
+        for port in [80, 443] {
+            let authority =
+                parse_authority(entry, port).ok_or("Invalid trusted host configuration")?;
+            let canonical = display_authority(&authority);
+            if !normalized.contains(&canonical) {
+                normalized.push(canonical);
+                if normalized.len() > 256 {
+                    return Err("Invalid trusted host configuration".into());
+                }
+            }
+        }
+    }
+    Ok(normalized)
+}
+
+pub(crate) fn configured_trusted_hosts(configured: &[String]) -> Result<Vec<String>, String> {
+    let entries = match std::env::var("ABV_TRUSTED_HOSTS") {
+        Ok(value) if value.trim().is_empty() => Vec::new(),
+        Ok(value) => value
+            .split(',')
+            .map(|entry| entry.trim().to_owned())
+            .collect(),
+        Err(std::env::VarError::NotPresent) => configured.to_vec(),
+        Err(_) => return Err("Invalid trusted host configuration".into()),
+    };
+    normalize_trusted_hosts(&entries)
+}
+
+pub(crate) fn listener_authorities(
+    http_host: &str,
+    http_port: u16,
+    https: Option<(&str, u16, Option<&str>)>,
+) -> Result<Vec<String>, String> {
+    let mut entries = Vec::new();
+    let mut add = |host: &str, port: u16| {
+        for loopback in ["localhost", "127.0.0.1", "[::1]"] {
+            entries.push(format!("{loopback}:{port}"));
+        }
+        if let Ok(ip) = host.parse::<std::net::IpAddr>() {
+            if !ip.is_unspecified() {
+                entries.push(display_authority(&Authority {
+                    host: canonical_ip(ip).to_string(),
+                    port,
+                }));
+            }
+        }
+    };
+    add(http_host, http_port);
+    if let Some((host, port, advertised)) = https {
+        add(host, port);
+        if let Some(host) = advertised {
+            // TLS validates the advertised SAN host separately; no URL/scheme here.
+            let host = host.trim_start_matches('[').trim_end_matches(']');
+            entries.push(display_authority(&Authority {
+                host: host.to_owned(),
+                port,
+            }));
+        }
+    }
+    normalize_trusted_hosts(&entries)
+}
+
+fn validate_request_authority(
+    request: &Request,
+    security: &crate::proxy::ProxySecurityConfig,
+) -> Result<(), StatusCode> {
+    let local = request.extensions().get::<ListenerAuthority>();
+    let default_port = match request.uri().scheme_str() {
+        Some("https") => 443,
+        Some("http") => 80,
+        Some(_) => return Err(StatusCode::FORBIDDEN),
+        None if local.is_some_and(|local| local.tls) => 443,
+        None => 80,
+    };
+    let mut hosts = request.headers().get_all(header::HOST).iter();
+    let host = hosts.next();
+    if hosts.next().is_some() {
+        return Err(StatusCode::FORBIDDEN);
+    }
+    let header_authority = host
+        .map(|host| {
+            host.to_str()
+                .ok()
+                .and_then(|host| parse_authority(host, default_port))
+                .ok_or(StatusCode::FORBIDDEN)
+        })
+        .transpose()?;
+    let uri_authority = request
+        .uri()
+        .authority()
+        .map(|authority| {
+            parse_authority(authority.as_str(), default_port).ok_or(StatusCode::FORBIDDEN)
+        })
+        .transpose()?;
+    if let (Some(header), Some(uri)) = (&header_authority, &uri_authority) {
+        if header != uri {
+            return Err(StatusCode::FORBIDDEN);
+        }
+    }
+    let authority = header_authority
+        .or(uri_authority)
+        .ok_or(StatusCode::FORBIDDEN)?;
+    let trusted = configured_trusted_hosts(&security.security_monitor.trusted_hosts)
+        .map_err(|_| StatusCode::FORBIDDEN)?;
+    let pinned = &security.listener_authorities;
+    let normalized = display_authority(&authority);
+    if trusted.contains(&normalized) || pinned.contains(&normalized) {
+        return Ok(());
+    }
+    if let Some(local) = local {
+        if authority.port == local.local_addr.port() {
+            let ip = canonical_ip(local.local_addr.ip());
+            if authority.host == ip.to_string()
+                || (ip.is_loopback()
+                    && matches!(authority.host.as_str(), "localhost" | "127.0.0.1" | "::1"))
+            {
+                return Ok(());
+            }
+        }
+    }
+    Err(StatusCode::FORBIDDEN)
+}
+
 /// Creates the CORS layer
 pub fn cors_layer() -> CorsLayer {
     CorsLayer::new()
@@ -62,11 +287,19 @@ fn builtin_tauri_origin(value: &str) -> bool {
     )
 }
 
-/// Shared HTTP/WebSocket policy. Native clients send no Origin. Hosted clients
-/// may use their own origin; cross-origin clients require an explicit allowlist.
+/// Origin policy for WS upgrades, after the global request-authority gate.
+/// Native clients send no Origin; hosted clients require same-origin or a list.
 pub fn validate_websocket_origin(
     headers: &HeaderMap,
     security: &crate::proxy::ProxySecurityConfig,
+) -> Result<(), StatusCode> {
+    validate_origin(headers, security, None)
+}
+
+fn validate_origin(
+    headers: &HeaderMap,
+    security: &crate::proxy::ProxySecurityConfig,
+    uri_authority: Option<&str>,
 ) -> Result<(), StatusCode> {
     let mut origins = headers.get_all(header::ORIGIN).iter();
     let Some(origin) = origins.next() else {
@@ -96,8 +329,8 @@ pub fn validate_websocket_origin(
     }) {
         return Ok(());
     }
-    // Use Host, never a caller-supplied forwarded-host/origin header. Reverse
-    // proxies preserving Host retain same-origin Web UI compatibility.
+    // The global gate has already established this authority belongs to the
+    // live listener or an explicitly trusted proxy. Never use forwarded-host.
     let mut hosts = headers.get_all(header::HOST).iter();
     if let (Some(host), None) = (hosts.next(), hosts.next()) {
         if let Ok(host) = host.to_str() {
@@ -105,6 +338,14 @@ pub fn validate_websocket_origin(
                 if host_url.origin() == origin.origin() {
                     return Ok(());
                 }
+            }
+        }
+    } else if !headers.contains_key(header::HOST) {
+        if let Some(host_url) =
+            uri_authority.and_then(|host| parse_origin(&format!("{}://{}", origin.scheme(), host)))
+        {
+            if host_url.origin() == origin.origin() {
+                return Ok(());
             }
         }
     }
@@ -118,6 +359,10 @@ pub async fn origin_policy_middleware(
     request: Request,
     next: Next,
 ) -> Response {
+    let policy = security.read().await;
+    if let Err(status) = validate_request_authority(&request, &policy) {
+        return status.into_response();
+    }
     let builtin_preflight = request.method() == Method::OPTIONS
         && request
             .headers()
@@ -129,10 +374,18 @@ pub async fn origin_policy_middleware(
             .and_then(|origin| origin.to_str().ok())
             .is_some_and(builtin_tauri_origin);
     if !builtin_preflight {
-        if let Err(status) = validate_websocket_origin(request.headers(), &*security.read().await) {
+        if let Err(status) = validate_origin(
+            request.headers(),
+            &policy,
+            request
+                .uri()
+                .authority()
+                .map(|authority| authority.as_str()),
+        ) {
             return status.into_response();
         }
     }
+    drop(policy);
     let origin = request.headers().get(header::ORIGIN).cloned();
     let mut response = next.run(request).await;
     if let Some(origin) = origin {
@@ -164,6 +417,230 @@ mod tests {
             headers.insert(header::ORIGIN, origin.parse().unwrap());
         }
         headers
+    }
+
+    fn authority_request(host: Option<&str>, local: Option<(&str, bool)>) -> Request {
+        let mut builder = Request::builder().uri("/v1/messages");
+        if let Some(host) = host {
+            builder = builder.header(header::HOST, host);
+        }
+        let mut request = builder.body(axum::body::Body::empty()).unwrap();
+        if let Some((local, tls)) = local {
+            request.extensions_mut().insert(ListenerAuthority {
+                local_addr: local.parse().unwrap(),
+                tls,
+            });
+        }
+        request
+    }
+
+    #[test]
+    fn trusted_hosts_are_exact_authorities_and_invalid_settings_fail_closed() {
+        assert_eq!(
+            normalize_trusted_hosts(&["Gateway.EXAMPLE.".into(), "[::1]:8443".into()]).unwrap(),
+            vec!["gateway.example:80", "gateway.example:443", "[::1]:8443"]
+        );
+        for invalid in [
+            "*",
+            "https://gateway.example",
+            "user@gateway.example:443",
+            "a/b",
+            "a?b",
+            "a#b",
+            "a%2eb",
+            "a,b",
+            "a:",
+            "a:0",
+            "a:65536",
+            "a:invalid",
+            "a b",
+            ".",
+            "a..b",
+            "-bad.example",
+            "",
+            "[::1",
+            "[localhost]:8045",
+            "[127.0.0.1]:8045",
+        ] {
+            assert!(
+                normalize_trusted_hosts(&[invalid.into()]).is_err(),
+                "{invalid}"
+            );
+        }
+        let mut policy = security(&["*"]);
+        policy.security_monitor.trusted_hosts = vec!["*".into()];
+        assert!(validate_request_authority(
+            &authority_request(Some("localhost:8045"), None),
+            &policy
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn rebinding_hosts_fail_even_without_origin_and_with_spoofed_proxy_headers() {
+        let policy = security(&["*"]);
+        for host in [
+            "attacker.example:8045",
+            "attacker.example",
+            "127.0.0.1:8046",
+            "localhost",
+            "192.168.1.99:8045",
+            "0.0.0.0:8045",
+            "127.0.0.1:8045@attacker.example",
+        ] {
+            let mut request = authority_request(Some(host), Some(("192.168.1.10:8045", false)));
+            request
+                .headers_mut()
+                .insert("x-forwarded-host", "localhost:8045".parse().unwrap());
+            request
+                .headers_mut()
+                .insert("forwarded", "host=localhost:8045".parse().unwrap());
+            assert!(
+                validate_request_authority(&request, &policy).is_err(),
+                "{host}"
+            );
+        }
+        let mut duplicate = authority_request(Some("localhost:8045"), None);
+        duplicate
+            .headers_mut()
+            .append(header::HOST, "localhost:8045".parse().unwrap());
+        assert!(validate_request_authority(&duplicate, &policy).is_err());
+        assert!(validate_request_authority(&authority_request(None, None), &policy).is_err());
+    }
+
+    #[test]
+    fn live_ipv4_ipv6_and_tls_advertisement_require_the_real_port() {
+        let mut config = crate::proxy::config::ProxyConfig::default();
+        config.allow_lan_access = true;
+        config.tls.enabled = true;
+        config.tls.advertised_host = Some("gateway.home.arpa".into());
+        let policy = crate::proxy::ProxySecurityConfig::from_proxy_config(&config);
+        for (host, local, tls) in [
+            ("192.168.1.10:8443", "192.168.1.10:8443", true),
+            ("gateway.home.arpa:8443", "192.168.1.10:8443", true),
+            ("[fd12::10]:8443", "[fd12::10]:8443", true),
+            ("192.168.1.10:8443", "[::ffff:192.168.1.10]:8443", true),
+            ("localhost:8045", "127.0.0.1:8045", false),
+        ] {
+            assert!(
+                validate_request_authority(
+                    &authority_request(Some(host), Some((local, tls))),
+                    &policy
+                )
+                .is_ok(),
+                "{host}"
+            );
+        }
+        for host in [
+            "gateway.home.arpa:443",
+            "gateway.home.arpa:8045",
+            "[fd12::11]:8443",
+            "192.168.1.10:8046",
+        ] {
+            assert!(
+                validate_request_authority(
+                    &authority_request(Some(host), Some(("192.168.1.10:8443", true))),
+                    &policy
+                )
+                .is_err(),
+                "{host}"
+            );
+        }
+    }
+
+    #[test]
+    fn uri_authority_is_supported_but_cannot_disagree_with_host() {
+        let policy = security(&[]);
+        let mut request = authority_request(None, None);
+        *request.uri_mut() = "http://localhost:8045/v1/messages".parse().unwrap();
+        assert!(validate_request_authority(&request, &policy).is_ok());
+        request
+            .headers_mut()
+            .insert(header::HOST, "attacker.example:8045".parse().unwrap());
+        assert!(validate_request_authority(&request, &policy).is_err());
+        request
+            .headers_mut()
+            .insert(header::HOST, "localhost:8045".parse().unwrap());
+        assert!(validate_request_authority(&request, &policy).is_ok());
+        *request.uri_mut() = "http://attacker.example:8045/v1/messages".parse().unwrap();
+        assert!(validate_request_authority(&request, &policy).is_err());
+    }
+
+    #[test]
+    fn trusted_reverse_proxy_hosts_are_explicit_and_port_scoped() {
+        let mut policy = security(&[]);
+        policy.security_monitor.trusted_hosts =
+            vec!["gateway.example".into(), "proxy.example:9443".into()];
+        for host in [
+            "gateway.example",
+            "gateway.example:443",
+            "proxy.example:9443",
+        ] {
+            assert!(
+                validate_request_authority(&authority_request(Some(host), None), &policy).is_ok(),
+                "{host}"
+            );
+        }
+        for host in [
+            "gateway.example:8045",
+            "proxy.example:443",
+            "sub.gateway.example",
+        ] {
+            assert!(
+                validate_request_authority(&authority_request(Some(host), None), &policy).is_err(),
+                "{host}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn mandatory_host_gate_precedes_preflight_and_websocket_upgrade() {
+        use tower::ServiceExt;
+        let policy = security(&["*"]);
+        let app = axum::Router::new()
+            .fallback(|| async { StatusCode::NO_CONTENT })
+            .layer(cors_layer())
+            .layer(axum::middleware::from_fn_with_state(
+                Arc::new(RwLock::new(policy)),
+                origin_policy_middleware,
+            ));
+        for origin in [
+            None,
+            Some("http://attacker.example:8045"),
+            Some("tauri://localhost"),
+        ] {
+            for method in [Method::GET, Method::OPTIONS] {
+                let mut request = authority_request(
+                    Some("attacker.example:8045"),
+                    Some(("127.0.0.1:8045", false)),
+                );
+                *request.method_mut() = method;
+                if let Some(origin) = origin {
+                    request
+                        .headers_mut()
+                        .insert(header::ORIGIN, origin.parse().unwrap());
+                }
+                request.headers_mut().insert(
+                    header::ACCESS_CONTROL_REQUEST_METHOD,
+                    "GET".parse().unwrap(),
+                );
+                request
+                    .headers_mut()
+                    .insert(header::UPGRADE, "websocket".parse().unwrap());
+                request
+                    .headers_mut()
+                    .insert(header::CONNECTION, "upgrade".parse().unwrap());
+                assert_eq!(
+                    app.clone().oneshot(request).await.unwrap().status(),
+                    StatusCode::FORBIDDEN
+                );
+            }
+        }
+        let request = authority_request(Some("localhost:8045"), None);
+        assert_eq!(
+            app.oneshot(request).await.unwrap().status(),
+            StatusCode::NO_CONTENT
+        );
     }
 
     #[test]
@@ -222,6 +699,7 @@ mod tests {
             let preflight = Request::builder()
                 .method("OPTIONS")
                 .uri("/v1/chat/completions")
+                .header("host", "127.0.0.1:8045")
                 .header("origin", origin)
                 .header("access-control-request-method", "POST")
                 .header(
@@ -244,6 +722,7 @@ mod tests {
                 let mut request = Request::builder()
                     .method("POST")
                     .uri("/v1/chat/completions")
+                    .header("host", "127.0.0.1:8045")
                     .header("origin", origin);
                 if let Some(key) = key {
                     request = request.header("authorization", format!("Bearer {key}"));

@@ -1,6 +1,7 @@
 // Middleware module - Axum middleware
 
 pub mod auth;
+pub mod admission;
 pub mod cors;
 pub mod internal;
 pub mod ip_filter;

@@ -43,6 +43,27 @@ const TOKEN_URL: &str = "https://oauth2.googleapis.com/token";
 const USERINFO_URL: &str = "https://www.googleapis.com/oauth2/v2/userinfo";
 const TOKEN_REFRESH_SKEW_SECONDS: i64 = 900;
 
+/// Why the caller needs a token. A rejected credential must not be returned
+/// merely because its recorded expiry is still in the future.
+#[derive(Clone, Copy)]
+pub enum RefreshIntent<'a> {
+    Expiring,
+    RejectedAccessToken(&'a str),
+}
+
+fn can_reuse_account_token(
+    token: &crate::models::TokenData,
+    intent: RefreshIntent<'_>,
+    now: i64,
+) -> bool {
+    !token.access_token.is_empty()
+        && token.expiry_timestamp > now + TOKEN_REFRESH_SKEW_SECONDS
+        && match intent {
+            RefreshIntent::Expiring => true,
+            RefreshIntent::RejectedAccessToken(rejected) => token.access_token != rejected,
+        }
+}
+
 const AUTH_URL: &str = "https://accounts.google.com/o/oauth2/v2/auth";
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -57,6 +78,77 @@ pub struct TokenResponse {
     pub id_token: Option<String>,
     #[serde(skip)]
     pub oauth_client_key: Option<String>,
+    /// Managed refreshes are durable before the single-flight lock is released.
+    #[serde(skip)]
+    pub(crate) persisted_token: Option<crate::models::TokenData>,
+}
+
+fn committed_token_response(token: crate::models::TokenData) -> TokenResponse {
+    TokenResponse {
+        access_token: token.access_token.clone(),
+        expires_in: token.expiry_timestamp - chrono::Utc::now().timestamp(),
+        token_type: token.token_type.clone(),
+        refresh_token: Some(token.refresh_token.clone()),
+        id_token: token.id_token.clone(),
+        oauth_client_key: token.oauth_client_key.clone(),
+        persisted_token: Some(token),
+    }
+}
+
+pub(crate) fn retain_rotated_refresh_token(rotated: Option<String>, previous: String) -> String {
+    rotated
+        .filter(|token| !token.is_empty())
+        .unwrap_or(previous)
+}
+
+/// Imports of known credentials must share managed refresh publication and
+/// preserve its revision instead of constructing an unversioned old snapshot.
+pub(crate) async fn refresh_access_token_for_import(
+    refresh_token: &str,
+    temporary_account_id: Option<&str>,
+) -> Result<TokenResponse, String> {
+    let lookup_token = refresh_token.to_string();
+    let managed_id = tokio::task::spawn_blocking(move || {
+        crate::modules::account::find_managed_account_for_refresh_token(&lookup_token)
+    })
+    .await
+    .map_err(|_| "Import credential lookup worker failed")??;
+    refresh_access_token(
+        refresh_token,
+        managed_id.as_deref().or(temporary_account_id),
+    )
+    .await
+}
+
+pub(crate) fn token_data_for_import(
+    response: &TokenResponse,
+    previous_refresh_token: &str,
+    email: Option<String>,
+    project_id: Option<String>,
+    is_gcp_tos: bool,
+) -> crate::models::TokenData {
+    if let Some(mut committed) = response.persisted_token.clone() {
+        committed.email = email;
+        if project_id.is_some() {
+            committed.project_id = project_id;
+        }
+        committed.is_gcp_tos |= is_gcp_tos;
+        return committed;
+    }
+    crate::models::TokenData::new(
+        response.access_token.clone(),
+        retain_rotated_refresh_token(
+            response.refresh_token.clone(),
+            previous_refresh_token.to_string(),
+        ),
+        response.expires_in,
+        email,
+        project_id,
+        None,
+        is_gcp_tos,
+        response.id_token.clone(),
+    )
+    .with_oauth_client_key(response.oauth_client_key.clone())
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -577,9 +669,13 @@ async fn refresh_access_token_once(
     refresh_token: &str,
     account_id: Option<&str>,
     client_cfg: &OAuthClientConfig,
+    token_endpoint: &str,
+    client_override: Option<&rquest::Client>,
 ) -> Result<TokenResponse, (Option<reqwest::StatusCode>, String)> {
     // [PHASE 2] Use the corresponding proxy based on account_id
-    let client = if let Some(pool) = crate::proxy::proxy_pool::get_global_proxy_pool() {
+    let client = if let Some(client) = client_override {
+        client.clone()
+    } else if let Some(pool) = crate::proxy::proxy_pool::get_global_proxy_pool() {
         pool.get_effective_standard_client(account_id, 60).await
     } else {
         crate::utils::http::get_long_standard_client()
@@ -604,8 +700,9 @@ async fn refresh_access_token_once(
         crate::constants::NATIVE_OAUTH_USER_AGENT.as_str()
     );
 
+    crate::proxy::pipeline::admission::check_current_activity().map_err(|error| (None, error))?;
     let response = client
-        .post(TOKEN_URL)
+        .post(token_endpoint)
         .header(
             rquest::header::USER_AGENT,
             crate::constants::NATIVE_OAUTH_USER_AGENT.as_str(),
@@ -653,6 +750,44 @@ pub async fn refresh_access_token_with_client(
     account_id: Option<&str>,
     preferred_client_key: Option<&str>,
 ) -> Result<TokenResponse, String> {
+    refresh_access_token_with_client_and_intent(
+        refresh_token,
+        account_id,
+        preferred_client_key,
+        RefreshIntent::Expiring,
+    )
+    .await
+}
+
+/// Refresh a rejected access token, or reuse a genuinely newer concurrent
+/// refresh result after acquiring the same per-account lock as expiry refreshes.
+pub async fn refresh_access_token_with_client_and_intent(
+    refresh_token: &str,
+    account_id: Option<&str>,
+    preferred_client_key: Option<&str>,
+    intent: RefreshIntent<'_>,
+) -> Result<TokenResponse, String> {
+    refresh_access_token_with_client_and_intent_at(
+        refresh_token,
+        account_id,
+        preferred_client_key,
+        intent,
+        TOKEN_URL,
+        None,
+    )
+    .await
+}
+
+// Private transport seam keeps tests on a loopback fixture without changing
+// production endpoint configuration or inheriting the host's proxy settings.
+async fn refresh_access_token_with_client_and_intent_at(
+    refresh_token: &str,
+    account_id: Option<&str>,
+    preferred_client_key: Option<&str>,
+    intent: RefreshIntent<'_>,
+    token_endpoint: &str,
+    client_override: Option<&rquest::Client>,
+) -> Result<TokenResponse, String> {
     let candidates = get_candidate_clients(preferred_client_key);
     if candidates.is_empty() {
         return Err("No OAuth clients configured".to_string());
@@ -668,7 +803,7 @@ pub async fn refresh_access_token_with_client(
         .entry(lock_key)
         .or_insert_with(|| std::sync::Arc::new(tokio::sync::Mutex::new(())))
         .clone();
-    let _refresh_guard = lock.lock().await;
+    let refresh_guard = lock.lock_owned().await;
 
     // [FIX #3319] Re-check the on-disk account state now that we hold the lock: a caller that
     // was waiting on it may have captured its refresh_token before another caller's refresh
@@ -678,31 +813,30 @@ pub async fn refresh_access_token_with_client(
     // this call was originally given - submitting an already-rotated refresh_token would
     // otherwise fail with invalid_grant on an endpoint that rotates them.
     let mut effective_refresh_token = refresh_token.to_string();
+    let mut managed_token = None;
     if let Some(id) = account_id.filter(|id| !id.is_empty()) {
         let id_owned = id.to_string();
-        if let Ok(Some(current)) = tokio::task::spawn_blocking(move || {
-            crate::modules::account::load_account(&id_owned).ok()
+        if let Some(current) = tokio::task::spawn_blocking(move || {
+            crate::modules::account::load_account_if_present(&id_owned)
         })
         .await
+        .map_err(|_| "Account credential read worker failed")??
         {
             let now = chrono::Local::now().timestamp();
-            if current.token.expiry_timestamp > now + TOKEN_REFRESH_SKEW_SECONDS {
+            if current.id != id {
+                return Err("OAuth account identity changed while refreshing".to_string());
+            }
+            if can_reuse_account_token(&current.token, intent, now) {
                 crate::modules::logger::log_info(&format!(
                     "[OAuth] Account {:?} was already refreshed by a concurrent caller while this call waited for the lock; reusing its result",
                     account_id
                 ));
-                return Ok(TokenResponse {
-                    access_token: current.token.access_token,
-                    expires_in: current.token.expiry_timestamp - now,
-                    token_type: "Bearer".to_string(),
-                    refresh_token: Some(current.token.refresh_token),
-                    id_token: current.token.id_token,
-                    oauth_client_key: current.token.oauth_client_key,
-                });
+                return Ok(committed_token_response(current.token));
             }
             if current.token.refresh_token != refresh_token {
-                effective_refresh_token = current.token.refresh_token;
+                effective_refresh_token = current.token.refresh_token.clone();
             }
+            managed_token = Some(current.token);
         }
     }
     let refresh_token = effective_refresh_token.as_str();
@@ -718,7 +852,15 @@ pub async fn refresh_access_token_with_client(
             if retry_count > 0 {
                 tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
             }
-            match refresh_access_token_once(refresh_token, account_id, client_cfg).await {
+            match refresh_access_token_once(
+                refresh_token,
+                account_id,
+                client_cfg,
+                token_endpoint,
+                client_override,
+            )
+            .await
+            {
                 Ok(token_res) => {
                     recovered_token = Some(token_res);
                     break;
@@ -745,6 +887,19 @@ pub async fn refresh_access_token_with_client(
                     "Refresh recovered via fallback OAuth client [{}]",
                     client_cfg.key
                 ));
+            }
+            if let Some(current) = managed_token.as_ref() {
+                let updated = token_data_from_refresh(current, token_res);
+                let id = account_id.unwrap().to_string();
+                let committed = tokio::task::spawn_blocking(move || {
+                    // Publication continues if the request is cancelled while
+                    // native storage blocks; keep the refresh lock with it.
+                    let _refresh_guard = refresh_guard;
+                    crate::modules::account::persist_refreshed_credentials(&id, &updated)
+                })
+                .await
+                .map_err(|_| "Credential publication worker failed")??;
+                return Ok(committed_token_response(committed));
             }
             return Ok(token_res);
         }
@@ -796,6 +951,7 @@ pub async fn get_user_info(
         crate::utils::http::get_client()
     };
 
+    crate::proxy::pipeline::admission::check_current_activity()?;
     let response = client
         .get(USERINFO_URL)
         .bearer_auth(access_token)
@@ -820,6 +976,17 @@ pub async fn ensure_fresh_token(
     current_token: &crate::models::TokenData,
     account_id: Option<&str>,
 ) -> Result<crate::models::TokenData, String> {
+    crate::proxy::pipeline::admission::check_current_activity()?;
+    let latest = if let Some(id) = account_id.filter(|id| !id.is_empty()) {
+        let id = id.to_string();
+        tokio::task::spawn_blocking(move || crate::modules::account::load_account_if_present(&id))
+            .await
+            .map_err(|_| "Account credential read worker failed")??
+            .map(|account| account.token)
+    } else {
+        None
+    };
+    let current_token = latest.as_ref().unwrap_or(current_token);
     let now = chrono::Local::now().timestamp();
 
     // Keep enough validity to avoid immediate post-switch refresh failure.
@@ -839,26 +1006,276 @@ pub async fn ensure_fresh_token(
     )
     .await?;
 
+    Ok(token_data_from_refresh(current_token, response))
+}
+
+pub(crate) fn token_data_from_refresh(
+    current_token: &crate::models::TokenData,
+    mut response: TokenResponse,
+) -> crate::models::TokenData {
+    if let Some(committed) = response.persisted_token.take() {
+        return committed;
+    }
     let oauth_client_key =
         normalize_refreshed_oauth_client_key(current_token, response.oauth_client_key.clone());
-
-    // Construct new TokenData
-    Ok(crate::models::TokenData::new(
+    let mut token = crate::models::TokenData::new(
         response.access_token,
-        current_token.refresh_token.clone(), // refresh_token may not be returned on refresh
+        retain_rotated_refresh_token(response.refresh_token, current_token.refresh_token.clone()),
         response.expires_in,
         current_token.email.clone(),
         current_token.project_id.clone(), // Keep original project_id
         None,                             // session_id will be generated in token_manager
         current_token.is_gcp_tos,
-        response.id_token.or(current_token.id_token.clone()), // Use new id_token or keep old one
+        response
+            .id_token
+            .filter(|token| !token.is_empty())
+            .or(current_token.id_token.clone()),
     )
-    .with_oauth_client_key(oauth_client_key))
+    .with_oauth_client_key(oauth_client_key);
+    token.credential_revision = current_token.credential_revision.clone();
+    if is_gcp_enterprise_client(token.oauth_client_key.as_deref()) {
+        token.is_gcp_tos = true;
+    }
+    token
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn token_refresh_retains_rotated_credentials_and_existing_identity_metadata() {
+        let mut current = crate::models::TokenData::new(
+            "old-access".into(),
+            "old-refresh".into(),
+            0,
+            Some("synthetic@test.invalid".into()),
+            Some("existing-project".into()),
+            None,
+            false,
+            Some("old-id".into()),
+        );
+        current.oauth_client_key = Some("antigravity".into());
+        let response = |refresh_token| TokenResponse {
+            access_token: "new-access".into(),
+            expires_in: 3600,
+            token_type: "Bearer".into(),
+            refresh_token,
+            id_token: None,
+            oauth_client_key: None,
+            persisted_token: None,
+        };
+        let rotated = token_data_from_refresh(&current, response(Some("new-refresh".into())));
+        assert_eq!(rotated.refresh_token, "new-refresh");
+        assert_eq!(rotated.id_token, current.id_token);
+        assert_eq!(rotated.project_id, current.project_id);
+        assert_eq!(rotated.oauth_client_key, current.oauth_client_key);
+        for missing in [None, Some(String::new())] {
+            assert_eq!(
+                token_data_from_refresh(&current, response(missing)).refresh_token,
+                "old-refresh"
+            );
+        }
+    }
+
+    #[test]
+    fn refresh_intent_never_reuses_the_rejected_credential() {
+        let now = 1_800_000_000;
+        let mut token = crate::models::TokenData::new(
+            "rejected-fixture".into(),
+            "refresh-fixture".into(),
+            3600,
+            None,
+            None,
+            None,
+            false,
+            None,
+        );
+        token.expiry_timestamp = now + 3600;
+        assert!(can_reuse_account_token(
+            &token,
+            RefreshIntent::Expiring,
+            now
+        ));
+        assert!(!can_reuse_account_token(
+            &token,
+            RefreshIntent::RejectedAccessToken("rejected-fixture"),
+            now,
+        ));
+        token.access_token = "newer-fixture".into();
+        assert!(can_reuse_account_token(
+            &token,
+            RefreshIntent::RejectedAccessToken("rejected-fixture"),
+            now,
+        ));
+        token.expiry_timestamp = now + TOKEN_REFRESH_SKEW_SECONDS;
+        assert!(!can_reuse_account_token(
+            &token,
+            RefreshIntent::RejectedAccessToken("rejected-fixture"),
+            now,
+        ));
+        assert!(!can_reuse_account_token(
+            &token,
+            RefreshIntent::Expiring,
+            now
+        ));
+        token.expiry_timestamp = now + 3600;
+        token.access_token.clear();
+        assert!(!can_reuse_account_token(
+            &token,
+            RefreshIntent::Expiring,
+            now
+        ));
+    }
+
+    #[tokio::test]
+    async fn rejected_token_refresh_uses_transport_but_reuses_a_newer_locked_result() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        let _dir = crate::proxy::monitor::prompt_log_tests::TestDataDir::new();
+        let token = crate::models::TokenData::new(
+            "rejected-fixture".into(),
+            "refresh-fixture".into(),
+            3600,
+            None,
+            None,
+            None,
+            false,
+            None,
+        );
+        let mut account = crate::modules::account::upsert_account(
+            "refresh-fixture@example.invalid".into(),
+            None,
+            token,
+        )
+        .unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let fixture_calls = calls.clone();
+        let fixture = axum::Router::new().route(
+            "/token",
+            axum::routing::post(
+                move |axum::Form(form): axum::Form<std::collections::HashMap<String, String>>| {
+                    let calls = fixture_calls.clone();
+                    async move {
+                        assert_eq!(
+                            form.get("grant_type").map(String::as_str),
+                            Some("refresh_token")
+                        );
+                        assert_eq!(
+                            form.get("refresh_token").map(String::as_str),
+                            Some("refresh-fixture")
+                        );
+                        calls.fetch_add(1, Ordering::SeqCst);
+                        axum::Json(serde_json::json!({
+                            "access_token": "http-refreshed-fixture",
+                            "refresh_token": "rotated-refresh-fixture",
+                            "expires_in": 3600,
+                            "token_type": "Bearer"
+                        }))
+                    }
+                },
+            ),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}/token", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, fixture).await.unwrap() });
+        let client = rquest::Client::builder().no_proxy().build().unwrap();
+        let refresh = || {
+            refresh_access_token_with_client_and_intent_at(
+                "refresh-fixture",
+                Some(&account.id),
+                Some(BUILTIN_PERSONAL_CLIENT_KEY),
+                RefreshIntent::RejectedAccessToken("rejected-fixture"),
+                &endpoint,
+                Some(&client),
+            )
+        };
+        let forced = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            tokio::join!(refresh(), refresh())
+        })
+        .await;
+        // No further network is needed: the remaining cases must use disk.
+        server.abort();
+        let (forced, concurrent) = forced.unwrap();
+        let forced = forced.unwrap();
+        assert_eq!(concurrent.unwrap().access_token, "http-refreshed-fixture");
+        let imported = token_data_for_import(
+            &forced,
+            "retired-import-refresh",
+            Some(account.email.clone()),
+            Some("import-project".into()),
+            false,
+        );
+        assert_eq!(imported.refresh_token, "rotated-refresh-fixture");
+        assert!(imported.credential_revision.is_some());
+        assert_eq!(
+            imported.expiry_timestamp,
+            forced.persisted_token.as_ref().unwrap().expiry_timestamp
+        );
+        assert_eq!(imported.project_id.as_deref(), Some("import-project"));
+        assert_eq!(forced.access_token, "http-refreshed-fixture");
+        assert_eq!(
+            crate::modules::account::load_account(&account.id)
+                .unwrap()
+                .token
+                .access_token,
+            "http-refreshed-fixture",
+            "single-flight refresh must publish before returning"
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            crate::modules::account::load_account(&account.id)
+                .unwrap()
+                .token
+                .refresh_token,
+            "rotated-refresh-fixture"
+        );
+        let ensured = ensure_fresh_token(&account.token, Some(&account.id))
+            .await
+            .unwrap();
+        assert_eq!(ensured.access_token, "http-refreshed-fixture");
+        assert_eq!(ensured.refresh_token, "rotated-refresh-fixture");
+
+        let ordinary = refresh_access_token_with_client_and_intent_at(
+            "refresh-fixture",
+            Some(&account.id),
+            Some(BUILTIN_PERSONAL_CLIENT_KEY),
+            RefreshIntent::Expiring,
+            &endpoint,
+            Some(&client),
+        )
+        .await
+        .unwrap();
+        assert_eq!(ordinary.access_token, "http-refreshed-fixture");
+
+        // The force caller starts before another caller persists its result.
+        // It must re-read that account after waiting for the refresh lock.
+        let lock = REFRESH_LOCKS
+            .get_or_init(dashmap::DashMap::new)
+            .get(&account.id)
+            .unwrap()
+            .clone();
+        let guard = lock.lock().await;
+        let pending_account_id = account.id.clone();
+        let pending = refresh_access_token_with_client_and_intent_at(
+            "refresh-fixture",
+            Some(&pending_account_id),
+            Some(BUILTIN_PERSONAL_CLIENT_KEY),
+            RefreshIntent::RejectedAccessToken("rejected-fixture"),
+            &endpoint,
+            Some(&client),
+        );
+        tokio::pin!(pending);
+        assert!(futures::poll!(&mut pending).is_pending());
+        account = crate::modules::account::load_account(&account.id).unwrap();
+        account.token.access_token = "concurrently-refreshed-fixture".into();
+        crate::modules::account::save_account(&account).unwrap();
+        drop(guard);
+        let reused = pending.await.unwrap();
+        assert_eq!(reused.access_token, "concurrently-refreshed-fixture");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
 
     #[test]
     fn test_get_auth_url_contains_state() {

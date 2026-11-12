@@ -55,6 +55,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             --no-web, --pure-proxy   Disable Web UI static console (pure proxy mode)\n  \
             --help                   Show help information\n\n\
             Commands:\n  \
+            tls-import --cert <PEM> --key <PEM> [--advertise <SAN>] [--port 8443]\n  \
+            credentials-migrate     Protect local credentials offline; close the app first\n  \
             switch, list, current, import, export, sync  (Run 'antigravity-tools help' for CLI command details)\n"
         );
         return Ok(());

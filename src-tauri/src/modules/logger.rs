@@ -131,10 +131,14 @@ where
     W: for<'writer> tracing_subscriber::fmt::MakeWriter<'writer> + Send + Sync + 'static,
 {
     let console_layer = fmt::Layer::new()
+        .with_ansi(false)
         .with_target(false)
         .with_thread_ids(false)
         .with_level(true)
-        .with_timer(LocalTimer);
+        .with_timer(LocalTimer)
+        .event_format(RedactingEventFormat(
+            fmt::format().with_timer(LocalTimer).with_target(false),
+        ));
 
     let error_file_layer = fmt::Layer::new()
         .with_writer(non_blocking)
@@ -142,6 +146,7 @@ where
         .with_target(true)
         .with_level(true)
         .with_timer(LocalTimer)
+        .event_format(RedactingEventFormat(fmt::format().with_timer(LocalTimer)))
         .with_filter(LevelFilter::ERROR);
 
     let filter_layer = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
@@ -155,6 +160,27 @@ where
         .try_init();
 
     std::mem::forget(guard);
+}
+
+struct RedactingEventFormat<F>(F);
+
+impl<S, N, F> fmt::FormatEvent<S, N> for RedactingEventFormat<F>
+where
+    S: tracing::Subscriber + for<'a> tracing_subscriber::registry::LookupSpan<'a>,
+    N: for<'a> fmt::FormatFields<'a> + 'static,
+    F: fmt::FormatEvent<S, N>,
+{
+    fn format_event(
+        &self,
+        context: &fmt::FmtContext<'_, S, N>,
+        mut writer: fmt::format::Writer<'_>,
+        event: &tracing::Event<'_>,
+    ) -> std::fmt::Result {
+        let mut rendered = String::new();
+        self.0
+            .format_event(context, fmt::format::Writer::new(&mut rendered), event)?;
+        write!(writer, "{}", crate::utils::redact::text(&rendered))
+    }
 }
 
 #[derive(Clone)]
@@ -539,6 +565,40 @@ pub fn log_error(message: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn formatted_events_redact_structured_and_embedded_secrets() {
+        #[derive(Clone)]
+        struct Capture(Arc<Mutex<Vec<u8>>>);
+        impl Write for Capture {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        let bytes = Arc::new(Mutex::new(Vec::new()));
+        let captured = bytes.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .event_format(RedactingEventFormat(fmt::format().without_time()))
+            .with_writer(move || Capture(captured.clone()))
+            .finish();
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::warn!(
+                access_token = "private-structured",
+                password = "private with spaces",
+                "request to http://alice:private-url@proxy.test?key=private-query failed"
+            );
+            tracing::warn!(id_token = ?Some("private-option"), "authentication failed");
+        });
+        let emitted = String::from_utf8(bytes.lock().unwrap().clone()).unwrap();
+        assert!(emitted.contains("WARN"));
+        assert!(emitted.contains("proxy.test"));
+        assert!(!emitted.contains("private"), "{emitted}");
+    }
 
     fn write_file(dir: &Path, name: &str, bytes: usize) {
         fs::write(dir.join(name), vec![b'x'; bytes]).expect("write log fixture");

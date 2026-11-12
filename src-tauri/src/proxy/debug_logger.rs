@@ -110,7 +110,7 @@ pub async fn write_debug_payload(
     let filename = build_filename(prefix, trace_id);
     let path = output_dir.join(filename);
 
-    match serde_json::to_vec_pretty(payload) {
+    match serde_json::to_vec_pretty(&crate::utils::redact::json(payload)) {
         Ok(bytes) => {
             if let Err(e) = fs::write(&path, bytes).await {
                 tracing::warn!("[Debug-Log] Failed to write file: {}", e);
@@ -148,7 +148,7 @@ pub async fn write_exchange_payload(
     let filename = build_filename(prefix, trace_id);
     let path = output_dir.join(filename);
 
-    match serde_json::to_vec_pretty(payload) {
+    match serde_json::to_vec_pretty(&crate::utils::redact::json(payload)) {
         Ok(bytes) => {
             if let Err(e) = fs::write(&path, bytes).await {
                 tracing::warn!("[Debug-Exchange] Failed to write file: {}", e);
@@ -254,7 +254,7 @@ fn enqueue_diagnostic(cfg: &DebugLoggingConfig, request_id: &str, prefix: &str, 
     let Some(dir) = resolve_output_dir(cfg) else {
         return;
     };
-    let Ok(bytes) = serde_json::to_vec(payload) else {
+    let Ok(bytes) = serde_json::to_vec(&crate::utils::redact::json(payload)) else {
         return;
     };
     if bytes.len() > MAX_DIAGNOSTIC_RECORD_BYTES {

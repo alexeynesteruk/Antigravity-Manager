@@ -196,12 +196,12 @@ const UserToken: React.FC = () => {
         }
     };
 
-    const handleCopyToken = async (text: string) => {
-        const success = await copyToClipboard(text);
-        if (success) {
-            showToast(t('common.copied') || 'Copied to clipboard', 'success');
-        } else {
-            showToast(t('common.copy_failed') || 'Failed to copy to clipboard', 'error');
+    const handleCopyToken = async (id: string) => {
+        try {
+            const success = await copyToClipboard(() => invoke<string>('reveal_user_token', { id }));
+            showToast(success ? t('common.copied') : t('common.copy_failed'), success ? 'success' : 'error');
+        } catch (error) {
+            showToast(String(error), 'error');
         }
     };
 
@@ -262,6 +262,10 @@ const UserToken: React.FC = () => {
                     </button>
                 </div>
             </div>
+
+            <p className="text-sm text-gray-500 dark:text-gray-400">
+                {t('user_token.device_keys_hint', { defaultValue: 'Create a separate key for each device on your local network. Copy retrieves that key securely. Disable or delete a key to revoke access; device keys cannot manage the gateway.' })}
+            </p>
 
             {/* Stats Cards Row */}
             <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
@@ -360,7 +364,7 @@ const UserToken: React.FC = () => {
                                                 {token.token.substring(0, 8)}••••••••
                                             </code>
                                             <button
-                                                onClick={() => handleCopyToken(token.token)}
+                                                onClick={() => handleCopyToken(token.id)}
                                                 className="p-1.5 hover:bg-gray-200 dark:hover:bg-base-300 rounded-md transition-all text-gray-400 hover:text-gray-600 dark:hover:text-white"
                                             >
                                                 <Copy size={13} />

@@ -658,6 +658,9 @@ pub struct ThinkingBudgetConfig {
     /// 旧默认值 16384 已迁移为官方 -1。置位后不再重复改写用户后来手选的 16384。
     #[serde(default)]
     pub flash_high_legacy_migrated: bool,
+    /// Internal one-time migration state; retain it across every configuration save.
+    #[serde(default)]
+    pub thinking_budget_32k_legacy_migrated: bool,
     #[serde(default = "default_flash_tiered")]
     pub flash_tiered: i32, // 默认 -1
 
@@ -752,6 +755,7 @@ impl Default for ThinkingBudgetConfig {
             flash_medium: default_flash_medium(),
             flash_high: default_flash_high(),
             flash_high_legacy_migrated: false,
+            thinking_budget_32k_legacy_migrated: false,
             flash_tiered: default_flash_tiered(),
 
             pro_mode: default_thinking_budget_mode(),
@@ -1083,6 +1087,9 @@ pub struct SecurityMonitorConfig {
     /// a literal "*" is an explicit opt-in to unrestricted browser access.
     #[serde(default)]
     pub cors_allowed_origins: Vec<String>,
+    /// Exact additional listener authorities used by an intentional reverse proxy.
+    #[serde(default)]
+    pub trusted_hosts: Vec<String>,
 }
 
 impl Default for SecurityMonitorConfig {
@@ -1092,6 +1099,7 @@ impl Default for SecurityMonitorConfig {
             whitelist: IpWhitelistConfig::default(),
             trusted_proxies: Vec::new(),
             cors_allowed_origins: Vec::new(),
+            trusted_hosts: Vec::new(),
         }
     }
 }
@@ -1101,12 +1109,18 @@ impl Default for SecurityMonitorConfig {
 pub struct ImageSchedulerConfig {
     #[serde(default = "default_image_per_account_concurrency")]
     pub per_account_concurrency: usize,
+    #[serde(default = "default_image_max_outputs")]
+    pub max_outputs_per_request: usize,
+    #[serde(default = "default_image_parallel_outputs")]
+    pub max_parallel_outputs: usize,
 }
 
 impl Default for ImageSchedulerConfig {
     fn default() -> Self {
         Self {
             per_account_concurrency: default_image_per_account_concurrency(),
+            max_outputs_per_request: default_image_max_outputs(),
+            max_parallel_outputs: default_image_parallel_outputs(),
         }
     }
 }
@@ -1115,9 +1129,20 @@ fn default_image_per_account_concurrency() -> usize {
     4
 }
 
+fn default_image_max_outputs() -> usize {
+    10
+}
+
+fn default_image_parallel_outputs() -> usize {
+    1
+}
+
 /// 反代服务配置
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProxyConfig {
+    /// Operator request budgets and the explicitly acknowledged emergency stop.
+    #[serde(default)]
+    pub account_safety: crate::proxy::pipeline::admission::AccountSafetyConfig,
     /// 是否启用反代服务
     pub enabled: bool,
 
@@ -1130,6 +1155,9 @@ pub struct ProxyConfig {
     /// Exact listener IP. When absent, the LAN toggle selects the legacy default.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bind_address: Option<String>,
+
+    #[serde(default)]
+    pub tls: crate::proxy::tls::GatewayTlsConfig,
 
     /// Authorization policy for the proxy.
     /// - off: no auth required
@@ -1408,9 +1436,11 @@ pub fn default_custom_mapping_expose() -> std::collections::HashMap<String, bool
 impl Default for ProxyConfig {
     fn default() -> Self {
         Self {
+            account_safety: crate::proxy::pipeline::admission::AccountSafetyConfig::default(),
             enabled: false,
             allow_lan_access: false, // 默认仅本机访问，隐私优先
             bind_address: None,
+            tls: Default::default(),
             auth_mode: ProxyAuthMode::default(),
             port: 8045,
             api_key: format!("sk-{}", uuid::Uuid::new_v4().simple()),
@@ -1468,6 +1498,11 @@ impl ProxyConfig {
 
     /// Validate before persistence or listener side effects. Never widen an exact IP.
     pub fn normalize_bind_address(&mut self) -> Result<(), String> {
+        self.security_monitor.trusted_hosts =
+            crate::proxy::middleware::cors::normalize_trusted_hosts(
+                &self.security_monitor.trusted_hosts,
+            )?;
+        crate::proxy::pipeline::image_outputs::validate_config(&self.image_scheduler)?;
         let Some(address) = self.bind_address.as_deref() else {
             return Ok(());
         };
@@ -1522,7 +1557,14 @@ impl ProxyConfig {
     }
 
     pub fn local_base_url(&self) -> String {
-        Self::base_url_for_bind(self.get_bind_address(), self.port)
+        Self::base_url_for_bind(
+            if self.tls.enabled {
+                "127.0.0.1"
+            } else {
+                self.get_bind_address()
+            },
+            self.port,
+        )
     }
 
     pub fn base_url_for_bind(host: &str, port: u16) -> String {

@@ -81,6 +81,12 @@ impl ProtocolStreamHandler for ClaudeStreamHandler {
     }
 
     fn emit_abnormal_finalize(&mut self, error_report: &StreamErrorReport) -> Vec<Bytes> {
+        if matches!(
+            error_report.classified.error_type,
+            "account_attention_required" | "gateway_request_limit"
+        ) {
+            return self.emit_initial_error(error_report);
+        }
         let mut out = Vec::new();
 
         // 协议守卫：若 message_stop 已发送，严禁追加任何事件帧，防止破坏客户端状态机
@@ -102,11 +108,20 @@ impl ProtocolStreamHandler for ClaudeStreamHandler {
         // [FIX #3634 契约对齐] 严禁下发 overloaded_error。
         // Claude Code 2.1.293 的 PU(e) 只要检测到 overloaded_error 字符串，立即触发 30 分钟冷却并在未产生内容前进入 10 次指数退避重试风暴。
         // 首包未就绪时发生错误统一使用 Anthropic 标准的 api_error，促使客户端转入 retryWithoutStreaming 单次重试或直接暴露错误。
-        let err_type = "api_error";
+        let err_type = if matches!(
+            error_report.classified.error_type,
+            "account_attention_required" | "gateway_request_limit"
+        ) {
+            error_report.classified.error_type
+        } else {
+            "api_error"
+        };
         let error_json = serde_json::json!({
             "type": "error",
             "error": {
                 "type": err_type,
+                "code": error_report.admission_error().map(|error| error.code),
+                "retry_after": error_report.admission_error().map(|error| error.retry_after),
                 "message": error_report.client_message(),
                 "function": error_report.function,
                 "call_site": error_report.call_site(),

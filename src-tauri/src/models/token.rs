@@ -6,6 +6,10 @@ fn default_is_gcp_tos() -> bool {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TokenData {
+    /// Persistence provenance travels with snapshots and refreshes, but is never
+    /// accepted from or exposed to external JSON clients.
+    #[serde(skip)]
+    pub(crate) credential_revision: Option<crate::modules::credential_store::CredentialRevision>,
     pub access_token: String,
     pub refresh_token: String,
     pub expires_in: i64,
@@ -39,6 +43,7 @@ impl TokenData {
     ) -> Self {
         let expiry_timestamp = chrono::Utc::now().timestamp() + expires_in;
         Self {
+            credential_revision: None,
             access_token,
             refresh_token,
             expires_in,

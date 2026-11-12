@@ -544,7 +544,7 @@ pub fn init_db() -> Result<(), String> {
 }
 
 fn map_request_log_row(row: &rusqlite::Row) -> rusqlite::Result<ProxyRequestLog> {
-    Ok(ProxyRequestLog {
+    let mut log = ProxyRequestLog {
         id: row.get(0)?,
         timestamp: row.get(1)?,
         method: row.get(2)?,
@@ -575,7 +575,11 @@ fn map_request_log_row(row: &rusqlite::Row) -> rusqlite::Result<ProxyRequestLog>
             .get::<_, Option<String>>("upstream_model")
             .ok()
             .flatten(),
-    })
+    };
+    // Existing history may predate credential-safe writes. Never expose those
+    // values through the monitor/detail/export APIs either.
+    log.redact_credentials();
+    Ok(log)
 }
 
 pub const MAX_TOOL_SIGNATURES_ROWS: usize = 10_000;
@@ -2071,6 +2075,7 @@ fn save_log_with_connection(
     mut log: ProxyRequestLog,
     policy: &LogRetentionConfig,
 ) -> Result<(), String> {
+    log.redact_credentials();
     conn.busy_timeout(std::time::Duration::from_millis(250))
         .map_err(|e| e.to_string())?;
     log.error = log
@@ -2241,6 +2246,34 @@ pub fn get_log_detail(log_id: &str) -> Result<ProxyRequestLog, String> {
 #[cfg(test)]
 mod thinking_pack_tests {
     use super::*;
+
+    #[test]
+    fn legacy_log_reads_and_exports_hide_credentials_without_changing_live_payloads() {
+        let _dir = crate::proxy::monitor::prompt_log_tests::TestDataDir::new();
+        init_db().unwrap();
+        let conn = connect_db().unwrap();
+        conn.execute("INSERT INTO request_logs (id,timestamp,method,url,status,duration,error,request_body)
+            VALUES (?1,?2,'POST',?3,403,10,?4,?5)", params!["legacy-secret",
+            chrono::Utc::now().timestamp_millis(), "/v1/chat/completions?key=private-query",
+            "http://user:private-proxy@proxy.test failed",
+            r#"{"refreshToken":"private-refresh","messages":[{"role":"user","content":"hello"}]}"#]).unwrap();
+        let detail = get_log_detail("legacy-secret").unwrap();
+        assert!(!serde_json::to_string(&detail).unwrap().contains("private"));
+        assert!(detail.request_body.unwrap().contains("hello"));
+        let exported = get_all_logs_for_export().unwrap();
+        assert!(!serde_json::to_string(&exported)
+            .unwrap()
+            .contains("private"));
+        // This change protects API reads; historical bytes are not claimed wiped.
+        let stored: String = conn
+            .query_row(
+                "SELECT request_body FROM request_logs WHERE id='legacy-secret'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(stored.contains("private-refresh"));
+    }
 
     #[test]
     fn pack_roundtrip_short_and_long() {

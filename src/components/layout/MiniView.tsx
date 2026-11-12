@@ -235,16 +235,16 @@ export default function MiniView() {
         );
     };
 
-    const handleRefresh = async () => {
+    const handleRefresh = async (automatic = false) => {
         if (isRefreshing) return;
         setIsRefreshing(true);
         try {
             if (activeTab === 'pool') {
-                await refreshAllQuotas();
+                await refreshAllQuotas(automatic);
                 await fetchAccounts();
                 await fetchCurrentAccount();
             } else if (displayedAccount) {
-                await refreshQuota(displayedAccount.id);
+                await refreshQuota(displayedAccount.id, automatic);
                 await fetchCurrentAccount();
             }
         } catch (e) {
@@ -265,7 +265,7 @@ export default function MiniView() {
             if (typeof document !== 'undefined' && document.hidden) {
                 return;
             }
-            handleRefreshRef.current();
+            handleRefreshRef.current(true);
         }, config.refresh_interval * 60 * 1000);
 
         return () => clearInterval(intervalId);
@@ -721,7 +721,7 @@ export default function MiniView() {
                         type="button"
                         data-tauri-drag-region="false"
                         onMouseDown={(e) => e.stopPropagation()}
-                        onClick={handleRefresh}
+                        onClick={() => { void handleRefresh(); }}
                         className="p-1 rounded-lg text-gray-500 hover:text-gray-900 dark:text-gray-400 dark:hover:text-white hover:bg-black/[0.04] dark:hover:bg-white/[0.08] transition-colors cursor-pointer outline-none focus:outline-none focus:ring-0 focus-visible:ring-0"
                         title={t('common.refresh', '刷新当前额度')}
                     >

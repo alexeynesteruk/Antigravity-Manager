@@ -141,6 +141,10 @@ pub fn start_scheduler(
                 continue;
             }
 
+            let Ok(safety_context) = crate::proxy::pipeline::admission::automatic_context().await
+            else {
+                continue;
+            };
             let now_ts = Utc::now().timestamp();
             let mut tasks_to_run = Vec::new();
 
@@ -149,13 +153,20 @@ pub fn start_scheduler(
                     continue;
                 }
 
-                let Ok((token, pid)) = quota::get_valid_token_for_warmup(acc).await else {
+                let Ok((token, pid)) = crate::proxy::pipeline::budget::scope(
+                    safety_context.clone(),
+                    quota::get_valid_token_for_warmup(acc),
+                )
+                .await
+                else {
                     continue;
                 };
 
-                let Ok((fresh_quota, _)) =
-                    quota::fetch_quota_with_cache(&token, &acc.email, Some(&pid), Some(&acc.id))
-                        .await
+                let Ok((fresh_quota, _)) = crate::proxy::pipeline::budget::scope(
+                    safety_context.clone(),
+                    quota::fetch_quota_with_cache(&token, &acc.email, Some(&pid), Some(&acc.id)),
+                )
+                .await
                 else {
                     continue;
                 };
@@ -277,43 +288,46 @@ pub fn start_scheduler(
                 let handle_for_warmup = app_handle.clone();
                 let state_for_warmup = proxy_state.clone();
 
-                tokio::spawn(async move {
-                    for (acc_id, email, model, token, pid, history_key) in tasks_to_run {
-                        logger::log_info(&format!(
-                            "[WeeklyWarmup] 🚀 Triggering weekly warmup for {} @ {}",
-                            model, email
-                        ));
-
-                        let success = quota::warmup_model_directly(
-                            &token,
-                            &model,
-                            &pid,
-                            &email,
-                            100,
-                            Some(&acc_id),
-                            false,
-                        )
-                        .await;
-
-                        if success {
-                            let now = Utc::now().timestamp();
-                            record_warmup_history(&history_key, now);
+                tokio::spawn(crate::proxy::pipeline::budget::scope(
+                    safety_context.clone(),
+                    async move {
+                        for (acc_id, email, model, token, pid, history_key) in tasks_to_run {
                             logger::log_info(&format!(
+                                "[WeeklyWarmup] 🚀 Triggering weekly warmup for {} @ {}",
+                                model, email
+                            ));
+
+                            let success = quota::warmup_model_directly(
+                                &token,
+                                &model,
+                                &pid,
+                                &email,
+                                100,
+                                Some(&acc_id),
+                                false,
+                            )
+                            .await;
+
+                            if success {
+                                let now = Utc::now().timestamp();
+                                record_warmup_history(&history_key, now);
+                                logger::log_info(&format!(
                                 "[WeeklyWarmup] ✅ Successfully started weekly timer for {} @ {}",
                                 model, email
                             ));
+                            }
+                            tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
                         }
-                        tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
-                    }
 
-                    // Refresh UI
-                    tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
-                    let _ = crate::commands::refresh_all_quotas_internal(
-                        &state_for_warmup,
-                        handle_for_warmup,
-                    )
-                    .await;
-                });
+                        // Refresh UI
+                        tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+                        let _ = crate::commands::refresh_all_quotas_internal(
+                            &state_for_warmup,
+                            handle_for_warmup,
+                        )
+                        .await;
+                    },
+                ));
             }
 
             // Regularly clean up history (keep last 30 days)
@@ -329,12 +343,23 @@ pub fn start_scheduler(
 
 /// Trigger immediate smart warmup check for a single account (e.g. on manual trigger / recovered event)
 pub async fn trigger_warmup_for_account(account: &Account) {
-    let Ok((token, pid)) = quota::get_valid_token_for_warmup(account).await else {
+    let Ok(safety_context) = crate::proxy::pipeline::admission::automatic_context().await else {
+        return;
+    };
+    let Ok((token, pid)) = crate::proxy::pipeline::budget::scope(
+        safety_context.clone(),
+        quota::get_valid_token_for_warmup(account),
+    )
+    .await
+    else {
         return;
     };
 
-    let Ok((fresh_quota, _)) =
-        quota::fetch_quota_with_cache(&token, &account.email, Some(&pid), Some(&account.id)).await
+    let Ok((fresh_quota, _)) = crate::proxy::pipeline::budget::scope(
+        safety_context.clone(),
+        quota::fetch_quota_with_cache(&token, &account.email, Some(&pid), Some(&account.id)),
+    )
+    .await
     else {
         return;
     };
@@ -398,14 +423,17 @@ pub async fn trigger_warmup_for_account(account: &Account) {
                                 continue;
                             }
 
-                            let success = quota::warmup_model_directly(
-                                &token,
-                                &model_to_ping,
-                                &pid,
-                                &account.email,
-                                100,
-                                Some(&account.id),
-                                false,
+                            let success = crate::proxy::pipeline::budget::scope(
+                                safety_context.clone(),
+                                quota::warmup_model_directly(
+                                    &token,
+                                    &model_to_ping,
+                                    &pid,
+                                    &account.email,
+                                    100,
+                                    Some(&account.id),
+                                    false,
+                                ),
                             )
                             .await;
 

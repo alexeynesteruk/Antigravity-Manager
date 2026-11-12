@@ -253,6 +253,12 @@ impl ProtocolStreamHandler for GeminiStreamHandler {
     }
 
     fn emit_abnormal_finalize(&mut self, error_report: &StreamErrorReport) -> Vec<Bytes> {
+        if matches!(
+            error_report.classified.error_type,
+            "account_attention_required" | "gateway_request_limit"
+        ) {
+            return self.emit_initial_error(error_report);
+        }
         let mut chunks = Vec::new();
 
         // 终态与内容防护：若上游已下发 finishReason 或从未产生任何正文/工具调用，绝不可伪造收尾
@@ -299,11 +305,16 @@ impl ProtocolStreamHandler for GeminiStreamHandler {
     }
 
     fn emit_initial_error(&mut self, error_report: &StreamErrorReport) -> Vec<Bytes> {
+        let attention = error_report.classified.error_type == "account_attention_required";
+        let budget = error_report.classified.error_type == "gateway_request_limit";
         let error_json = serde_json::json!({
             "error": {
-                "code": 503,
+                "code": if budget { 429 } else if attention { 400 } else { 503 },
+                "gateway_code": error_report.admission_error().map(|error| error.code),
+                "retry_after": error_report.admission_error().map(|error| error.retry_after),
                 "message": error_report.client_message(),
-                "status": "UNAVAILABLE",
+                "status": if budget { "RESOURCE_EXHAUSTED" } else if attention { "FAILED_PRECONDITION" } else { "UNAVAILABLE" },
+                "type": error_report.classified.error_type,
                 "function": error_report.function,
                 "call_site": error_report.call_site(),
                 "params": error_report.params
@@ -330,6 +341,31 @@ impl ProtocolStreamHandler for GeminiStreamHandler {
 mod tests {
     use super::*;
     use futures::StreamExt;
+
+    #[test]
+    fn account_attention_stream_error_is_non_retryable_before_and_after_content() {
+        use crate::proxy::pipeline::ProtocolStreamHandler;
+        let mut handler = test_gemini_handler();
+        let report = crate::proxy::mappers::error_classifier::report_stream_error(
+            "gemini",
+            "attention_test",
+            &r#"{"error":{"type":"account_attention_required"}}"#,
+            "",
+        );
+        for frames in [
+            handler.emit_initial_error(&report),
+            handler.emit_abnormal_finalize(&report),
+        ] {
+            let text = frames
+                .into_iter()
+                .map(|bytes| String::from_utf8_lossy(&bytes).to_string())
+                .collect::<String>();
+            assert!(text.contains("FAILED_PRECONDITION"));
+            assert!(text.contains("account_attention_required"));
+            assert!(!text.contains("UNAVAILABLE"));
+            assert!(!text.contains("MAX_TOKENS"));
+        }
+    }
 
     fn test_gemini_handler() -> GeminiStreamHandler {
         GeminiStreamHandler::new(

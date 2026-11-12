@@ -29,21 +29,34 @@ pub struct UpdateTokenRequest {
 /// List all tokens
 #[tauri::command]
 pub async fn list_user_tokens() -> Result<Vec<UserToken>, String> {
-    user_token_db::list_tokens()
+    tokio::task::spawn_blocking(user_token_db::list_tokens)
+        .await
+        .map_err(|_| "Device-key listing worker failed".to_string())?
+}
+
+#[tauri::command]
+pub async fn reveal_user_token(id: String) -> Result<String, String> {
+    tokio::task::spawn_blocking(move || user_token_db::reveal_token(&id))
+        .await
+        .map_err(|_| "Device-key reveal worker failed".to_string())?
 }
 
 /// Create a new token
 #[tauri::command]
 pub async fn create_user_token(request: CreateTokenRequest) -> Result<UserToken, String> {
-    user_token_db::create_token(
-        request.username,
-        request.expires_type,
-        request.description,
-        request.max_ips,
-        request.curfew_start,
-        request.curfew_end,
-        request.custom_expires_at,
-    )
+    tokio::task::spawn_blocking(move || {
+        user_token_db::create_token(
+            request.username,
+            request.expires_type,
+            request.description,
+            request.max_ips,
+            request.curfew_start,
+            request.curfew_end,
+            request.custom_expires_at,
+        )
+    })
+    .await
+    .map_err(|_| "Device-key creation worker failed".to_string())?
 }
 
 /// Update a token
@@ -63,7 +76,9 @@ pub async fn update_user_token(id: String, request: UpdateTokenRequest) -> Resul
 /// Delete a token
 #[tauri::command]
 pub async fn delete_user_token(id: String) -> Result<(), String> {
-    user_token_db::delete_token(&id)
+    tokio::task::spawn_blocking(move || user_token_db::delete_token(&id))
+        .await
+        .map_err(|_| "Device-key revocation worker failed".to_string())?
 }
 
 /// Renew a token

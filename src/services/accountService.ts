@@ -82,8 +82,8 @@ export async function switchAccount(accountId: string, targetIde?: string): Prom
     return await invoke('switch_account', { accountId, targetIde });
 }
 
-export async function fetchAccountQuota(accountId: string): Promise<QuotaData> {
-    return await invoke('fetch_account_quota', { accountId });
+export async function fetchAccountQuota(accountId: string, automatic = false): Promise<QuotaData> {
+    return await invoke(automatic ? 'fetch_account_quota_automatically' : 'fetch_account_quota', { accountId });
 }
 
 export interface RefreshStats {
@@ -93,8 +93,8 @@ export interface RefreshStats {
     details: string[];
 }
 
-export async function refreshAllQuotas(): Promise<RefreshStats> {
-    return await invoke('refresh_all_quotas');
+export async function refreshAllQuotas(automatic = false): Promise<RefreshStats> {
+    return await invoke(automatic ? 'refresh_all_quotas_automatically' : 'refresh_all_quotas');
 }
 
 // OAuth

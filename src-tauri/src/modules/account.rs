@@ -27,6 +27,17 @@ fn get_account_lock(account_id: &str) -> Arc<Mutex<()>> {
         .clone()
 }
 
+pub(crate) fn with_account_file_write<T>(
+    account_id: &str,
+    operation: impl FnOnce() -> Result<T, String>,
+) -> Result<T, String> {
+    let lock = get_account_lock(account_id);
+    let _guard = lock
+        .lock()
+        .map_err(|_| "Account file lock is unavailable")?;
+    operation()
+}
+
 #[cfg(test)]
 pub(crate) static SHARED_TEST_ENV_LOCK: Lazy<std::sync::Mutex<()>> =
     Lazy::new(|| std::sync::Mutex::new(()));
@@ -2960,7 +2971,7 @@ fn try_migrate_legacy_single_file(
     if !entries.iter().any(|entry| entry.get("token").is_some()) {
         return Ok(None);
     }
-    let parsed_accounts: Vec<Account> = entries
+    let mut parsed_accounts: Vec<Account> = entries
         .into_iter()
         .map(|entry| {
             serde_json::from_value(entry.clone())
@@ -2977,7 +2988,7 @@ fn try_migrate_legacy_single_file(
     fs::create_dir_all(&accounts_dir)
         .map_err(|e| format!("Failed to create account shards: {}", e))?;
     // Validate the entire archive before creating a backup or changing any shard.
-    for account in &parsed_accounts {
+    for account in &mut parsed_accounts {
         if !ids.insert(account.id.clone()) || !emails.insert(account.email.trim().to_lowercase()) {
             return Err("Legacy archive contains duplicate account IDs or emails".to_string());
         }
@@ -2986,13 +2997,14 @@ fn try_migrate_legacy_single_file(
         if path.exists() {
             let existing = load_account_at_path(&path)?;
             if serde_json::to_value(&existing).map_err(|e| e.to_string())?
-                != serde_json::to_value(account).map_err(|e| e.to_string())?
+                != serde_json::to_value(&*account).map_err(|e| e.to_string())?
             {
                 return Err(
                     "Legacy account conflicts with an existing shard; original archive preserved"
                         .to_string(),
                 );
             }
+            account.token.credential_revision = existing.token.credential_revision;
         }
         shards.push(path);
     }
@@ -3247,49 +3259,52 @@ fn validate_account_file_identity(path: &std::path::Path, account_id: &str) -> R
 }
 
 fn load_account_at_path(account_path: &PathBuf) -> Result<Account, String> {
-    let content = fs::read_to_string(account_path)
-        .map_err(|e| format!("failed_to_read_account_data: {}", e))?;
-
-    let mut account = match serde_json::from_str::<Account>(&content) {
-        Ok(account) => account,
-        Err(e) => {
-            let err_msg = e.to_string();
-            // Self-healing attempt: handle trailing characters / extra closing brackets
-            if err_msg.contains("trailing characters")
-                || err_msg.contains("trailing comma")
-                || err_msg.contains("trailing")
-            {
-                let mut de = serde_json::Deserializer::from_str(&content);
-                if let Ok(account) = serde::Deserialize::deserialize(&mut de) {
-                    let account: Account = account;
-                    validate_account_file_identity(account_path, &account.id)?;
-                    crate::modules::logger::log_warn(&format!(
-                        "Self-healing account JSON at {:?}: recovered valid account data from trailing characters, saving clean file",
-                        account_path
-                    ));
-                    let _ = save_account_at_path(account_path, &account);
-                    return Ok(account);
-                }
+    let filename_id = account_path
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .ok_or("Invalid account filename")?;
+    crate::utils::db_import_path::validate_account_id(filename_id)?;
+    let (account, repair) = with_account_file_write(filename_id, || {
+        let content = fs::read_to_string(account_path)
+            .map_err(|e| format!("failed_to_read_account_data: {}", e))?;
+        let mut repair = false;
+        let mut document: serde_json::Value = match serde_json::from_str(&content) {
+            Ok(document) => document,
+            Err(error) if error.to_string().contains("trailing") => {
+                let mut parser = serde_json::Deserializer::from_str(&content);
+                let document = serde::Deserialize::deserialize(&mut parser)
+                    .map_err(|e| format!("failed_to_parse_account_data: {}", e))?;
+                repair = true;
+                document
             }
-            return Err(format!("failed_to_parse_account_data: {}", err_msg));
+            Err(error) => return Err(format!("failed_to_parse_account_data: {}", error)),
+        };
+        let id = document
+            .get("id")
+            .and_then(serde_json::Value::as_str)
+            .ok_or("Account document has no managed identity")?;
+        validate_account_file_identity(account_path, id)?;
+        crate::modules::credential_store::hydrate_account_document(&mut document)?;
+        let credential_revision =
+            crate::modules::credential_store::capture_credential_revision(&document)?;
+        let mut account: Account = serde_json::from_value(document)
+            .map_err(|e| format!("failed_to_parse_account_data: {}", e))?;
+        account.token.credential_revision = Some(credential_revision);
+        if let Some(ref mut quota) = account.quota {
+            let original = quota.subscription_tier.clone();
+            quota.ensure_subscription_tier();
+            repair |= quota.subscription_tier != original;
         }
-    };
-
-    validate_account_file_identity(account_path, &account.id)?;
-
-    // Self-healing: if subscription_tier is missing or unnormalized, heal it and persist to disk
-    if let Some(ref mut quota) = account.quota {
-        let original_tier = quota.subscription_tier.clone();
-        quota.ensure_subscription_tier();
-        if quota.subscription_tier != original_tier {
-            crate::modules::logger::log_info(&format!(
-                "Self-healing subscription tier for account {} ({:?} -> {:?})",
-                account.email, original_tier, quota.subscription_tier
-            ));
-            let _ = save_account_at_path(account_path, &account);
+        Ok((account, repair))
+    })?;
+    if repair {
+        if save_account_at_path(account_path, &account).is_ok() {
+            // Healing may promote legacy credentials or merge a concurrent
+            // rotation. Return the committed revision rather than the one
+            // observed before that write.
+            return load_account_at_path(account_path);
         }
     }
-
     Ok(account)
 }
 
@@ -3395,17 +3410,45 @@ pub fn load_account(account_id: &str) -> Result<Account, String> {
     load_account_at_path(&account_path)
 }
 
+pub(crate) fn load_account_if_present(account_id: &str) -> Result<Option<Account>, String> {
+    let directory = get_accounts_dir()?;
+    match crate::utils::db_import_path::resolve_account_file_path_checked(&directory, account_id) {
+        Ok(path) => load_account_at_path(&path).map(Some),
+        Err(crate::utils::db_import_path::ManagedPathError::Io(error))
+            if error.kind() == std::io::ErrorKind::NotFound =>
+        {
+            Ok(None)
+        }
+        Err(error) => Err(error.to_string()),
+    }
+}
+
+pub(crate) fn find_managed_account_for_refresh_token(
+    refresh_token: &str,
+) -> Result<Option<String>, String> {
+    let index = load_account_index()?;
+    for summary in index.accounts {
+        if let Some(account) = load_account_if_present(&summary.id)? {
+            if !refresh_token.is_empty() && account.token.refresh_token == refresh_token {
+                return Ok(Some(account.id));
+            }
+        }
+    }
+    Ok(None)
+}
+
 /// Save account data at specific file path (thread-safe and atomic)
 fn save_account_at_path(account_path: &PathBuf, account: &Account) -> Result<(), String> {
     validate_account_file_identity(account_path, &account.id)?;
-    let _lock = get_account_lock(&account.id);
-    let _guard = _lock.lock().unwrap();
 
-    let content = serde_json::to_string_pretty(account)
+    let document = serde_json::to_value(account)
         .map_err(|e| format!("failed_to_serialize_account_data: {}", e))?;
-
-    crate::utils::fs::write_private_atomic(account_path, content.as_bytes())
-        .map_err(|e| format!("failed_to_save_account_file: {}", e))
+    crate::modules::credential_store::persist_typed_account_document(
+        account_path,
+        document,
+        account.token.credential_revision.as_ref(),
+    )
+    .map_err(|e| format!("failed_to_save_account_file: {}", e))
 }
 
 /// Save account data (thread-safe and atomic)
@@ -3414,6 +3457,28 @@ pub fn save_account(account: &Account) -> Result<(), String> {
     let account_path =
         crate::utils::db_import_path::resolve_account_write_path(&accounts_dir, &account.id)?;
     save_account_at_path(&account_path, account)
+}
+
+fn save_account_after_verified_recovery(account: &Account) -> Result<(), String> {
+    let directory = get_accounts_dir()?;
+    let path = crate::utils::db_import_path::resolve_account_write_path(&directory, &account.id)?;
+    validate_account_file_identity(&path, &account.id)?;
+    let document =
+        serde_json::to_value(account).map_err(|_| "Failed to encode recovered account")?;
+    crate::modules::credential_store::persist_account_document_after_verified_recovery(
+        &path,
+        document,
+        account.token.credential_revision.as_ref(),
+    )
+}
+
+pub(crate) fn persist_refreshed_credentials(
+    account_id: &str,
+    token: &TokenData,
+) -> Result<TokenData, String> {
+    let directory = get_accounts_dir()?;
+    let path = crate::utils::db_import_path::resolve_account_file_path(&directory, account_id)?;
+    crate::modules::credential_store::persist_credential_update(&path, token)
 }
 
 /// Save proxy selection priority using the shared account write lock.
@@ -3502,12 +3567,49 @@ pub async fn auto_fetch_account_project_id(account_id: &str) -> Result<String, S
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    // Pause a list scan at its read/write boundary for deterministic race tests.
+    static ACCOUNT_LIST_SCAN_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Promote every indexed legacy account before startup/list use. The writer
+/// boundary ensures migration never publishes a stale metadata snapshot.
+pub(crate) fn migrate_managed_credentials_in_dir(
+    data_dir: &std::path::Path,
+) -> Result<usize, String> {
+    let _writer = lock_account_file_updates()?;
+    let index = load_account_index_in_dir(&data_dir.to_path_buf())?;
+    let directory = data_dir.join("accounts");
+    let mut migrated = 0;
+    for summary in index.accounts {
+        let path = match crate::utils::db_import_path::resolve_account_file_path_checked(
+            &directory,
+            &summary.id,
+        ) {
+            Ok(path) => path,
+            Err(crate::utils::db_import_path::ManagedPathError::Io(error))
+                if error.kind() == std::io::ErrorKind::NotFound =>
+            {
+                continue
+            }
+            Err(error) => return Err(error.to_string()),
+        };
+        if crate::modules::credential_store::migrate_account_file(&path)? {
+            migrated += 1;
+        }
+    }
+    Ok(migrated)
+}
+
 /// List all accounts
 pub fn list_accounts() -> Result<Vec<Account>, String> {
+    migrate_managed_credentials_in_dir(&get_data_dir()?)?;
     crate::modules::logger::log_info("Listing accounts...");
     let mut index = load_account_index()?;
     let mut accounts = Vec::new();
-    let mut index_dirty = false;
+    let mut dirty_account_ids = Vec::new();
 
     for summary in &mut index.accounts {
         match load_account(&summary.id) {
@@ -3515,11 +3617,11 @@ pub fn list_accounts() -> Result<Vec<Account>, String> {
                 // 实体文件是账号状态的权威来源。若索引中的停用状态与实体文件发生漂移，以实体文件为准并同步修正索引
                 if summary.disabled != account.disabled {
                     summary.disabled = account.disabled;
-                    index_dirty = true;
+                    dirty_account_ids.push(summary.id.clone());
                 }
                 if summary.proxy_disabled != account.proxy_disabled {
                     summary.proxy_disabled = account.proxy_disabled;
-                    index_dirty = true;
+                    dirty_account_ids.push(summary.id.clone());
                 }
                 accounts.push(account);
             }
@@ -3535,14 +3637,54 @@ pub fn list_accounts() -> Result<Vec<Account>, String> {
         }
     }
 
-    if index_dirty {
-        let _ = save_account_index(&index);
+    #[cfg(test)]
+    ACCOUNT_LIST_SCAN_HOOK.with(|hook| {
+        if let Some(callback) = hook.borrow_mut().take() {
+            callback();
+        }
+    });
+    if !dirty_account_ids.is_empty() {
+        if let Err(error) = sync_account_index_flags(&dirty_account_ids) {
+            crate::modules::logger::log_warn(&format!(
+                "Failed to synchronize account index flags: {}",
+                error
+            ));
+        }
     }
 
     if let Err(error) = crate::modules::token_stats::populate_weekly_usage(&mut accounts) {
         tracing::warn!("Weekly token usage unavailable: {}", error);
     }
     Ok(accounts)
+}
+
+/// A list scan may overlap imports, deletion, or quota changes. Re-read both the
+/// index and affected entities under the writer boundary instead of publishing
+/// the list's stale index snapshot over a concurrent mutation.
+fn sync_account_index_flags(account_ids: &[String]) -> Result<(), String> {
+    let _writer = lock_account_file_updates()?;
+    let mut index = load_account_index()?;
+    let account_ids: std::collections::HashSet<_> =
+        account_ids.iter().map(String::as_str).collect();
+    let mut changed = false;
+    for summary in &mut index.accounts {
+        if !account_ids.contains(summary.id.as_str()) {
+            continue;
+        }
+        let Ok(account) = load_account(&summary.id) else {
+            continue;
+        };
+        if summary.disabled != account.disabled || summary.proxy_disabled != account.proxy_disabled
+        {
+            summary.disabled = account.disabled;
+            summary.proxy_disabled = account.proxy_disabled;
+            changed = true;
+        }
+    }
+    if changed {
+        save_account_index(&index)?;
+    }
+    Ok(())
 }
 
 /// Resolve persisted CLI credentials without changing any client's login state.
@@ -3568,7 +3710,7 @@ pub fn add_account(
 pub fn upsert_account(
     email: String,
     name: Option<String>,
-    token: TokenData,
+    mut token: TokenData,
 ) -> Result<Account, String> {
     let _lock = ACCOUNT_INDEX_LOCK
         .lock()
@@ -3590,6 +3732,11 @@ pub fn upsert_account(
             Ok(mut account) => {
                 let old_access_token = account.token.access_token.clone();
                 let old_refresh_token = account.token.refresh_token.clone();
+                if token.credential_revision.is_none() {
+                    // An explicit import/login replacement observes this exact
+                    // account revision; concurrent refreshes still win safely.
+                    token.credential_revision = account.token.credential_revision.clone();
+                }
                 account.token = token;
                 account.name = name.clone();
                 if account.disabled
@@ -3610,7 +3757,7 @@ pub fn upsert_account(
                     save_account_index(&index)?;
                 }
 
-                return Ok(account);
+                return load_account(&account_id);
             }
             Err(e) => {
                 crate::modules::logger::log_warn(&format!(
@@ -3627,7 +3774,7 @@ pub fn upsert_account(
                     save_account_index(&index)?;
                 }
 
-                return Ok(account);
+                return load_account(&account_id);
             }
         }
     }
@@ -3654,7 +3801,49 @@ pub fn upsert_account(
     }
 
     save_account_index(&index)?;
-    Ok(account)
+    load_account(&account.id)
+}
+
+/// The caller has already retired the index entry under the account writer.
+/// A failed unlink must retain the OS generation needed to read the orphan.
+fn remove_account_credential_file(account_id: &str, path: &std::path::Path) -> Result<(), String> {
+    remove_account_credential_file_using(
+        account_id,
+        path,
+        crate::modules::credential_store::delete_account_reference,
+    )
+}
+
+fn remove_account_credential_file_using(
+    account_id: &str,
+    path: &std::path::Path,
+    delete_native: impl FnOnce(&crate::modules::credential_store::VaultRef) -> Result<(), String>,
+) -> Result<(), String> {
+    let lock = get_account_lock(account_id);
+    let _file_write = lock
+        .lock()
+        .map_err(|_| "Account file lock is unavailable")?;
+    let reference = match crate::modules::credential_store::account_reference_at(path) {
+        Ok(reference) => reference,
+        Err(error) => {
+            crate::modules::logger::log_warn(&format!(
+                "Could not recover retired credential reference: {error}"
+            ));
+            None
+        }
+    };
+    match fs::remove_file(path) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(format!("failed_to_delete_account_file: {error}")),
+    }
+    if let Some(reference) = reference {
+        if let Err(error) = delete_native(&reference) {
+            let cleanup = serde_json::json!({"scope":"account","owner":account_id,"credential_store":reference});
+            return Err(format!("Account file removed, but native credential cleanup failed: {error}. Retired nonsecret cleanup reference: {cleanup}"));
+        }
+    }
+    Ok(())
 }
 
 /// Delete account
@@ -3690,30 +3879,26 @@ pub fn delete_account(account_id: &str) -> Result<(), String> {
     }
 
     // 无论索引中是否存在，均尝试删除受管凭据文件（兜底清理孤儿文件）；删除失败通过 ? 向上抛错
-    if file_existed {
-        fs::remove_file(&account_path)
-            .map_err(|e| format!("failed_to_delete_account_file: {}", e))?;
-    }
-
-    // [FIX #1477] Trigger TokenManager cache cleanup signal
     crate::proxy::server::trigger_account_delete(account_id);
+    remove_account_credential_file(account_id, &account_path)?;
 
     Ok(())
 }
 
 /// Batch delete accounts (atomic index operation)
 pub fn delete_accounts(account_ids: &[String]) -> Result<(), String> {
+    if account_ids.is_empty() {
+        return Ok(());
+    }
+    let _lock = lock_account_file_updates()?;
     let accounts_dir = get_accounts_dir()?;
     let account_paths: Vec<_> = account_ids
         .iter()
         .map(|id| crate::utils::db_import_path::resolve_account_write_path(&accounts_dir, id))
         .collect::<Result<_, _>>()?;
-    let _lock = ACCOUNT_INDEX_LOCK
-        .lock()
-        .map_err(|e| format!("failed_to_acquire_lock: {}", e))?;
     let mut index = load_account_index()?;
 
-    for (account_id, account_path) in account_ids.iter().zip(account_paths) {
+    for account_id in account_ids {
         // Remove from index
         index.accounts.retain(|s| &s.id != account_id);
 
@@ -3721,14 +3906,6 @@ pub fn delete_accounts(account_ids: &[String]) -> Result<(), String> {
         if index.current_account_id.as_deref() == Some(account_id) {
             index.current_account_id = None;
         }
-
-        // Delete account file
-        if account_path.exists() {
-            let _ = fs::remove_file(&account_path);
-        }
-
-        // [FIX #1477] Trigger TokenManager cache cleanup signal
-        crate::proxy::server::trigger_account_delete(account_id);
     }
 
     // If current account is empty, use first one as default
@@ -3736,7 +3913,27 @@ pub fn delete_accounts(account_ids: &[String]) -> Result<(), String> {
         index.current_account_id = index.accounts.first().map(|s| s.id.clone());
     }
 
-    save_account_index(&index)
+    // Fail before deleting any credentials or invalidating live caches. Once
+    // committed, the index keeps even an undeletable orphan out of the pool.
+    save_account_index(&index)?;
+    let mut cleanup_errors = Vec::new();
+    for (account_id, account_path) in account_ids.iter().zip(account_paths) {
+        crate::proxy::server::trigger_account_delete(account_id);
+        if let Err(error) = remove_account_credential_file(account_id, &account_path) {
+            cleanup_errors.push(format!("{}: {}", account_id, error));
+        }
+    }
+    if cleanup_errors.is_empty() {
+        Ok(())
+    } else {
+        // Keep the durable deletion rather than restoring accounts whose files
+        // may already be gone. Cleanup needs review: an intervening import or
+        // restore can reuse an ID, and deletion always targets its current account.
+        Err(format!(
+            "Accounts removed from index, but credential cleanup failed for these IDs: {}. Review remaining files and current account state before cleanup; an intervening import or restore may have reused these IDs",
+            cleanup_errors.join("; ")
+        ))
+    }
 }
 
 /// Reorder account list
@@ -4076,7 +4273,18 @@ fn format_rate_limit_block_reason(err: &crate::error::AppError) -> String {
     )
 }
 
+fn has_explicit_manual_attention_hold(account: &Account) -> bool {
+    account.validation_blocked
+        && account
+            .validation_blocked_reason
+            .as_deref()
+            .is_some_and(|reason| reason.starts_with("manual_attention_required:"))
+}
+
 fn mark_validation_blocked(account: &mut Account, reason: &str) {
+    if has_explicit_manual_attention_hold(account) {
+        return;
+    }
     let now = chrono::Utc::now().timestamp();
     let block_until = now + (10 * 60);
     let extracted_url = extract_action_url(reason);
@@ -5131,7 +5339,9 @@ pub fn mark_account_forbidden_with_models(
     if lock_kind == AccountLockKind::Validation {
         let block_until = now + (10 * 60);
         mark_validation_blocked(&mut account, reason);
-        account.validation_blocked_until = Some(block_until);
+        if !has_explicit_manual_attention_hold(&account) {
+            account.validation_blocked_until = Some(block_until);
+        }
         account.proxy_disabled = true;
 
         // 关键守卫：若账号已有 Hard 403 / Banned 原因，必须保留原证据，绝对不能被降级为 validation_required
@@ -5361,7 +5571,7 @@ pub fn clear_account_ban(account_id: &str) -> Result<bool, String> {
         quota.forbidden_reason = None;
     }
 
-    save_account(&account)?;
+    save_account_after_verified_recovery(&account)?;
 
     if let Ok(mut index) = load_account_index() {
         if let Some(summary) = index.accounts.iter_mut().find(|a| a.id == account_id) {
@@ -5696,7 +5906,7 @@ pub fn clear_account_forbidden_and_validation(
         return Ok(false);
     }
 
-    save_account(&account)?;
+    save_account_after_verified_recovery(&account)?;
 
     if let Ok(mut index) = load_account_index() {
         if let Some(summary) = index.accounts.iter_mut().find(|a| a.id == account_id) {
@@ -5727,7 +5937,9 @@ pub fn mark_account_validation_blocked(
     let mut account = load_account(account_id)?;
 
     mark_validation_blocked(&mut account, reason);
-    account.validation_blocked_until = Some(block_until);
+    if !has_explicit_manual_attention_hold(&account) {
+        account.validation_blocked_until = Some(block_until);
+    }
 
     save_account(&account)?;
 
@@ -5814,6 +6026,7 @@ fn demote_model_scoped_quota(account: &mut Account, mut quota: QuotaData) -> Quo
 pub async fn fetch_quota_with_retry(account: &mut Account) -> crate::error::AppResult<QuotaData> {
     use crate::error::AppError;
     use crate::modules::oauth;
+    crate::proxy::pipeline::admission::check_current_activity().map_err(AppError::Account)?;
 
     // 1. Time-based check - ensure Token is valid first
     let token = match oauth::ensure_fresh_token(&account.token, Some(&account.id)).await {
@@ -5887,6 +6100,7 @@ pub async fn fetch_quota_with_retry(account: &mut Account) -> crate::error::AppR
     // Daily/Sandbox quota endpoints keep returning 200 for TOS-banned accounts; a successful
     // quota snapshot is therefore NOT evidence that the account is healthy. Probe the
     // production endpoint on every refresh and only a confirmed 2xx may clear a ban.
+    crate::proxy::pipeline::admission::check_current_activity().map_err(AppError::Account)?;
     match crate::modules::quota::probe_account_ban(&account.token.access_token, Some(&account.id))
         .await
     {
@@ -6020,10 +6234,11 @@ pub async fn fetch_quota_with_retry(account: &mut Account) -> crate::error::AppR
                 ));
 
                 // Force refresh
-                let token_res = match oauth::refresh_access_token_with_client(
+                let token_res = match oauth::refresh_access_token_with_client_and_intent(
                     &account.token.refresh_token,
                     Some(&account.id),
                     account.token.oauth_client_key.as_deref(),
+                    oauth::RefreshIntent::RejectedAccessToken(&account.token.access_token),
                 )
                 .await
                 {
@@ -6044,39 +6259,13 @@ pub async fn fetch_quota_with_retry(account: &mut Account) -> crate::error::AppR
                     }
                 };
 
-                let is_gcp_tos = if crate::modules::oauth::is_gcp_enterprise_client(
-                    token_res
-                        .oauth_client_key
-                        .as_deref()
-                        .or(account.token.oauth_client_key.as_deref()),
-                ) {
-                    true
-                } else {
-                    account.token.is_gcp_tos
-                };
-
-                let new_token = TokenData::new(
-                    token_res.access_token.clone(),
-                    account.token.refresh_token.clone(),
-                    token_res.expires_in,
-                    account.token.email.clone(),
-                    account.token.project_id.clone(), // Keep original project_id
-                    None,                             // Add None as session_id
-                    is_gcp_tos,
-                    token_res.id_token.clone(),
-                )
-                .with_oauth_client_key(
-                    token_res
-                        .oauth_client_key
-                        .clone()
-                        .or_else(|| account.token.oauth_client_key.clone()),
-                );
+                let new_token = oauth::token_data_from_refresh(&account.token, token_res);
 
                 // Re-fetch display name
                 let name = if account.name.is_none()
                     || account.name.as_ref().map_or(false, |n| n.trim().is_empty())
                 {
-                    match oauth::get_user_info(&token_res.access_token, Some(&account.id)).await {
+                    match oauth::get_user_info(&new_token.access_token, Some(&account.id)).await {
                         Ok(user_info) => user_info.get_display_name(),
                         Err(_) => None,
                     }
@@ -6194,6 +6383,7 @@ pub async fn refresh_all_quotas_logic() -> Result<RefreshStats, String> {
     use futures::stream::{self, StreamExt};
     use std::sync::Arc;
     use tokio::sync::Semaphore;
+    crate::proxy::pipeline::admission::check_current_activity()?;
 
     const MAX_CONCURRENT: usize = 5;
     let start = std::time::Instant::now();
@@ -6318,8 +6508,12 @@ pub async fn refresh_all_quotas_logic() -> Result<RefreshStats, String> {
     ));
 
     // After quota refresh, immediately check and trigger warmup for weekly recovered models
-    tokio::spawn(async {
-        check_and_trigger_warmup_for_recovered_models().await;
+    crate::proxy::pipeline::admission::spawn_scoped(async {
+        let _ = crate::proxy::pipeline::admission::run_automatic(async {
+            check_and_trigger_warmup_for_recovered_models().await;
+            Ok(())
+        })
+        .await;
     });
 
     Ok(RefreshStats {
@@ -6453,20 +6647,24 @@ pub async fn batch_import_accounts_logic(
     ));
 
     // 1. 内存预查重：单次加载现存索引，构建已有 Email 与 Refresh Token 到 ID 的映射（用于幂等原地复用）
-    let (existing_email_map, existing_rt_map) = {
+    let (existing_email_map, existing_rt_map, existing_revisions) = {
         let index = load_account_index()?;
         let mut email_map = std::collections::HashMap::new();
         let mut rt_map = std::collections::HashMap::new();
+        let mut revisions = std::collections::HashMap::new();
         for s in &index.accounts {
             email_map.insert(s.email.trim().to_lowercase(), s.id.clone());
             if let Ok(acc) = load_account(&s.id) {
+                if let Some(revision) = acc.token.credential_revision.clone() {
+                    revisions.insert(s.id.clone(), revision);
+                }
                 let rt_clean = acc.token.refresh_token.trim().to_string();
                 if !rt_clean.is_empty() {
                     rt_map.insert(rt_clean, s.id.clone());
                 }
             }
         }
-        (Arc::new(email_map), Arc::new(rt_map))
+        (Arc::new(email_map), Arc::new(rt_map), Arc::new(revisions))
     };
 
     const CONCURRENCY: usize = 6;
@@ -6480,6 +6678,7 @@ pub async fn batch_import_accounts_logic(
         .map(|entry| {
             let existing_email_map = existing_email_map.clone();
             let existing_rt_map = existing_rt_map.clone();
+            let existing_revisions = existing_revisions.clone();
             let processed_counter = processed_counter.clone();
             let success_counter = success_counter.clone();
             let failed_counter = failed_counter.clone();
@@ -6500,13 +6699,19 @@ pub async fn batch_import_accounts_logic(
                     tokio::time::sleep(std::time::Duration::from_millis(jitter)).await;
 
                     let temp_account_id = uuid::Uuid::new_v4().to_string();
+                    // Known credentials share the managed account's refresh
+                    // single-flight lock and durable rotation publication.
+                    let refresh_account_id = existing_rt_map
+                        .get(&rt)
+                        .map(String::as_str)
+                        .unwrap_or(&temp_account_id);
 
                     // 1. 换取 Token（两阶段轻量验证，附带 429 自动退避重试）
                     let mut token_res = None;
                     for attempt in 0..2 {
                         match crate::modules::oauth::refresh_access_token(
                             &rt,
-                            Some(&temp_account_id),
+                            Some(refresh_account_id),
                         )
                         .await
                         {
@@ -6593,9 +6798,18 @@ pub async fn batch_import_accounts_logic(
 
                     // 5. 构造 TokenData 与 Account（若为既有账号，保留原有偏好与配额数据原地更新，杜绝重复凭据文件！）
                     let account = if let Ok(mut existing_acc) = load_account(&account_id) {
+                        let committed_token = token_res.persisted_token.clone();
+                        let observed = token_res
+                            .persisted_token
+                            .as_ref()
+                            .and_then(|token| token.credential_revision.clone())
+                            .or_else(|| existing_revisions.get(&account_id).cloned());
                         existing_acc.token = crate::models::TokenData::new(
                             token_res.access_token,
-                            rt,
+                            token_res
+                                .refresh_token
+                                .filter(|token| !token.is_empty())
+                                .unwrap_or(rt),
                             token_res.expires_in,
                             Some(real_email.clone()),
                             project_id.or(existing_acc.token.project_id.clone()),
@@ -6604,6 +6818,11 @@ pub async fn batch_import_accounts_logic(
                             token_res.id_token,
                         )
                         .with_oauth_client_key(token_res.oauth_client_key);
+                        existing_acc.token.credential_revision = observed;
+                        if let Some(mut committed) = committed_token {
+                            committed.project_id = existing_acc.token.project_id.take();
+                            existing_acc.token = committed;
+                        }
                         existing_acc.name = user_info.get_display_name();
                         existing_acc.email = real_email.clone();
                         existing_acc.update_last_used();
@@ -6624,7 +6843,10 @@ pub async fn batch_import_accounts_logic(
                     } else {
                         let token_data = crate::models::TokenData::new(
                             token_res.access_token,
-                            rt,
+                            token_res
+                                .refresh_token
+                                .filter(|token| !token.is_empty())
+                                .unwrap_or(rt),
                             token_res.expires_in,
                             Some(real_email.clone()),
                             project_id,
@@ -6785,6 +7007,9 @@ fn commit_imported_accounts(prepared: Vec<Account>) -> Result<Vec<String>, Strin
                 .map(|summary| summary.id.clone());
             if let Some(id) = existing_id {
                 let mut latest = load_account(&id)?;
+                if incoming.token.credential_revision.is_none() {
+                    incoming.token.credential_revision = latest.token.credential_revision.clone();
+                }
                 latest.token = incoming.token;
                 latest.email = incoming.email;
                 latest.name = incoming.name;
@@ -6816,6 +7041,614 @@ fn commit_imported_accounts(prepared: Vec<Account>) -> Result<Vec<String>, Strin
     }
     save_account_index(&index)?;
     Ok(errors)
+}
+
+#[cfg(test)]
+mod account_credential_store_tests {
+    use super::*;
+
+    fn credential_fixture(id: &str) -> Account {
+        Account::new(
+            id.into(),
+            format!("{id}@example.invalid"),
+            TokenData::new(
+                "initial-access".into(),
+                "initial-refresh".into(),
+                3600,
+                None,
+                Some("initial-project".into()),
+                None,
+                false,
+                Some("initial-id".into()),
+            ),
+        )
+    }
+
+    #[tokio::test]
+    async fn automatic_quota_work_stops_on_a_stale_safety_permit_before_credentials_or_network() {
+        let dir = tempfile::tempdir().unwrap();
+        let controller =
+            crate::proxy::pipeline::admission::SafetyController::for_dir(dir.path()).unwrap();
+        let context = crate::proxy::pipeline::budget::RequestContext::new(
+            std::time::Instant::now() + std::time::Duration::from_secs(5),
+        );
+        context.set_safety(controller.permit().unwrap());
+        controller.halt("fixture-attention").unwrap();
+        let status = controller.status().unwrap();
+        controller.resume(status.generation, true).unwrap();
+        crate::proxy::pipeline::budget::scope(context, async {
+            let mut unpersisted = credential_fixture("never-read-or-dispatched");
+            assert!(fetch_quota_with_retry(&mut unpersisted)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("GATEWAY_EMERGENCY_STOP"));
+            assert!(refresh_all_quotas_logic()
+                .await
+                .err()
+                .unwrap()
+                .contains("GATEWAY_EMERGENCY_STOP"));
+        })
+        .await;
+        // Explicit recovery remains unscoped and can inspect local state.
+        assert!(crate::proxy::pipeline::admission::check_current_activity().is_ok());
+    }
+
+    #[test]
+    fn stale_typed_metadata_saves_merge_current_credentials_but_stale_rotations_conflict() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("typed-revision.json");
+        save_account_at_path(&path, &credential_fixture("typed-revision")).unwrap();
+        let mut stale = load_account_at_path(&path).unwrap();
+        let mut winner = stale.clone();
+        winner.token.access_token = "winner-access".into();
+        winner.token.refresh_token = "winner-refresh".into();
+        winner.token.id_token = Some("winner-id".into());
+        // Deliberately shorter validity: ordering follows revisions, not time.
+        winner.token.expiry_timestamp = 123;
+        winner.token.expires_in = 100;
+        save_account_at_path(&path, &winner).unwrap();
+
+        stale.custom_label = Some("acknowledged-metadata".into());
+        stale.token.project_id = Some("edited-project".into());
+        stale.token.session_id = Some("edited-session".into());
+        save_account_at_path(&path, &stale).unwrap();
+        let current = load_account_at_path(&path).unwrap();
+        assert_eq!(current.token.access_token, "winner-access");
+        assert_eq!(current.token.refresh_token, "winner-refresh");
+        assert_eq!(current.token.id_token.as_deref(), Some("winner-id"));
+        assert_eq!(current.token.expiry_timestamp, 123);
+        assert_eq!(current.token.project_id.as_deref(), Some("edited-project"));
+        assert_eq!(current.token.session_id.as_deref(), Some("edited-session"));
+        assert_eq!(current.custom_label, stale.custom_label);
+
+        stale.token.refresh_token = "late-rotated-refresh".into();
+        let error = save_account_at_path(&path, &stale).unwrap_err();
+        assert!(error.contains("changed concurrently"));
+        assert_eq!(
+            load_account_at_path(&path).unwrap().token.refresh_token,
+            "winner-refresh"
+        );
+        let encoded = serde_json::to_value(&current).unwrap();
+        assert!(encoded["token"].get("credential_revision").is_none());
+        let mut decoded: Account = serde_json::from_value(encoded).unwrap();
+        assert!(decoded.token.credential_revision.is_none());
+        save_account_at_path(&path, &decoded).unwrap(); // Exact current values can edit metadata.
+        decoded.token.refresh_token = "unobserved-replacement".into();
+        assert!(save_account_at_path(&path, &decoded)
+            .unwrap_err()
+            .contains("observed credential revision"));
+    }
+
+    #[test]
+    fn credential_revision_covers_expiry_changes_even_when_vault_generation_is_reused() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("metadata-revision.json");
+        save_account_at_path(&path, &credential_fixture("metadata-revision")).unwrap();
+        let stale = load_account_at_path(&path).unwrap();
+        let original = crate::modules::credential_store::account_reference_at(&path).unwrap();
+        let mut changed = stale.clone();
+        changed.token.expiry_timestamp = 42;
+        changed.token.oauth_client_key = Some("replacement-client".into());
+        save_account_at_path(&path, &changed).unwrap();
+        assert_eq!(
+            crate::modules::credential_store::account_reference_at(&path).unwrap(),
+            original
+        );
+        // Even an A→B→A metadata cycle keeps a distinct credential revision.
+        let mut restored = load_account_at_path(&path).unwrap();
+        restored.token.expiry_timestamp = stale.token.expiry_timestamp;
+        restored.token.oauth_client_key = stale.token.oauth_client_key.clone();
+        save_account_at_path(&path, &restored).unwrap();
+        let mut late = stale.token;
+        late.access_token = "late-access".into();
+        assert!(
+            crate::modules::credential_store::persist_credential_update(&path, &late)
+                .unwrap_err()
+                .contains("changed concurrently")
+        );
+        let current = load_account_at_path(&path).unwrap();
+        assert_eq!(current.token.access_token, "initial-access");
+        assert_eq!(
+            current.token.expiry_timestamp,
+            restored.token.expiry_timestamp
+        );
+    }
+
+    #[test]
+    fn read_time_healing_returns_the_promoted_credential_revision() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("healed-revision.json");
+        let legacy = serde_json::to_string(&credential_fixture("healed-revision")).unwrap();
+        std::fs::write(&path, format!("{legacy} trailing-garbage")).unwrap();
+        let mut healed = load_account_at_path(&path).unwrap();
+        assert!(
+            crate::modules::credential_store::account_reference_at(&path)
+                .unwrap()
+                .is_some()
+        );
+        healed.token.refresh_token = "post-heal-refresh".into();
+        save_account_at_path(&path, &healed).unwrap();
+        assert_eq!(
+            load_account_at_path(&path).unwrap().token.refresh_token,
+            "post-heal-refresh"
+        );
+    }
+
+    #[test]
+    fn upsert_and_prepared_import_cannot_replay_an_older_observed_credential_version() {
+        let _data = crate::proxy::monitor::prompt_log_tests::TestDataDir::new();
+        let token = credential_fixture("import-revision").token;
+        let initial = upsert_account("cas-import@example.invalid".into(), None, token).unwrap();
+        assert_eq!(
+            find_managed_account_for_refresh_token("initial-refresh").unwrap(),
+            Some(initial.id.clone())
+        );
+        assert_eq!(
+            find_managed_account_for_refresh_token("unrelated-refresh").unwrap(),
+            None
+        );
+        let mut delayed = initial.clone();
+        delayed.token.access_token = "delayed-access".into();
+        delayed.token.refresh_token = "delayed-refresh".into();
+        let mut replacement = credential_fixture("explicit-import").token;
+        replacement.access_token = "explicit-access".into();
+        replacement.refresh_token = "explicit-refresh".into();
+        upsert_account(initial.email.clone(), None, replacement).unwrap();
+        assert!(
+            upsert_account(initial.email.clone(), None, delayed.token.clone())
+                .unwrap_err()
+                .contains("changed concurrently")
+        );
+        let errors = commit_imported_accounts(vec![delayed]).unwrap();
+        assert_eq!(errors.len(), 1);
+        assert!(errors[0].contains("changed concurrently"));
+        assert_eq!(
+            load_account(&initial.id).unwrap().token.refresh_token,
+            "explicit-refresh"
+        );
+    }
+
+    #[test]
+    fn native_cleanup_runs_after_unlink_and_reports_only_reference_on_failure() {
+        let _data = crate::proxy::monitor::prompt_log_tests::TestDataDir::new();
+        let account = upsert_account(
+            "native-delete@example.invalid".into(),
+            None,
+            TokenData::new(
+                "private-delete-access".into(),
+                "private-delete-refresh".into(),
+                3600,
+                None,
+                None,
+                None,
+                false,
+                None,
+            ),
+        )
+        .unwrap();
+        let path = get_accounts_dir()
+            .unwrap()
+            .join(format!("{}.json", account.id));
+        let reference = crate::modules::credential_store::account_reference_at(&path)
+            .unwrap()
+            .unwrap();
+        save_account_index(&AccountIndex::new()).unwrap();
+        let error = remove_account_credential_file_using(&account.id, &path, |_| {
+            assert!(
+                !path.exists(),
+                "native cleanup must follow successful unlink"
+            );
+            Err("fixture native store unavailable".into())
+        })
+        .unwrap_err();
+        assert!(error.contains("Retired nonsecret cleanup reference"));
+        assert!(error.contains(&account.id));
+        assert!(!error.contains("private-delete-access"));
+        assert!(!error.contains("private-delete-refresh"));
+        assert!(!path.exists());
+        assert_eq!(
+            crate::modules::credential_store::load_json("account", &account.id, &reference)
+                .unwrap()["refresh_token"],
+            "private-delete-refresh"
+        );
+        crate::modules::credential_store::delete_account_reference(&reference).unwrap();
+    }
+
+    #[test]
+    fn stale_account_saves_and_daily_quota_cannot_clear_manual_holds_or_ban_evidence() {
+        let _data = crate::proxy::monitor::prompt_log_tests::TestDataDir::new();
+        for banned in [false, true] {
+            let stale = upsert_account(
+                format!("stale-hold-{banned}@example.invalid"),
+                None,
+                TokenData::new(
+                    "fixture-access".into(),
+                    "fixture-refresh".into(),
+                    3600,
+                    None,
+                    None,
+                    None,
+                    false,
+                    None,
+                ),
+            )
+            .unwrap();
+            let mut held = stale.clone();
+            held.proxy_disabled = true;
+            held.proxy_disabled_reason = Some("VALIDATION_REQUIRED".into());
+            held.validation_blocked = true;
+            held.validation_blocked_until = Some(0);
+            held.validation_blocked_reason =
+                Some("manual_attention_required: account_restricted".into());
+            held.last_used = chrono::Utc::now().timestamp() - 3 * 86400;
+            if banned {
+                held.banned = true;
+                held.banned_code = Some("TOS_VIOLATION".into());
+                held.banned_reason = Some("fixture evidence".into());
+                let mut ban_only = held.clone();
+                ban_only.validation_blocked = false;
+                ban_only.validation_blocked_until = None;
+                ban_only.validation_blocked_reason = None;
+                save_account(&ban_only).unwrap();
+                save_account(&stale).unwrap();
+                assert!(
+                    load_account(&stale.id).unwrap().banned,
+                    "ban evidence must survive even before manual marker publication"
+                );
+            }
+            save_account(&held).unwrap();
+            save_account(&stale).unwrap();
+            let restored = load_account(&stale.id).unwrap();
+            assert!(has_explicit_manual_attention_hold(&restored));
+            assert_eq!(restored.validation_blocked_until, Some(0));
+            assert_eq!(restored.banned, banned);
+            assert!(restored.proxy_disabled);
+            update_account_quota_internal(&stale.id, QuotaData::new(), true).unwrap();
+            assert!(has_explicit_manual_attention_hold(
+                &load_account(&stale.id).unwrap()
+            ));
+            if banned {
+                assert!(!clear_account_forbidden_and_validation(&stale.id, None).unwrap());
+                assert!(clear_account_ban(&stale.id).unwrap());
+            }
+            assert!(clear_account_forbidden_and_validation(&stale.id, None).unwrap());
+            let recovered = load_account(&stale.id).unwrap();
+            assert!(!has_explicit_manual_attention_hold(&recovered));
+            assert!(!recovered.banned);
+        }
+    }
+
+    #[test]
+    fn credential_migration_skips_a_missing_index_shard_without_skipping_live_accounts() {
+        let _data = crate::proxy::monitor::prompt_log_tests::TestDataDir::new();
+        let live = upsert_account(
+            "live-vault@example.invalid".into(),
+            None,
+            TokenData::new(
+                "fixture-access".into(),
+                "fixture-refresh".into(),
+                3600,
+                None,
+                None,
+                None,
+                false,
+                None,
+            ),
+        )
+        .unwrap();
+        let mut missing = live.clone();
+        missing.id = "missing-vault-shard".into();
+        let mut index = load_account_index().unwrap();
+        index.accounts.insert(0, account_summary(&missing));
+        save_account_index(&index).unwrap();
+        let accounts = list_accounts().unwrap();
+        assert_eq!(accounts.len(), 1);
+        assert_eq!(accounts[0].id, live.id);
+    }
+
+    #[test]
+    fn credential_migration_rejects_mismatched_document_identity_without_rewriting() {
+        let _data = crate::proxy::monitor::prompt_log_tests::TestDataDir::new();
+        let account = Account::new(
+            "foreign-id".into(),
+            "foreign@example.invalid".into(),
+            TokenData::new(
+                "fixture-access".into(),
+                "fixture-refresh".into(),
+                3600,
+                None,
+                None,
+                None,
+                false,
+                None,
+            ),
+        );
+        let mut summary = account_summary(&account);
+        summary.id = "managed-id".into();
+        let mut index = AccountIndex::new();
+        index.accounts.push(summary);
+        save_account_index(&index).unwrap();
+        let path = get_accounts_dir().unwrap().join("managed-id.json");
+        let before = serde_json::to_vec(&account).unwrap();
+        fs::write(&path, &before).unwrap();
+        assert!(migrate_managed_credentials_in_dir(&get_data_dir().unwrap()).is_err());
+        assert_eq!(fs::read(&path).unwrap(), before);
+        assert!(!serde_json::from_slice::<serde_json::Value>(&before)
+            .unwrap()
+            .get("credential_store")
+            .is_some());
+    }
+
+    #[test]
+    fn indexed_legacy_accounts_migrate_before_listing_and_preserve_metadata() {
+        let _data = crate::proxy::monitor::prompt_log_tests::TestDataDir::new();
+        let mut account = Account::new(
+            "vault-fixture".into(),
+            "vault@example.invalid".into(),
+            TokenData::new(
+                "legacy-access-fixture".into(),
+                "legacy-refresh-fixture".into(),
+                3600,
+                None,
+                Some("fixture-project".into()),
+                None,
+                false,
+                Some("legacy-id-fixture".into()),
+            ),
+        );
+        account.manual_proxy_disabled = true;
+        account.proxy_disabled = true;
+        let path = get_accounts_dir().unwrap().join("vault-fixture.json");
+        fs::write(&path, serde_json::to_vec(&account).unwrap()).unwrap();
+        let mut index = AccountIndex::new();
+        index.accounts.push(account_summary(&account));
+        save_account_index(&index).unwrap();
+        let accounts = list_accounts().unwrap();
+        assert_eq!(accounts.len(), 1);
+        assert_eq!(accounts[0].token.refresh_token, "legacy-refresh-fixture");
+        assert!(accounts[0].manual_proxy_disabled && accounts[0].proxy_disabled);
+        let raw = fs::read_to_string(&path).unwrap();
+        assert!(!raw.contains("legacy-access-fixture"));
+        assert!(!raw.contains("legacy-refresh-fixture"));
+        assert!(!raw.contains("legacy-id-fixture"));
+        assert_eq!(
+            migrate_managed_credentials_in_dir(&get_data_dir().unwrap()).unwrap(),
+            0
+        );
+        let reference = crate::modules::credential_store::account_reference_at(&path)
+            .unwrap()
+            .unwrap();
+        delete_accounts(&[account.id.clone()]).unwrap();
+        assert!(
+            crate::modules::credential_store::load_json("account", &account.id, &reference)
+                .is_err()
+        );
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn manual_attention_hold_survives_timed_background_validation() {
+        let _data = crate::proxy::monitor::prompt_log_tests::TestDataDir::new();
+        let mut account = upsert_account(
+            "hold-vault@example.invalid".into(),
+            None,
+            TokenData::new(
+                "fixture-access".into(),
+                "fixture-refresh".into(),
+                3600,
+                None,
+                None,
+                None,
+                false,
+                None,
+            ),
+        )
+        .unwrap();
+        account.validation_blocked = true;
+        account.validation_blocked_until = Some(0);
+        account.validation_blocked_reason =
+            Some("manual_attention_required: validation_required".into());
+        account.proxy_disabled = true;
+        save_account(&account).unwrap();
+        mark_account_validation_blocked(
+            &account.id,
+            chrono::Utc::now().timestamp() + 600,
+            "VALIDATION_REQUIRED",
+        )
+        .unwrap();
+        let held = load_account(&account.id).unwrap();
+        assert_eq!(held.validation_blocked_until, Some(0));
+        assert!(has_explicit_manual_attention_hold(&held));
+        assert!(held.proxy_disabled);
+    }
+}
+
+#[cfg(test)]
+mod account_lifecycle_safety_tests {
+    use super::*;
+
+    fn seed(ids: &[&str]) -> Vec<Account> {
+        ids.iter()
+            .map(|id| {
+                upsert_account(
+                    format!("{id}@example.test"),
+                    None,
+                    TokenData::new(
+                        "access".into(),
+                        "refresh".into(),
+                        3600,
+                        None,
+                        None,
+                        None,
+                        false,
+                        None,
+                    ),
+                )
+                .unwrap()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn batch_delete_preserves_unselected_accounts_and_tolerates_absent_ids() {
+        let _data = crate::proxy::monitor::prompt_log_tests::TestDataDir::new();
+        let accounts = seed(&["first", "remaining", "last"]);
+        let ids = vec![accounts[0].id.clone(), accounts[2].id.clone()];
+        delete_accounts(&ids).unwrap();
+        let index = load_account_index().unwrap();
+        assert_eq!(index.accounts.len(), 1);
+        assert_eq!(
+            index.current_account_id.as_deref(),
+            Some(accounts[1].id.as_str())
+        );
+        assert_eq!(index.accounts[0].id, accounts[1].id);
+        assert!(load_account(&accounts[1].id).is_ok());
+        assert!(load_account(&accounts[0].id).is_err());
+        assert!(load_account(&accounts[2].id).is_err());
+        delete_accounts(&ids).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn batch_delete_index_failure_keeps_all_credentials() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let _data = crate::proxy::monitor::prompt_log_tests::TestDataDir::new();
+        let accounts = seed(&["first", "second"]);
+        let index_path = get_data_dir().unwrap().join(ACCOUNTS_INDEX);
+        let before = fs::read(&index_path).unwrap();
+        // Ordinary reads work; atomic replacement fails because DELETE sharing
+        // is denied, matching Windows scanners/editors holding the index open.
+        let held = fs::OpenOptions::new()
+            .read(true)
+            .share_mode(3)
+            .open(&index_path)
+            .unwrap();
+        let ids: Vec<_> = accounts.iter().map(|account| account.id.clone()).collect();
+        assert!(delete_accounts(&ids)
+            .unwrap_err()
+            .contains("failed_to_save_account_index"));
+        assert_eq!(fs::read(&index_path).unwrap(), before);
+        for account in &accounts {
+            assert_eq!(
+                load_account(&account.id).unwrap().token.refresh_token,
+                "refresh"
+            );
+        }
+        drop(held);
+        delete_accounts(&ids).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn batch_delete_reports_partial_cleanup_and_allows_reviewed_orphan_removal() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let _data = crate::proxy::monitor::prompt_log_tests::TestDataDir::new();
+        let accounts = seed(&["locked", "other"]);
+        let path = get_accounts_dir()
+            .unwrap()
+            .join(format!("{}.json", accounts[0].id));
+        let held = fs::OpenOptions::new()
+            .read(true)
+            .share_mode(3)
+            .open(&path)
+            .unwrap();
+        let ids: Vec<_> = accounts.iter().map(|account| account.id.clone()).collect();
+        let error = delete_accounts(&ids).unwrap_err();
+        assert!(error.contains("Accounts removed from index"));
+        assert!(error.contains("Review remaining files and current account state"));
+        assert!(error.contains("import or restore may have reused these IDs"));
+        assert!(error.contains(&accounts[0].id));
+        assert!(load_account_index().unwrap().accounts.is_empty());
+        assert!(path.exists());
+        assert!(
+            load_account(&accounts[1].id).is_err(),
+            "other deletions must still finish"
+        );
+        drop(held);
+        // Explicit cleanup is safe here only after reviewing that the ID is
+        // still absent from the index and its retained credentials are unchanged.
+        assert!(load_account_index().unwrap().accounts.is_empty());
+        assert_eq!(
+            load_account(&accounts[0].id).unwrap().token.refresh_token,
+            "refresh"
+        );
+        delete_accounts(&ids).unwrap();
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn list_flag_healing_preserves_concurrent_import_and_latest_entity_state() {
+        let _data = crate::proxy::monitor::prompt_log_tests::TestDataDir::new();
+        let accounts = seed(&["existing"]);
+        let id = accounts[0].id.clone();
+        let mut account = load_account(&id).unwrap();
+        account.disabled = true;
+        save_account(&account).unwrap(); // Leave the index stale to trigger healing.
+        let (scanned_tx, scanned_rx) = std::sync::mpsc::channel();
+        let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+        let reader = std::thread::spawn(move || {
+            ACCOUNT_LIST_SCAN_HOOK.with(|hook| {
+                *hook.borrow_mut() = Some(Box::new(move || {
+                    scanned_tx.send(()).unwrap();
+                    resume_rx
+                        .recv_timeout(std::time::Duration::from_secs(5))
+                        .unwrap();
+                }));
+            });
+            list_accounts().unwrap()
+        });
+        scanned_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+        let added = seed(&["concurrent"]).remove(0);
+        {
+            let _writer = lock_account_file_updates().unwrap();
+            let mut latest = load_account(&id).unwrap();
+            latest.disabled = false;
+            latest.proxy_disabled = true;
+            latest.manual_proxy_disabled = true;
+            save_account(&latest).unwrap();
+        }
+        resume_tx.send(()).unwrap();
+        reader.join().unwrap();
+        let index = load_account_index().unwrap();
+        assert!(index.accounts.iter().any(|summary| summary.id == added.id));
+        let summary = index
+            .accounts
+            .iter()
+            .find(|summary| summary.id == id)
+            .unwrap();
+        assert!(
+            !summary.disabled,
+            "the reader's stale disabled value must not win"
+        );
+        assert!(
+            summary.proxy_disabled,
+            "healing must use the latest entity flags"
+        );
+        assert!(load_account(&id).unwrap().manual_proxy_disabled);
+    }
 }
 
 #[cfg(test)]

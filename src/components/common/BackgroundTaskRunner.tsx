@@ -25,7 +25,7 @@ function BackgroundTaskRunner() {
 
         if (auto_refresh && !prevAutoRefreshRef.current && !isFirstMount) {
             console.log('[BackgroundTask] Auto-refresh manually toggled on, executing once...');
-            refreshAllQuotas();
+            void refreshAllQuotas(true).catch(error => console.debug('[BackgroundTask] Automatic refresh skipped or failed:', error));
         }
         prevAutoRefreshRef.current = auto_refresh;
 
@@ -33,7 +33,7 @@ function BackgroundTaskRunner() {
             console.log(`[BackgroundTask] Starting auto-refresh quota timer: ${refresh_interval} mins`);
             intervalId = setInterval(() => {
                 console.log('[BackgroundTask] Auto-refreshing all quotas...');
-                refreshAllQuotas();
+                void refreshAllQuotas(true).catch(error => console.debug('[BackgroundTask] Automatic refresh skipped or failed:', error));
             }, Math.min(refresh_interval * 60 * 1000, 2147483647));
         }
 

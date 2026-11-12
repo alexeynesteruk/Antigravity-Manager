@@ -44,7 +44,9 @@ pub const REPLAY_CAP_TERMINAL_MARKER: &str = "[upstream_replay_cap_terminal]";
 pub const TRANSPORT_RESET_TERMINAL_MARKER: &str = "[upstream_transport_reset_terminal]";
 
 /// 全部内部标记：写给客户端前逐一剔除
-pub const ALL_TERMINAL_MARKERS: [&str; 6] = [
+pub const ALL_TERMINAL_MARKERS: [&str; 8] = [
+    "[gateway_safety_halt]",
+    "[gateway_request_limit]",
     UPLOAD_STAGE_TERMINAL_MARKER,
     UPLOAD_STALLED_TERMINAL_MARKER,
     FIRST_BYTE_STAGE_TERMINAL_MARKER,
@@ -59,6 +61,8 @@ pub const ALL_TERMINAL_MARKERS: [&str; 6] = [
 /// 区分它们只是为了状态码与排障措辞（阶段时间线 / 日志）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UpstreamTerminal {
+    SafetyHalt,
+    RequestLimit,
     /// 首字节预算耗尽：上游排队或大上下文 prefill 慢
     FirstByte,
     /// 上传阶段被截断：底层传输错误或大 body 单次尝试策略
@@ -97,6 +101,8 @@ impl UpstreamTerminal {
     /// 稳定标识（日志 / 阶段时间线 / metrics 分桶用）
     pub fn as_str(self) -> &'static str {
         match self {
+            Self::SafetyHalt => "gateway_emergency_stop",
+            Self::RequestLimit => "gateway_request_limit",
             Self::FirstByte => "first_byte_timeout",
             Self::Upload => "upload_aborted",
             Self::UploadStalled => "upload_stalled",
@@ -109,6 +115,8 @@ impl UpstreamTerminal {
     /// 写进错误文本的内部标记
     pub fn marker(self) -> &'static str {
         match self {
+            Self::SafetyHalt => "[gateway_safety_halt]",
+            Self::RequestLimit => "[gateway_request_limit]",
             Self::FirstByte => FIRST_BYTE_STAGE_TERMINAL_MARKER,
             Self::Upload => UPLOAD_STAGE_TERMINAL_MARKER,
             Self::UploadStalled => UPLOAD_STALLED_TERMINAL_MARKER,
@@ -140,6 +148,8 @@ impl UpstreamTerminal {
     pub fn disposition(self) -> TerminalDisposition {
         TerminalDisposition {
             status: match self {
+                Self::SafetyHalt => StatusCode::BAD_REQUEST,
+                Self::RequestLimit => StatusCode::TOO_MANY_REQUESTS,
                 Self::FirstByte | Self::Upload | Self::UploadStalled | Self::GlobalBudget => {
                     StatusCode::GATEWAY_TIMEOUT
                 }
@@ -147,7 +157,10 @@ impl UpstreamTerminal {
                 Self::TransportReset => StatusCode::BAD_GATEWAY,
             },
             penalize_account: false,
-            stop_rotation: matches!(self, Self::GlobalBudget | Self::ReplayCap),
+            stop_rotation: matches!(
+                self,
+                Self::GlobalBudget | Self::ReplayCap | Self::SafetyHalt | Self::RequestLimit
+            ),
             abandon_sticky_account: matches!(
                 self,
                 Self::FirstByte | Self::GlobalBudget | Self::TransportReset
@@ -156,7 +169,10 @@ impl UpstreamTerminal {
                 self,
                 Self::Upload | Self::UploadStalled | Self::TransportReset
             ),
-            cross_account_replay_allowed: !matches!(self, Self::Upload | Self::UploadStalled),
+            cross_account_replay_allowed: !matches!(
+                self,
+                Self::Upload | Self::UploadStalled | Self::SafetyHalt | Self::RequestLimit
+            ),
         }
     }
 }
@@ -253,6 +269,19 @@ impl TerminalDisposition {
 
 /// 从上游错误文本里识别终态分类；普通网络错误 / 上游 HTTP 错误返回 `None`
 pub fn classify(error_text: &str) -> Option<UpstreamTerminal> {
+    if error_text.contains("[gateway_safety_halt]") {
+        return Some(UpstreamTerminal::SafetyHalt);
+    }
+    if error_text.contains("[gateway_request_limit]") {
+        return Some(UpstreamTerminal::RequestLimit);
+    }
+    if let Some(error) = super::admission::error_from_encoded(error_text) {
+        return Some(if error.retry_after > 0 {
+            UpstreamTerminal::RequestLimit
+        } else {
+            UpstreamTerminal::SafetyHalt
+        });
+    }
     if error_text.contains(GATEWAY_BUDGET_TERMINAL_MARKER) {
         return Some(UpstreamTerminal::GlobalBudget);
     }

@@ -54,6 +54,12 @@ where
                 }
 
                 if let Ok(json) = serde_json::from_str::<Value>(data_str) {
+                    if let Some(error) =
+                        crate::proxy::pipeline::account_safety::account_attention_payload(&json)
+                    {
+                        return Err(error.to_string());
+                    }
+
                     // Update meta fields
                     if let Some(id) = json.get("id").and_then(|v| v.as_str()) {
                         response.id = id.to_string();

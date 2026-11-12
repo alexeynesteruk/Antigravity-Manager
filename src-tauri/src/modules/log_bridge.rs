@@ -111,7 +111,7 @@ impl FieldVisitor {
 
 impl Visit for FieldVisitor {
     fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
-        let value_str = format!("{:?}", value);
+        let value_str = crate::utils::redact::field(field.name(), &format!("{:?}", value));
         if field.name() == "message" {
             self.message = Some(value_str.trim_matches('"').to_string());
         } else {
@@ -120,27 +120,33 @@ impl Visit for FieldVisitor {
     }
 
     fn record_str(&mut self, field: &Field, value: &str) {
+        let value = crate::utils::redact::field(field.name(), value);
         if field.name() == "message" {
-            self.message = Some(value.to_string());
+            self.message = Some(value);
         } else {
-            self.fields
-                .insert(field.name().to_string(), value.to_string());
+            self.fields.insert(field.name().to_string(), value);
         }
     }
 
     fn record_i64(&mut self, field: &Field, value: i64) {
-        self.fields
-            .insert(field.name().to_string(), value.to_string());
+        self.fields.insert(
+            field.name().to_string(),
+            crate::utils::redact::field(field.name(), &value.to_string()),
+        );
     }
 
     fn record_u64(&mut self, field: &Field, value: u64) {
-        self.fields
-            .insert(field.name().to_string(), value.to_string());
+        self.fields.insert(
+            field.name().to_string(),
+            crate::utils::redact::field(field.name(), &value.to_string()),
+        );
     }
 
     fn record_bool(&mut self, field: &Field, value: bool) {
-        self.fields
-            .insert(field.name().to_string(), value.to_string());
+        self.fields.insert(
+            field.name().to_string(),
+            crate::utils::redact::field(field.name(), &value.to_string()),
+        );
     }
 }
 

@@ -1,9 +1,20 @@
+export interface GatewayTlsConfig {
+    enabled: boolean;
+    port: number;
+    certificate_path: string;
+    private_key_path?: string;
+    private_key_ref?: { version: number; generation: string; parts: number; digest: string };
+    advertised_host?: string;
+}
+
 export interface UpstreamProxyConfig {
     enabled: boolean;
     url: string;
 }
 
 export interface ProxyConfig {
+    tls?: GatewayTlsConfig;
+    account_safety?: AccountSafetyConfig;
     enabled: boolean;
     allow_lan_access?: boolean;
     bind_address?: string;
@@ -18,7 +29,8 @@ export interface ProxyConfig {
     request_timeout: number;
     enable_logging: boolean;
     account_max_concurrency?: number;
-    security_monitor?: { trusted_proxies?: string[]; cors_allowed_origins?: string[]; blacklist: { enabled: boolean; block_message: string }; whitelist: { enabled: boolean; whitelist_priority: boolean } };
+    image_scheduler?: ImageSchedulerConfig;
+    security_monitor?: { trusted_proxies?: string[]; cors_allowed_origins?: string[]; trusted_hosts?: string[]; blacklist: { enabled: boolean; block_message: string }; whitelist: { enabled: boolean; whitelist_priority: boolean } };
     capture_health_logs?: boolean;
     log_retention?: LogRetentionConfig;
     internal_error_log_retention?: InternalErrorLogRetentionConfig;
@@ -39,6 +51,21 @@ export interface ProxyConfig {
     stream_timeouts?: StreamTimeoutConfig;
     upload_timeouts?: UploadTimeoutConfig;
     qos_auto_jail?: boolean; // [NEW] 遇到限流账号自动进小黑屋 (QoS 降速熔断)
+}
+
+export interface AccountSafetyConfig {
+    halt_on_account_restriction: boolean;
+    halt_on_authentication_challenge: boolean;
+    client_requests_per_minute: number;
+    client_requests_per_day: number;
+    upstream_requests_per_minute: number;
+    upstream_requests_per_day: number;
+}
+
+export interface ImageSchedulerConfig {
+    per_account_concurrency: number;
+    max_outputs_per_request: number;
+    max_parallel_outputs: number;
 }
 
 export interface UploadTimeoutConfig {
@@ -110,6 +137,9 @@ export interface ThinkingBudgetConfig {
     flash_low?: number;
     flash_medium?: number;
     flash_high?: number;
+    /** Internal migration state, preserved when settings are saved. */
+    flash_high_legacy_migrated?: boolean;
+    thinking_budget_32k_legacy_migrated?: boolean;
     flash_tiered?: number;
 
     // --- Gemini Pro 系列（仅官方未收录模型生效；-1 = 自适应）---

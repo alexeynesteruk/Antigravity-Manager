@@ -48,6 +48,10 @@ pub async fn ip_filter_middleware(
                 }
                 Err(e) => {
                     tracing::error!("[IP Filter] Failed to check whitelist: {}", e);
+                    return create_blocked_response(
+                        ip,
+                        "Access denied. Unable to verify the enabled IP whitelist.",
+                    );
                 }
             }
         } else {
@@ -143,6 +147,10 @@ pub async fn ip_filter_middleware(
                 }
                 Err(e) => {
                     tracing::error!("[IP Filter] Failed to check blacklist: {}", e);
+                    return create_blocked_response(
+                        ip,
+                        "Access denied. Unable to verify the enabled IP blacklist.",
+                    );
                 }
             }
         }
@@ -389,6 +397,83 @@ fn create_blocked_response(ip: &str, message: &str) -> Response {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn enabled_ip_policies_fail_closed_when_their_database_is_unavailable() {
+        use tower::ServiceExt;
+
+        let _dir = crate::proxy::monitor::prompt_log_tests::TestDataDir::new();
+        security_db::init_db().unwrap();
+        let state = crate::proxy::server::config_reload_tests::test_state();
+        state
+            .security
+            .write()
+            .await
+            .security_monitor
+            .whitelist
+            .enabled = true;
+        let app = axum::Router::new()
+            .route("/", axum::routing::get(|| async { StatusCode::NO_CONTENT }))
+            .layer(axum::middleware::from_fn_with_state(
+                state.clone(),
+                ip_filter_middleware,
+            ));
+
+        security_db::add_to_whitelist("203.0.113.8", Some("fixture")).unwrap();
+        let admitted = || request_from("203.0.113.8".parse().unwrap(), None);
+        assert_eq!(
+            app.clone().oneshot(admitted()).await.unwrap().status(),
+            StatusCode::NO_CONTENT
+        );
+
+        // A valid database with a missing policy table reproduces an SQL read
+        // failure without permissions differences or access to real user data.
+        let path = security_db::get_security_db_path().unwrap();
+        let conn = rusqlite::Connection::open(path).unwrap();
+        conn.execute("DROP TABLE ip_whitelist", []).unwrap();
+        let response = app.clone().oneshot(admitted()).await.unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        let body = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .unwrap();
+        let body = String::from_utf8(body.to_vec()).unwrap();
+        assert!(body.contains("Unable to verify"));
+        assert!(!body.contains("no such table"));
+
+        // An optional whitelist is only an exemption: its lookup failure must
+        // still permit a successful mandatory blacklist evaluation.
+        {
+            let mut security = state.security.write().await;
+            security.security_monitor.whitelist.enabled = false;
+            security.security_monitor.whitelist.whitelist_priority = true;
+            security.security_monitor.blacklist.enabled = true;
+        }
+        assert_eq!(
+            app.clone().oneshot(admitted()).await.unwrap().status(),
+            StatusCode::NO_CONTENT
+        );
+
+        conn.execute("DROP TABLE ip_blacklist", []).unwrap();
+        let response = app.clone().oneshot(admitted()).await.unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        let body = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .unwrap();
+        let body = String::from_utf8(body.to_vec()).unwrap();
+        assert!(body.contains("Unable to verify"));
+        assert!(!body.contains("no such table"));
+
+        // With both mandatory policies disabled, a broken optional exemption
+        // database cannot block requests.
+        {
+            let mut security = state.security.write().await;
+            security.security_monitor.blacklist.enabled = false;
+        }
+        assert_eq!(
+            app.oneshot(admitted()).await.unwrap().status(),
+            StatusCode::NO_CONTENT
+        );
+    }
 
     #[tokio::test]
     async fn malformed_proxy_headers_cannot_inherit_the_proxys_whitelist() {

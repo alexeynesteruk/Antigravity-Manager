@@ -105,6 +105,7 @@ pub struct AppState {
     pub is_running: Arc<RwLock<bool>>, // [NEW] 运行状态标识
     pub port: u16,                     // [NEW] 本地监听端口 (v4.0.8 修复)
     pub listener_base_url: String,
+    pub https_base_url: Option<String>,
     pub proxy_pool_state: Arc<tokio::sync::RwLock<crate::proxy::config::ProxyPoolConfig>>, // [FIX Web Mode]
     pub proxy_pool_manager: Arc<crate::proxy::proxy_pool::ProxyPoolManager>, // [FIX Web Mode]
     pub only_raw_quota_models: Arc<tokio::sync::RwLock<bool>>, // [NEW] 是否只暴露真实配额模型
@@ -439,6 +440,7 @@ fn to_account_response(
 pub struct AxumServer {
     pub port: u16,
     pub base_url: String,
+    pub https_base_url: Option<String>,
     cancel_token: tokio_util::sync::CancellationToken,
     custom_mapping: Arc<tokio::sync::RwLock<std::collections::HashMap<String, String>>>,
     proxy_state: Arc<tokio::sync::RwLock<crate::proxy::config::UpstreamProxyConfig>>,
@@ -500,6 +502,7 @@ impl AxumServer {
     }
 
     pub async fn update_security(&self, config: &crate::proxy::config::ProxyConfig) {
+        if let Ok(safety) = self.token_manager.safety_controller() { safety.configure(config.account_safety.clone()); }
         let mut sec = self.security_state.write().await;
         sec.update_from_proxy_config(config);
         tracing::info!("反代服务安全配置已热更新");
@@ -544,7 +547,7 @@ impl AxumServer {
         request_timeout: u64,
         upstream_proxy: crate::proxy::config::UpstreamProxyConfig,
         user_agent_override: Option<String>,
-        security_config: crate::proxy::ProxySecurityConfig,
+        mut security_config: crate::proxy::ProxySecurityConfig,
         monitor: Arc<crate::proxy::monitor::ProxyMonitor>,
         experimental_config: crate::proxy::config::ExperimentalConfig,
         debug_logging: crate::proxy::config::DebugLoggingConfig,
@@ -554,7 +557,26 @@ impl AxumServer {
         proxy_pool_config: crate::proxy::config::ProxyPoolConfig, // [NEW]
         only_raw_quota_models: bool,
         image_scheduler_config: crate::proxy::config::ImageSchedulerConfig,
+        tls_config: crate::proxy::tls::GatewayTlsConfig,
     ) -> Result<(Self, tokio::task::JoinHandle<()>), String> {
+        // Validate identity and bind both transports before starting background work.
+        let tls_options = tls_config.clone();
+        let acceptor = tokio::task::spawn_blocking(move || tls_options.acceptor(port))
+            .await.map_err(|_| "HTTPS identity loading task failed".to_string())??;
+        let http_host = if acceptor.is_some() { "127.0.0.1" } else { host.as_str() };
+        let listener = bind_tcp_listener(http_host, port)?;
+        let https_listener = if acceptor.is_some() { Some(bind_tcp_listener(&host, tls_config.port)?) } else { None };
+        crate::proxy::middleware::cors::configured_trusted_hosts(
+            &security_config.security_monitor.trusted_hosts,
+        )?;
+        security_config.listener_authorities = crate::proxy::middleware::cors::listener_authorities(
+            http_host, listener.local_addr().map_err(|_| "Cannot resolve HTTP listener")?.port(),
+            if let Some(listener) = &https_listener {
+                Some((host.as_str(), listener.local_addr().map_err(|_| "Cannot resolve HTTPS listener")?.port(), tls_config.advertised_host.as_deref()))
+            } else { None },
+        )?;
+        let https_base_url = tls_config.base_url(&host);
+        let local_base_url = crate::proxy::config::ProxyConfig::base_url_for_bind(http_host, port);
         let custom_mapping_state = Arc::new(tokio::sync::RwLock::new(custom_mapping));
         let proxy_state = Arc::new(tokio::sync::RwLock::new(upstream_proxy.clone()));
         let proxy_pool_state = Arc::new(tokio::sync::RwLock::new(proxy_pool_config));
@@ -568,6 +590,7 @@ impl AxumServer {
         token_manager.start_auto_cleanup().await;
 
         let security_state = Arc::new(RwLock::new(security_config));
+        let safety = token_manager.safety_controller()?;
         let experimental_state = Arc::new(RwLock::new(experimental_config));
         let debug_logging_state = Arc::new(RwLock::new(debug_logging));
         let is_running_state = Arc::new(RwLock::new(false));
@@ -588,7 +611,8 @@ impl AxumServer {
         );
 
         let state = AppState {
-            listener_base_url: crate::proxy::config::ProxyConfig::base_url_for_bind(&host, port),
+            listener_base_url: local_base_url,
+            https_base_url: https_base_url.clone(),
             token_manager: token_manager.clone(),
             custom_mapping: custom_mapping_state.clone(),
             request_timeout,
@@ -606,6 +630,7 @@ impl AxumServer {
                     u.set_user_agent_override(user_agent_override).await;
                 }
                 token_manager.register_qos_upstream(&u);
+                u.set_safety_controller(safety.clone());
                 u
             },
             monitor: monitor.clone(),
@@ -763,6 +788,7 @@ impl AxumServer {
                 crate::proxy::middleware::request_body::validate_decoded_body,
             ))
             .layer(tower_http::decompression::RequestDecompressionLayer::new())
+            .layer(axum::middleware::from_fn_with_state(state.clone(), crate::proxy::middleware::admission::admission_middleware))
             .layer(axum::middleware::from_fn_with_state(
                 state.clone(),
                 auth_middleware,
@@ -791,6 +817,7 @@ impl AxumServer {
             .route("/accounts/current", get(admin_get_current_account))
             .route("/accounts/switch", post(admin_switch_account))
             .route("/accounts/refresh", post(admin_refresh_all_quotas))
+            .route("/accounts/refresh-automatic", post(admin_refresh_all_quotas_automatically))
             .route("/accounts/:accountId", delete(admin_delete_account))
             .route(
                 "/accounts/:accountId/concurrency",
@@ -898,6 +925,9 @@ impl AxumServer {
             .route("/proxy/droid/restore", post(admin_execute_droid_restore))
             .route("/proxy/droid/config", post(admin_get_droid_config_content))
             .route("/proxy/status", get(admin_get_proxy_status))
+            .route("/proxy/account-safety", get(admin_get_account_safety))
+            .route("/proxy/account-safety/resume", post(admin_resume_account_safety))
+            .route("/proxy/account-safety/halt", post(admin_halt_account_safety))
             .route("/proxy/pool/config", get(admin_get_proxy_pool_config))
             .route("/proxy/pool/bindings", get(admin_get_all_account_bindings))
             .route("/proxy/pool/bind", post(admin_bind_account_proxy))
@@ -1016,6 +1046,7 @@ impl AxumServer {
             .route("/accounts/export", post(admin_export_accounts))
             .route("/accounts/reorder", post(admin_reorder_accounts))
             .route("/accounts/:accountId/quota", get(admin_fetch_account_quota))
+            .route("/accounts/:accountId/quota/automatic", get(admin_fetch_account_quota_automatically))
             .route(
                 "/accounts/:accountId/toggle-proxy",
                 post(admin_toggle_proxy_status),
@@ -1116,6 +1147,7 @@ impl AxumServer {
             .route("/user-tokens/summary", get(admin_get_user_token_summary))
             .route("/user-tokens/ranking", get(admin_get_user_tokens_ranking))
             .route("/user-tokens/:id/renew", post(admin_renew_user_token))
+            .route("/user-tokens/:id/reveal", post(admin_reveal_user_token))
             .route("/user-tokens/:id/stats", get(admin_get_user_token_stats))
             .route(
                 "/user-tokens/:id",
@@ -1148,10 +1180,6 @@ impl AxumServer {
             .route("/auth/callback", get(handle_oauth_callback))
             // 应用全局监控与状态层 (外层)
             .layer(cors_layer())
-            .layer(axum::middleware::from_fn_with_state(
-                security_state.clone(),
-                crate::proxy::middleware::cors::origin_policy_middleware,
-            ))
             .layer(axum::middleware::from_fn(
                 crate::proxy::middleware::internal::internal_loopback_middleware,
             ))
@@ -1181,22 +1209,22 @@ impl AxumServer {
         };
 
         // 绑定地址（使用 socket2 开启 SO_REUSEADDR，通配地址自动开启 IPv6/IPv4 双栈支持）
-        let listener = bind_tcp_listener(&host, port)?;
-        let display_host = if host == "0.0.0.0" || host == "::" || host == "[::]" {
-            "0.0.0.0 / [::] (IPv4/IPv6 Dual-Stack)".to_string()
-        } else if host.contains(':') && !host.starts_with('[') {
-            format!("[{}]", host)
-        } else {
-            host.to_string()
-        };
-        tracing::info!("反代服务器启动在 http://{}:{}", display_host, port);
 
-        // 创建统一取消令牌
+        // Include static assets and fallback routes in the mandatory Host gate.
+        let app = app.layer(axum::middleware::from_fn_with_state(
+            security_state.clone(),
+            crate::proxy::middleware::cors::origin_policy_middleware,
+        ));
+
+        tracing::info!("Gateway HTTP listening at {}", state.listener_base_url);
+        if let Some(url) = &https_base_url { tracing::info!("Gateway HTTPS listening at {url}"); }
+
         let cancel_token = tokio_util::sync::CancellationToken::new();
 
         let server_instance = Self {
             port,
             base_url: state.listener_base_url.clone(),
+            https_base_url: https_base_url.clone(),
             cancel_token: cancel_token.clone(),
             custom_mapping: custom_mapping_state.clone(),
             proxy_state,
@@ -1215,74 +1243,12 @@ impl AxumServer {
         let server_cancel_token = cancel_token.clone();
         // 在新任务中启动服务器
         let handle = tokio::spawn(async move {
-            use hyper::server::conn::http1;
-            use hyper_util::rt::TokioIo;
-            use hyper_util::service::TowerToHyperService;
-
-            loop {
-                tokio::select! {
-                    _ = server_cancel_token.cancelled() => {
-                        tracing::info!("反代服务器收到终止信号，停止监听并释放端口");
-                        break;
-                    }
-                    res = listener.accept() => {
-                        match res {
-                            Ok((stream, remote_addr)) => {
-                                let io = TokioIo::new(stream);
-
-                                // 若为 IPv4 映射的 IPv6 地址 (如 ::ffff:192.168.1.1)，将其规范化为原生 IPv4 地址
-                                let normalized_remote_addr = match remote_addr {
-                                    std::net::SocketAddr::V6(v6_addr) => {
-                                        if let Some(v4) = v6_addr.ip().to_ipv4_mapped() {
-                                            std::net::SocketAddr::V4(std::net::SocketAddrV4::new(v4, v6_addr.port()))
-                                        } else {
-                                            std::net::SocketAddr::V6(v6_addr)
-                                        }
-                                    }
-                                    v4_addr => v4_addr,
-                                };
-
-                                // 注入 ConnectInfo (用于获取真实 IP)
-                                use tower::ServiceExt;
-                                use hyper::body::Incoming;
-                                let app_with_info = app.clone().map_request(move |mut req: axum::http::Request<Incoming>| {
-                                    req.extensions_mut().insert(axum::extract::ConnectInfo(normalized_remote_addr));
-                                    req
-                                });
-
-                                let service = TowerToHyperService::new(app_with_info);
-                                let conn_cancel_token = server_cancel_token.clone();
-
-                                tokio::task::spawn(async move {
-                                    let conn = http1::Builder::new()
-                                        .serve_connection(io, service)
-                                        .with_upgrades();
-                                    tokio::pin!(conn);
-
-                                    tokio::select! {
-                                        res = conn.as_mut() => {
-                                            if let Err(err) = res {
-                                                debug!("连接处理结束或出错: {:?}", err);
-                                            }
-                                        }
-                                        _ = conn_cancel_token.cancelled() => {
-                                            // 收到全局关闭通知，通知 Hyper 优雅终止连接
-                                            conn.as_mut().graceful_shutdown();
-                                            // 给予请求最多 500ms 缓冲，超时后自动强行断开并关闭底层套接字
-                                            let _ = tokio::time::timeout(std::time::Duration::from_millis(500), conn).await;
-                                        }
-                                    }
-                                });
-                            }
-                            Err(e) => {
-                                if server_cancel_token.is_cancelled() {
-                                    break;
-                                }
-                                error!("接收连接失败: {:?}", e);
-                            }
-                        }
-                    }
-                }
+            let plain = crate::proxy::tls::serve_listener(listener, None, app.clone(), server_cancel_token.clone());
+            if let Some(listener) = https_listener {
+                let secure = crate::proxy::tls::serve_listener(listener, acceptor, app, server_cancel_token);
+                tokio::join!(plain, secure);
+            } else {
+                plain.await;
             }
         });
 
@@ -1867,6 +1833,51 @@ async fn admin_refresh_all_quotas() -> Result<impl IntoResponse, (StatusCode, Js
     Ok(Json(stats))
 }
 
+async fn admin_refresh_all_quotas_automatically() -> Response {
+    let context=match crate::proxy::pipeline::admission::automatic_context().await {
+        Ok(context)=>context,
+        Err(error)=>return crate::proxy::pipeline::admission::response_from_encoded(&error).unwrap_or_else(||(StatusCode::INTERNAL_SERVER_ERROR,error).into_response()),
+    };
+    crate::proxy::pipeline::budget::scope(context,admin_refresh_all_quotas()).await.into_response()
+}
+
+async fn admin_fetch_account_quota_automatically(Path(account_id):Path<String>) -> Response {
+    let context=match crate::proxy::pipeline::admission::automatic_context().await {
+        Ok(context)=>context,
+        Err(error)=>return crate::proxy::pipeline::admission::response_from_encoded(&error).unwrap_or_else(||(StatusCode::INTERNAL_SERVER_ERROR,error).into_response()),
+    };
+    crate::proxy::pipeline::budget::scope(context,admin_fetch_account_quota(Path(account_id))).await.into_response()
+}
+
+#[cfg(test)]
+mod account_safety_automatic_refresh_tests {
+    use super::*;
+    use tower::ServiceExt;
+
+    #[tokio::test]
+    async fn automatic_refresh_is_stopped_before_credential_loading_and_manual_management_remains_available() {
+        let _data=crate::proxy::monitor::prompt_log_tests::TestDataDir::new();
+        crate::modules::config::save_app_config(&crate::models::AppConfig::default()).unwrap();
+        let safety=crate::proxy::pipeline::admission::global_controller().unwrap();
+        safety.halt("OPERATOR_STOP").unwrap();
+        let app=Router::new()
+            .route("/api/accounts/refresh-automatic",post(admin_refresh_all_quotas_automatically))
+            .route("/api/accounts/:accountId/quota/automatic",get(admin_fetch_account_quota_automatically))
+            .route("/api/config",get(admin_get_config));
+        for (method,path) in [(axum::http::Method::POST,"/api/accounts/refresh-automatic"),(axum::http::Method::GET,"/api/accounts/nonexistent/quota/automatic")] {
+            let response=app.clone().oneshot(axum::http::Request::builder().method(method).uri(path).body(axum::body::Body::empty()).unwrap()).await.unwrap();
+            assert_eq!(response.status(),StatusCode::BAD_REQUEST);
+            let bytes=axum::body::to_bytes(response.into_body(),65536).await.unwrap();
+            let body:serde_json::Value=serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(body["error"]["code"],"GATEWAY_EMERGENCY_STOP");
+        }
+        let response=app.oneshot(axum::http::Request::builder().uri("/api/config").body(axum::body::Body::empty()).unwrap()).await.unwrap();
+        assert_eq!(response.status(),StatusCode::OK);
+        assert!(safety.status().unwrap().halted,"management reads never acknowledge the stop");
+        safety.resume(safety.status().unwrap().generation,true).unwrap();
+    }
+}
+
 // --- OAuth Handlers ---
 
 #[derive(Deserialize, Default)]
@@ -2106,6 +2117,7 @@ async fn admin_save_config(
     Json(payload): Json<SaveConfigWrapper>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
     let new_config = payload.config;
+    state.token_manager.safety_controller().map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR,Json(ErrorResponse {error})))?.configure(new_config.proxy.account_safety.clone());
     // 1. 持久化
     config::save_app_config(&new_config).map_err(|e| {
         (
@@ -2308,6 +2320,7 @@ async fn admin_get_proxy_status(
         "running": is_running,
         "port": state.port,
         "base_url": state.listener_base_url,
+        "https_base_url": state.https_base_url,
         "active_accounts": active_accounts,
     })))
 }
@@ -2404,6 +2417,21 @@ async fn admin_update_model_mapping(
 async fn admin_generate_api_key() -> impl IntoResponse {
     let new_key = format!("sk-{}", uuid::Uuid::new_v4().to_string().replace("-", ""));
     Json(new_key)
+}
+
+async fn admin_get_account_safety(State(state): State<AppState>) -> Result<Json<crate::proxy::pipeline::admission::SafetyStatus>, (StatusCode, String)> {
+    state.token_manager.safety_controller().and_then(|safety| safety.status()).map(Json).map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR,error))
+}
+
+#[derive(Deserialize)]
+struct SafetyResume { generation: u64, acknowledged: bool }
+
+async fn admin_resume_account_safety(State(state): State<AppState>, Json(payload): Json<SafetyResume>) -> Result<Json<crate::proxy::pipeline::admission::SafetyStatus>, (StatusCode,String)> {
+    state.token_manager.safety_controller().and_then(|safety| safety.resume(payload.generation,payload.acknowledged)).map(Json).map_err(|error| (StatusCode::CONFLICT,error))
+}
+
+async fn admin_halt_account_safety(State(state): State<AppState>) -> Result<StatusCode,(StatusCode,String)> {
+    state.token_manager.safety_controller().and_then(|safety| safety.halt("OPERATOR_STOP")).map(|_| StatusCode::OK).map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR,error))
 }
 
 async fn admin_clear_proxy_session_bindings(State(state): State<AppState>) -> impl IntoResponse {
@@ -2747,10 +2775,7 @@ async fn admin_test_model(
         "probe_intent": true
     });
 
-    let client = rquest::Client::builder()
-        .timeout(std::time::Duration::from_secs(60))
-        .no_proxy()
-        .build()
+    let client = crate::utils::http::internal_loopback_client(std::time::Duration::from_secs(60))
         .map_err(|e| {
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -2885,6 +2910,13 @@ async fn admin_list_user_tokens() -> Result<impl IntoResponse, (StatusCode, Json
     Ok(Json(tokens))
 }
 
+async fn admin_reveal_user_token(Path(id): Path<String>) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    let key = crate::commands::user_token::reveal_user_token(id).await.map_err(|error| (
+        StatusCode::BAD_REQUEST, Json(ErrorResponse { error })
+    ))?;
+    Ok(([("Cache-Control", "no-store")], Json(key)))
+}
+
 async fn admin_get_user_token_summary(
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
     let summary = crate::commands::user_token::get_user_token_summary()
@@ -2909,7 +2941,7 @@ async fn admin_create_user_token(
                 Json(ErrorResponse { error: e }),
             )
         })?;
-    Ok(Json(token))
+    Ok(([("Cache-Control", "no-store")], Json(token)))
 }
 
 #[derive(Deserialize)]
@@ -5360,6 +5392,7 @@ pub(crate) mod config_reload_tests {
         let integration = crate::modules::integration::SystemManager::Headless;
         let state = AppState {
             listener_base_url: "http://127.0.0.1:8045".into(),
+            https_base_url: None,
             token_manager: Arc::new(TokenManager::new(account::get_data_dir().unwrap())),
             custom_mapping: Arc::new(RwLock::new(Default::default())),
             request_timeout: 60,

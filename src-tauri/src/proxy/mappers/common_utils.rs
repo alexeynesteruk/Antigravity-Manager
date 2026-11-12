@@ -1417,6 +1417,55 @@ mod tests {
     }
 
     #[test]
+    fn admitted_unpadded_audio_survives_the_upstream_inline_sanitizer() {
+        use base64::{engine::general_purpose::STANDARD, Engine as _};
+
+        for encoded in ["QQ", "QQ=="] {
+            let incoming = json!({
+                "messages":[{"role":"user", "content":[{
+                    "type":"input_audio", "input_audio":{"format":"wav", "data":encoded}
+                }]}]
+            });
+            crate::proxy::pipeline::media_sources::validate_request_media_sources(&incoming)
+                .expect("valid inline audio admission");
+            let part = crate::proxy::audio::audio_part_from_inline_data(encoded, Some("wav"))
+                .expect("audio adapter keeps admitted bytes");
+            let mut payload = json!({"request":{"contents":[{"role":"user", "parts":[part]}]}});
+            assert_eq!(sanitize_gemini_payload_inline_data(&mut payload), 0);
+            let data = payload["request"]["contents"][0]["parts"][0]["inlineData"]["data"]
+                .as_str()
+                .expect("upstream gate must retain the audio part");
+            assert_eq!(data, "QQ==");
+            assert_eq!(STANDARD.decode(data).unwrap(), b"A");
+        }
+    }
+
+    #[test]
+    fn inline_sanitizer_canonicalizes_supported_base64_without_relaxing_corruption_checks() {
+        use base64::{engine::general_purpose::STANDARD, Engine as _};
+
+        // Preserve the existing padded URL-safe decoder as well as standard
+        // input, adding only the unpadded standard alphabet accepted at ingress.
+        for encoded in ["+w==", "-w==", "+w"] {
+            let (_, canonical) = validate_and_sanitize_inline_data(Some("audio/wav"), encoded)
+                .expect("supported encoded byte");
+            assert_eq!(canonical, "+w==");
+            assert_eq!(STANDARD.decode(canonical).unwrap(), vec![0xfb]);
+        }
+        for encoded in ["", "not-base64!", "QR", "QR==", "+_=="] {
+            let mut payload = json!({"contents":[{"parts":[{
+                "inlineData":{"mimeType":"audio/wav", "data":encoded}
+            }]}]});
+            assert_eq!(sanitize_gemini_payload_inline_data(&mut payload), 1);
+            assert!(payload["contents"][0]["parts"][0]
+                .get("inlineData")
+                .is_none());
+        }
+        // A valid Base64 string still cannot pass as an invalid image.
+        assert!(validate_and_sanitize_inline_data(Some("image/png"), "QQ").is_none());
+    }
+
+    #[test]
     fn test_corrupted_image_recovery_preserves_healthy_media() {
         use base64::Engine;
         let png = base64::engine::general_purpose::STANDARD
@@ -1696,19 +1745,17 @@ pub fn validate_and_sanitize_inline_data(
         return None;
     }
 
-    use base64::{engine::general_purpose::STANDARD, Engine as _};
+    use base64::{
+        engine::general_purpose::{STANDARD, STANDARD_NO_PAD, URL_SAFE},
+        Engine as _,
+    };
 
     // Try decoding base64 to check validity and magic bytes
-    let decoded_bytes = match STANDARD.decode(clean_b64) {
-        Ok(bytes) => bytes,
-        Err(_) => {
-            use base64::engine::general_purpose::URL_SAFE;
-            match URL_SAFE.decode(clean_b64) {
-                Ok(bytes) => bytes,
-                Err(_) => return None,
-            }
-        }
-    };
+    let decoded_bytes = STANDARD
+        .decode(clean_b64)
+        .or_else(|_| URL_SAFE.decode(clean_b64))
+        .or_else(|_| STANDARD_NO_PAD.decode(clean_b64))
+        .ok()?;
 
     if decoded_bytes.is_empty() {
         return None;
@@ -1833,7 +1880,9 @@ pub fn validate_and_sanitize_inline_data(
         }
     }
 
-    Some((final_mime, clean_b64.to_string()))
+    // Ingress also accepts unpadded standard Base64. Emit one canonical form
+    // after validation so the final upstream gate preserves those same bytes.
+    Some((final_mime, STANDARD.encode(&decoded_bytes)))
 }
 
 /// Helper to create a Gemini inlineData part or fallback text if invalid

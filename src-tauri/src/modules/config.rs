@@ -23,14 +23,8 @@ fn load_app_config_locked() -> Result<AppConfig, String> {
 
     if !config_path.exists() {
         let config = AppConfig::new();
-        // [FIX #1460] Persist initial config to prevent new API Key on every refresh
-        if let Err(e) = save_app_config_locked(&config) {
-            tracing::warn!(
-                "Failed to persist initial config to {}: {}. An in-memory config will be used; the next start may generate a new API key if the file is still missing.",
-                config_path.display(),
-                e
-            );
-        }
+        // Initial keys must be protected and durable before the gateway starts.
+        save_app_config_locked(&config)?;
         return Ok(config);
     }
 
@@ -38,9 +32,18 @@ fn load_app_config_locked() -> Result<AppConfig, String> {
         .map_err(|e| format!("failed_to_read_config_file: {}", e))?;
 
     let (config, modified) = parse_and_migrate_config(&content)?;
+    let needs_credential_migration =
+        serde_json::from_str::<serde_json::Value>(&content).map_or(true, |value| {
+            value.get("credential_store").is_none()
+                || super::config_secrets::has_unprotected_fields(&value)
+        });
 
     // If migration occurred or empty config was generated, auto-save once to clean up the file
     if modified {
+        if needs_credential_migration {
+            save_app_config_locked(&config)?;
+            return Ok(config);
+        }
         if let Err(e) = save_app_config_locked(&config) {
             tracing::warn!(
                 "Failed to persist healed or migrated config to {}: {}. An in-memory config will be used; the next start may generate a new API key if the file is still empty.",
@@ -53,7 +56,7 @@ fn load_app_config_locked() -> Result<AppConfig, String> {
     Ok(config)
 }
 
-/// Parse, migrate and normalize raw configuration JSON string.
+/// Parse, hydrate native-store references, migrate and normalize configuration JSON.
 /// Returns (AppConfig, modified_flag).
 pub fn parse_and_migrate_config(content: &str) -> Result<(AppConfig, bool), String> {
     let trimmed = content.trim();
@@ -64,8 +67,9 @@ pub fn parse_and_migrate_config(content: &str) -> Result<(AppConfig, bool), Stri
 
     let mut v: serde_json::Value =
         serde_json::from_str(trimmed).map_err(|e| format!("failed_to_parse_config_file: {}", e))?;
-
-    let mut modified = false;
+    let mut modified =
+        v.get("credential_store").is_none() || super::config_secrets::has_unprotected_fields(&v);
+    super::config_secrets::hydrate(&mut v)?;
 
     // Migration logic
     if let Some(proxy) = v.get_mut("proxy") {
@@ -311,6 +315,7 @@ pub fn parse_and_migrate_config(content: &str) -> Result<(AppConfig, bool), Stri
     let old_address = config.proxy.bind_address.clone();
     let old_lan = config.proxy.allow_lan_access;
     config.proxy.normalize_bind_address()?;
+    config.proxy.tls.validate(config.proxy.port)?;
     modified |=
         old_address != config.proxy.bind_address || old_lan != config.proxy.allow_lan_access;
 
@@ -328,19 +333,102 @@ pub fn save_app_config(config: &AppConfig) -> Result<(), String> {
 fn save_app_config_locked(config: &AppConfig) -> Result<(), String> {
     let mut config = config.clone();
     config.proxy.normalize_bind_address()?;
+    config.proxy.tls.validate(config.proxy.port)?;
     let data_dir = get_data_dir()?;
     let config_path = data_dir.join(CONFIG_FILE);
 
-    let content = serde_json::to_string_pretty(&config)
-        .map_err(|e| format!("failed_to_serialize_config: {}", e))?;
+    // One-time migration state belongs to storage. An older GUI/API snapshot
+    // must not clear a marker and remigrate a budget the user subsequently chose.
+    if let Some(saved) = fs::read_to_string(&config_path)
+        .ok()
+        .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
+    {
+        if saved
+            .pointer("/proxy/thinking_budget/thinking_budget_32k_legacy_migrated")
+            .and_then(serde_json::Value::as_bool)
+            == Some(true)
+        {
+            config
+                .proxy
+                .thinking_budget
+                .thinking_budget_32k_legacy_migrated = true;
+        }
+    }
 
-    crate::utils::fs::write_atomic(&config_path, content.as_bytes())
+    let mut document =
+        serde_json::to_value(&config).map_err(|e| format!("failed_to_serialize_config: {}", e))?;
+    // Native storage protects the actual credential. Avoid the legacy serializer's
+    // random machine-derived ciphertext causing a vault rotation on every save.
+    if let Some(proxies) = document
+        .pointer_mut("/proxy/proxy_pool/proxies")
+        .and_then(serde_json::Value::as_array_mut)
+    {
+        for (serialized, proxy) in proxies.iter_mut().zip(&config.proxy.proxy_pool.proxies) {
+            if let Some(auth) = &proxy.auth {
+                serialized["auth"]["password"] = serde_json::Value::String(auth.password.clone());
+            }
+        }
+    }
+    super::config_secrets::persist(&config_path, document)
         .map_err(|e| format!("failed_to_save_config: {}", e))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn thinking_32k_migration_is_durable_and_does_not_repeat_after_settings_saves() {
+        use crate::proxy::config::ThinkingBudgetMode;
+        let _dir = crate::proxy::monitor::prompt_log_tests::TestDataDir::new();
+        let path = get_data_dir().unwrap().join(CONFIG_FILE);
+        let mut config = AppConfig::default();
+        config.proxy.thinking_budget.flash_mode = ThinkingBudgetMode::Default;
+        config.proxy.thinking_budget.pro_mode = ThinkingBudgetMode::Default;
+        config.proxy.thinking_budget.flash_high = 32768;
+        config.proxy.thinking_budget.pro_high = 32768;
+        save_app_config(&config).unwrap();
+
+        let mut migrated = load_app_config().unwrap();
+        assert!(
+            migrated
+                .proxy
+                .thinking_budget
+                .thinking_budget_32k_legacy_migrated
+        );
+        assert_eq!(migrated.proxy.thinking_budget.flash_high, -1);
+        assert_eq!(migrated.proxy.thinking_budget.pro_high, -1);
+        let raw = fs::read_to_string(&path).unwrap();
+        assert!(!parse_and_migrate_config(&raw).unwrap().1);
+
+        // A later deliberate 32k selection must survive both normal settings
+        // round trips and an old client omitting the internal marker.
+        migrated.proxy.thinking_budget.flash_high = 32768;
+        migrated.proxy.thinking_budget.pro_high = 32768;
+        migrated
+            .proxy
+            .thinking_budget
+            .thinking_budget_32k_legacy_migrated = false;
+        save_app_config(&migrated).unwrap();
+        let saved = fs::read(&path).unwrap();
+        for _ in 0..3 {
+            let loaded = load_app_config().unwrap();
+            assert!(
+                loaded
+                    .proxy
+                    .thinking_budget
+                    .thinking_budget_32k_legacy_migrated
+            );
+            assert_eq!(loaded.proxy.thinking_budget.flash_high, 32768);
+            assert_eq!(loaded.proxy.thinking_budget.pro_high, 32768);
+            assert_eq!(fs::read(&path).unwrap(), saved);
+            assert!(
+                !parse_and_migrate_config(std::str::from_utf8(&saved).unwrap())
+                    .unwrap()
+                    .1
+            );
+        }
+    }
 
     #[test]
     fn invalid_config_load_and_bind_save_preserve_existing_file() {

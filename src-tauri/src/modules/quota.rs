@@ -296,6 +296,9 @@ const BAN_PROBE_ENDPOINT: &str = "https://cloudcode-pa.googleapis.com/v1internal
 /// 只把「生产端点 403 + 明确封禁证据」视为封禁；其余情况一律返回 `Unknown`，
 /// 避免网络抖动或临时限流误伤正常账号。
 pub async fn probe_account_ban(access_token: &str, account_id: Option<&str>) -> BanProbeOutcome {
+    if crate::proxy::pipeline::admission::check_current_activity().is_err() {
+        return BanProbeOutcome::Unknown;
+    }
     let client = create_standard_client(account_id).await;
     let payload = json!({ "metadata": { "ideType": "ANTIGRAVITY" } });
 
@@ -318,6 +321,7 @@ pub async fn probe_account_ban(access_token: &str, account_id: Option<&str>) -> 
                 BanProbeOutcome::Healthy
             } else if status == rquest::StatusCode::FORBIDDEN {
                 let text = response.text().await.unwrap_or_default();
+                observe_quota_attention(status.as_u16(), &text);
                 let text_lower = text.to_lowercase();
                 // 验证挑战不是账号封禁，交给配额/代理层的验证锁路径处理。
                 // 否则同一份 403 在“配额刷新”和“代理请求”两条路径上会得到不同结论。
@@ -402,6 +406,9 @@ async fn fetch_project_id(
         health_tracker.get_ordered_endpoints(&CLOUD_CODE_LOAD_PROJECT_ENDPOINTS);
 
     for (ep_idx, ep_url) in candidate_endpoints.iter().enumerate() {
+        if crate::proxy::pipeline::admission::check_current_activity().is_err() {
+            return (None, None);
+        }
         let res = client
             .post(*ep_url)
             .timeout(std::time::Duration::from_secs(15))
@@ -482,6 +489,10 @@ async fn fetch_project_id(
                         return (project_id, subscription_tier);
                     }
                 } else {
+                    if matches!(status.as_u16(), 401 | 403) {
+                        let body = res.text().await.unwrap_or_default();
+                        observe_quota_attention(status.as_u16(), &body);
+                    }
                     if crate::proxy::upstream::client::should_try_next_endpoint_for_url(
                         status, ep_url,
                     ) {
@@ -525,6 +536,7 @@ pub async fn fetch_quota_with_cache(
     account_id: Option<&str>,
 ) -> crate::error::AppResult<(QuotaData, Option<String>)> {
     use crate::error::AppError;
+    crate::proxy::pipeline::admission::check_current_activity().map_err(AppError::Account)?;
 
     // `loadCodeAssist` 是订阅等级的唯一权威来源，必须每次都调用。
     //
@@ -562,6 +574,7 @@ pub async fn fetch_quota_with_cache(
     let candidate_endpoints = health_tracker.get_ordered_endpoints(&QUOTA_API_ENDPOINTS);
 
     for (ep_idx, ep_url) in candidate_endpoints.iter().enumerate() {
+        crate::proxy::pipeline::admission::check_current_activity().map_err(AppError::Account)?;
         let has_next = ep_idx + 1 < candidate_endpoints.len();
 
         match client
@@ -590,6 +603,7 @@ pub async fn fetch_quota_with_cache(
                     // 403 说明该账号本身不可用（未验证 / 被限制）。
                     if status == rquest::StatusCode::FORBIDDEN {
                         let text = response.text().await.unwrap_or_default();
+                        observe_quota_attention(status.as_u16(), &text);
                         crate::modules::logger::log_warn(&format!(
                             "Account unauthorized (403 Forbidden): {}",
                             text
@@ -1075,6 +1089,9 @@ async fn fetch_quota_summary(
     let candidate_endpoints = health_tracker.get_ordered_endpoints(&QUOTA_SUMMARY_ENDPOINTS);
 
     for (ep_idx, ep_url) in candidate_endpoints.iter().enumerate() {
+        if crate::proxy::pipeline::admission::check_current_activity().is_err() {
+            return None;
+        }
         let res = client
             .post(*ep_url)
             .timeout(std::time::Duration::from_secs(15))
@@ -1091,6 +1108,10 @@ async fn fetch_quota_summary(
             Ok(response) => {
                 let status = response.status();
                 if !status.is_success() {
+                    if matches!(status.as_u16(), 401 | 403) {
+                        let body = response.text().await.unwrap_or_default();
+                        observe_quota_attention(status.as_u16(), &body);
+                    }
                     if crate::proxy::upstream::client::should_try_next_endpoint_for_url(
                         status, ep_url,
                     ) {
@@ -1191,6 +1212,10 @@ pub async fn fetch_all_quotas(
 pub async fn get_valid_token_for_warmup(
     account: &crate::models::account::Account,
 ) -> Result<(String, String), String> {
+    crate::proxy::pipeline::admission::check_current_activity()?;
+    if !crate::proxy::pipeline::admission::automatic_activity_allowed() {
+        return Err("Gateway dispatch is paused; review Account safety".into());
+    }
     let mut account = account.clone();
 
     // Check and auto-refresh token
@@ -1247,6 +1272,11 @@ pub async fn warmup_model_directly(
     account_id: Option<&str>,
     probe_intent: bool,
 ) -> bool {
+    if crate::proxy::pipeline::admission::check_current_activity().is_err()
+        || !crate::proxy::pipeline::admission::automatic_activity_allowed()
+    {
+        return false;
+    }
     // Get currently configured proxy port
     let proxy_config = config::load_app_config()
         .map(|config| config.proxy)
@@ -1269,17 +1299,14 @@ pub async fn warmup_model_directly(
 
     // Use a no-proxy client for local loopback requests
     // This prevents Docker environments from routing localhost through external proxies
-    let client = match rquest::Client::builder()
-        .timeout(std::time::Duration::from_secs(60))
-        .no_proxy()
-        .build()
-    {
-        Ok(client) => client,
-        Err(error) => {
-            tracing::warn!("Unable to create local warmup client: {}", error);
-            return false;
-        }
-    };
+    let client =
+        match crate::utils::http::internal_loopback_client(std::time::Duration::from_secs(60)) {
+            Ok(client) => client,
+            Err(error) => {
+                tracing::warn!("Unable to create local warmup client: {}", error);
+                return false;
+            }
+        };
     let resp = client
         .post(&warmup_url)
         .header(
@@ -1321,6 +1348,10 @@ pub async fn warmup_model_directly(
 
 /// Smart warmup for all accounts
 pub async fn warm_up_all_accounts() -> Result<String, String> {
+    crate::proxy::pipeline::admission::run_automatic(warm_up_all_accounts_inner()).await
+}
+
+async fn warm_up_all_accounts_inner() -> Result<String, String> {
     let mut retry_count = 0;
 
     loop {
@@ -1349,7 +1380,7 @@ pub async fn warm_up_all_accounts() -> Result<String, String> {
             let mut handles = Vec::new();
             for account in batch {
                 let account = account.clone();
-                let handle = tokio::spawn(async move {
+                let handle = crate::proxy::pipeline::admission::spawn_scoped(async move {
                     let (token, pid) = match get_valid_token_for_warmup(&account).await {
                         Ok(t) => t,
                         Err(_) => return None,
@@ -1460,7 +1491,7 @@ pub async fn warm_up_all_accounts() -> Result<String, String> {
                 total
             ));
 
-            tokio::spawn(async move {
+            crate::proxy::pipeline::admission::spawn_scoped(async move {
                 let mut success = 0;
                 let now_ts = chrono::Utc::now().timestamp();
 
@@ -1478,7 +1509,7 @@ pub async fn warm_up_all_accounts() -> Result<String, String> {
 
                 let mut account_handles = Vec::new();
                 for (_email, items) in account_tasks {
-                    let handle = tokio::spawn(async move {
+                    let handle = crate::proxy::pipeline::admission::spawn_scoped(async move {
                         let mut local_success = 0;
                         let item_count = items.len();
                         for (idx, (id, email, model, token, pid, pct)) in
@@ -1522,7 +1553,10 @@ pub async fn warm_up_all_accounts() -> Result<String, String> {
                     success, total
                 ));
                 tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
-                let _ = crate::modules::account::refresh_all_quotas_logic().await;
+                let _ = crate::proxy::pipeline::admission::run_automatic(
+                    crate::modules::account::refresh_all_quotas_logic(),
+                )
+                .await;
             });
             crate::modules::logger::log_info(&format!(
                 "[Warmup] Returning to frontend: Warmup task triggered for {} models",
@@ -1547,6 +1581,10 @@ pub async fn warm_up_all_accounts() -> Result<String, String> {
 
 /// Warmup for single account
 pub async fn warm_up_account(account_id: &str) -> Result<String, String> {
+    crate::proxy::pipeline::admission::run_automatic(warm_up_account_inner(account_id)).await
+}
+
+async fn warm_up_account_inner(account_id: &str) -> Result<String, String> {
     let accounts = crate::modules::account::list_accounts().unwrap_or_default();
     let account_owned = accounts
         .iter()
@@ -1616,7 +1654,7 @@ pub async fn warm_up_account(account_id: &str) -> Result<String, String> {
     let warmed_count = models_to_warm.len();
     let account_id_clone = account_id.to_string();
 
-    tokio::spawn(async move {
+    crate::proxy::pipeline::admission::spawn_scoped(async move {
         for (name, pct) in models_to_warm {
             if warmup_model_directly(
                 &token,
@@ -1635,7 +1673,10 @@ pub async fn warm_up_account(account_id: &str) -> Result<String, String> {
             }
             tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
         }
-        let _ = crate::modules::account::refresh_all_quotas_logic().await;
+        let _ = crate::proxy::pipeline::admission::run_automatic(
+            crate::modules::account::refresh_all_quotas_logic(),
+        )
+        .await;
     });
 
     Ok(format!(
@@ -1851,5 +1892,15 @@ mod tests {
             tracker.get_ordered_endpoints(&QUOTA_SUMMARY_ENDPOINTS)[0],
             "https://cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSummary"
         );
+    }
+}
+
+fn observe_quota_attention(status: u16, body: &str) {
+    if let Some(attention) =
+        crate::proxy::pipeline::account_safety::AccountAttention::classify(status, body)
+    {
+        if let Err(error) = crate::proxy::pipeline::admission::observe_global_attention(attention) {
+            tracing::error!(error = %error, "Unable to persist global quota safety stop");
+        }
     }
 }

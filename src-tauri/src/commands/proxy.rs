@@ -12,6 +12,8 @@ pub struct ProxyStatus {
     pub running: bool,
     pub port: u16,
     pub base_url: String,
+    #[serde(default)]
+    pub https_base_url: Option<String>,
     pub active_accounts: usize,
 }
 
@@ -207,6 +209,7 @@ pub async fn internal_start_proxy_service(
             running: false,
             port: axum_server.port,
             base_url: axum_server.base_url.clone(),
+            https_base_url: axum_server.https_base_url.clone(),
             active_accounts: 0,
         });
     }
@@ -232,6 +235,7 @@ pub async fn internal_start_proxy_service(
         running: true,
         port: axum_server.port,
         base_url: axum_server.base_url.clone(),
+        https_base_url: axum_server.https_base_url.clone(),
         active_accounts,
     })
 }
@@ -280,6 +284,7 @@ pub async fn ensure_admin_server(
     // [NEW] 加载账号数据，否则管理界面统计为 0
     let _ = token_manager.load_accounts().await;
 
+    token_manager.safety_controller()?.configure(config.account_safety.clone());
     let (axum_server, server_handle) = match crate::proxy::AxumServer::start(
         config.get_bind_address().to_string(),
         config.port,
@@ -297,6 +302,7 @@ pub async fn ensure_admin_server(
         config.proxy_pool.clone(),
         config.only_raw_quota_models,
         config.image_scheduler.clone(),
+        config.tls.clone(),
     )
     .await
     {
@@ -369,6 +375,7 @@ pub async fn get_proxy_status(state: State<'_, ProxyServiceState>) -> Result<Pro
             running: false, // 逻辑上还没运行
             port: 0,
             base_url: "starting".to_string(), // 给前端标识
+            https_base_url: None,
             active_accounts: 0,
         });
     }
@@ -382,12 +389,14 @@ pub async fn get_proxy_status(state: State<'_, ProxyServiceState>) -> Result<Pro
                 running: true,
                 port: instance.axum_server.port,
                 base_url: instance.axum_server.base_url.clone(),
+                https_base_url: instance.axum_server.https_base_url.clone(),
                 active_accounts: instance.token_manager.len(),
             }),
             None => Ok(ProxyStatus {
                 running: false,
                 port: 0,
                 base_url: String::new(),
+                https_base_url: None,
                 active_accounts: 0,
             }),
         },
@@ -397,6 +406,7 @@ pub async fn get_proxy_status(state: State<'_, ProxyServiceState>) -> Result<Pro
                 running: false,
                 port: 0,
                 base_url: "busy".to_string(),
+                https_base_url: None,
                 active_accounts: 0,
             })
         }
@@ -829,6 +839,25 @@ pub async fn clear_all_proxy_rate_limits(
     }
 }
 
+fn configured_safety_controller() -> Result<Arc<crate::proxy::pipeline::admission::SafetyController>, String> {
+    crate::proxy::pipeline::admission::global_controller()
+}
+
+#[tauri::command]
+pub async fn get_account_safety_status() -> Result<crate::proxy::pipeline::admission::SafetyStatus,String> {
+    tokio::task::spawn_blocking(|| configured_safety_controller()?.status()).await.map_err(|_| "Safety worker unavailable".to_string())?
+}
+
+#[tauri::command]
+pub async fn resume_account_safety(generation: u64, acknowledged: bool) -> Result<crate::proxy::pipeline::admission::SafetyStatus,String> {
+    tokio::task::spawn_blocking(move || configured_safety_controller()?.resume(generation,acknowledged)).await.map_err(|_| "Safety worker unavailable".to_string())?
+}
+
+#[tauri::command]
+pub async fn halt_account_safety() -> Result<(),String> {
+    tokio::task::spawn_blocking(|| configured_safety_controller()?.halt("OPERATOR_STOP")).await.map_err(|_| "Safety worker unavailable".to_string())?
+}
+
 /// 触发所有代理的健康检查，并返回更新后的配置
 #[tauri::command]
 pub async fn check_proxy_health(
@@ -919,10 +948,7 @@ pub async fn test_model_connectivity(
         "probe_intent": true
     });
 
-    let client = rquest::Client::builder()
-        .timeout(std::time::Duration::from_secs(60))
-        .no_proxy()
-        .build()
+    let client = crate::utils::http::internal_loopback_client(std::time::Duration::from_secs(60))
         .map_err(|e| format!("创建客户端失败: {}", e))?;
 
     let resp = client

@@ -477,13 +477,7 @@ pub fn strip_internal_markers(error_text: &str) -> String {
 
 /// [NEW] 错误日志脱敏：抹除报错信息中的 access_token, proxy_url 等敏感凭证
 pub fn sanitize_error_for_log(error_text: &str) -> String {
-    // 抹除常见敏感 key 的值
-    let re = regex::Regex::new(r#"(?i)(access_token|refresh_token|id_token|authorization|api_key|secret|password|proxy_url|http_proxy|https_proxy)\s*[:=]\s*[^"'\\\s,}\]]+"#).unwrap();
-    let redacted = re.replace_all(error_text, "$1=<redacted>");
-
-    // 抹除 Bearer token
-    let re_bearer = regex::Regex::new(r#"(?i)(bearer\s+)[^"'\\\s,}\]]+"#).unwrap();
-    let redacted = re_bearer.replace_all(&redacted, "$1<redacted>");
+    let redacted = crate::utils::redact::text(error_text);
 
     // 限制长度防止日志炸弹 (UTF-8 字符边界安全保护)
     if redacted.len() > 1000 {
@@ -494,6 +488,45 @@ pub fn sanitize_error_for_log(error_text: &str) -> String {
     } else {
         redacted.into_owned()
     }
+}
+
+/// Inspect a project-header 403 without losing the response that account-safety
+/// handling must see. Buffered bodies have already passed the client's decoder.
+pub(crate) async fn buffer_project_header_failure(
+    response: Response,
+) -> Result<(Response, String), String> {
+    use rquest::ResponseBuilderExt;
+    let status = response.status();
+    let version = response.version();
+    let url = response.url().clone();
+    let mut headers = response.headers().clone();
+    let bytes = response.bytes().await.map_err(|error| {
+        format!(
+            "Unable to inspect project-header failure: {}",
+            sanitize_error_for_log(&error.to_string())
+        )
+    })?;
+    let body = String::from_utf8_lossy(&bytes).into_owned();
+    headers.remove(header::CONTENT_ENCODING);
+    headers.remove(header::TRANSFER_ENCODING);
+    headers.insert(
+        header::CONTENT_LENGTH,
+        header::HeaderValue::from_str(&bytes.len().to_string())
+            .map_err(|_| "Invalid buffered response length")?,
+    );
+    let mut rebuilt = hyper::Response::builder()
+        .status(status)
+        .version(version)
+        .url(url);
+    *rebuilt
+        .headers_mut()
+        .ok_or("Unable to rebuild provider error headers")? = headers;
+    let response = Response::from(
+        rebuilt
+            .body(bytes)
+            .map_err(|_| "Unable to rebuild provider error response")?,
+    );
+    Ok((response, body))
 }
 
 // Cloud Code v1internal endpoints (fallback order: Daily → Sandbox → Prod)
@@ -725,6 +758,7 @@ impl Default for EndpointHealthTracker {
 }
 
 pub struct UpstreamClient {
+    safety: std::sync::OnceLock<Arc<crate::proxy::pipeline::admission::SafetyController>>,
     default_client: RwLock<Client>,
     proxy_pool: Option<Arc<crate::proxy::proxy_pool::ProxyPoolManager>>,
     client_cache: DashMap<String, Client>, // proxy_id -> Client
@@ -733,6 +767,84 @@ pub struct UpstreamClient {
 }
 
 impl UpstreamClient {
+    async fn safety_controller(
+        &self,
+    ) -> Result<Arc<crate::proxy::pipeline::admission::SafetyController>, String> {
+        if let Some(controller) = self.safety.get() {
+            return Ok(controller.clone());
+        }
+        tokio::task::spawn_blocking(|| crate::proxy::pipeline::admission::global_controller())
+            .await
+            .map_err(|_| "Safety worker unavailable".to_string())?
+    }
+
+    pub async fn dispatch_context(
+        &self,
+    ) -> Result<Arc<crate::proxy::pipeline::budget::RequestContext>, String> {
+        let context = crate::proxy::pipeline::budget::current().unwrap_or_else(|| {
+            crate::proxy::pipeline::budget::RequestContext::new(
+                crate::proxy::pipeline::budget::deadline_now(),
+            )
+        });
+        if context.safety().is_none() {
+            let controller = self.safety_controller().await.map_err(|_| {
+                crate::proxy::pipeline::admission::AdmissionError::unavailable().encoded()
+            })?;
+            let permit = tokio::task::spawn_blocking(move || controller.permit())
+                .await
+                .map_err(|_| {
+                    crate::proxy::pipeline::admission::AdmissionError::unavailable().encoded()
+                })?
+                .map_err(|error| error.encoded())?;
+            context.set_safety(permit);
+        }
+        Ok(context)
+    }
+
+    pub async fn observe_account_attention(
+        &self,
+        attention: crate::proxy::pipeline::account_safety::AccountAttention,
+    ) -> Result<(), String> {
+        let controller = self.safety_controller().await?;
+        tokio::task::spawn_blocking(move || controller.observe_attention(attention))
+            .await
+            .map_err(|_| "Safety worker unavailable".to_string())?
+    }
+
+    pub fn set_safety_controller(
+        &self,
+        controller: Arc<crate::proxy::pipeline::admission::SafetyController>,
+    ) {
+        let _ = self.safety.set(controller);
+    }
+
+    /// Every real content send, including retries, fan-out, probes and continuations.
+    pub async fn admit_dispatch(&self, method: &str) -> Result<(), String> {
+        let permit = crate::proxy::pipeline::budget::current().and_then(|context| context.safety());
+        let controller = self.safety_controller().await.map_err(|_| {
+            crate::proxy::pipeline::admission::AdmissionError::unavailable().encoded()
+        })?;
+        let method = method.to_string();
+        tokio::task::spawn_blocking(move || {
+            if let Some(permit) = permit {
+                if crate::proxy::pipeline::admission::is_model_call(&method) {
+                    permit.outbound()
+                } else {
+                    permit.check()
+                }
+            } else {
+                if crate::proxy::pipeline::admission::is_model_call(&method) {
+                    controller.outbound(None, chrono::Utc::now().timestamp())
+                } else {
+                    controller.check(None)
+                }
+            }
+        })
+        .await
+        .map_err(|_| crate::proxy::pipeline::admission::AdmissionError::unavailable().encoded())?
+        .map_err(|error| error.encoded())
+    }
+
     pub fn new(
         proxy_config: Option<crate::proxy::config::UpstreamProxyConfig>,
         proxy_pool: Option<Arc<crate::proxy::proxy_pool::ProxyPoolManager>>,
@@ -759,6 +871,7 @@ impl UpstreamClient {
 
         Self {
             default_client: RwLock::new(default_client),
+            safety: std::sync::OnceLock::new(),
             proxy_pool,
             client_cache: DashMap::new(),
             user_agent_override: RwLock::new(None),
@@ -1389,6 +1502,31 @@ impl UpstreamClient {
         extra_headers: std::collections::HashMap<String, String>,
         account_id: Option<&str>,
     ) -> Result<UpstreamCallResult, String> {
+        let context = self.dispatch_context().await?;
+        crate::proxy::pipeline::budget::scope(
+            context,
+            self.call_v1_internal_with_headers_budgeted(
+                method,
+                access_token,
+                body,
+                query_string,
+                extra_headers,
+                account_id,
+            ),
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn call_v1_internal_with_headers_budgeted(
+        &self,
+        method: &str,
+        access_token: &str,
+        body: Value,
+        query_string: Option<&str>,
+        extra_headers: std::collections::HashMap<String, String>,
+        account_id: Option<&str>,
+    ) -> Result<UpstreamCallResult, String> {
         let Some(deadline) = crate::proxy::pipeline::budget::current_deadline() else {
             // 无入口上下文（后台任务 / 辅助调用 / 单测）：行为不变
             return self
@@ -1823,10 +1961,11 @@ impl UpstreamClient {
                     );
                 }
 
-                let _ = crate::proxy::monitor::CURRENT_UPSTREAM_CAPTURE
-                    .try_with(|capture| capture.record_dispatch());
                 crate::proxy::debug_logger::log_upstream_dispatch(&url, method, &body, account_id)
                     .await;
+                self.admit_dispatch(method).await?;
+                let _ = crate::proxy::monitor::CURRENT_UPSTREAM_CAPTURE
+                    .try_with(|capture| capture.record_dispatch());
                 let outcome = match progress {
                     Some(progress) => {
                         Self::send_with_phased_budget(
@@ -1886,8 +2025,20 @@ impl UpstreamClient {
                 let response = outcome.result;
 
                 match response {
-                    Ok(resp) => {
+                    Ok(mut resp) => {
                         let status = resp.status();
+                        if matches!(status.as_u16(), 401 | 403) {
+                            let (buffered, body) = buffer_project_header_failure(resp).await?;
+                            if let Some(attention) =
+                                crate::proxy::pipeline::account_safety::AccountAttention::classify(
+                                    status.as_u16(),
+                                    &body,
+                                )
+                            {
+                                self.observe_account_attention(attention).await?;
+                            }
+                            resp = buffered;
+                        }
                         crate::proxy::debug_logger::log_upstream_result(
                             Some(resp.url().as_str()),
                             Some(status.as_u16()),
@@ -1950,7 +2101,30 @@ impl UpstreamClient {
                             && headers.contains_key("x-goog-user-project")
                         {
                             last_attempt_failed_at = Some(std::time::Instant::now());
-                            let raw_body = resp.text().await.unwrap_or_default();
+                            let (buffered_response, raw_body) =
+                                buffer_project_header_failure(resp).await?;
+                            if crate::proxy::pipeline::account_safety::AccountAttention::classify(
+                                403, &raw_body,
+                            )
+                            .is_some()
+                            {
+                                // The caller persists the hold and asks for attention. Do not
+                                // replay proven restrictions merely to remove a project header.
+                                fallback_attempts.push(FallbackAttemptLog {
+                                    endpoint_name: parse_endpoint_name(base_url).to_string(),
+                                    endpoint_url: url.clone(),
+                                    status: Some(403),
+                                    duration_s,
+                                    switch_delay_s,
+                                    error: sanitize_error_for_log(&raw_body),
+                                    is_effective: true,
+                                });
+                                return Ok(UpstreamCallResult {
+                                    response: buffered_response,
+                                    fallback_attempts,
+                                    effective_attempt_start: attempt_start,
+                                });
+                            }
                             let sanitized = sanitize_error_for_log(&raw_body);
                             let err_detail = if sanitized.trim().is_empty() {
                                 "403 Forbidden with project header (downgrading without header)"
@@ -2223,6 +2397,28 @@ impl UpstreamClient {
         account_id: Option<&str>,
         timeout_secs: u64,
     ) -> Result<Value, String> {
+        let context = self.dispatch_context().await?;
+        crate::proxy::pipeline::budget::scope(
+            context,
+            self.call_v1_internal_auxiliary_inner(
+                method,
+                access_token,
+                body,
+                account_id,
+                timeout_secs,
+            ),
+        )
+        .await
+    }
+
+    async fn call_v1_internal_auxiliary_inner(
+        &self,
+        method: &str,
+        access_token: &str,
+        mut body: Value,
+        account_id: Option<&str>,
+        timeout_secs: u64,
+    ) -> Result<Value, String> {
         crate::proxy::pipeline::schema_limits::validate_request_tool_schemas(&body)?;
 
         if method == "countTokens" {
@@ -2240,10 +2436,11 @@ impl UpstreamClient {
         for base_url in candidate_endpoints.iter() {
             let url = Self::build_url(base_url, method, None);
 
-            let _ = crate::proxy::monitor::CURRENT_UPSTREAM_CAPTURE
-                .try_with(|capture| capture.record_dispatch());
             crate::proxy::debug_logger::log_upstream_dispatch(&url, method, &body, account_id)
                 .await;
+            self.admit_dispatch(method).await?;
+            let _ = crate::proxy::monitor::CURRENT_UPSTREAM_CAPTURE
+                .try_with(|capture| capture.record_dispatch());
             let response = match client
                 .post(&url)
                 .header("Authorization", format!("Bearer {}", access_token))
@@ -2275,6 +2472,14 @@ impl UpstreamClient {
             .await;
             if !status.is_success() {
                 let text = response.text().await.unwrap_or_default();
+                if let Some(attention) =
+                    crate::proxy::pipeline::account_safety::AccountAttention::classify(
+                        status.as_u16(),
+                        &text,
+                    )
+                {
+                    self.observe_account_attention(attention).await?;
+                }
                 last_error = format!("{} returned {}: {}", url, status, text);
 
                 // 与主请求路径同一判定：408 / 404 / 5xx 以及 sandbox 400 换端点；
@@ -2336,6 +2541,37 @@ fn derive_session_uuid(seed: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn project_header_failures_preserve_attention_response_bytes_and_metadata() {
+        use rquest::ResponseBuilderExt;
+        let bytes = r#"{"error":{"code":403,"message":"Validation required","details":[{"reason":"VALIDATION_REQUIRED"}]}}"#;
+        let response = Response::from(
+            hyper::Response::builder()
+                .status(403)
+                .header("retry-after", "60")
+                .header("content-type", "application/json")
+                .url(rquest::Url::parse("https://example.test/provider").unwrap())
+                .body(bytes)
+                .unwrap(),
+        );
+        let (preserved, body) = buffer_project_header_failure(response).await.unwrap();
+        assert!(
+            crate::proxy::pipeline::account_safety::AccountAttention::classify(403, &body)
+                .is_some()
+        );
+        assert_eq!(preserved.status().as_u16(), 403);
+        assert_eq!(preserved.headers()["retry-after"], "60");
+        assert_eq!(preserved.url().as_str(), "https://example.test/provider");
+        assert_eq!(preserved.text().await.unwrap(), bytes);
+        assert!(
+            crate::proxy::pipeline::account_safety::AccountAttention::classify(
+                403,
+                r#"{"error":{"code":403,"message":"Missing serviceusage.services.use permission"}}"#
+            )
+            .is_none()
+        );
+    }
 
     #[test]
     fn test_build_url() {

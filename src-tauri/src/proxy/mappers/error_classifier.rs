@@ -42,7 +42,34 @@ impl ClassifiedStreamError {
 
 /// 分类上游字节流错误。判定只看错误文本，与客户端协议无关。
 pub fn classify_stream_error<E: std::fmt::Display>(error: &E) -> ClassifiedStreamError {
-    let error_str = error.to_string().to_lowercase();
+    let error_text = error.to_string();
+    if crate::proxy::pipeline::admission::error_from_encoded(&error_text)
+        .is_some_and(|error| error.retry_after > 0)
+    {
+        return ClassifiedStreamError {
+            error_type: "gateway_request_limit",
+            message:
+                "The local gateway request budget is exhausted. Retry after the indicated delay.",
+            i18n_key: "accounts.status.validation_required",
+        };
+    }
+    let error_str = error_text.to_lowercase();
+    if serde_json::from_str::<serde_json::Value>(&error_text)
+        .ok()
+        .and_then(|body| {
+            body.pointer("/error/type")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string)
+        })
+        .as_deref()
+        == Some("account_attention_required")
+    {
+        return ClassifiedStreamError {
+            error_type: "account_attention_required",
+            message: "The provider account needs attention. The request stopped; check authorization or verification in Accounts before retrying explicitly.",
+            i18n_key: "accounts.status.validation_required",
+        };
+    }
 
     // 1. 超时优先：`connection timed out` 同时带 connection 与 timeout。
     if error_str.contains("timeout")
@@ -99,6 +126,9 @@ pub struct StreamErrorReport {
 }
 
 impl StreamErrorReport {
+    pub fn admission_error(&self) -> Option<crate::proxy::pipeline::admission::AdmissionError> {
+        crate::proxy::pipeline::admission::error_from_encoded(&self.raw)
+    }
     pub fn call_site(&self) -> String {
         format!("{}:{}", self.file, self.line)
     }

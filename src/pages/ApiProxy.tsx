@@ -35,6 +35,9 @@ import {
 import { AppConfig, ProxyConfig, StickySessionConfig, ExperimentalConfig } from '../types/config';
 import { useConfigStore } from '../stores/useConfigStore';
 import HelpTooltip from '../components/common/HelpTooltip';
+import ProxyTlsSettings from '../components/settings/ProxyTlsSettings';
+import TrustedHostsSettings from '../components/settings/TrustedHostsSettings';
+import ImageRequestLimits from '../components/settings/ImageRequestLimits';
 import ModalDialog from '../components/common/ModalDialog';
 import { showToast } from '../components/common/ToastContainer';
 import { cn } from '../utils/cn';
@@ -46,6 +49,7 @@ import type { ProbeResult } from '../utils/proxyProbe';
 import { listAccounts } from '../services/accountService';
 import { motion } from 'framer-motion';
 import CircuitBreaker from '../components/settings/CircuitBreaker';
+import AccountSafetySettings from '../components/settings/AccountSafetySettings';
 import GlobalSystemPrompt from '../components/settings/GlobalSystemPrompt';
 import ImageThinkingMode from '../components/settings/ImageThinkingMode';
 import ThinkingBudget from '../components/settings/ThinkingBudget';
@@ -58,6 +62,7 @@ interface ProxyStatus {
     running: boolean;
     port: number;
     base_url: string;
+    https_base_url?: string | null;
     active_accounts: number;
 }
 
@@ -1007,11 +1012,12 @@ export default function ApiProxy() {
     };
 
     const updateProxyConfig = (updates: Partial<ProxyConfig>) => {
-        if (!appConfig) return;
+        const latestConfig = useConfigStore.getState().config ?? appConfig;
+        if (!latestConfig) return;
         const newConfig = {
-            ...appConfig,
+            ...latestConfig,
             proxy: {
-                ...appConfig.proxy,
+                ...latestConfig.proxy,
                 ...updates
             }
         };
@@ -1305,7 +1311,14 @@ print(response.choices[0].message.content)`;
     });
 
     const getProxyBaseUrl = () => {
+        if (status.https_base_url) return status.https_base_url;
         if (status.base_url.startsWith('http')) return status.base_url;
+        const tls = appConfig?.proxy.tls;
+        if (tls?.enabled) {
+            const rawHost = tls.advertised_host || appConfig?.proxy.bind_address || 'localhost';
+            const host = rawHost === '0.0.0.0' || rawHost === '::' ? 'localhost' : rawHost.includes(':') ? `[${rawHost}]` : rawHost;
+            return `https://${host}:${tls.port || 8443}`;
+        }
         const address = appConfig?.proxy.bind_address?.trim();
         const host = !address || address === '0.0.0.0' || address === '::'
             ? '127.0.0.1' : address.includes(':') && !address.startsWith('[') ? `[${address}]` : address;
@@ -2254,6 +2267,8 @@ print(response.choices[0].message.content)`;
                                             />
                                         </label>
                                         <p className="text-xs text-gray-500 dark:text-gray-400">{t('proxy.config.bind_address_hint')}</p>
+                                        <ProxyTlsSettings proxy={appConfig.proxy} onChange={updateProxyConfig} httpsBaseUrl={status.https_base_url} />
+                                        <TrustedHostsSettings proxy={appConfig.proxy} onChange={updateProxyConfig} />
                                         {(appConfig.proxy.allow_lan_access || false) && (
                                             <p className="text-xs text-amber-600 dark:text-amber-400 font-medium">
                                                 {t('proxy.config.allow_lan_access_warning')}
@@ -2826,6 +2841,9 @@ print(response.choices[0].message.content)`;
                     !configLoading && !configError && appConfig && activeMenuTab === 'settings' && (
                         <div className="space-y-4">
                             {/* Account Scheduling & Rotation */}
+                            <CollapsibleCard title={t('proxy.safety.title', { defaultValue: 'Account safety and request budgets' })} icon={<AlertTriangle size={18} className="text-amber-500" />} defaultExpanded={true}>
+                                <AccountSafetySettings config={appConfig.proxy.account_safety} onChange={account_safety => updateProxyConfig({ account_safety })} />
+                            </CollapsibleCard>
                             <CollapsibleCard
                                 title={t('proxy.config.scheduling.title')}
                                 icon={<RefreshCw size={18} className="text-indigo-500" />}
@@ -3078,6 +3096,7 @@ print(response.choices[0].message.content)`;
                                         value={appConfig.proxy.image_thinking_mode || 'enabled'}
                                         onChange={(newValue) => updateProxyConfig({ image_thinking_mode: newValue })}
                                     />
+                                    <ImageRequestLimits proxy={appConfig.proxy} onChange={updateProxyConfig} />
                                     {/* 全局系统提示词 */}
                                     <div className="pt-4 border-t border-gray-100 dark:border-base-300">
                                         <GlobalSystemPrompt

@@ -16,6 +16,10 @@ const MAX_REQUEST_LOG_SIZE: usize = 100 * 1024 * 1024; // 100MB
 const MAX_RESPONSE_LOG_SIZE: usize = 100 * 1024 * 1024; // 100MB for image responses
 const MAX_LOGGED_FIELD_CHARS: usize = 500;
 
+#[path = "monitor_body.rs"]
+mod diagnostic_body;
+use diagnostic_body::capture_body_in_scope;
+
 async fn next_chunk_while_receiver_open<S, T>(
     stream: &mut S,
     tx: &tokio::sync::mpsc::Sender<T>,
@@ -966,11 +970,40 @@ pub async fn monitor_middleware(
     monitor_request(state.monitor, debug_cfg, request, next).await
 }
 
+fn scoped_passthrough_response(
+    response: Response,
+    capture: UpstreamRequestBodyHolder,
+    budget: Option<std::sync::Arc<crate::proxy::pipeline::budget::RequestContext>>,
+) -> Response {
+    let (parts, body) = response.into_parts();
+    let (body, _) = capture_body_in_scope(body, 0, None, capture, budget);
+    Response::from_parts(parts, body)
+}
+
 async fn monitor_request(
     monitor: std::sync::Arc<crate::proxy::monitor::ProxyMonitor>,
     debug_cfg: crate::proxy::config::DebugLoggingConfig,
     request: Request,
     next: Next,
+) -> Response {
+    monitor_request_with_limits(
+        monitor,
+        debug_cfg,
+        request,
+        next,
+        MAX_REQUEST_LOG_SIZE,
+        MAX_RESPONSE_LOG_SIZE,
+    )
+    .await
+}
+
+async fn monitor_request_with_limits(
+    monitor: std::sync::Arc<crate::proxy::monitor::ProxyMonitor>,
+    debug_cfg: crate::proxy::config::DebugLoggingConfig,
+    request: Request,
+    next: Next,
+    request_capture_limit: usize,
+    response_capture_limit: usize,
 ) -> Response {
     let method = request.method().to_string();
     let uri = request.uri().to_string();
@@ -1029,67 +1062,73 @@ async fn monitor_request(
     let request_headers_json =
         crate::proxy::payload_audit::headers_to_redacted_json(request.headers());
 
-    let request_body_str;
-
     // [FIX] Extract UserTokenIdentity from the request extensions (injected by the Auth middleware)
     // Must be extracted before processing the request body, since this value needs to survive into_parts()
     let user_token_identity = request.extensions().get::<UserTokenIdentity>().cloned();
 
-    let request = if method == "POST" {
-        let (parts, body) = request.into_parts();
-        match axum::body::to_bytes(body, MAX_REQUEST_LOG_SIZE).await {
-            Ok(bytes) => {
-                request_body_str = if request_content_type.starts_with("multipart/form-data") {
-                    if let Some((summary, multipart_model)) =
-                        summarize_multipart_request(&bytes, &request_content_type, &uri)
-                    {
-                        if model.is_none() {
-                            model = multipart_model;
-                        }
-                        Some(summary)
-                    } else {
-                        Some(format!(
-                            "[Multipart Request Data: {} bytes, failed to parse summary]",
-                            bytes.len()
-                        ))
-                    }
-                } else if let Ok(s) = std::str::from_utf8(&bytes) {
-                    if model.is_none() {
-                        model = serde_json::from_slice::<Value>(&bytes).ok().and_then(|v| {
-                            v.get("model")
-                                .and_then(|m| m.as_str())
-                                .map(|s| s.to_string())
-                        });
-                    }
-                    Some(s.to_string())
-                } else {
-                    Some("[Binary Request Data]".to_string())
-                };
-                Request::from_parts(parts, Body::from(bytes))
-            }
-            Err(_) => {
-                request_body_str = None;
-                Request::from_parts(parts, Body::empty())
-            }
-        }
-    } else {
-        request_body_str = None;
-        request
-    };
-
     let log_id = uuid::Uuid::new_v4().to_string();
     let upstream_holder = UpstreamRequestBodyHolder::new();
     upstream_holder.configure_diagnostics(debug_cfg, log_id.clone());
+    let request_budget = crate::proxy::pipeline::budget::current();
+    let (request, request_capture) = if method == "POST" {
+        let (parts, body) = request.into_parts();
+        let (body, capture) = capture_body_in_scope(
+            body,
+            request_capture_limit,
+            None,
+            upstream_holder.clone(),
+            request_budget.clone(),
+        );
+        (Request::from_parts(parts, body), Some(capture))
+    } else {
+        (request, None)
+    };
     let mut request = request;
     request.extensions_mut().insert(upstream_holder.clone());
 
-    let request_budget = crate::proxy::pipeline::budget::current();
     let response = crate::proxy::monitor::scope_upstream_work(
         upstream_holder.clone(),
         request_budget.clone(),
         next.run(request),
     )
     .await;
+    // The handler owns body consumption; monitoring never drains or substitutes it.
+    let request_body_str = request_capture.map(|capture| {
+        let captured = capture.take();
+        if !captured.is_complete() {
+            return captured.marker("Request body");
+        }
+        let bytes = &captured.bytes;
+        if request_content_type.starts_with("multipart/form-data") {
+            if let Some((summary, multipart_model)) =
+                summarize_multipart_request(bytes, &request_content_type, &uri)
+            {
+                if model.is_none() {
+                    model = multipart_model;
+                }
+                summary
+            } else {
+                format!(
+                    "[Multipart Request Data: {} bytes, failed to parse summary]",
+                    bytes.len()
+                )
+            }
+        } else if let Ok(text) = std::str::from_utf8(bytes) {
+            if model.is_none() {
+                model = serde_json::from_slice::<Value>(bytes)
+                    .ok()
+                    .and_then(|value| {
+                        value
+                            .get("model")
+                            .and_then(Value::as_str)
+                            .map(str::to_string)
+                    });
+            }
+            text.to_string()
+        } else {
+            "[Binary Request Data]".to_string()
+        }
+    });
     let upstream_request_body = upstream_holder.take();
     let upstream_request_headers = upstream_holder.take_headers();
     let upstream_attempts = upstream_holder.take_attempts();
@@ -1112,7 +1151,7 @@ async fn monitor_request(
         request_body_str.as_deref(),
         upstream_request_body.as_deref(),
     ) {
-        return response;
+        return scoped_passthrough_response(response, upstream_holder, request_budget);
     }
 
     let content_type = response
@@ -1228,7 +1267,8 @@ async fn monitor_request(
                             first_chunk_elapsed_ms =
                                 Some(start_instant.elapsed().as_secs_f64() * 1000.0);
                         }
-                        let remaining = MAX_RESPONSE_LOG_SIZE.saturating_sub(all_stream_data.len());
+                        let remaining =
+                            response_capture_limit.saturating_sub(all_stream_data.len());
                         all_stream_data.extend_from_slice(&chunk[..remaining.min(chunk.len())]);
 
                         if chunk.len() > 8192 {
@@ -1266,84 +1306,86 @@ async fn monitor_request(
                     .and_then(|h| serde_json::from_str(h).ok())
                     .unwrap_or_default();
 
-            // 解析真实纯净 TTFT (消除发头时 -1 哨兵值造成的负时间 Bug)
-            let mut final_ttft_ms: Option<f64> = None;
-            // 1. 优先使用生效端点探针捕获到的真实首包耗时
-            if let Some(cap) = stream_ttft_capture.as_ref().and_then(|c| c.get()) {
-                if cap > 0.0 {
-                    final_ttft_ms = Some(cap);
-                }
-            }
-            // 2. 其次使用 monitor 自身观测到的首个非空数据块耗时
-            if final_ttft_ms.is_none() {
-                if let Some(ms) = first_chunk_elapsed_ms {
-                    if ms > 0.0 {
-                        final_ttft_ms = Some(ms);
+                // 解析真实纯净 TTFT (消除发头时 -1 哨兵值造成的负时间 Bug)
+                let mut final_ttft_ms: Option<f64> = None;
+                // 1. 优先使用生效端点探针捕获到的真实首包耗时
+                if let Some(cap) = stream_ttft_capture.as_ref().and_then(|c| c.get()) {
+                    if cap > 0.0 {
+                        final_ttft_ms = Some(cap);
                     }
                 }
-            }
-            // 3. 再次使用 headers_map 中有效的正数 TTFT
-            if final_ttft_ms.is_none() {
-                if let Some(ttft) = headers_map.get("x-timing-ttft-ms").and_then(|v| v.as_str()) {
-                    if let Ok(n) = ttft.parse::<f64>() {
-                        if n > 0.0 {
-                            final_ttft_ms = Some(n);
+                // 2. 其次使用 monitor 自身观测到的首个非空数据块耗时
+                if final_ttft_ms.is_none() {
+                    if let Some(ms) = first_chunk_elapsed_ms {
+                        if ms > 0.0 {
+                            final_ttft_ms = Some(ms);
                         }
                     }
                 }
-            }
-            // 4. 再次兜底使用响应头到达耗时 (x-timing-headers-ms)
-            if final_ttft_ms.is_none() {
-                if let Some(hms) = headers_map
-                    .get("x-timing-headers-ms")
+                // 3. 再次使用 headers_map 中有效的正数 TTFT
+                if final_ttft_ms.is_none() {
+                    if let Some(ttft) = headers_map.get("x-timing-ttft-ms").and_then(|v| v.as_str())
+                    {
+                        if let Ok(n) = ttft.parse::<f64>() {
+                            if n > 0.0 {
+                                final_ttft_ms = Some(n);
+                            }
+                        }
+                    }
+                }
+                // 4. 再次兜底使用响应头到达耗时 (x-timing-headers-ms)
+                if final_ttft_ms.is_none() {
+                    if let Some(hms) = headers_map
+                        .get("x-timing-headers-ms")
+                        .and_then(|v| v.as_str())
+                    {
+                        if let Ok(n) = hms.parse::<f64>() {
+                            if n > 0.0 {
+                                final_ttft_ms = Some(n);
+                            }
+                        }
+                    }
+                }
+                // 5. 再次兜底使用生效端点尝试的 duration_s
+                if final_ttft_ms.is_none() {
+                    if let Some(attempts) = &attempts_for_stream {
+                        if let Some(eff) = attempts.iter().find(|a| a.is_effective) {
+                            if eff.duration_s > 0.0 {
+                                final_ttft_ms = Some(eff.duration_s * 1000.0);
+                            }
+                        }
+                    }
+                }
+
+                // 回填真实 TTFT 到响应头，彻底消除 -1.000
+                if let Some(ttft_ms) = final_ttft_ms {
+                    headers_map.insert(
+                        "x-timing-ttft-ms".to_string(),
+                        serde_json::json!(format!("{:.3}", ttft_ms)),
+                    );
+                    if let Some(ref mut attempts) = attempts_for_stream {
+                        if let Some(eff) = attempts.iter_mut().find(|a| a.is_effective) {
+                            eff.duration_s = ttft_ms / 1000.0;
+                        }
+                    }
+                } else if headers_map
+                    .get("x-timing-ttft-ms")
                     .and_then(|v| v.as_str())
+                    .map_or(false, |s| s.starts_with('-'))
                 {
-                    if let Ok(n) = hms.parse::<f64>() {
-                        if n > 0.0 {
-                            final_ttft_ms = Some(n);
-                        }
-                    }
+                    headers_map.remove("x-timing-ttft-ms");
                 }
-            }
-            // 5. 再次兜底使用生效端点尝试的 duration_s
-            if final_ttft_ms.is_none() {
-                if let Some(attempts) = &attempts_for_stream {
-                    if let Some(eff) = attempts.iter().find(|a| a.is_effective) {
-                        if eff.duration_s > 0.0 {
-                            final_ttft_ms = Some(eff.duration_s * 1000.0);
-                        }
-                    }
-                }
-            }
 
-            // 回填真实 TTFT 到响应头，彻底消除 -1.000
-            if let Some(ttft_ms) = final_ttft_ms {
                 headers_map.insert(
-                    "x-timing-ttft-ms".to_string(),
-                    serde_json::json!(format!("{:.3}", ttft_ms)),
+                    "x-timing-stream-ms".to_string(),
+                    serde_json::json!(format!("{:.3}", stream_ms)),
                 );
-                if let Some(ref mut attempts) = attempts_for_stream {
-                    if let Some(eff) = attempts.iter_mut().find(|a| a.is_effective) {
-                        eff.duration_s = ttft_ms / 1000.0;
-                    }
-                }
-            } else if headers_map
-                .get("x-timing-ttft-ms")
-                .and_then(|v| v.as_str())
-                .map_or(false, |s| s.starts_with('-'))
-            {
-                headers_map.remove("x-timing-ttft-ms");
-            }
-
-            headers_map.insert(
-                "x-timing-stream-ms".to_string(),
-                serde_json::json!(format!("{:.3}", stream_ms)),
-            );
-            headers_map.insert(
-                "x-timing-total-ms".to_string(),
-                serde_json::json!(format!("{:.3}", total_ms)),
-            );
-            log.response_headers = serde_json::to_string(&Value::Object(headers_map.clone())).ok();
+                headers_map.insert(
+                    "x-timing-total-ms".to_string(),
+                    serde_json::json!(format!("{:.3}", total_ms)),
+                );
+                log.response_headers =
+                    serde_json::to_string(&Value::Object(headers_map.clone())).ok();
 
                 // Parse and consolidate stream data into readable format
                 if let Ok(full_response) = std::str::from_utf8(&all_stream_data) {
@@ -1881,111 +1923,146 @@ async fn monitor_request(
         log.response_headers = serde_json::to_string(&Value::Object(headers_map.clone())).ok();
 
         let (parts, body) = response.into_parts();
-        match crate::proxy::monitor::scope_upstream_work(
-            upstream_holder.clone(),
-            request_budget.clone(),
-            axum::body::to_bytes(body, MAX_RESPONSE_LOG_SIZE),
-        )
-        .await
-        {
-            Ok(bytes) => {
-                log.physical_requests = upstream_holder.physical_requests();
-                log.upstream_request_body = upstream_holder.take().or(log.upstream_request_body);
-                log.upstream_request_headers = upstream_holder
-                    .take_headers()
-                    .or(log.upstream_request_headers);
-                let captured_usage = upstream_holder.usage();
-                if let Ok(s) = std::str::from_utf8(&bytes) {
-                    if let Ok(json) = serde_json::from_str::<Value>(&s) {
-                        if let Some(mv) = json
-                            .get("modelVersion")
-                            .or_else(|| json.get("response").and_then(|r| r.get("modelVersion")))
-                            .and_then(|v| v.as_str())
-                        {
-                            if !mv.trim().is_empty() {
-                                log.upstream_model = Some(mv.to_string());
+        let body_holder = upstream_holder.clone();
+        let body_budget = request_budget.clone();
+        let finish = move |captured: diagnostic_body::CapturedBody| {
+            // Finalization follows consumer reads/drop, without a buffering task or
+            // channel that could drain a cancelled response ahead of the client.
+            let scope_holder = upstream_holder.clone();
+            let work = async move {
+                let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
+                log.duration = elapsed_ms.round() as u64;
+                headers_map.insert(
+                    "x-timing-total-ms".into(),
+                    serde_json::json!(format!("{elapsed_ms:.3}")),
+                );
+                log.response_headers =
+                    serde_json::to_string(&Value::Object(headers_map.clone())).ok();
+                if captured.is_complete() {
+                    let bytes = captured.bytes;
+
+                    log.physical_requests = upstream_holder.physical_requests();
+                    log.upstream_request_body =
+                        upstream_holder.take().or(log.upstream_request_body);
+                    log.upstream_request_headers = upstream_holder
+                        .take_headers()
+                        .or(log.upstream_request_headers);
+                    let captured_usage = upstream_holder.usage();
+                    if let Ok(s) = std::str::from_utf8(&bytes) {
+                        if let Ok(json) = serde_json::from_str::<Value>(&s) {
+                            if let Some(mv) = json
+                                .get("modelVersion")
+                                .or_else(|| {
+                                    json.get("response").and_then(|r| r.get("modelVersion"))
+                                })
+                                .and_then(|v| v.as_str())
+                            {
+                                if !mv.trim().is_empty() {
+                                    log.upstream_model = Some(mv.to_string());
+                                }
+                            }
+
+                            // Supports OpenAI's "usage" or Gemini's "usageMetadata"
+                            if let Some(usage) = json
+                                .get("usage")
+                                .or(json.get("usageMetadata"))
+                                .or(json.get("response").and_then(|r| r.get("usage")))
+                                .or(json.get("response").and_then(|r| r.get("usageMetadata")))
+                            {
+                                log.input_tokens = extract_input_tokens(usage);
+                                log.output_tokens = extract_output_tokens(usage);
+                                log.cached_tokens =
+                                    log.cached_tokens.or_else(|| extract_cached_tokens(usage));
+                                log.reasoning_tokens = log
+                                    .reasoning_tokens
+                                    .or_else(|| extract_reasoning_tokens(usage));
+                                log.total_tokens =
+                                    crate::proxy::pipeline::CanonicalUsage::from_gemini(usage)
+                                        .total_tokens;
                             }
                         }
-
-                        // Supports OpenAI's "usage" or Gemini's "usageMetadata"
-                        if let Some(usage) = json
-                            .get("usage")
-                            .or(json.get("usageMetadata"))
-                            .or(json.get("response").and_then(|r| r.get("usage")))
-                            .or(json.get("response").and_then(|r| r.get("usageMetadata")))
-                        {
-                            log.input_tokens = extract_input_tokens(usage);
-                            log.output_tokens = extract_output_tokens(usage);
-                            log.cached_tokens =
-                                log.cached_tokens.or_else(|| extract_cached_tokens(usage));
-                            log.reasoning_tokens = log
-                                .reasoning_tokens
-                                .or_else(|| extract_reasoning_tokens(usage));
-                            log.total_tokens =
-                                crate::proxy::pipeline::CanonicalUsage::from_gemini(usage)
-                                    .total_tokens;
+                        apply_captured_usage(
+                            &mut log,
+                            &mut serde_json::Map::new(),
+                            captured_usage.as_ref(),
+                        );
+                        if is_image_route {
+                            log.response_body = serde_json::from_str::<Value>(&s)
+                                .ok()
+                                .and_then(|json| summarize_image_json_response(&json))
+                                .or_else(|| Some(s.to_string()));
+                        } else if let Ok(json) = serde_json::from_str::<Value>(&s) {
+                            // 🌟 非流式响应入库统一转换为满血简要版 (包含网关权威签名回填与防雪崩确定性 Tool ID)
+                            if let Some(canonical) = consolidate_non_streaming_response(
+                                &json,
+                                &log,
+                                &headers_map,
+                                upstream_attempts.clone(),
+                                captured_usage.as_ref(),
+                            ) {
+                                log.response_body = serde_json::to_string_pretty(&canonical)
+                                    .ok()
+                                    .or_else(|| Some(s.to_string()));
+                            } else {
+                                log.response_body = serde_json::to_string_pretty(&json)
+                                    .ok()
+                                    .or_else(|| Some(s.to_string()));
+                            }
+                        } else {
+                            log.response_body = Some(s.to_string());
                         }
+                    } else {
+                        log.response_body = Some("[Binary Response Data]".to_string());
                     }
+
+                    if log.status >= 400 {
+                        log.error = log.response_body.clone();
+                    }
+
+                    // Record User Token Usage
+                    record_user_token_usage(&user_token_identity, &log, user_agent.clone());
+
+                    monitor.log_request(log).await;
+                } else {
+                    log.physical_requests = upstream_holder.physical_requests();
+                    log.upstream_request_body =
+                        upstream_holder.take().or(log.upstream_request_body);
+                    log.upstream_request_headers = upstream_holder
+                        .take_headers()
+                        .or(log.upstream_request_headers);
                     apply_captured_usage(
                         &mut log,
                         &mut serde_json::Map::new(),
-                        captured_usage.as_ref(),
+                        upstream_holder.usage().as_ref(),
                     );
-                    if is_image_route {
-                        log.response_body = serde_json::from_str::<Value>(&s)
-                            .ok()
-                            .and_then(|json| summarize_image_json_response(&json))
-                            .or_else(|| Some(s.to_string()));
-                    } else if let Ok(json) = serde_json::from_str::<Value>(&s) {
-                        // 🌟 非流式响应入库统一转换为满血简要版 (包含网关权威签名回填与防雪崩确定性 Tool ID)
-                        if let Some(canonical) = consolidate_non_streaming_response(
-                            &json,
-                            &log,
-                            &headers_map,
-                            upstream_attempts.clone(),
-                            captured_usage.as_ref(),
-                        ) {
-                            log.response_body = serde_json::to_string_pretty(&canonical)
-                                .ok()
-                                .or_else(|| Some(s.to_string()));
-                        } else {
-                            log.response_body = serde_json::to_string_pretty(&json)
-                                .ok()
-                                .or_else(|| Some(s.to_string()));
-                        }
-                    } else {
-                        log.response_body = Some(s.to_string());
+                    log.response_body = Some(captured.marker("Response body"));
+                    if captured.failed {
+                        log.error = Some("Response body stream failed".into());
+                    } else if !captured.complete {
+                        log.error = Some("Response body consumption ended early".into());
+                    } else if log.status >= 400 {
+                        log.error = log.response_body.clone();
                     }
-                } else {
-                    log.response_body = Some("[Binary Response Data]".to_string());
+                    record_user_token_usage(&user_token_identity, &log, user_agent);
+                    monitor.log_request(log).await;
                 }
-
-                if log.status >= 400 {
-                    log.error = log.response_body.clone();
-                }
-
-                // Record User Token Usage
-                record_user_token_usage(&user_token_identity, &log, user_agent.clone());
-
-                monitor.log_request(log).await;
-                Response::from_parts(parts, Body::from(bytes))
+            };
+            if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+                runtime.spawn(crate::proxy::monitor::scope_upstream_work(
+                    scope_holder,
+                    request_budget,
+                    work,
+                ));
             }
-            Err(_) => {
-                log.physical_requests = upstream_holder.physical_requests();
-                apply_captured_usage(
-                    &mut log,
-                    &mut serde_json::Map::new(),
-                    upstream_holder.usage().as_ref(),
-                );
-                log.response_body = Some("[Response too large (>100MB)]".to_string());
-
-                // Record User Token Usage (even if too large)
-                record_user_token_usage(&user_token_identity, &log, user_agent.clone());
-
-                monitor.log_request(log).await;
-                Response::from_parts(parts, Body::empty())
-            }
-        }
+        };
+        let (body, _) = capture_body_in_scope(
+            body,
+            response_capture_limit,
+            Some(Box::new(finish)),
+            body_holder,
+            body_budget,
+        );
+        Response::from_parts(parts, body)
     } else {
         log.physical_requests = upstream_holder.physical_requests();
         apply_captured_usage(
@@ -1999,7 +2076,471 @@ async fn monitor_request(
         record_user_token_usage(&user_token_identity, &log, user_agent);
 
         monitor.log_request(log).await;
-        response
+        scoped_passthrough_response(response, upstream_holder, request_budget)
+    }
+}
+
+#[cfg(test)]
+mod body_preservation_regressions {
+    use super::*;
+    use axum::{body::Bytes, http::StatusCode, middleware, routing::post, Router};
+    use std::sync::Arc;
+    use tower::ServiceExt;
+
+    fn monitored(
+        app: Router,
+        monitor: Arc<crate::proxy::monitor::ProxyMonitor>,
+        request_limit: usize,
+        response_limit: usize,
+    ) -> Router {
+        app.layer(middleware::from_fn(move |request: Request, next: Next| {
+            monitor_request_with_limits(
+                monitor.clone(),
+                Default::default(),
+                request,
+                next,
+                request_limit,
+                response_limit,
+            )
+        }))
+    }
+
+    async fn stored_log(monitor: &crate::proxy::monitor::ProxyMonitor) -> ProxyRequestLog {
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if let Some(log) = monitor.get_logs(10).await.into_iter().next() {
+                    // Listing deliberately omits large bodies; assert against the
+                    // persisted detail, as the request-detail UI does.
+                    if let Ok(Ok(detail)) = tokio::task::spawn_blocking(move || {
+                        crate::modules::proxy_db::get_log_detail(&log.id)
+                    })
+                    .await
+                    {
+                        break detail;
+                    }
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("body finalization did not publish its diagnostic log")
+    }
+
+    #[tokio::test]
+    async fn diagnostic_caps_preserve_request_and_response_bytes_status_headers_and_usage() {
+        let _data = crate::proxy::monitor::prompt_log_tests::TestDataDir::new();
+        let monitor = Arc::new(crate::proxy::monitor::ProxyMonitor::new(10, None));
+        monitor.set_enabled(true);
+        let expected = Bytes::from_static(br#"{"model":"fixture-model","messages":[{"role":"user","content":"a valid request larger than either diagnostic limit"}]}"#);
+        let sent = expected.clone();
+        let app = monitored(Router::new().route("/v1/chat/completions", post(move |request: Request| {
+            let expected = expected.clone();
+            async move {
+                let bytes = axum::body::to_bytes(request.into_body(), 1024).await.unwrap();
+                assert_eq!(bytes, expected);
+                assert!(serde_json::from_slice::<Value>(&bytes).is_ok());
+                let context = crate::proxy::pipeline::budget::current().unwrap();
+                let body = Body::from_stream(futures::stream::once(async move {
+                    assert!(Arc::ptr_eq(&crate::proxy::pipeline::budget::current().unwrap(), &context));
+                    crate::proxy::monitor::CURRENT_UPSTREAM_CAPTURE.with(|capture| {
+                        capture.record_dispatch();
+                        capture.record_usage(&serde_json::json!({"promptTokenCount":9,"candidatesTokenCount":3,"totalTokenCount":12}));
+                    });
+                    Ok::<_, std::io::Error>(bytes)
+                }));
+                Response::builder().status(StatusCode::CREATED)
+                    .header("content-type", "application/json").header("x-test-transport", "unchanged")
+                    .header("content-length", expected.len().to_string()).body(body).unwrap()
+            }
+        })), monitor.clone(), 16, 8);
+        let context = crate::proxy::pipeline::budget::RequestContext::new(
+            crate::proxy::pipeline::budget::deadline_now(),
+        );
+        let response = crate::proxy::pipeline::budget::scope(
+            context,
+            app.oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header("content-type", "application/json")
+                    .body(Body::from(sent.clone()))
+                    .unwrap(),
+            ),
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.status(), StatusCode::CREATED);
+        assert_eq!(response.headers()["x-test-transport"], "unchanged");
+        assert_eq!(response.headers()["content-length"], sent.len().to_string());
+        assert_eq!(
+            axum::body::to_bytes(response.into_body(), 1024)
+                .await
+                .unwrap(),
+            sent
+        );
+        let log = stored_log(&monitor).await;
+        assert_eq!(log.status, 201);
+        assert!(log
+            .request_body
+            .unwrap()
+            .contains("diagnostic limit reached"));
+        assert!(log
+            .response_body
+            .unwrap()
+            .contains("diagnostic limit reached"));
+        assert_eq!(
+            (
+                log.physical_requests,
+                log.input_tokens,
+                log.output_tokens,
+                log.total_tokens
+            ),
+            (Some(1), Some(9), Some(3), Some(12))
+        );
+    }
+
+    #[tokio::test]
+    async fn normal_complete_bodies_keep_model_and_json_usage_inspection() {
+        let _data = crate::proxy::monitor::prompt_log_tests::TestDataDir::new();
+        let monitor = Arc::new(crate::proxy::monitor::ProxyMonitor::new(10, None));
+        monitor.set_enabled(true);
+        let response_text = r#"{"modelVersion":"upstream-fixture","usage":{"prompt_tokens":11,"completion_tokens":2,"total_tokens":13},"choices":[{"message":{"role":"assistant","content":"fixture reply"}}]}"#;
+        let app = monitored(
+            Router::new().route(
+                "/v1/chat/completions",
+                post(move |request: Request| async move {
+                    let _ = axum::body::to_bytes(request.into_body(), 1024)
+                        .await
+                        .unwrap();
+                    Response::builder()
+                        .header("content-type", "application/json")
+                        .body(Body::from(response_text))
+                        .unwrap()
+                }),
+            ),
+            monitor.clone(),
+            1024,
+            1024,
+        );
+        let request_text = r#"{"model":"requested-fixture","messages":[{"role":"user","content":"do real fixture work"}]}"#;
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header("content-type", "application/json")
+                    .body(Body::from(request_text))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            axum::body::to_bytes(response.into_body(), 1024)
+                .await
+                .unwrap(),
+            response_text
+        );
+        let log = stored_log(&monitor).await;
+        assert_eq!(log.model.as_deref(), Some("requested-fixture"));
+        assert_eq!(log.upstream_model.as_deref(), Some("upstream-fixture"));
+        assert_eq!(
+            serde_json::from_str::<Value>(log.request_body.as_deref().unwrap()).unwrap(),
+            serde_json::from_str::<Value>(request_text).unwrap()
+        );
+        assert_eq!(
+            (log.input_tokens, log.output_tokens, log.total_tokens),
+            (Some(11), Some(2), Some(13))
+        );
+    }
+
+    #[tokio::test]
+    async fn request_and_response_body_errors_reach_the_original_consumer() {
+        let _data = crate::proxy::monitor::prompt_log_tests::TestDataDir::new();
+        let monitor = Arc::new(crate::proxy::monitor::ProxyMonitor::new(10, None));
+        monitor.set_enabled(true);
+        let app = monitored(
+            Router::new().route(
+                "/v1/chat/completions",
+                post(|request: Request| async move {
+                    let error = axum::body::to_bytes(request.into_body(), 1024)
+                        .await
+                        .unwrap_err();
+                    assert!(format!("{error:?}").contains("request-fixture-error"));
+                    let frames = futures::stream::iter([
+                        Ok(Bytes::from_static(b"original response prefix")),
+                        Err(std::io::Error::new(
+                            std::io::ErrorKind::ConnectionReset,
+                            "response-fixture-error",
+                        )),
+                    ]);
+                    Response::builder()
+                        .status(StatusCode::IM_A_TEAPOT)
+                        .header("content-type", "text/plain")
+                        .header("x-test-transport", "unchanged")
+                        .body(Body::from_stream(frames))
+                        .unwrap()
+                }),
+            ),
+            monitor.clone(),
+            8,
+            8,
+        );
+        let request = Body::from_stream(futures::stream::iter([
+            Ok(Bytes::from_static(b"original request prefix")),
+            Err(std::io::Error::new(
+                std::io::ErrorKind::ConnectionReset,
+                "request-fixture-error",
+            )),
+        ]));
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .body(request)
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::IM_A_TEAPOT);
+        assert_eq!(response.headers()["x-test-transport"], "unchanged");
+        let error = axum::body::to_bytes(response.into_body(), 1024)
+            .await
+            .unwrap_err();
+        assert!(format!("{error:?}").contains("response-fixture-error"));
+        let log = stored_log(&monitor).await;
+        assert_eq!(log.status, 418);
+        assert_eq!(log.error.as_deref(), Some("Response body stream failed"));
+        assert!(log.request_body.unwrap().contains("body stream failed"));
+    }
+
+    #[tokio::test]
+    async fn logging_disabled_still_accounts_usage_when_response_is_never_polled() {
+        let _data = crate::proxy::monitor::prompt_log_tests::TestDataDir::new();
+        crate::modules::user_token_db::init_db().unwrap();
+        let token = crate::modules::user_token_db::create_token(
+            "monitor-fixture".into(),
+            "never".into(),
+            None,
+            0,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        let monitor = Arc::new(crate::proxy::monitor::ProxyMonitor::new(10, None));
+        assert!(!monitor.is_enabled());
+        let app = monitored(
+            Router::new().route(
+                "/v1/chat/completions",
+                post(|request: Request| async move {
+                    let _ = axum::body::to_bytes(request.into_body(), 1024)
+                        .await
+                        .unwrap();
+                    crate::proxy::monitor::CURRENT_UPSTREAM_CAPTURE.with(|capture| {
+                        capture.record_dispatch();
+                        capture.record_usage(
+                            &serde_json::json!({"promptTokenCount":4,"candidatesTokenCount":2}),
+                        );
+                    });
+                    Response::builder()
+                        .header("content-type", "application/json")
+                        .body(Body::from("unused response fixture"))
+                        .unwrap()
+                }),
+            ),
+            monitor,
+            8,
+            8,
+        );
+        let mut request = Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .body(Body::from("large request fixture"))
+            .unwrap();
+        request.extensions_mut().insert(UserTokenIdentity {
+            token_id: token.id.clone(),
+            username: token.username,
+        });
+        let response = app.oneshot(request).await.unwrap();
+        drop(response);
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                let stored = crate::modules::user_token_db::get_token_by_id(&token.id)
+                    .unwrap()
+                    .unwrap();
+                if stored.total_requests == 1 {
+                    assert_eq!(stored.total_tokens_used, 6);
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("unpolled response drop lost usage accounting");
+    }
+
+    struct PassthroughDropGuard {
+        context: Arc<crate::proxy::pipeline::budget::RequestContext>,
+        capture: UpstreamRequestBodyHolder,
+        dropped: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl Drop for PassthroughDropGuard {
+        fn drop(&mut self) {
+            assert!(Arc::ptr_eq(
+                &crate::proxy::pipeline::budget::current().unwrap(),
+                &self.context
+            ));
+            crate::proxy::monitor::CURRENT_UPSTREAM_CAPTURE.with(|capture| {
+                assert!(Arc::ptr_eq(&capture.0, &self.capture.0));
+                capture.record_dispatch();
+            });
+            self.dropped
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    #[tokio::test]
+    async fn skipped_probe_get_and_binary_bodies_keep_scopes_on_poll_and_cancel() {
+        use std::sync::{
+            atomic::{AtomicBool, Ordering},
+            Mutex,
+        };
+        let _data = crate::proxy::monitor::prompt_log_tests::TestDataDir::new();
+        let monitor = Arc::new(crate::proxy::monitor::ProxyMonitor::new(10, None));
+        let safety = crate::proxy::pipeline::admission::SafetyController::for_dir(
+            &crate::modules::account::get_data_dir().unwrap(),
+        )
+        .unwrap();
+        let original_permit = safety.permit().unwrap();
+        for (kind, method, path, request_text, content_type) in [
+            (
+                "probe",
+                "POST",
+                "/v1/chat/completions",
+                r#"{"messages":[{"role":"user","content":"ping"}]}"#,
+                "application/json",
+            ),
+            ("get", "GET", "/v1/models", "", "application/json"),
+            (
+                "binary",
+                "POST",
+                "/v1/chat/completions",
+                r#"{"messages":[{"role":"user","content":"do fixture work"}]}"#,
+                "application/octet-stream",
+            ),
+        ] {
+            for consume in [true, false] {
+                let context = crate::proxy::pipeline::budget::RequestContext::new(
+                    crate::proxy::pipeline::budget::deadline_now(),
+                );
+                if kind == "probe" {
+                    context.set_safety(original_permit.clone());
+                }
+                let dropped = Arc::new(AtomicBool::new(false));
+                let polled = Arc::new(AtomicBool::new(false));
+                let holder_slot = Arc::new(Mutex::new(None));
+                let (handler_dropped, handler_polled, handler_holder) =
+                    (dropped.clone(), polled.clone(), holder_slot.clone());
+                let app = monitored(
+                    Router::new().route(
+                        path,
+                        axum::routing::any(move |request: Request| {
+                            let (dropped, polled, holder_slot) = (
+                                handler_dropped.clone(),
+                                handler_polled.clone(),
+                                handler_holder.clone(),
+                            );
+                            async move {
+                                let _ = axum::body::to_bytes(request.into_body(), 1024)
+                                    .await
+                                    .unwrap();
+                                let context = crate::proxy::pipeline::budget::current().unwrap();
+                                let capture = crate::proxy::monitor::CURRENT_UPSTREAM_CAPTURE
+                                    .with(Clone::clone);
+                                *holder_slot.lock().unwrap() = Some(capture.clone());
+                                let guard = PassthroughDropGuard {
+                                    context: context.clone(),
+                                    capture,
+                                    dropped,
+                                };
+                                let body = Body::from_stream(futures::stream::once(async move {
+                                    let _guard = guard;
+                                    assert!(Arc::ptr_eq(
+                                        &crate::proxy::pipeline::budget::current().unwrap(),
+                                        &context
+                                    ));
+                                    polled.store(true, Ordering::SeqCst);
+                                    if context
+                                        .safety()
+                                        .is_some_and(|permit| permit.check().is_err())
+                                    {
+                                        return Err(std::io::Error::other(
+                                            "fixture gateway stopped",
+                                        ));
+                                    }
+                                    Ok(Bytes::from_static(b"unchanged response"))
+                                }));
+                                Response::builder()
+                                    .header("content-type", content_type)
+                                    .body(body)
+                                    .unwrap()
+                            }
+                        }),
+                    ),
+                    monitor.clone(),
+                    1024,
+                    8,
+                );
+                let response = crate::proxy::pipeline::budget::scope(
+                    context,
+                    app.oneshot(
+                        Request::builder()
+                            .method(method)
+                            .uri(path)
+                            .header("content-type", "application/json")
+                            .body(Body::from(request_text))
+                            .unwrap(),
+                    ),
+                )
+                .await
+                .unwrap();
+                assert!(
+                    !polled.load(Ordering::SeqCst),
+                    "monitor must not drain the {kind} body"
+                );
+                if kind == "probe" {
+                    safety.halt("manual_stop").unwrap();
+                }
+                if consume {
+                    let result = axum::body::to_bytes(response.into_body(), 1024).await;
+                    if kind == "probe" {
+                        assert!(format!("{:?}", result.unwrap_err())
+                            .contains("fixture gateway stopped"));
+                    } else {
+                        assert_eq!(result.unwrap(), b"unchanged response"[..]);
+                    }
+                } else {
+                    drop(response);
+                }
+                assert_eq!(polled.load(Ordering::SeqCst), consume);
+                assert!(
+                    dropped.load(Ordering::SeqCst),
+                    "{kind} drop lost its request context"
+                );
+                assert_eq!(
+                    holder_slot
+                        .lock()
+                        .unwrap()
+                        .as_ref()
+                        .unwrap()
+                        .physical_requests(),
+                    Some(1)
+                );
+                assert!(crate::proxy::pipeline::budget::current().is_none());
+            }
+        }
     }
 }
 

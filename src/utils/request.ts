@@ -13,8 +13,10 @@ const COMMAND_MAPPING: Record<string, { url: string; method: 'GET' | 'POST' | 'D
   'release_account_qos_jail': { url: '/api/accounts/:accountId/release-qos', method: 'POST' },
   'delete_accounts': { url: '/api/accounts/bulk-delete', method: 'POST' },
   'fetch_account_quota': { url: '/api/accounts/:accountId/quota', method: 'GET' },
+  'fetch_account_quota_automatically': { url: '/api/accounts/:accountId/quota/automatic', method: 'GET' },
   'refresh_account_quota': { url: '/api/accounts/:accountId/quota', method: 'GET' },
   'refresh_all_quotas': { url: '/api/accounts/refresh', method: 'POST' },
+  'refresh_all_quotas_automatically': { url: '/api/accounts/refresh-automatic', method: 'POST' },
   'reorder_accounts': { url: '/api/accounts/reorder', method: 'POST' },
   'toggle_proxy_status': { url: '/api/accounts/:accountId/toggle-proxy', method: 'POST' },
   'warm_up_accounts': { url: '/api/accounts/warmup', method: 'POST' },
@@ -36,6 +38,9 @@ const COMMAND_MAPPING: Record<string, { url: string; method: 'GET' | 'POST' | 'D
 
   // Proxy Control & Status
   'get_proxy_status': { url: '/api/proxy/status', method: 'GET' },
+  'get_account_safety_status': { url: '/api/proxy/account-safety', method: 'GET' },
+  'resume_account_safety': { url: '/api/proxy/account-safety/resume', method: 'POST' },
+  'halt_account_safety': { url: '/api/proxy/account-safety/halt', method: 'POST' },
   'start_proxy_service': { url: '/api/proxy/start', method: 'POST' },
   'stop_proxy_service': { url: '/api/proxy/stop', method: 'POST' },
   'update_model_mapping': { url: '/api/proxy/mapping', method: 'POST' },
@@ -189,6 +194,7 @@ const COMMAND_MAPPING: Record<string, { url: string; method: 'GET' | 'POST' | 'D
   'list_user_tokens': { url: '/api/user-tokens', method: 'GET' },
   'get_user_token_summary': { url: '/api/user-tokens/summary', method: 'GET' },
   'create_user_token': { url: '/api/user-tokens', method: 'POST' },
+  'reveal_user_token': { url: '/api/user-tokens/:id/reveal', method: 'POST' },
   'renew_user_token': { url: '/api/user-tokens/:id/renew', method: 'POST' },
   'delete_user_token': { url: '/api/user-tokens/:id', method: 'DELETE' },
   'update_user_token': { url: '/api/user-tokens/:id', method: 'PATCH' },

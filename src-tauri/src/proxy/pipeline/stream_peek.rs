@@ -37,7 +37,7 @@ pub enum PeekOutcome {
     /// 上游在首包前返回流错误
     StreamError { error: String, waited_ms: f64 },
     /// 首包即协议错误事件（如 `event: error` / `data: {"error": ...}`）
-    ErrorEvent { waited_ms: f64 },
+    ErrorEvent { bytes: Bytes, waited_ms: f64 },
 }
 
 impl PeekOutcome {
@@ -130,7 +130,7 @@ where
                 }
                 let waited_ms = started.elapsed().as_secs_f64() * 1000.0;
                 if has_error_event(&bytes) {
-                    return PeekOutcome::ErrorEvent { waited_ms };
+                    return PeekOutcome::ErrorEvent { bytes, waited_ms };
                 }
                 return PeekOutcome::Data { bytes, waited_ms };
             }
@@ -168,19 +168,87 @@ pub enum StreamDialect {
 /// 四个协议过去各写一份内联谓词；探针与 peek 共用同一份判据，
 /// 避免“探针把心跳当首块”或“peek 把心跳当数据”的漂移。
 pub fn is_heartbeat(bytes: &[u8], dialect: StreamDialect) -> bool {
-    let text = String::from_utf8_lossy(bytes);
-    let trimmed = text.trim_start();
-    if trimmed.starts_with(':') || trimmed.starts_with("data: :") {
+    // HTTP chunks need not align with SSE events. Skip a chunk only when every
+    // complete event is unambiguously a heartbeat; preserve mixed/partial data.
+    let Ok(text) = std::str::from_utf8(bytes) else {
+        return false;
+    };
+    if text.is_empty() || !text.ends_with(['\r', '\n']) {
+        return false;
+    }
+    let normalized = if text.contains('\r') {
+        std::borrow::Cow::Owned(text.replace("\r\n", "\n").replace('\r', "\n"))
+    } else {
+        std::borrow::Cow::Borrowed(text)
+    };
+    let mut payload = Vec::new();
+    let mut event = None;
+    let mut saw_heartbeat = false;
+    for line in normalized.split_terminator('\n') {
+        if !heartbeat_line(line, dialect, &mut payload, &mut event, &mut saw_heartbeat) {
+            return false;
+        }
+    }
+    payload.is_empty() && event.is_none() && saw_heartbeat
+}
+
+fn heartbeat_line<'a>(
+    line: &'a str,
+    dialect: StreamDialect,
+    payload: &mut Vec<&'a str>,
+    event: &mut Option<&'a str>,
+    saw_heartbeat: &mut bool,
+) -> bool {
+    if line.is_empty() {
+        if payload.is_empty() {
+            return event.is_none();
+        }
+        let data = match payload.as_slice() {
+            [single] => std::borrow::Cow::Borrowed(*single),
+            _ => std::borrow::Cow::Owned(payload.join("\n")),
+        };
+        let candidate = match dialect {
+            StreamDialect::Anthropic => data.contains("\"type\"") && data.contains("\"ping\""),
+            StreamDialect::Gemini => data.contains("\"__cloudCodeMeta\""),
+            StreamDialect::OpenAi => false,
+        };
+        let heartbeat = if data.starts_with(':') {
+            event.is_none()
+        } else if !candidate {
+            false
+        } else if let Ok(Value::Object(object)) = serde_json::from_str::<Value>(&data) {
+            match dialect {
+                StreamDialect::Anthropic => {
+                    object.len() == 1
+                        && object.get("type").and_then(Value::as_str) == Some("ping")
+                        && event.is_none_or(|name| name == "ping")
+                }
+                StreamDialect::Gemini => {
+                    object.len() == 1 && object.contains_key("__cloudCodeMeta") && event.is_none()
+                }
+                StreamDialect::OpenAi => false,
+            }
+        } else {
+            false
+        };
+        payload.clear();
+        *event = None;
+        *saw_heartbeat |= heartbeat;
+        return heartbeat;
+    }
+    if line.starts_with(':') {
+        *saw_heartbeat = true;
         return true;
     }
-    match dialect {
-        StreamDialect::Anthropic => {
-            text.contains("\"type\":\"ping\"") || text.contains("\"type\": \"ping\"")
-        }
-        // Gemini 的 `__cloudCodeMeta` 是流首元数据帧，不是首 token
-        StreamDialect::Gemini => text.contains("__cloudCodeMeta"),
-        StreamDialect::OpenAi => false,
+    if let Some(data) = line.strip_prefix("data:") {
+        payload.push(data.strip_prefix(' ').unwrap_or(data));
+        return true;
     }
+    if let Some(name) = line.strip_prefix("event:") {
+        *event = Some(name.strip_prefix(' ').unwrap_or(name));
+        return true;
+    }
+    false
 }
 
 /// TTFT 的唯一语义口径：从**最终生效的上游尝试开始**（含建连/上传/排队）
@@ -473,6 +541,50 @@ mod tests {
             StreamDialect::Gemini
         ));
         assert!(!is_heartbeat(b"data: {\"x\":1}\n\n", StreamDialect::Gemini));
+    }
+
+    #[tokio::test]
+    async fn coalesced_heartbeats_never_discard_real_sse_data() {
+        for (dialect, data) in [
+            (StreamDialect::OpenAi, ": ping\n\ndata: {\"choices\":[{\"delta\":{\"content\":\"hello\"}}]}\n\n"),
+            (StreamDialect::Gemini, "data: {\"__cloudCodeMeta\":{}}\n\ndata: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"hello\"}]}}]}\n\n"),
+            (StreamDialect::Gemini, "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"__cloudCodeMeta\"}]}}]}\n\n"),
+            (StreamDialect::Anthropic, "event: ping\ndata: {\"type\":\"ping\"}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"delta\":{\"text\":\"hello\"}}\n\n"),
+            (StreamDialect::Gemini, "data: {\"__cloudCodeMeta\":{},\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"hello\"}]}}]}\n\n"),
+            (StreamDialect::Anthropic, "data: {\"type\":\"content_block_delta\",\"tool\":{\"type\":\"ping\"}}\n\n"),
+        ] {
+            let bytes = Bytes::from(data);
+            assert!(!is_heartbeat(&bytes, dialect), "{data}");
+            let mut input = boxed(vec![Ok(bytes.clone())]);
+            match peek_first_data(&mut input, 1, |chunk| is_heartbeat(chunk, dialect), |_| false).await {
+                PeekOutcome::Data { bytes: observed, .. } => assert_eq!(observed, bytes),
+                other => panic!("mixed chunk was discarded: {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn heartbeat_classification_preserves_fragmented_and_stateful_events() {
+        for bytes in [
+            &b": partial comment"[..],
+            &b"data: {\"__cloudCodeMeta\":"[..],
+            &b"data: {\"__cloudCodeMeta\":{}}\n"[..],
+            &b"event: ping\n"[..],
+            &b": ping\n\ndata: {\"candidates\":"[..],
+            &b"id: event-1\n\ndata: {\"type\":\"ping\"}\n\n"[..],
+            &b": ping\n\ndata: \xc3"[..],
+        ] {
+            assert!(!is_heartbeat(bytes, StreamDialect::Gemini), "{bytes:?}");
+        }
+        for bytes in [
+            &b": ping\n"[..],
+            &b": ping\r\n\r\n"[..],
+            &b": ping\r\r"[..],
+            &b"data: {\"__cloudCodeMeta\":{}}\r\n\r\n"[..],
+            &b": ping\n\ndata: {\"__cloudCodeMeta\":{}}\n\n"[..],
+        ] {
+            assert!(is_heartbeat(bytes, StreamDialect::Gemini), "{bytes:?}");
+        }
     }
 
     #[test]

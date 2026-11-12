@@ -24,6 +24,7 @@ import {
     ResponsiveContainer,
 } from 'recharts';
 import { request as invoke } from '../../utils/request';
+import { showToast } from '../common/ToastContainer';
 import { copyToClipboard } from '../../utils/clipboard';
 
 export interface UserTokenSummaryItem {
@@ -150,11 +151,16 @@ export const UserTokenStatsModal: React.FC<UserTokenStatsModalProps> = ({
         }
     }, [isOpen, token, timeRange, loadStats]);
 
-    const handleCopy = () => {
+    const handleCopy = async () => {
         if (!token) return;
-        copyToClipboard(token.token);
-        setCopied(true);
-        setTimeout(() => setCopied(false), 2000);
+        try {
+            if (await copyToClipboard(() => invoke<string>('reveal_user_token', { id: token.id }))) {
+                setCopied(true);
+                setTimeout(() => setCopied(false), 2000);
+            }
+        } catch (error) {
+            showToast(String(error), 'error');
+        }
     };
 
     if (!isOpen || !token) return null;

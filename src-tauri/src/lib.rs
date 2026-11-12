@@ -193,6 +193,10 @@ pub async fn run_headless_server(
             config.proxy.allow_lan_access,
         );
 
+    // HTTPS options are equally available to desktop-headless and server binaries.
+    modified |= crate::proxy::tls::apply_environment(&mut config.proxy.tls, config.proxy.port)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))?;
+
     // Force auth mode to AllExceptHealth in headless mode if it's Off or Auto
     if matches!(
         config.proxy.auth_mode,
@@ -840,6 +844,8 @@ pub fn run() {
             // Quota commands
             commands::fetch_account_quota,
             commands::refresh_all_quotas,
+            commands::refresh_all_quotas_automatically,
+            commands::fetch_account_quota_automatically,
             // Config commands
             commands::load_config,
             commands::get_config,
@@ -930,6 +936,9 @@ pub fn run() {
             commands::proxy::get_effective_timeout_config,
             commands::proxy::clear_proxy_rate_limit,
             commands::proxy::clear_all_proxy_rate_limits,
+            commands::proxy::get_account_safety_status,
+            commands::proxy::resume_account_safety,
+            commands::proxy::halt_account_safety,
             // Proxy Pool Binding commands
             commands::proxy_pool::bind_account_proxy,
             commands::proxy_pool::unbind_account_proxy,
@@ -1019,6 +1028,7 @@ pub fn run() {
             modules::log_bridge::clear_debug_console_logs,
             // User Token commands
             commands::user_token::list_user_tokens,
+            commands::user_token::reveal_user_token,
             commands::user_token::create_user_token,
             commands::user_token::update_user_token,
             commands::user_token::delete_user_token,

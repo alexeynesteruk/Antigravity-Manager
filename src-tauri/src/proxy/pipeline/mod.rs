@@ -7,11 +7,14 @@
 //! 架构设计规范：出站发散由各协议 mapper 适配器独立实现（Gemini -> 各协议线缆格式）。
 //! 出站不设统一流水线，保持协议发散的灵活性与流式稳定性。
 
+pub mod account_safety;
+pub mod admission;
 pub mod auto_heal;
 pub mod budget;
 pub mod errors;
 pub mod estimator;
 pub mod image;
+pub mod image_outputs;
 pub mod inbound;
 pub mod media_sources;
 #[cfg(test)]

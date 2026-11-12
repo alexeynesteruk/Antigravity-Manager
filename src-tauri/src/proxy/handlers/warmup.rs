@@ -61,12 +61,43 @@ pub struct WarmupResponse {
     pub error_type: Option<String>,
 }
 
+async fn guard_automatic_warmup(
+    manager: &crate::proxy::token_manager::TokenManager,
+    req: &WarmupRequest,
+) -> Option<Response> {
+    if req.probe_intent {
+        return None;
+    }
+    let account_id = req
+        .account_id
+        .clone()
+        .filter(|id| !id.is_empty())
+        .or_else(|| crate::modules::account::find_account_id_by_email(&req.email));
+    if let Some(id) = &account_id {
+        if manager.allows_automatic_account_use(id).await {
+            return None;
+        }
+    }
+    Some((StatusCode::BAD_REQUEST, Json(json!({
+        "success": false,
+        "message": "Automatic warmup is paused for this account. Review its status in Accounts; use an explicit availability check after resolving the issue.",
+        "status": 400, "account_email": req.email, "account_id": account_id,
+        "error_type": "account_attention_required"
+    }))).into_response())
+}
+
 /// 处理预热请求
 pub async fn handle_warmup(
     State(state): State<AppState>,
     Json(req): Json<WarmupRequest>,
 ) -> Response {
     let start_time = std::time::Instant::now();
+
+    // Supplied credentials must not bypass a durable hold or an in-flight hold
+    // whose write failed. Only an explicit user probe may attempt recovery.
+    if let Some(response) = guard_automatic_warmup(&state.token_manager, &req).await {
+        return response;
+    }
 
     let mapped_model = {
         let custom_mapping = state.custom_mapping.read().await;
@@ -400,7 +431,7 @@ pub async fn handle_warmup(
         .await;
 
     // 如果流式请求失败，尝试非流式请求
-    if result.is_err() && !prefer_non_stream {
+    if result.as_ref().err().is_some_and(|error| crate::proxy::pipeline::admission::error_from_encoded(error).is_none()) && !prefer_non_stream {
         result = state
             .upstream
             .call_v1_internal(
@@ -424,6 +455,10 @@ pub async fn handle_warmup(
 
             let mut response = if status.is_success() {
                 let response_text = response.text().await.unwrap_or_default();
+                if let Some((attention,body)) = std::iter::once(response_text.as_bytes()).chain(response_text.lines().map(str::as_bytes)).find_map(crate::proxy::pipeline::account_safety::AccountAttention::classify_stream_event) {
+                    let saved = state.token_manager.hold_account_for_attention(&account_id,attention,&body).await.is_ok();
+                    return crate::proxy::pipeline::account_safety::AccountSafetyStop {account_id,upstream_status:200,attention:Some(attention),hold_persisted:saved,inspection_incomplete:false}.response();
+                }
                 let is_retired = response_text.contains("no longer available")
                     || response_text.contains("is not available")
                     || response_text.contains("is retired")
@@ -536,6 +571,10 @@ pub async fn handle_warmup(
                     .into_response()
             } else {
                 let error_text = response.text().await.unwrap_or_default();
+                if let Some(attention) = crate::proxy::pipeline::account_safety::AccountAttention::classify(status_code,&error_text) {
+                    let saved = state.token_manager.hold_account_for_attention(&account_id,attention,&error_text).await.is_ok();
+                    return crate::proxy::pipeline::account_safety::AccountSafetyStop {account_id,upstream_status:status_code,attention:Some(attention),hold_persisted:saved,inspection_incomplete:false}.response();
+                }
 
                 // 记录内部错误日志，让 error.log 抓到该问题
                 error!(
@@ -696,6 +735,7 @@ pub async fn handle_warmup(
             response
         }
         Err(e) => {
+            if let Some(response) = crate::proxy::pipeline::admission::response_from_encoded(&e) { return response; }
             // 关键：升级为 ERROR 级别，写入 error.log
             error!(
                 "[Warmup-API] ========== ERROR (non-server fault): {} / {} - {} ({}ms) ==========",
@@ -777,6 +817,42 @@ pub async fn handle_warmup(
 mod tests {
     use super::*;
     use std::collections::HashMap;
+
+    #[tokio::test]
+    async fn supplied_credentials_cannot_bypass_automatic_warmup_hold() {
+        let _dir = crate::proxy::monitor::prompt_log_tests::TestDataDir::new();
+        let root = crate::modules::account::get_data_dir().unwrap();
+        std::fs::create_dir_all(root.join("accounts")).unwrap();
+        let path = root.join("accounts/held-account.json");
+        std::fs::write(
+            &path,
+            serde_json::json!({"id":"held-account", "proxy_disabled":true,
+            "validation_blocked":true,"validation_blocked_until":0,
+            "validation_blocked_reason":"manual_attention_required: AUTHENTICATION_CHALLENGE"})
+            .to_string(),
+        )
+        .unwrap();
+        let manager = crate::proxy::token_manager::TokenManager::new(root);
+        let mut request = WarmupRequest {
+            email: "synthetic@test.invalid".into(),
+            model: "gemini-3-flash".into(),
+            access_token: Some("synthetic-not-real".into()),
+            project_id: Some("synthetic-project".into()),
+            account_id: Some("held-account".into()),
+            probe_intent: false,
+        };
+        let stopped = guard_automatic_warmup(&manager, &request).await.unwrap();
+        assert_eq!(stopped.status(), StatusCode::BAD_REQUEST);
+        request.probe_intent = true;
+        assert!(guard_automatic_warmup(&manager, &request).await.is_none());
+        request.probe_intent = false;
+        std::fs::write(
+            &path,
+            r#"{"id":"held-account","proxy_disabled":false,"validation_blocked":false}"#,
+        )
+        .unwrap();
+        assert!(guard_automatic_warmup(&manager, &request).await.is_none());
+    }
 
     #[test]
     fn test_warmup_model_route_resolution() {

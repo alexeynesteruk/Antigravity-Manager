@@ -302,6 +302,19 @@ where
                                         config.trace_info.clone(),
                                     );
 
+                                    // Account attention is a semantic terminal event in every
+                                    // stream phase. Never turn it into a recoverable socket
+                                    // failure, a normal completion, or a partial success.
+                                    if matches!(report.classified.error_type,"account_attention_required" | "gateway_request_limit") {
+                                        let (mut frames, handled) = handler.emit_error_finalize(&report);
+                                        if !handled {
+                                            frames.extend(handler.emit_initial_error(&report));
+                                        }
+                                        for frame in frames { yield Ok(frame); }
+                                        handler.on_finish();
+                                        return;
+                                    }
+
                                     // [黄金三元组收尾契约] 若已有正文/工具调用输出（has_content == true）：
                                     // 发生上游网络断开（如 TCP RST、连接重置或中断）时，严禁透传底层 Err 截断连接！
                                     // 透传底层 Err 会导致客户端未闭合块抛出 StreamTruncatedError，
@@ -538,10 +551,23 @@ where
                 handler.emit_finalize()
             };
             // 终结屏障：允许协议在真正下发终结帧前完成异步确认（如会话落盘）
-            if handler.finalize_barrier().await {
+            // Persistence acknowledgements share the configured stream-idle
+            // budget. A stalled writer must not hold the response open forever,
+            // and a missing acknowledgement must never fabricate completion.
+            let acknowledged = tokio::time::timeout(
+                std::time::Duration::from_secs(config.streaming_sliding_secs),
+                handler.finalize_barrier(),
+            ).await;
+            if matches!(acknowledged, Ok(true)) {
                 for c in final_chunks {
                     yield Ok(c);
                 }
+            } else if acknowledged.is_err() {
+                tracing::warn!(
+                    adapter = config.adapter_name,
+                    timeout_secs = config.streaming_sliding_secs,
+                    "Stream finalization acknowledgement timed out; withholding completion frames"
+                );
             }
         }
 
@@ -554,6 +580,7 @@ mod tests {
     use super::*;
 
     struct MockHandler {
+        finishes: std::sync::Arc<std::sync::atomic::AtomicUsize>,
         processed_lines: Vec<String>,
         has_content: bool,
         has_thinking: bool,
@@ -562,11 +589,13 @@ mod tests {
         abnormal_finalized: bool,
         initial_error_emitted: bool,
         is_terminal: bool,
+        pending_ack: bool,
     }
 
     impl MockHandler {
         fn new(has_content: bool, has_thinking: bool) -> Self {
             Self {
+                finishes: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
                 processed_lines: Vec::new(),
                 has_content,
                 has_thinking,
@@ -575,6 +604,7 @@ mod tests {
                 abnormal_finalized: false,
                 initial_error_emitted: false,
                 is_terminal: false,
+                pending_ack: false,
             }
         }
     }
@@ -627,6 +657,80 @@ mod tests {
             self.initial_error_emitted = true;
             vec![Bytes::from("[initial_error]\n")]
         }
+
+        fn finalize_barrier(
+            &mut self,
+        ) -> Pin<Box<dyn std::future::Future<Output = bool> + Send + '_>> {
+            if self.pending_ack {
+                Box::pin(std::future::pending())
+            } else {
+                Box::pin(std::future::ready(true))
+            }
+        }
+
+        fn on_finish(&mut self) {
+            self.finishes
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    #[tokio::test]
+    async fn account_attention_is_semantically_terminal_in_every_stream_phase() {
+        for (content, thinking) in [(false, false), (false, true), (true, false), (true, true)] {
+            let handler = MockHandler::new(content, thinking);
+            let finishes = handler.finishes.clone();
+            let error = serde_json::json!({"error":{"type":"account_attention_required",
+                "message":"Review account authorization before retrying explicitly."}})
+            .to_string();
+            let stream = futures::stream::iter(vec![Err::<Bytes, String>(error)]);
+            let config = StreamLifecycleConfig::new("test", "attention", "synthetic".into());
+            let output = run_stream_lifecycle(Box::pin(stream), handler, config)
+                .collect::<Vec<_>>()
+                .await;
+            assert!(output.iter().all(Result::is_ok));
+            let frames = output
+                .into_iter()
+                .flat_map(|frame| frame.unwrap().to_vec())
+                .collect::<Vec<_>>();
+            let frames = String::from_utf8(frames).unwrap();
+            assert!(
+                frames.contains("[initial_error]"),
+                "content={content}, thinking={thinking}: {frames}"
+            );
+            assert!(!frames.contains("[finalized]"));
+            assert!(!frames.contains("[abnormal_finalized]"));
+            assert_eq!(finishes.load(std::sync::atomic::Ordering::SeqCst), 1);
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn finalization_ack_uses_the_configured_idle_deadline() {
+        let mut handler = MockHandler::new(true, false);
+        handler.pending_ack = true;
+        let config =
+            StreamLifecycleConfig::new("test", "ack", "pending_ack".into()).with_timeouts(1, 2, 3);
+        let started = tokio::time::Instant::now();
+        let stream = run_stream_lifecycle(
+            Box::pin(futures::stream::empty::<Result<Bytes, String>>()),
+            handler,
+            config,
+        );
+        let output = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            stream.collect::<Vec<_>>(),
+        )
+        .await
+        .expect("a stalled acknowledgement must stop within its idle budget");
+        assert_eq!(started.elapsed(), std::time::Duration::from_secs(3));
+        assert!(output.iter().all(Result::is_ok));
+        let frames = output
+            .into_iter()
+            .map(|frame| String::from_utf8_lossy(&frame.unwrap()).into_owned())
+            .collect::<String>();
+        // The immediately-ready heartbeat tick may precede EOF. It is harmless;
+        // neither terminal completion variant may escape the failed barrier.
+        assert!(!frames.contains("[finalized]"));
+        assert!(!frames.contains("[abnormal_finalized]"));
     }
 
     #[tokio::test]
@@ -843,7 +947,8 @@ mod tests {
         assert!(text.contains("processed:data: preamble"));
         assert!(text.contains(": ping"));
         assert!(!text.contains("unreachable"));
-        assert_eq!(text.matches("[finalized]").count(), 1);
+        assert_eq!(text.matches("[abnormal_finalized]").count(), 1);
+        assert!(!text.contains("[finalized]"));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

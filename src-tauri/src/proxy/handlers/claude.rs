@@ -1,3 +1,4 @@
+use crate::proxy::handlers::common::{handle_upstream_account_safety, AccountSafetyAction};
 // Claude 协议处理器
 
 use axum::{
@@ -2176,6 +2177,7 @@ pub async fn handle_messages(
         {
             Ok(r) => r,
             Err(e) => {
+                if let Some(response) = crate::proxy::pipeline::admission::response_from_encoded(&e) { return response; }
                 last_error = e.clone();
                 // 终态（首字节 / 上传 / 全局预算 / 重放上限）都不是账号故障：
                 // 不冷却、不跨账号重放；判定、状态码与观测统一由 pipeline::terminal 给出。
@@ -2379,6 +2381,11 @@ pub async fn handle_messages(
                         Box::pin(gemini_stream),
                         auto_heal_ctx,
                     );
+                let gemini_stream = crate::proxy::handlers::common::guard_upstream_account_stream(
+                    Box::pin(gemini_stream),
+                    token_manager.clone(),
+                    account_id.clone(),
+                );
 
                 let current_message_count = request_with_mapped.messages.len();
 
@@ -2585,7 +2592,16 @@ pub async fn handle_messages(
                         );
                         break;
                     }
-                    crate::proxy::pipeline::stream_peek::PeekOutcome::ErrorEvent { .. } => {
+                    crate::proxy::pipeline::stream_peek::PeekOutcome::ErrorEvent {
+                        bytes, ..
+                    } => {
+                        if let Some(response) =
+                            crate::proxy::handlers::common::account_attention_stream_response(
+                                &bytes,
+                            )
+                        {
+                            return response;
+                        }
                         last_error = "Error event during peek".to_string();
                         retry_this_account = true;
                     }
@@ -2657,6 +2673,7 @@ pub async fn handle_messages(
                                     .unwrap();
                             }
                             Err(e) => {
+                                if let Some(response) = crate::proxy::pipeline::account_safety::account_attention_error_response(&e) { return response; }
                                 tracing::warn!(
                                         "[{}] Stream collection error (possibly upstream interrupted): {}, retrying with another account...",
                                         trace_id,
@@ -2840,6 +2857,34 @@ pub async fn handle_messages(
             .await
             .unwrap_or_else(|_| format!("HTTP {}", status));
         last_error = format!("HTTP {}: {}", status_code, error_text);
+        match handle_upstream_account_safety(
+            &token_manager,
+            &mut retry_state,
+            &account_id,
+            &access_token,
+            status_code,
+            &error_text,
+        )
+        .await
+        {
+            AccountSafetyAction::Continue => {}
+            AccountSafetyAction::RetrySame(refreshed) => {
+                retry_credentials = Some((
+                    refreshed,
+                    project_id.clone(),
+                    email.clone(),
+                    account_id.clone(),
+                    0,
+                    session_lease.clone(),
+                ));
+                force_rotate = false;
+                continue;
+            }
+            AccountSafetyAction::Stop(failure) => {
+                return failure.response();
+            }
+        }
+
         debug!("[{}] Upstream Error Response: {}", trace_id, error_text);
         if debug_logger::is_payload_enabled(&debug_cfg) {
             let payload = json!({

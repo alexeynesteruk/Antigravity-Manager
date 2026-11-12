@@ -4,11 +4,42 @@
 #![allow(dead_code)]
 // User token storage; some interfaces are reserved for future extension
 
+use crate::modules::credential_store::{self, VaultRef};
 use chrono::{FixedOffset, Timelike, Utc};
+use rand::RngCore;
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::path::PathBuf;
 use uuid::Uuid;
+
+const DEVICE_KEY_SCOPE: &str = "device_key";
+
+fn key_digest(value: &str) -> String {
+    format!("sha256:{:x}", Sha256::digest(value.as_bytes()))
+}
+
+fn key_preview(value: &str) -> String {
+    if value.chars().count() <= 16 {
+        return "<protected key>".into();
+    }
+    format!(
+        "{}…{}",
+        value.chars().take(10).collect::<String>(),
+        value
+            .chars()
+            .rev()
+            .take(4)
+            .collect::<String>()
+            .chars()
+            .rev()
+            .collect::<String>()
+    )
+}
+
+fn protect_device_key(id: &str, value: &str) -> Result<VaultRef, String> {
+    credential_store::store_json(DEVICE_KEY_SCOPE, id, &serde_json::json!({"token":value}))
+}
 
 /// User token struct
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -68,12 +99,14 @@ pub fn connect_db() -> Result<Connection, String> {
     let conn = Connection::open(&path).map_err(|e| format!("Failed to open database: {}", e))?;
     conn.busy_timeout(std::time::Duration::from_secs(5))
         .map_err(|e| format!("Failed to configure database busy timeout: {}", e))?;
+    conn.pragma_update(None, "secure_delete", "ON")
+        .map_err(|e| format!("Failed to configure device-key storage: {e}"))?;
     Ok(conn)
 }
 
 /// Initialize the database
 pub fn init_db() -> Result<(), String> {
-    let conn = connect_db()?;
+    let mut conn = connect_db()?;
 
     // Create the user_tokens table
     conn.execute(
@@ -119,6 +152,11 @@ pub fn init_db() -> Result<(), String> {
     );
     let _ = conn.execute("ALTER TABLE user_tokens ADD COLUMN curfew_start TEXT", []);
     let _ = conn.execute("ALTER TABLE user_tokens ADD COLUMN curfew_end TEXT", []);
+    let _ = conn.execute(
+        "ALTER TABLE user_tokens ADD COLUMN credential_store_ref TEXT",
+        [],
+    );
+    let _ = conn.execute("ALTER TABLE user_tokens ADD COLUMN token_preview TEXT", []);
 
     // Create the token_ip_bindings table
     conn.execute(
@@ -182,7 +220,75 @@ pub fn init_db() -> Result<(), String> {
         [],
     );
 
+    migrate_legacy_device_keys(&mut conn)?;
     Ok(())
+}
+
+fn migrate_legacy_device_keys(conn: &mut Connection) -> Result<usize, String> {
+    let mut published = Vec::new();
+    let result = (|| {
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|e| format!("Failed to start device-key migration: {e}"))?;
+        let legacy = {
+            let mut query = tx
+                .prepare("SELECT id,token FROM user_tokens WHERE credential_store_ref IS NULL")
+                .map_err(|e| e.to_string())?;
+            let rows = query
+                .query_map([], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                })
+                .map_err(|e| e.to_string())?;
+            rows.collect::<Result<Vec<_>, _>>()
+                .map_err(|e| e.to_string())?
+        };
+        for (id, value) in &legacy {
+            if value.starts_with("sha256:") {
+                return Err("Protected device key is missing its credential reference".into());
+            }
+            let reference = protect_device_key(id, value)?;
+            published.push(reference.clone());
+            tx.execute("UPDATE user_tokens SET token=?1,credential_store_ref=?2,token_preview=?3 WHERE id=?4",
+                params![key_digest(value),serde_json::to_string(&reference).map_err(|_| "Invalid device-key reference")?,key_preview(value),id])
+                .map_err(|e| format!("Failed to publish protected device key: {e}"))?;
+        }
+        tx.commit()
+            .map_err(|e| format!("Failed to commit device-key migration: {e}"))?;
+        Ok(legacy.len())
+    })();
+    if result.is_err() {
+        for reference in published {
+            let _ = credential_store::delete(DEVICE_KEY_SCOPE, &reference);
+        }
+    }
+    result
+}
+
+/// Explicit administrator action; metadata/list APIs never reveal complete keys.
+pub fn reveal_token(id: &str) -> Result<String, String> {
+    let conn = connect_db()?;
+    let stored: Option<(String, Option<String>)> = conn
+        .query_row(
+            "SELECT token,credential_store_ref FROM user_tokens WHERE id=?1",
+            [id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()
+        .map_err(|e| e.to_string())?;
+    let (digest, reference) = stored.ok_or("Device key no longer exists")?;
+    let reference: VaultRef = serde_json::from_str(
+        &reference.ok_or("Device key must be migrated before it can be revealed")?,
+    )
+    .map_err(|_| "Invalid device-key credential reference")?;
+    let value = credential_store::load_json(DEVICE_KEY_SCOPE, id, &reference)?;
+    let key = value
+        .get("token")
+        .and_then(serde_json::Value::as_str)
+        .ok_or("Invalid protected device key")?;
+    if key_digest(key) != digest {
+        return Err("Device-key credential does not match its database identity".into());
+    }
+    Ok(key.into())
 }
 
 /// Create a new token
@@ -197,7 +303,15 @@ pub fn create_token(
 ) -> Result<UserToken, String> {
     let conn = connect_db()?;
     let id = Uuid::new_v4().to_string();
-    let token = format!("sk-{}", Uuid::new_v4().to_string().replace("-", ""));
+    let mut random = [0u8; 32];
+    rand::rngs::OsRng.fill_bytes(&mut random);
+    let token = format!(
+        "sk-device-{}",
+        random
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>()
+    );
     let now = Utc::now().timestamp();
 
     let expires_at = match expires_type.as_str() {
@@ -223,6 +337,7 @@ pub fn create_token(
         _ => None,                     // "never" or other
     };
 
+    let secret_ref = protect_device_key(&id, &token)?;
     let user_token = UserToken {
         id: id.clone(),
         token: token.clone(),
@@ -245,11 +360,11 @@ pub fn create_token(
         "INSERT INTO user_tokens (
             id, token, username, description, enabled, expires_type, expires_at, max_ips,
             curfew_start, curfew_end,
-            created_at, updated_at, total_requests, total_tokens_used
-        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+            created_at, updated_at, total_requests, total_tokens_used, credential_store_ref, token_preview
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
         params![
             user_token.id,
-            user_token.token,
+            key_digest(&user_token.token),
             user_token.username,
             user_token.description,
             user_token.enabled,
@@ -262,9 +377,11 @@ pub fn create_token(
             user_token.updated_at,
             user_token.total_requests,
             user_token.total_tokens_used,
+            serde_json::to_string(&secret_ref).map_err(|_| "Invalid device-key reference")?,
+            key_preview(&user_token.token),
         ],
     )
-    .map_err(|e| format!("Failed to insert user token: {}", e))?;
+    .map_err(|e| { let _ = credential_store::delete(DEVICE_KEY_SCOPE,&secret_ref); format!("Failed to insert user token: {e}") })?;
 
     Ok(user_token)
 }
@@ -277,25 +394,7 @@ pub fn list_tokens() -> Result<Vec<UserToken>, String> {
         .map_err(|e| format!("Failed to prepare query: {}", e))?;
 
     let token_iter = stmt
-        .query_map([], |row| {
-            Ok(UserToken {
-                id: row.get("id")?,
-                token: row.get("token")?,
-                username: row.get("username")?,
-                description: row.get("description")?,
-                enabled: row.get("enabled").unwrap_or(true), // Defensive default value
-                expires_type: row.get("expires_type").unwrap_or("never".to_string()), // Defensive default value
-                expires_at: row.get("expires_at").unwrap_or(None),
-                max_ips: row.get("max_ips").unwrap_or(0),
-                curfew_start: row.get("curfew_start").unwrap_or(None),
-                curfew_end: row.get("curfew_end").unwrap_or(None),
-                created_at: row.get("created_at")?,
-                updated_at: row.get("updated_at")?,
-                last_used_at: row.get("last_used_at").unwrap_or(None),
-                total_requests: row.get("total_requests").unwrap_or(0),
-                total_tokens_used: row.get("total_tokens_used").unwrap_or(0),
-            })
-        })
+        .query_map([], user_token_from_row)
         .map_err(|e| format!("Failed to query tokens: {}", e))?;
 
     let mut tokens = Vec::new();
@@ -314,25 +413,7 @@ pub fn get_token_by_id(id: &str) -> Result<Option<UserToken>, String> {
         .map_err(|e| format!("Failed to prepare query: {}", e))?;
 
     let token = stmt
-        .query_row(params![id], |row| {
-            Ok(UserToken {
-                id: row.get("id")?,
-                token: row.get("token")?,
-                username: row.get("username")?,
-                description: row.get("description")?,
-                enabled: row.get("enabled")?,
-                expires_type: row.get("expires_type")?,
-                expires_at: row.get("expires_at")?,
-                max_ips: row.get("max_ips")?,
-                curfew_start: row.get("curfew_start").unwrap_or(None),
-                curfew_end: row.get("curfew_end").unwrap_or(None),
-                created_at: row.get("created_at")?,
-                updated_at: row.get("updated_at")?,
-                last_used_at: row.get("last_used_at")?,
-                total_requests: row.get("total_requests")?,
-                total_tokens_used: row.get("total_tokens_used")?,
-            })
-        })
+        .query_row(params![id], user_token_from_row)
         .optional()
         .map_err(|e| format!("Failed to query token: {}", e))?;
 
@@ -342,7 +423,17 @@ pub fn get_token_by_id(id: &str) -> Result<Option<UserToken>, String> {
 fn user_token_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<UserToken> {
     Ok(UserToken {
         id: row.get("id")?,
-        token: row.get("token")?,
+        token: {
+            let raw: String = row.get("token")?;
+            let reference: Option<String> = row.get("credential_store_ref").unwrap_or(None);
+            if reference.is_some() {
+                row.get::<_, Option<String>>("token_preview")
+                    .unwrap_or(None)
+                    .unwrap_or_else(|| "<protected key>".into())
+            } else {
+                key_preview(&raw)
+            }
+        },
         username: row.get("username")?,
         description: row.get("description")?,
         enabled: row.get("enabled")?,
@@ -364,8 +455,8 @@ fn user_token_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<UserToken> {
 pub fn get_token_by_value(token: &str) -> Result<Option<UserToken>, String> {
     connect_db()?
         .query_row(
-            "SELECT * FROM user_tokens WHERE token = ?1",
-            params![token],
+            "SELECT * FROM user_tokens WHERE token = ?1 AND credential_store_ref IS NOT NULL",
+            params![key_digest(token)],
             user_token_from_row,
         )
         .optional()
@@ -474,9 +565,33 @@ pub fn renew_token(id: &str, expires_type: &str) -> Result<(), String> {
 
 /// Delete a token
 pub fn delete_token(id: &str) -> Result<(), String> {
-    let conn = connect_db()?;
-    conn.execute("DELETE FROM user_tokens WHERE id = ?1", params![id])
+    let mut conn = connect_db()?;
+    let tx = conn
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(|e| e.to_string())?;
+    let reference: Option<Option<String>> = tx
+        .query_row(
+            "SELECT credential_store_ref FROM user_tokens WHERE id=?1",
+            [id],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|e| e.to_string())?;
+    tx.execute("DELETE FROM user_tokens WHERE id = ?1", params![id])
         .map_err(|e| format!("Failed to delete token: {}", e))?;
+    tx.commit()
+        .map_err(|e| format!("Failed to revoke device key: {e}"))?;
+    if let Some(Some(reference)) = reference {
+        let reference: VaultRef = serde_json::from_str(&reference).map_err(|_| {
+            "Device key revoked; its malformed native-store reference needs manual cleanup"
+        })?;
+        credential_store::delete(DEVICE_KEY_SCOPE, &reference).map_err(|_| {
+            format!(
+                "Device key revoked; protected native entry cleanup failed. Cleanup reference: {}",
+                serde_json::to_string(&reference).unwrap_or_default()
+            )
+        })?;
+    }
     Ok(())
 }
 
@@ -620,8 +735,8 @@ fn admit_token_on_connection(
         .map_err(|e| format!("Failed to start token admission: {}", e))?;
     let token = tx
         .query_row(
-            "SELECT * FROM user_tokens WHERE token = ?1",
-            params![token_str],
+            "SELECT * FROM user_tokens WHERE token = ?1 AND credential_store_ref IS NOT NULL",
+            params![key_digest(token_str)],
             user_token_from_row,
         )
         .optional()
@@ -951,7 +1066,7 @@ pub fn get_user_tokens_ranking(time_range: &str) -> Result<Vec<UserTokenRankItem
         .prepare(
             "SELECT 
                 t.id,
-                t.token,
+                COALESCE(t.token_preview, '<protected key>'),
                 t.username,
                 t.description,
                 t.enabled,
@@ -1036,6 +1151,156 @@ pub fn get_user_tokens_ranking(time_range: &str) -> Result<Vec<UserTokenRankItem
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn missing_vault_reference_never_turns_a_database_hash_into_a_bearer_key() {
+        let _data = crate::proxy::monitor::prompt_log_tests::TestDataDir::new();
+        init_db().unwrap(); let token=admission_fixture(0); let mut conn=connect_db().unwrap();
+        let (digest, reference):(String,String)=conn.query_row("SELECT token,credential_store_ref FROM user_tokens WHERE id=?1",[&token.id],|row|Ok((row.get(0)?,row.get(1)?))).unwrap();
+        conn.execute("UPDATE user_tokens SET credential_store_ref=NULL WHERE id=?1",[&token.id]).unwrap();
+        assert!(migrate_legacy_device_keys(&mut conn).is_err());
+        for value in [&digest,&token.token] {
+            assert!(matches!(admit_token(value,"192.0.2.1").unwrap(),TokenAdmission::Rejected(_)));
+            assert!(get_token_by_value(value).unwrap().is_none());
+        }
+        credential_store::delete(DEVICE_KEY_SCOPE,&serde_json::from_str(&reference).unwrap()).unwrap();
+    }
+
+    #[test]
+    fn device_keys_are_protected_revealable_and_independently_revocable() {
+        let _data = crate::proxy::monitor::prompt_log_tests::TestDataDir::new();
+        init_db().unwrap();
+        let first = admission_fixture(0);
+        let second = admission_fixture(0);
+        let conn = connect_db().unwrap();
+        let (stored, reference): (String, String) = conn
+            .query_row(
+                "SELECT token,credential_store_ref FROM user_tokens WHERE id=?1",
+                [&first.id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(stored, key_digest(&first.token));
+        assert_ne!(stored, first.token);
+        assert_eq!(reveal_token(&first.id).unwrap(), first.token);
+        assert!(list_tokens()
+            .unwrap()
+            .iter()
+            .all(|token| token.token != first.token && token.token != second.token));
+        assert!(
+            !serde_json::to_string(&get_user_tokens_ranking("all").unwrap())
+                .unwrap()
+                .contains(&first.token)
+        );
+        assert!(matches!(
+            admit_token(&first.token, "192.0.2.1").unwrap(),
+            TokenAdmission::Admitted(_)
+        ));
+        update_token(&first.id, None, None, Some(false), None, None, None).unwrap();
+        assert!(matches!(
+            admit_token(&first.token, "192.0.2.1").unwrap(),
+            TokenAdmission::Rejected(_)
+        ));
+        assert!(matches!(
+            admit_token(&second.token, "192.0.2.1").unwrap(),
+            TokenAdmission::Admitted(_)
+        ));
+        delete_token(&first.id).unwrap();
+        let reference: VaultRef = serde_json::from_str(&reference).unwrap();
+        assert!(credential_store::load_json(DEVICE_KEY_SCOPE, &first.id, &reference).is_err());
+        assert!(reveal_token(&first.id).is_err());
+    }
+
+    #[test]
+    fn legacy_device_key_migration_preserves_client_values_and_policies() {
+        let _data = crate::proxy::monitor::prompt_log_tests::TestDataDir::new();
+        init_db().unwrap();
+        let mut conn = connect_db().unwrap();
+        let original = "sk-legacy-synthetic-credential-for-migration";
+        conn.execute("INSERT INTO user_tokens (id,token,username,enabled,expires_type,created_at,updated_at,max_ips)
+            VALUES ('legacy-device',?1,'Legacy device',1,'never',1,1,1)",[original]).unwrap();
+        conn.execute("INSERT INTO token_ip_bindings (id,token_id,ip_address,first_seen_at,last_seen_at) VALUES
+            ('old-binding','legacy-device','192.0.2.7',1,1)",[]).unwrap();
+        assert_eq!(migrate_legacy_device_keys(&mut conn).unwrap(), 1);
+        assert_eq!(migrate_legacy_device_keys(&mut conn).unwrap(), 0);
+        let stored: String = conn
+            .query_row(
+                "SELECT token FROM user_tokens WHERE id='legacy-device'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(stored, key_digest(original));
+        assert_eq!(reveal_token("legacy-device").unwrap(), original);
+        assert!(matches!(
+            admit_token(original, "192.0.2.7").unwrap(),
+            TokenAdmission::Admitted(_)
+        ));
+        assert!(matches!(
+            admit_token(original, "192.0.2.8").unwrap(),
+            TokenAdmission::Rejected(_)
+        ));
+    }
+
+    #[test]
+    fn failed_device_key_migration_keeps_the_existing_client_credential_recoverable() {
+        let _data = crate::proxy::monitor::prompt_log_tests::TestDataDir::new();
+        init_db().unwrap();
+        let mut conn = connect_db().unwrap();
+        let original = "sk-synthetic-existing-client-credential";
+        conn.execute(
+            "INSERT INTO user_tokens (id,token,username,expires_type,created_at,updated_at)
+            VALUES ('rollback-device',?1,'Rollback','never',1,1)",
+            [original],
+        )
+        .unwrap();
+        conn.execute_batch("CREATE TRIGGER reject_device_migration BEFORE UPDATE ON user_tokens BEGIN SELECT RAISE(ABORT,'fixture write failure'); END;").unwrap();
+        assert!(migrate_legacy_device_keys(&mut conn).is_err());
+        let stored: String = conn
+            .query_row(
+                "SELECT token FROM user_tokens WHERE id='rollback-device'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(stored, original);
+        conn.execute_batch("DROP TRIGGER reject_device_migration")
+            .unwrap();
+        assert!(matches!(
+            admit_token(original, "192.0.2.1").unwrap(),
+            TokenAdmission::Rejected(_)
+        ));
+        assert_eq!(migrate_legacy_device_keys(&mut conn).unwrap(), 1);
+        assert_eq!(reveal_token("rollback-device").unwrap(), original);
+        assert!(matches!(admit_token(original,"192.0.2.1").unwrap(),TokenAdmission::Admitted(_)));
+    }
+
+    #[test]
+    fn native_cleanup_errors_do_not_undo_device_key_revocation() {
+        let _data = crate::proxy::monitor::prompt_log_tests::TestDataDir::new();
+        init_db().unwrap();
+        let token = admission_fixture(0);
+        let conn = connect_db().unwrap();
+        let reference: String = conn
+            .query_row(
+                "SELECT credential_store_ref FROM user_tokens WHERE id=?1",
+                [&token.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        conn.execute(
+            "UPDATE user_tokens SET credential_store_ref='{}' WHERE id=?1",
+            [&token.id],
+        )
+        .unwrap();
+        assert!(delete_token(&token.id).unwrap_err().contains("revoked"));
+        assert!(matches!(
+            admit_token(&token.token, "192.0.2.1").unwrap(),
+            TokenAdmission::Rejected(_)
+        ));
+        credential_store::delete(DEVICE_KEY_SCOPE, &serde_json::from_str(&reference).unwrap())
+            .unwrap();
+    }
 
     fn admission_fixture(max_ips: i32) -> UserToken {
         create_token(

@@ -1,10 +1,12 @@
 pub mod account;
+pub mod credential_store;
 pub mod account_service;
 pub mod auto_switch;
 pub mod cache;
 pub mod cli_handler;
 pub mod cloudflared;
 pub mod config;
+mod config_secrets;
 pub mod db;
 pub mod device;
 #[allow(dead_code)]

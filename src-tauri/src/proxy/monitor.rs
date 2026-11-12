@@ -50,6 +50,28 @@ pub struct ProxyRequestLog {
 }
 
 impl ProxyRequestLog {
+    /// Apply before emitting, buffering or persisting a diagnostic copy.
+    pub fn redact_credentials(&mut self) {
+        self.url = crate::utils::redact::text(&self.url).into_owned();
+        for value in [
+            &mut self.error,
+            &mut self.request_body,
+            &mut self.upstream_request_body,
+            &mut self.response_body,
+            &mut self.request_headers,
+            &mut self.upstream_request_headers,
+            &mut self.response_headers,
+        ]
+        .into_iter()
+        .flatten()
+        {
+            *value = match serde_json::from_str::<serde_json::Value>(value) {
+                Ok(json) => crate::utils::redact::json(&json).to_string(),
+                Err(_) => crate::utils::redact::text(value).into_owned(),
+            };
+        }
+    }
+
     /// 获取从响应头或显式字段提取的首字延迟 (毫秒)
     pub fn ttft_ms(&self) -> Option<f64> {
         self.response_headers
@@ -76,6 +98,29 @@ impl ProxyRequestLog {
 #[cfg(test)]
 pub(crate) mod prompt_log_tests {
     use super::*;
+
+    #[test]
+    fn diagnostic_copies_hide_credentials_before_buffering_or_persistence() {
+        let mut log = sample_log("redaction", 0);
+        log.url = "/v1/chat/completions?key=private-query&stream=true".into();
+        log.request_body = Some(
+            r#"{"refresh_token":"private-refresh","messages":[{"role":"user","content":"hello"}]}"#
+                .into(),
+        );
+        log.request_headers = Some(
+            r#"{"Authorization":"Bearer private-header","x-session-id":"session-123"}"#.into(),
+        );
+        log.error = Some("proxy http://alice:private-proxy@proxy.test failed".into());
+        log.redact_credentials();
+        let stored = serde_json::to_string(&log).unwrap();
+        assert!(!stored.contains("private"));
+        assert!(stored.contains("session-123"));
+        assert!(stored.contains("hello"));
+        assert!(log.url.ends_with("&stream=true"));
+        assert!(
+            serde_json::from_str::<serde_json::Value>(log.request_body.as_ref().unwrap()).is_ok()
+        );
+    }
 
     pub(crate) fn sample_log(id: &str, bytes: usize) -> ProxyRequestLog {
         serde_json::from_value(serde_json::json!({
@@ -612,7 +657,8 @@ impl ProxyMonitor {
         self.capture_health_logs.load(Ordering::Relaxed)
     }
 
-    pub async fn log_request(&self, log: ProxyRequestLog) {
+    pub async fn log_request(&self, mut log: ProxyRequestLog) {
+        log.redact_credentials();
         if let (Some(account), Some(input), Some(output)) =
             (&log.account_email, log.input_tokens, log.output_tokens)
         {
@@ -812,26 +858,23 @@ mod lazy_request_context_tests {
     #[tokio::test]
     async fn lazy_body_keeps_original_deadline_replay_limit_and_dispatch_capture() {
         let deadline = budget::deadline_now();
+        let guarded_body_bytes = budget::replay_guard_threshold_bytes();
         let context = budget::RequestContext::new(deadline);
         let capture = UpstreamRequestBodyHolder::new();
         let (body, captured_context) =
             scope_upstream_work(capture.clone(), Some(context), async move {
-                assert_eq!(
-                    budget::register_upstream_call(budget::REPLAY_GUARD_BODY_BYTES),
-                    Ok(())
-                );
+                assert_eq!(budget::register_upstream_call(guarded_body_bytes), Ok(()));
                 CURRENT_UPSTREAM_CAPTURE.with(|capture| capture.record_dispatch());
                 let context = budget::current();
                 let body = axum::body::Body::from_stream(futures::stream::once(async move {
                     assert_eq!(budget::current_deadline(), Some(deadline));
+                    for _ in 1..budget::MAX_LARGE_BODY_UPSTREAM_CALLS {
+                        assert_eq!(budget::register_upstream_call(guarded_body_bytes), Ok(()));
+                        CURRENT_UPSTREAM_CAPTURE.with(|capture| capture.record_dispatch());
+                    }
                     assert_eq!(
-                        budget::register_upstream_call(budget::REPLAY_GUARD_BODY_BYTES),
-                        Ok(())
-                    );
-                    CURRENT_UPSTREAM_CAPTURE.with(|capture| capture.record_dispatch());
-                    assert_eq!(
-                        budget::register_upstream_call(budget::REPLAY_GUARD_BODY_BYTES),
-                        Err(3)
+                        budget::register_upstream_call(guarded_body_bytes),
+                        Err(budget::MAX_LARGE_BODY_UPSTREAM_CALLS + 1)
                     );
                     Ok::<_, std::io::Error>(bytes::Bytes::from_static(b"data: done\n\n"))
                 }));
@@ -848,22 +891,25 @@ mod lazy_request_context_tests {
         .unwrap()
         .unwrap();
         assert_eq!(&polled[..], b"data: done\n\n");
-        assert_eq!(capture.physical_requests(), Some(2));
+        assert_eq!(
+            capture.physical_requests(),
+            Some(budget::MAX_LARGE_BODY_UPSTREAM_CALLS as u32)
+        );
         // The next WebSocket turn starts with a fresh request context and capture.
         let next_capture = UpstreamRequestBodyHolder::new();
         scope_upstream_work(
             next_capture.clone(),
             Some(budget::RequestContext::new(budget::deadline_now())),
             async {
-                assert_eq!(
-                    budget::register_upstream_call(budget::REPLAY_GUARD_BODY_BYTES),
-                    Ok(())
-                );
+                assert_eq!(budget::register_upstream_call(guarded_body_bytes), Ok(()));
                 CURRENT_UPSTREAM_CAPTURE.with(|capture| capture.record_dispatch());
             },
         )
         .await;
         assert_eq!(next_capture.physical_requests(), Some(1));
-        assert_eq!(capture.physical_requests(), Some(2));
+        assert_eq!(
+            capture.physical_requests(),
+            Some(budget::MAX_LARGE_BODY_UPSTREAM_CALLS as u32)
+        );
     }
 }

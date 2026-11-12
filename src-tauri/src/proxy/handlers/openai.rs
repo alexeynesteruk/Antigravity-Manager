@@ -1,3 +1,4 @@
+use crate::proxy::handlers::common::{handle_upstream_account_safety, AccountSafetyAction};
 // OpenAI Handler
 use axum::{
     body::Body, extract::Json, extract::State, http::StatusCode, response::IntoResponse,
@@ -48,7 +49,7 @@ use crate::proxy::session_manager::SessionManager;
 use axum::http::HeaderMap;
 use std::collections::VecDeque;
 use std::io;
-use tokio::task::JoinSet;
+use crate::proxy::pipeline::image_outputs::BoundedJoinSet;
 use tokio::time::Duration;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -2783,6 +2784,7 @@ pub async fn handle_chat_completions(
         {
             Ok(r) => r,
             Err(e) => {
+                if let Some(response) = crate::proxy::pipeline::admission::response_from_encoded(&e) { return Ok(response); }
                 last_error = e.clone();
                 drop(image_permit.take());
                 // 终态（首字节 / 上传 / 全局预算 / 重放上限）都不是账号故障：
@@ -2970,6 +2972,11 @@ pub async fn handle_chat_completions(
                         Box::pin(gemini_stream),
                         auto_heal_ctx,
                     );
+                let gemini_stream = crate::proxy::handlers::common::guard_upstream_account_stream(
+                    Box::pin(gemini_stream),
+                    token_manager.clone(),
+                    account_id.clone(),
+                );
 
                 // [P1 FIX] Enhanced Peek logic to handle heartbeats and slow start
                 // Pre-read until we find meaningful content, skip heartbeats
@@ -3062,7 +3069,17 @@ pub async fn handle_chat_completions(
                             );
                             break;
                         }
-                        crate::proxy::pipeline::stream_peek::PeekOutcome::ErrorEvent { .. } => {
+                        crate::proxy::pipeline::stream_peek::PeekOutcome::ErrorEvent {
+                            bytes,
+                            ..
+                        } => {
+                            if let Some(response) =
+                                crate::proxy::handlers::common::account_attention_stream_response(
+                                    &bytes,
+                                )
+                            {
+                                return Ok(response);
+                            }
                             last_error = "Error event during peek".to_string();
                             force_rotate = true;
                             failure_statuses.record(StatusCode::BAD_GATEWAY);
@@ -3331,6 +3348,7 @@ pub async fn handle_chat_completions(
                                 .into_response());
                         }
                         Err(e) => {
+                            if let Some(response) = crate::proxy::pipeline::account_safety::account_attention_error_response(&e) { return Ok(response); }
                             error!("[{}] Stream collection error: {}", trace_id, e);
                             return Ok((
                                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -3455,6 +3473,33 @@ pub async fn handle_chat_completions(
             .await
             .unwrap_or_else(|_| format!("HTTP {}", status_code));
         last_error = format!("HTTP {}: {}", status_code, error_text);
+        match handle_upstream_account_safety(
+            &token_manager,
+            &mut retry_state,
+            &account_id,
+            &access_token,
+            status_code,
+            &error_text,
+        )
+        .await
+        {
+            AccountSafetyAction::Continue => {}
+            AccountSafetyAction::RetrySame(refreshed) => {
+                retry_credentials = Some((
+                    refreshed,
+                    project_id.clone(),
+                    email.clone(),
+                    account_id.clone(),
+                    0,
+                    session_lease.clone(),
+                ));
+                force_rotate = false;
+                continue;
+            }
+            AccountSafetyAction::Stop(failure) => {
+                return Ok(failure.response());
+            }
+        }
 
         // [New] 打印错误报文日志
         tracing::error!(
@@ -4965,6 +5010,7 @@ pub async fn handle_completions(
         {
             Ok(r) => r,
             Err(e) => {
+                if let Some(response) = crate::proxy::pipeline::admission::response_from_encoded(&e) { return response; }
                 last_error = e.clone();
                 // 终态（首字节 / 上传 / 全局预算 / 重放上限）都不是账号故障：
                 // 不冷却、不跨账号重放；判定、状态码与观测统一由 pipeline::terminal 给出。
@@ -5119,6 +5165,11 @@ pub async fn handle_completions(
                         Box::pin(gemini_stream),
                         auto_heal_ctx,
                     );
+                let gemini_stream = crate::proxy::handlers::common::guard_upstream_account_stream(
+                    Box::pin(gemini_stream),
+                    token_manager.clone(),
+                    account_id.clone(),
+                );
 
                 // DECISION: Which stream to create?
                 // If client wants stream: give them what they asked (Legacy/Codex SSE).
@@ -5368,7 +5419,17 @@ pub async fn handle_completions(
                             );
                             break;
                         }
-                        crate::proxy::pipeline::stream_peek::PeekOutcome::ErrorEvent { .. } => {
+                        crate::proxy::pipeline::stream_peek::PeekOutcome::ErrorEvent {
+                            bytes,
+                            ..
+                        } => {
+                            if let Some(response) =
+                                crate::proxy::handlers::common::account_attention_stream_response(
+                                    &bytes,
+                                )
+                            {
+                                return response;
+                            }
                             last_error = "Error event in internal stream".to_string();
                             force_rotate = true;
                             failure_statuses.record(StatusCode::BAD_GATEWAY);
@@ -5575,6 +5636,7 @@ pub async fn handle_completions(
                                 .into_response();
                         }
                         Err(e) => {
+                            if let Some(response) = crate::proxy::pipeline::account_safety::account_attention_error_response(&e) { return response; }
                             return (
                                 StatusCode::INTERNAL_SERVER_ERROR,
                                 format!("Stream collection error: {}", e),
@@ -5756,6 +5818,33 @@ pub async fn handle_completions(
             .await
             .unwrap_or_else(|_| format!("HTTP {}", status_code));
         last_error = format!("HTTP {}: {}", status_code, error_text);
+        match handle_upstream_account_safety(
+            &token_manager,
+            &mut retry_state,
+            &account_id,
+            &access_token,
+            status_code,
+            &error_text,
+        )
+        .await
+        {
+            AccountSafetyAction::Continue => {}
+            AccountSafetyAction::RetrySame(refreshed) => {
+                retry_credentials = Some((
+                    refreshed,
+                    project_id.clone(),
+                    email.clone(),
+                    account_id.clone(),
+                    0,
+                    session_lease.clone(),
+                ));
+                force_rotate = false;
+                continue;
+            }
+            AccountSafetyAction::Stop(failure) => {
+                return failure.response();
+            }
+        }
 
         tracing::error!(
             "[Codex-Upstream] Error Response {}: {}",
@@ -6394,6 +6483,13 @@ pub async fn handle_images_generations_internal(
     tenant_id: Option<String>,
     body: Value,
 ) -> Result<(String, Value), (StatusCode, String, Option<String>)> {
+    let output_policy = crate::proxy::pipeline::image_outputs::request_policy()
+        .await
+        .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error, None))?;
+    let n = output_policy
+        .json_count(body.get("n"))
+        .map_err(|error| (StatusCode::BAD_REQUEST, error, None))?;
+
     // 1. 解析请求参数
     let prompt = body.get("prompt").and_then(|v| v.as_str()).ok_or((
         StatusCode::BAD_REQUEST,
@@ -6426,8 +6522,6 @@ pub async fn handle_images_generations_internal(
     {
         return Err((status, reason.to_string(), None));
     }
-
-    let n = body.get("n").and_then(|v| v.as_u64()).unwrap_or(1) as usize;
 
     let size = body.get("size").and_then(|v| v.as_str());
 
@@ -6478,7 +6572,7 @@ pub async fn handle_images_generations_internal(
         "natural" => final_prompt.push_str(", (natural lighting, realistic, photorealistic)"),
         _ => {}
     }
-    let contents_parts = build_image_contents(final_prompt, &input_images, None);
+    let contents_parts = Arc::new(build_image_contents(final_prompt, &input_images, None));
 
     // 4. 并发发送请求
     // 注意：不再在外部获取 Token，而是移入 Task 内部并在重试时获取
@@ -6494,13 +6588,11 @@ pub async fn handle_images_generations_internal(
     // 并在子任务内恢复，否则图片链路既没有 270s 总预算，也不会被大 body 重放护栏计数。
     let request_budget = crate::proxy::pipeline::budget::current();
 
-    let mut tasks = JoinSet::new();
-
     // Track the last account actually attempted, so error responses (502/503) can be
     // attributed to an account in the traffic log instead of showing "(none)".
     let attempted_account = std::sync::Arc::new(std::sync::Mutex::new(None::<String>));
 
-    for _ in 0..n {
+    let mut tasks = BoundedJoinSet::new(n, output_policy.parallelism(), |_| {
         let upstream = upstream.clone();
         let token_manager = token_manager.clone();
         let request_budget = request_budget.as_ref().map(|ctx| ctx.fork());
@@ -6513,7 +6605,7 @@ pub async fn handle_images_generations_internal(
         let image_scheduler = image_scheduler.clone();
         let affinity_key = affinity_key.clone();
 
-        tasks.spawn(async move {
+        crate::proxy::pipeline::budget::scope_optional(request_budget.clone(), async move {
             let mut image_permit = None;
             let mut last_error = String::new();
             let mut force_rotate = false;
@@ -6597,7 +6689,7 @@ pub async fn handle_images_generations_internal(
                     "request": {
                         "contents": [{
                             "role": "user",
-                            "parts": contents_parts
+                            "parts": contents_parts.as_ref()
                         }],
                         "generationConfig": {
                             "candidateCount": 1, // 强制单张
@@ -6638,6 +6730,19 @@ pub async fn handle_images_generations_internal(
                             let err_text = response.text().await.unwrap_or_default();
                             let status_code = status.as_u16();
                             last_error = format!("Upstream error {}: {}", status, err_text);
+                            match crate::proxy::pipeline::budget::scope_optional(
+                                request_budget.clone(),
+                                handle_upstream_account_safety(&token_manager, &mut retry_state, &account_id, &access_token, status_code, &err_text),
+                            ).await {
+                                AccountSafetyAction::Continue => {}
+                                AccountSafetyAction::RetrySame(refreshed) => {
+                                    retry_credentials = Some((refreshed, project_id.clone(), email.clone(), account_id.clone(), 0, session_lease.clone()));
+                                    force_rotate = false;
+                                    continue;
+                                }
+                                AccountSafetyAction::Stop(failure) => return Err((StatusCode::BAD_REQUEST, failure.encoded())),
+                            }
+
                             let strategy = (status_code == 429).then(|| {
                                 retry_state.determine_strategy(
                                     &account_id,
@@ -6792,6 +6897,7 @@ pub async fn handle_images_generations_internal(
                         }
                     }
                     Err(e) => {
+                        if let Some(error) = crate::proxy::pipeline::admission::error_from_encoded(&e) { return Err((if error.retry_after > 0 { StatusCode::TOO_MANY_REQUESTS } else { StatusCode::BAD_REQUEST }, error.encoded())); }
                         // 终态（首字节 / 上传 / 全局预算 / 重放上限）都不是账号故障：
                         // 不轮换账号、不重复上传同一份 body（图片同样受预算与重放护栏约束）
                         if let Some(handling) = crate::proxy::pipeline::terminal::apply_terminal(
@@ -6836,8 +6942,8 @@ pub async fn handle_images_generations_internal(
                 failure_statuses.final_status(),
                 format!("Max retries exhausted. Last error: {}", last_error),
             ))
-        });
-    }
+        })
+    });
 
     // 5. 收集结果
     let mut images: Vec<Value> = Vec::new();
@@ -6885,6 +6991,11 @@ pub async fn handle_images_generations_internal(
                     }
                 }
                 Err((status, e)) => {
+                    if let Some(error) = crate::proxy::pipeline::admission::error_from_encoded(&e) { tasks.abort_all(); return Err((if error.retry_after > 0 { StatusCode::TOO_MANY_REQUESTS } else { StatusCode::BAD_REQUEST }, error.encoded(), None)); }
+                    if crate::proxy::handlers::common::is_account_attention_error(&e) {
+                        tasks.abort_all();
+                        return Err((StatusCode::BAD_REQUEST, e, None));
+                    }
                     tracing::error!("[Images] Task failed: {}", e);
                     failure_statuses.record(status);
                     errors.push(e);
@@ -6938,8 +7049,8 @@ pub async fn handle_images_generations_internal(
     });
 
     // [FIX] 图像生成成功后触发配额刷新 (Issue #1995)
-    tokio::spawn(async move {
-        let _ = account::refresh_all_quotas_logic().await;
+    crate::proxy::pipeline::admission::spawn_scoped(async move {
+        let _ = crate::proxy::pipeline::admission::run_automatic(account::refresh_all_quotas_logic()).await;
     });
 
     let email_header = used_email.unwrap_or_default();
@@ -6954,6 +7065,9 @@ pub async fn handle_images_edits(
     >,
     mut multipart: axum::extract::Multipart,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
+    let output_policy = crate::proxy::pipeline::image_outputs::request_policy()
+        .await
+        .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error))?;
     tracing::info!("[Images] Received edit request");
 
     let mut input_images: Vec<NormalizedInputImage> = Vec::new();
@@ -7018,9 +7132,13 @@ pub async fn handle_images_edits(
                 .await
                 .map_err(|e| (StatusCode::BAD_REQUEST, format!("Prompt read error: {}", e)))?;
         } else if name == "n" {
-            if let Ok(val) = field.text().await {
-                n = val.parse().unwrap_or(1);
-            }
+            let value = field
+                .text()
+                .await
+                .map_err(|error| (StatusCode::BAD_REQUEST, format!("Image count read error: {error}")))?;
+            n = output_policy
+                .multipart_count(&value)
+                .map_err(|error| (StatusCode::BAD_REQUEST, error))?;
         } else if name == "size" {
             let val = field
                 .text()
@@ -7118,7 +7236,7 @@ pub async fn handle_images_edits(
     if let Some(s) = style {
         final_prompt.push_str(&format!(", style: {}", s));
     }
-    let contents_parts = build_image_contents(final_prompt, &input_images, mask_data.as_ref());
+    let contents_parts = Arc::new(build_image_contents(final_prompt, &input_images, mask_data.as_ref()));
 
     // 4. 并发发送请求
     // 注意：不再在外部获取 Token，而是移入 Task 内部
@@ -7132,8 +7250,7 @@ pub async fn handle_images_edits(
 
     let request_budget = crate::proxy::pipeline::budget::current();
 
-    let mut tasks = JoinSet::new();
-    for _ in 0..n {
+    let mut tasks = BoundedJoinSet::new(n, output_policy.parallelism(), |_| {
         let upstream = upstream.clone();
         let token_manager = token_manager.clone();
         let request_budget = request_budget.as_ref().map(|ctx| ctx.fork());
@@ -7144,7 +7261,7 @@ pub async fn handle_images_edits(
         let image_scheduler = image_scheduler.clone();
         let affinity_key = affinity_key.clone();
 
-        tasks.spawn(async move {
+        crate::proxy::pipeline::budget::scope_optional(request_budget.clone(), async move {
             let mut image_permit = None;
             let mut last_error = String::new();
             let mut force_rotate = false;
@@ -7209,7 +7326,7 @@ pub async fn handle_images_edits(
                 let gemini_body = build_image_edit_body(
                     project_id.clone(),
                     &resolved_model,
-                    contents_parts.clone(),
+                    contents_parts.as_ref().clone(),
                     image_config.clone(),
                 );
 
@@ -7239,6 +7356,19 @@ pub async fn handle_images_edits(
                             let err_text = response.text().await.unwrap_or_default();
                             let status_code = status.as_u16();
                             last_error = format!("Upstream error {}: {}", status, err_text);
+                            match crate::proxy::pipeline::budget::scope_optional(
+                                request_budget.clone(),
+                                handle_upstream_account_safety(&token_manager, &mut retry_state, &account_id, &access_token, status_code, &err_text),
+                            ).await {
+                                AccountSafetyAction::Continue => {}
+                                AccountSafetyAction::RetrySame(refreshed) => {
+                                    retry_credentials = Some((refreshed, project_id.clone(), email.clone(), account_id.clone(), 0, session_lease.clone()));
+                                    force_rotate = false;
+                                    continue;
+                                }
+                                AccountSafetyAction::Stop(failure) => return Err((StatusCode::BAD_REQUEST, failure.encoded())),
+                            }
+
                             let strategy = (status_code == 429).then(|| {
                                 retry_state.determine_strategy(
                                     &account_id,
@@ -7387,6 +7517,7 @@ pub async fn handle_images_edits(
                         }
                     }
                     Err(e) => {
+                        if let Some(error) = crate::proxy::pipeline::admission::error_from_encoded(&e) { return Err((if error.retry_after > 0 { StatusCode::TOO_MANY_REQUESTS } else { StatusCode::BAD_REQUEST }, error.encoded())); }
                         // 终态（首字节 / 上传 / 全局预算 / 重放上限）都不是账号故障：
                         // 不轮换账号、不重复上传同一份 body（图片同样受预算与重放护栏约束）
                         if let Some(handling) = crate::proxy::pipeline::terminal::apply_terminal(
@@ -7429,8 +7560,8 @@ pub async fn handle_images_edits(
                 failure_statuses.final_status(),
                 format!("Max retries exhausted. Last error: {}", last_error),
             ))
-        });
-    }
+        })
+    });
 
     // 5. Collect Results
     let mut images: Vec<Value> = Vec::new();
@@ -7477,6 +7608,11 @@ pub async fn handle_images_edits(
                     }
                 }
                 Err((status, e)) => {
+                    if let Some(error) = crate::proxy::pipeline::admission::error_from_encoded(&e) { tasks.abort_all(); return Err((if error.retry_after > 0 { StatusCode::TOO_MANY_REQUESTS } else { StatusCode::BAD_REQUEST }, error.encoded())); }
+                    if crate::proxy::handlers::common::is_account_attention_error(&e) {
+                        tasks.abort_all();
+                        return Err((StatusCode::BAD_REQUEST, e));
+                    }
                     tracing::error!("[Images] Task failed: {}", e);
                     failure_statuses.record(status);
                     errors.push(e);
@@ -7527,8 +7663,8 @@ pub async fn handle_images_edits(
         "data": images
     });
 
-    tokio::spawn(async move {
-        let _ = account::refresh_all_quotas_logic().await;
+    crate::proxy::pipeline::admission::spawn_scoped(async move {
+        let _ = crate::proxy::pipeline::admission::run_automatic(account::refresh_all_quotas_logic()).await;
     });
 
     let email_header = used_email.unwrap_or_default();
@@ -7761,6 +7897,16 @@ async fn handle_websocket_session(
         let budget = crate::proxy::pipeline::budget::RequestContext::new(
             crate::proxy::pipeline::budget::deadline_now(),
         );
+        let client = crate::proxy::middleware::admission::client_id(identity.as_ref(), false);
+        let safety = match state.token_manager.safety_controller() {
+            Ok(safety) => safety,
+            Err(_) => { let _ = socket.send(Message::Text(crate::proxy::pipeline::admission::AdmissionError::unavailable().encoded())).await; continue; }
+        };
+        let admission = tokio::task::spawn_blocking(move || safety.admit(&client,chrono::Utc::now().timestamp())).await;
+        match admission {
+            Ok(Ok(permit)) => budget.set_safety(permit),
+            error => { let error = match error { Ok(Err(error)) => error, _ => crate::proxy::pipeline::admission::AdmissionError::unavailable() }; let mut event = error.body(); event["type"] = json!("error"); let _ = socket.send(Message::Text(event.to_string())).await; continue; }
+        }
         crate::proxy::monitor::scope_upstream_work(
             capture,
             Some(budget),
