@@ -1248,11 +1248,14 @@ pub async fn warmup_model_directly(
     probe_intent: bool,
 ) -> bool {
     // Get currently configured proxy port
-    let port = config::load_app_config()
-        .map(|c| c.proxy.port)
-        .unwrap_or(8045);
-
-    let warmup_url = format!("http://127.0.0.1:{}/internal/warmup", port);
+    let proxy_config = config::load_app_config()
+        .map(|config| config.proxy)
+        .unwrap_or_default();
+    let Ok(warmup_url) =
+        crate::proxy::middleware::internal::warmup_url(&proxy_config.local_base_url())
+    else {
+        return false;
+    };
     let mut body = json!({
         "email": email,
         "model": model_name,
@@ -1266,11 +1269,17 @@ pub async fn warmup_model_directly(
 
     // Use a no-proxy client for local loopback requests
     // This prevents Docker environments from routing localhost through external proxies
-    let client = rquest::Client::builder()
+    let client = match rquest::Client::builder()
         .timeout(std::time::Duration::from_secs(60))
         .no_proxy()
         .build()
-        .unwrap_or_else(|_| rquest::Client::new());
+    {
+        Ok(client) => client,
+        Err(error) => {
+            tracing::warn!("Unable to create local warmup client: {}", error);
+            return false;
+        }
+    };
     let resp = client
         .post(&warmup_url)
         .header(

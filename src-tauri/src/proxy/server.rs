@@ -104,6 +104,7 @@ pub struct AppState {
     pub cloudflared_state: Arc<crate::commands::cloudflared::CloudflaredState>, // [NEW] Cloudflared 插件状态
     pub is_running: Arc<RwLock<bool>>, // [NEW] 运行状态标识
     pub port: u16,                     // [NEW] 本地监听端口 (v4.0.8 修复)
+    pub listener_base_url: String,
     pub proxy_pool_state: Arc<tokio::sync::RwLock<crate::proxy::config::ProxyPoolConfig>>, // [FIX Web Mode]
     pub proxy_pool_manager: Arc<crate::proxy::proxy_pool::ProxyPoolManager>, // [FIX Web Mode]
     pub only_raw_quota_models: Arc<tokio::sync::RwLock<bool>>, // [NEW] 是否只暴露真实配额模型
@@ -436,6 +437,8 @@ fn to_account_response(
 /// Axum 服务器实例
 #[derive(Clone)]
 pub struct AxumServer {
+    pub port: u16,
+    pub base_url: String,
     cancel_token: tokio_util::sync::CancellationToken,
     custom_mapping: Arc<tokio::sync::RwLock<std::collections::HashMap<String, String>>>,
     proxy_state: Arc<tokio::sync::RwLock<crate::proxy::config::UpstreamProxyConfig>>,
@@ -498,7 +501,7 @@ impl AxumServer {
 
     pub async fn update_security(&self, config: &crate::proxy::config::ProxyConfig) {
         let mut sec = self.security_state.write().await;
-        *sec = crate::proxy::ProxySecurityConfig::from_proxy_config(config);
+        sec.update_from_proxy_config(config);
         tracing::info!("反代服务安全配置已热更新");
     }
 
@@ -585,6 +588,7 @@ impl AxumServer {
         );
 
         let state = AppState {
+            listener_base_url: crate::proxy::config::ProxyConfig::base_url_for_bind(&host, port),
             token_manager: token_manager.clone(),
             custom_mapping: custom_mapping_state.clone(),
             request_timeout,
@@ -1191,6 +1195,8 @@ impl AxumServer {
         let cancel_token = tokio_util::sync::CancellationToken::new();
 
         let server_instance = Self {
+            port,
+            base_url: state.listener_base_url.clone(),
             cancel_token: cancel_token.clone(),
             custom_mapping: custom_mapping_state.clone(),
             proxy_state,
@@ -2142,7 +2148,7 @@ async fn admin_save_config(
     // 更新安全策略
     {
         let mut security = state.security.write().await;
-        *security = crate::proxy::ProxySecurityConfig::from_proxy_config(&new_config.proxy);
+        security.update_from_proxy_config(&new_config.proxy);
     }
 
     // 更新实验性配置
@@ -2301,7 +2307,7 @@ async fn admin_get_proxy_status(
     Ok(Json(serde_json::json!({
         "running": is_running,
         "port": state.port,
-        "base_url": format!("http://127.0.0.1:{}", state.port),
+        "base_url": state.listener_base_url,
         "active_accounts": active_accounts,
     })))
 }
@@ -2692,7 +2698,8 @@ async fn admin_test_model(
     State(state): State<AppState>,
     Json(payload): Json<AdminTestModelRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    let port = state.port;
+    let warmup_url = crate::proxy::middleware::internal::warmup_url(&state.listener_base_url)
+        .map_err(|error| (StatusCode::BAD_REQUEST, Json(ErrorResponse { error })))?;
     let accounts = crate::modules::account::list_accounts().unwrap_or_default();
 
     let (chosen_account, token, pid) = if let Some(acc_id) = payload
@@ -2731,7 +2738,6 @@ async fn admin_test_model(
         (probe.account, probe.access_token, probe.project_id)
     };
 
-    let warmup_url = format!("http://127.0.0.1:{}/internal/warmup", port);
     let body = serde_json::json!({
         "email": chosen_account.email,
         "model": payload.model,
@@ -2757,6 +2763,10 @@ async fn admin_test_model(
     let resp = client
         .post(&warmup_url)
         .header("Content-Type", "application/json")
+        .header(
+            crate::proxy::middleware::internal::INTERNAL_REQUEST_CREDENTIAL_HEADER,
+            crate::proxy::middleware::internal::internal_request_credential(),
+        )
         .json(&body)
         .send()
         .await
@@ -4848,7 +4858,7 @@ async fn admin_update_security_config(
 
     {
         let mut sec = state.security.write().await;
-        *sec = crate::proxy::ProxySecurityConfig::from_proxy_config(&app_config.proxy);
+        sec.update_from_proxy_config(&app_config.proxy);
         tracing::info!("[Security] Runtime security config hot-reloaded via Web API");
     }
 
@@ -5349,6 +5359,7 @@ pub(crate) mod config_reload_tests {
         ));
         let integration = crate::modules::integration::SystemManager::Headless;
         let state = AppState {
+            listener_base_url: "http://127.0.0.1:8045".into(),
             token_manager: Arc::new(TokenManager::new(account::get_data_dir().unwrap())),
             custom_mapping: Arc::new(RwLock::new(Default::default())),
             request_timeout: 60,
@@ -5640,6 +5651,17 @@ mod image_scheduler_tests {
         let listener2 = super::bind_tcp_listener("127.0.0.1", port)
             .expect("immediate re-bind must succeed with SO_REUSEADDR");
         drop(listener2);
+    }
+
+    #[tokio::test]
+    async fn test_bind_tcp_listener_preserves_exact_loopback_family() {
+        for host in ["127.0.0.1", "::1"] {
+            let listener = super::bind_tcp_listener(host, 0).unwrap();
+            assert_eq!(
+                listener.local_addr().unwrap().ip(),
+                host.parse::<std::net::IpAddr>().unwrap()
+            );
+        }
     }
 
     #[tokio::test]

@@ -1127,6 +1127,10 @@ pub struct ProxyConfig {
     #[serde(default)]
     pub allow_lan_access: bool,
 
+    /// Exact listener IP. When absent, the LAN toggle selects the legacy default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bind_address: Option<String>,
+
     /// Authorization policy for the proxy.
     /// - off: no auth required
     /// - strict: auth required for all routes
@@ -1406,6 +1410,7 @@ impl Default for ProxyConfig {
         Self {
             enabled: false,
             allow_lan_access: false, // 默认仅本机访问，隐私优先
+            bind_address: None,
             auth_mode: ProxyAuthMode::default(),
             port: 8045,
             api_key: format!("sk-{}", uuid::Uuid::new_v4().simple()),
@@ -1449,15 +1454,85 @@ fn default_request_timeout() -> u64 {
 }
 
 impl ProxyConfig {
-    /// 获取实际的监听地址
-    /// - allow_lan_access = false: 返回 "127.0.0.1"（默认，隐私优先）
-    /// - allow_lan_access = true: 返回 "0.0.0.0"（通配监听：底层自动启用 IPv6/IPv4 双栈监听，允许局域网与外部公网 IPv4/IPv6 访问）
+    /// Exact configured IP takes precedence over the legacy LAN toggle.
+    /// Wildcards retain the existing IPv4/IPv6 dual-stack listener behavior.
     pub fn get_bind_address(&self) -> &str {
-        if self.allow_lan_access {
+        if let Some(address) = self.bind_address.as_deref() {
+            address
+        } else if self.allow_lan_access {
             "0.0.0.0"
         } else {
             "127.0.0.1"
         }
+    }
+
+    /// Validate before persistence or listener side effects. Never widen an exact IP.
+    pub fn normalize_bind_address(&mut self) -> Result<(), String> {
+        let Some(address) = self.bind_address.as_deref() else {
+            return Ok(());
+        };
+        let address = address.trim();
+        if address.is_empty() {
+            self.bind_address = None;
+            return Ok(());
+        }
+        let address = if address.eq_ignore_ascii_case("localhost") {
+            "127.0.0.1"
+        } else {
+            address
+                .strip_prefix('[')
+                .and_then(|value| value.strip_suffix(']'))
+                .unwrap_or(address)
+        };
+        let ip: std::net::IpAddr = address.parse().map_err(|_| {
+            "Invalid bind address: use an IPv4/IPv6 address or localhost".to_string()
+        })?;
+        self.bind_address = Some(ip.to_string());
+        self.allow_lan_access = !ip.is_loopback();
+        Ok(())
+    }
+
+    /// Explicit CLI > explicit environment > local-only environment > saved IP.
+    /// Preserve the historical wildcard default for headless installs without an IP.
+    pub fn apply_headless_bind_overrides(
+        &mut self,
+        cli_host: Option<&str>,
+        env_host: Option<&str>,
+        local_only: bool,
+    ) -> Result<(), String> {
+        if let Some(host) = cli_host.or(env_host) {
+            if host.trim().is_empty() {
+                return Err("The headless bind address cannot be empty".to_string());
+            }
+            self.bind_address = Some(host.to_string());
+        } else if local_only {
+            self.bind_address = Some("127.0.0.1".to_string());
+        } else if self.bind_address.is_none() {
+            self.allow_lan_access = true;
+        }
+        self.normalize_bind_address()
+    }
+
+    pub fn is_network_exposed(&self) -> bool {
+        self.get_bind_address()
+            .parse::<std::net::IpAddr>()
+            .map(|address| !address.is_loopback())
+            // Invalid/unvalidated configuration must not disable automatic auth.
+            .unwrap_or(true)
+    }
+
+    pub fn local_base_url(&self) -> String {
+        Self::base_url_for_bind(self.get_bind_address(), self.port)
+    }
+
+    pub fn base_url_for_bind(host: &str, port: u16) -> String {
+        let host = match host.parse::<std::net::IpAddr>() {
+            Ok(address) if address.is_unspecified() => "127.0.0.1".to_string(),
+            Ok(std::net::IpAddr::V6(address)) => format!("[{address}]"),
+            Ok(address) => address.to_string(),
+            _ => "127.0.0.1".to_string(),
+        };
+        format!("http://{host}:{port}")
     }
 }
 
@@ -1536,6 +1611,81 @@ pub enum ProxySelectionStrategy {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn exact_bind_addresses_are_preserved_and_validate_before_use() {
+        let mut config = ProxyConfig::default();
+        for (input, expected, exposed) in [
+            ("::1", "::1", false),
+            (" [::1] ", "::1", false),
+            ("localhost", "127.0.0.1", false),
+            ("127.0.0.2", "127.0.0.2", false),
+            ("192.168.1.10", "192.168.1.10", true),
+            ("0.0.0.0", "0.0.0.0", true),
+            ("::", "::", true),
+        ] {
+            config.bind_address = Some(input.into());
+            config.normalize_bind_address().unwrap();
+            assert_eq!(config.get_bind_address(), expected);
+            assert_eq!(config.allow_lan_access, exposed);
+            assert_eq!(config.is_network_exposed(), exposed);
+        }
+        for input in [
+            "invalid-host",
+            "127.0.0.1:8045",
+            "http://127.0.0.1",
+            "[::1",
+            "::1]",
+        ] {
+            config.bind_address = Some(input.into());
+            assert!(config.normalize_bind_address().is_err(), "{input}");
+        }
+        config.bind_address = Some("  ".into());
+        config.allow_lan_access = false;
+        config.normalize_bind_address().unwrap();
+        assert_eq!(config.get_bind_address(), "127.0.0.1");
+        assert!(config.bind_address.is_none());
+    }
+
+    #[test]
+    fn headless_bind_precedence_and_saved_exact_ip_are_stable() {
+        let mut config = ProxyConfig::default();
+        config
+            .apply_headless_bind_overrides(None, None, false)
+            .unwrap();
+        assert_eq!(config.get_bind_address(), "0.0.0.0");
+        config
+            .apply_headless_bind_overrides(Some("::1"), Some("0.0.0.0"), true)
+            .unwrap();
+        assert_eq!(config.get_bind_address(), "::1");
+        config
+            .apply_headless_bind_overrides(None, None, false)
+            .unwrap();
+        assert_eq!(config.get_bind_address(), "::1");
+        config
+            .apply_headless_bind_overrides(None, Some("192.168.1.10"), true)
+            .unwrap();
+        assert_eq!(config.get_bind_address(), "192.168.1.10");
+        config
+            .apply_headless_bind_overrides(None, None, true)
+            .unwrap();
+        assert_eq!(config.get_bind_address(), "127.0.0.1");
+        assert!(config
+            .apply_headless_bind_overrides(Some(""), None, false)
+            .is_err());
+    }
+
+    #[test]
+    fn listener_urls_follow_exact_ip_and_bracket_ipv6() {
+        for (host, expected) in [
+            ("::1", "http://[::1]:8045"),
+            ("192.168.1.10", "http://192.168.1.10:8045"),
+            ("0.0.0.0", "http://127.0.0.1:8045"),
+            ("::", "http://127.0.0.1:8045"),
+        ] {
+            assert_eq!(ProxyConfig::base_url_for_bind(host, 8045), expected);
+        }
+    }
 
     #[test]
     fn test_normalize_proxy_url() {

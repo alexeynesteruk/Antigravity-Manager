@@ -101,11 +101,12 @@ impl Drop for StartingGuard {
 
 /// 内部启动反代服务逻辑 (解耦版本)
 pub async fn internal_start_proxy_service(
-    config: ProxyConfig,
+    mut config: ProxyConfig,
     state: &ProxyServiceState,
     integration: crate::modules::integration::SystemManager,
     cloudflared_state: Arc<crate::commands::cloudflared::CloudflaredState>,
 ) -> Result<ProxyStatus, String> {
+    config.normalize_bind_address()?;
     // 1. 检查状态并加锁
     {
         let instance_lock = state.instance.read().await;
@@ -191,24 +192,26 @@ pub async fn internal_start_proxy_service(
 
     // 3. 加載賬號
     let active_accounts = token_manager.load_accounts().await.unwrap_or(0);
+    let axum_server = state
+        .admin_server
+        .read()
+        .await
+        .as_ref()
+        .expect("admin server must exist after ensure_admin_server")
+        .axum_server
+        .clone();
 
     if active_accounts == 0 {
         tracing::warn!("沒有可用賬號，反代邏輯將暫停，請通過管理界面添加。");
         return Ok(ProxyStatus {
             running: false,
-            port: config.port,
-            base_url: format!("http://127.0.0.1:{}", config.port),
+            port: axum_server.port,
+            base_url: axum_server.base_url.clone(),
             active_accounts: 0,
         });
     }
 
     let mut instance_lock = state.instance.write().await;
-    let admin_lock = state.admin_server.read().await;
-    let axum_server = admin_lock
-        .as_ref()
-        .expect("admin server must exist after ensure_admin_server")
-        .axum_server
-        .clone();
 
     // 创建服务实例（逻辑启动）。不再保存假的 server_handle：
     // 监听任务的真实句柄已由 AdminServerInstance 持有（见 ensure_admin_server）。
@@ -227,19 +230,20 @@ pub async fn internal_start_proxy_service(
     // 但其实我们可以直接手动掉，或者相信 guard
     Ok(ProxyStatus {
         running: true,
-        port: config.port,
-        base_url: format!("http://127.0.0.1:{}", config.port),
+        port: axum_server.port,
+        base_url: axum_server.base_url.clone(),
         active_accounts,
     })
 }
 
 /// 确保管理服务器正在运行
 pub async fn ensure_admin_server(
-    config: ProxyConfig,
+    mut config: ProxyConfig,
     state: &ProxyServiceState,
     integration: crate::modules::integration::SystemManager,
     cloudflared_state: Arc<crate::commands::cloudflared::CloudflaredState>,
 ) -> Result<(), String> {
+    config.normalize_bind_address()?;
     let mut admin_lock = state.admin_server.write().await;
     if admin_lock.is_some() {
         return Ok(());
@@ -376,8 +380,8 @@ pub async fn get_proxy_status(state: State<'_, ProxyServiceState>) -> Result<Pro
         Ok(instance_lock) => match instance_lock.as_ref() {
             Some(instance) => Ok(ProxyStatus {
                 running: true,
-                port: instance.config.port,
-                base_url: format!("http://127.0.0.1:{}", instance.config.port),
+                port: instance.axum_server.port,
+                base_url: instance.axum_server.base_url.clone(),
                 active_accounts: instance.token_manager.len(),
             }),
             None => Ok(ProxyStatus {
@@ -872,14 +876,16 @@ pub async fn test_model_connectivity(
     model: String,
     target_account_id: Option<String>,
 ) -> Result<crate::proxy::handlers::warmup::WarmupResponse, String> {
-    let port = {
+    let base_url = {
         let instance_guard = state.instance.read().await;
         if let Some(ref inst) = *instance_guard {
-            inst.config.port
+            inst.axum_server.base_url.clone()
         } else {
             return Err("反代服务未运行，请先在代理页面启动反代服务".to_string());
         }
     };
+
+    let warmup_url = crate::proxy::middleware::internal::warmup_url(&base_url)?;
 
     let accounts = crate::modules::account::list_accounts().unwrap_or_default();
 
@@ -904,7 +910,6 @@ pub async fn test_model_connectivity(
         (probe.account, probe.access_token, probe.project_id)
     };
 
-    let warmup_url = format!("http://127.0.0.1:{}/internal/warmup", port);
     let body = serde_json::json!({
         "email": chosen_account.email,
         "model": model,

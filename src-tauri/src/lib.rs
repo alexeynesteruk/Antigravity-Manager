@@ -143,6 +143,10 @@ pub async fn run_headless_server(
     // Initialize logger
     logger::init_logger();
 
+    // Fail before database startup or override persistence if the saved config is invalid.
+    let mut config = modules::config::load_app_config()
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+
     // Initialize databases
     if let Err(e) = modules::token_stats::init_db() {
         error!("Failed to initialize token stats database: {}", e);
@@ -160,7 +164,6 @@ pub async fn run_headless_server(
     let cf_state = Arc::new(commands::cloudflared::CloudflaredState::new());
 
     // Load config
-    let mut config = modules::config::load_app_config().unwrap_or_default();
     let mut modified = false;
 
     if let Some(port) = port_override {
@@ -168,26 +171,27 @@ pub async fn run_headless_server(
         modified = true;
     }
 
-    if let Some(host) = host_override {
-        if host == "127.0.0.1" || host == "localhost" {
-            config.proxy.allow_lan_access = false;
-        } else {
-            config.proxy.allow_lan_access = true;
-        }
-        modified = true;
-    } else {
-        // Headless/docker 默认允许 LAN 访问（绑定 0.0.0.0）
-        // 若设置 ABV_BIND_LOCAL_ONLY，则仅绑定 127.0.0.1
-        let bind_local_only = std::env::var("ABV_BIND_LOCAL_ONLY")
-            .map(|v| matches!(v.to_lowercase().as_str(), "1" | "true" | "yes" | "on"))
-            .unwrap_or(false);
-        if bind_local_only {
-            config.proxy.allow_lan_access = false;
-            modified = true;
-        } else {
-            config.proxy.allow_lan_access = true;
-        }
-    }
+    let env_host = std::env::var("ABV_BIND_ADDRESS").ok();
+    let bind_local_only = std::env::var("ABV_BIND_LOCAL_ONLY")
+        .map(|value| matches!(value.to_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+        .unwrap_or(false);
+    let previous_bind = (
+        config.proxy.bind_address.clone(),
+        config.proxy.allow_lan_access,
+    );
+    config
+        .proxy
+        .apply_headless_bind_overrides(
+            host_override.as_deref(),
+            env_host.as_deref(),
+            bind_local_only,
+        )
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))?;
+    modified |= previous_bind
+        != (
+            config.proxy.bind_address.clone(),
+            config.proxy.allow_lan_access,
+        );
 
     // Force auth mode to AllExceptHealth in headless mode if it's Off or Auto
     if matches!(
@@ -265,14 +269,11 @@ pub async fn run_headless_server(
             info!("🔐 Web UI Password: (Same as API Key)");
         }
         info!(
-            "💡 Tips: Access Web UI at http://127.0.0.1:{}",
-            config.proxy.port
+            "💡 Tips: Access Web UI at {}",
+            config.proxy.local_base_url()
         );
     }
-    info!(
-        "🤖 API Endpoints: http://127.0.0.1:{}/v1",
-        config.proxy.port
-    );
+    info!("🤖 API Endpoints: {}/v1", config.proxy.local_base_url());
     info!("--------------------------------------------------");
 
     if modified {
@@ -287,11 +288,13 @@ pub async fn run_headless_server(
         config.proxy.hub_version.as_deref(),
         config.proxy.hub_cl.as_deref(),
     );
-    tokio::spawn(crate::modules::hub_version::refresh_hub_fingerprint_if_unchanged(
-        startup_fingerprint,
-        config.proxy.hub_version.clone(),
-        config.proxy.hub_cl.clone(),
-    ));
+    tokio::spawn(
+        crate::modules::hub_version::refresh_hub_fingerprint_if_unchanged(
+            startup_fingerprint,
+            config.proxy.hub_version.clone(),
+            config.proxy.hub_cl.clone(),
+        ),
+    );
 
     // Start proxy service
     if let Err(e) = commands::proxy::internal_start_proxy_service(

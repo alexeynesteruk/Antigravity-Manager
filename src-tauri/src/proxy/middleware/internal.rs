@@ -19,6 +19,30 @@ pub(crate) fn internal_request_credential() -> &'static str {
     INTERNAL_REQUEST_CREDENTIAL.as_str()
 }
 
+/// Validate the destination before attaching process credentials or account tokens.
+/// Internal routes accept direct loopback peers, so a specific LAN listener
+/// cannot serve these calls and must fail before making a network request.
+pub(crate) fn warmup_url(base_url: &str) -> Result<String, String> {
+    let origin = url::Url::parse(base_url).map_err(|_| "Invalid local proxy origin".to_string())?;
+    let loopback = match origin.host() {
+        Some(url::Host::Ipv4(address)) => address.is_loopback(),
+        Some(url::Host::Ipv6(address)) => {
+            address.is_loopback()
+                || address
+                    .to_ipv4_mapped()
+                    .is_some_and(|address| address.is_loopback())
+        }
+        _ => false,
+    };
+    if origin.scheme() != "http" || !loopback {
+        return Err("Internal warmup requires a loopback or wildcard listener; restart with a compatible bind address".into());
+    }
+    Ok(format!(
+        "{}/internal/warmup",
+        base_url.trim_end_matches('/')
+    ))
+}
+
 #[derive(Clone)]
 struct ValidatedInternalRequest;
 
@@ -76,6 +100,24 @@ mod tests {
     };
     use std::net::SocketAddr;
     use tower::ServiceExt;
+
+    #[test]
+    fn warmup_destinations_are_validated_before_credentials_are_attached() {
+        for origin in ["http://127.0.0.1:8045", "http://[::1]:8045"] {
+            assert_eq!(
+                warmup_url(origin).unwrap(),
+                format!("{origin}/internal/warmup")
+            );
+        }
+        for origin in [
+            "http://192.168.1.10:8045",
+            "http://203.0.113.10:8045",
+            "http://example.com",
+            "not-a-url",
+        ] {
+            assert!(warmup_url(origin).is_err(), "{origin}");
+        }
+    }
 
     fn app() -> Router {
         Router::new()

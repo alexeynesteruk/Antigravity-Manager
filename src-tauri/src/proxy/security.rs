@@ -16,10 +16,17 @@ impl ProxySecurityConfig {
             auth_mode: config.auth_mode.clone(),
             api_key: config.api_key.clone(),
             admin_password: config.admin_password.clone(),
-            allow_lan_access: config.allow_lan_access,
+            allow_lan_access: config.is_network_exposed(),
             port: config.port,
             security_monitor: config.security_monitor.clone(),
         }
+    }
+
+    /// Config edits do not rebind the live listener; retain its exposure until restart.
+    pub fn update_from_proxy_config(&mut self, config: &ProxyConfig) {
+        let listener_exposed = self.allow_lan_access;
+        *self = Self::from_proxy_config(config);
+        self.allow_lan_access = listener_exposed;
     }
 
     pub fn effective_auth_mode(&self) -> ProxyAuthMode {
@@ -49,6 +56,29 @@ impl ProxySecurityConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn automatic_auth_uses_actual_address_and_survives_pending_rebind() {
+        let mut config = ProxyConfig::default();
+        config.auth_mode = ProxyAuthMode::Auto;
+        config.bind_address = Some("192.168.1.10".into());
+        let mut security = ProxySecurityConfig::from_proxy_config(&config);
+        assert!(matches!(
+            security.effective_auth_mode_with_tunnel(false),
+            ProxyAuthMode::AllExceptHealth
+        ));
+        config.bind_address = Some("::1".into());
+        security.update_from_proxy_config(&config);
+        assert!(matches!(
+            security.effective_auth_mode_with_tunnel(false),
+            ProxyAuthMode::AllExceptHealth
+        ));
+        let restarted = ProxySecurityConfig::from_proxy_config(&config);
+        assert!(matches!(
+            restarted.effective_auth_mode_with_tunnel(false),
+            ProxyAuthMode::Off
+        ));
+    }
 
     #[test]
     fn active_public_tunnels_require_auth_without_rewriting_the_preference() {

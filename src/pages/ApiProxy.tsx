@@ -1015,7 +1015,7 @@ export default function ApiProxy() {
                 ...updates
             }
         };
-        saveConfig(newConfig);
+        return saveConfig(newConfig);
     };
 
     const updateSchedulingConfig = (updates: Partial<StickySessionConfig>) => {
@@ -1198,9 +1198,8 @@ export default function ApiProxy() {
 
 
     const getPythonExample = (modelId: string) => {
-        const port = status.running ? status.port : (appConfig?.proxy.port || 8045);
-        // 推荐使用 127.0.0.1 以避免部分环境 IPv6 解析延迟问题
-        const baseUrl = `http://127.0.0.1:${port}/v1`;
+        const rawBaseUrl = getProxyBaseUrl();
+        const baseUrl = `${rawBaseUrl}/v1`;
         const apiKey = appConfig?.proxy.api_key || 'YOUR_API_KEY';
 
         // 1. Anthropic Protocol
@@ -1208,8 +1207,7 @@ export default function ApiProxy() {
             return `from anthropic import Anthropic
 
 client = Anthropic(
-    # Recommended: use 127.0.0.1
-    base_url="${`http://127.0.0.1:${port}`}",
+    base_url="${rawBaseUrl}",
     api_key="${apiKey}"
 )
 
@@ -1225,11 +1223,10 @@ print(response.content[0].text)`;
 
         // 2. Gemini Protocol (Native)
         if (selectedProtocol === 'gemini') {
-            const rawBaseUrl = `http://127.0.0.1:${port}`;
             return `# Requires: pip install google-generativeai
 import google.generativeai as genai
 
-# Use the Antigravity proxy address (recommended: 127.0.0.1)
+# Use the configured Antigravity proxy address
 genai.configure(
     api_key="${apiKey}",
     transport='rest',
@@ -1307,8 +1304,16 @@ print(response.choices[0].message.content)`;
         return true;
     });
 
+    const getProxyBaseUrl = () => {
+        if (status.base_url.startsWith('http')) return status.base_url;
+        const address = appConfig?.proxy.bind_address?.trim();
+        const host = !address || address === '0.0.0.0' || address === '::'
+            ? '127.0.0.1' : address.includes(':') && !address.startsWith('[') ? `[${address}]` : address;
+        return `http://${host}:${appConfig?.proxy.port || 8045}`;
+    };
+
     const getProbeBaseUrl = () => isTauri()
-        ? (status.running ? status.base_url : `http://127.0.0.1:${appConfig?.proxy.port || 8045}`)
+        ? getProxyBaseUrl()
         : window.location.origin;
 
     const renderModelRouterSection = () => {
@@ -1645,7 +1650,7 @@ print(response.choices[0].message.content)`;
                                 <span className="text-xs font-bold text-blue-600">{t('proxy.multi_protocol.openai_label')}</span>
                                 <button onClick={(e) => {
                                     e.stopPropagation();
-                                    const baseUrl = status.running ? status.base_url : `http://127.0.0.1:${appConfig.proxy.port || 8045}`;
+                                    const baseUrl = getProxyBaseUrl();
                                     copyToClipboardHandler(`${baseUrl}/v1`, 'openai');
                                 }} className="btn btn-ghost btn-xs">
                                     {copied === 'openai' ? <CheckCircle size={14} /> : <div className="flex items-center gap-1 text-[10px] uppercase font-bold tracking-tighter"><Copy size={12} /> {t('proxy.multi_protocol.copy_base', { defaultValue: 'Base' })}</div>}
@@ -1656,7 +1661,7 @@ print(response.choices[0].message.content)`;
                                     <code className="text-[10px] opacity-70">/v1/chat/completions</code>
                                     <button onClick={(e) => {
                                         e.stopPropagation();
-                                        const baseUrl = status.running ? status.base_url : `http://127.0.0.1:${appConfig.proxy.port || 8045}`;
+                                        const baseUrl = getProxyBaseUrl();
                                         copyToClipboardHandler(`${baseUrl}/v1/chat/completions`, 'openai-chat');
                                     }} className="opacity-0 group-hover:opacity-100 transition-opacity">
                                         {copied === 'openai-chat' ? <CheckCircle size={10} className="text-green-500" /> : <Copy size={10} />}
@@ -1666,7 +1671,7 @@ print(response.choices[0].message.content)`;
                                     <code className="text-[10px] opacity-70">/v1/completions</code>
                                     <button onClick={(e) => {
                                         e.stopPropagation();
-                                        const baseUrl = status.running ? status.base_url : `http://127.0.0.1:${appConfig.proxy.port || 8045}`;
+                                        const baseUrl = getProxyBaseUrl();
                                         copyToClipboardHandler(`${baseUrl}/v1/completions`, 'openai-compl');
                                     }} className="opacity-0 group-hover:opacity-100 transition-opacity">
                                         {copied === 'openai-compl' ? <CheckCircle size={10} className="text-green-500" /> : <Copy size={10} />}
@@ -1676,7 +1681,7 @@ print(response.choices[0].message.content)`;
                                     <code className="text-[10px] opacity-70 font-bold text-blue-500">/v1/responses (Codex)</code>
                                     <button onClick={(e) => {
                                         e.stopPropagation();
-                                        const baseUrl = status.running ? status.base_url : `http://127.0.0.1:${appConfig.proxy.port || 8045}`;
+                                        const baseUrl = getProxyBaseUrl();
                                         copyToClipboardHandler(`${baseUrl}/v1/responses`, 'openai-resp');
                                     }} className="opacity-0 group-hover:opacity-100 transition-opacity">
                                         {copied === 'openai-resp' ? <CheckCircle size={10} className="text-green-500" /> : <Copy size={10} />}
@@ -1694,7 +1699,7 @@ print(response.choices[0].message.content)`;
                                 <span className="text-xs font-bold text-purple-600">{t('proxy.multi_protocol.anthropic_label')}</span>
                                 <button onClick={(e) => {
                                     e.stopPropagation();
-                                    const baseUrl = status.running ? status.base_url : `http://127.0.0.1:${appConfig.proxy.port || 8045}`;
+                                    const baseUrl = getProxyBaseUrl();
                                     copyToClipboardHandler(`${baseUrl}/v1/messages`, 'anthropic');
                                 }} className="btn btn-ghost btn-xs">
                                     {copied === 'anthropic' ? <CheckCircle size={14} /> : <Copy size={14} />}
@@ -1712,7 +1717,7 @@ print(response.choices[0].message.content)`;
                                 <span className="text-xs font-bold text-green-600">{t('proxy.multi_protocol.gemini_label')}</span>
                                 <button onClick={(e) => {
                                     e.stopPropagation();
-                                    const baseUrl = status.running ? status.base_url : `http://127.0.0.1:${appConfig.proxy.port || 8045}`;
+                                    const baseUrl = getProxyBaseUrl();
                                     copyToClipboardHandler(`${baseUrl}/v1beta/models`, 'gemini');
                                 }} className="btn btn-ghost btn-xs">
                                     {copied === 'gemini' ? <CheckCircle size={14} /> : <Copy size={14} />}
@@ -2144,8 +2149,8 @@ print(response.choices[0].message.content)`;
                                             </span>
                                         </div>
                                         {status.running && (
-                                            <span className="text-[10px] font-mono text-gray-400 dark:text-gray-500 truncate max-w-[130px]" title={status.base_url || `http://127.0.0.1:${appConfig.proxy.port || 8045}`}>
-                                                {status.base_url || `http://127.0.0.1:${appConfig.proxy.port || 8045}`}
+                                            <span className="text-[10px] font-mono text-gray-400 dark:text-gray-500 truncate max-w-[130px]" title={getProxyBaseUrl()}>
+                                                {getProxyBaseUrl()}
                                             </span>
                                         )}
                                     </div>
@@ -2217,14 +2222,38 @@ print(response.choices[0].message.content)`;
                                                 type="checkbox"
                                                 className="toggle toggle-sm bg-gray-200 dark:bg-base-300 border-gray-300 dark:border-base-300 checked:bg-blue-600 checked:border-blue-600"
                                                 checked={appConfig.proxy.allow_lan_access || false}
-                                                onChange={(e) => updateProxyConfig({ allow_lan_access: e.target.checked })}
+                                                onChange={(e) => updateProxyConfig({ allow_lan_access: e.target.checked, bind_address: undefined })}
                                             />
                                         </div>
                                         <p className="text-xs text-gray-500 dark:text-gray-400">
-                                            {(appConfig.proxy.allow_lan_access || false)
+                                            {appConfig.proxy.bind_address
+                                                ? t('proxy.config.bind_address_active', { address: appConfig.proxy.bind_address })
+                                                : (appConfig.proxy.allow_lan_access || false)
                                                 ? t('proxy.config.allow_lan_access_hint_enabled')
                                                 : t('proxy.config.allow_lan_access_hint_disabled')}
                                         </p>
+                                        <label className="block text-xs text-gray-600 dark:text-gray-400">
+                                            {t('proxy.config.bind_address')}
+                                            <input
+                                                key={appConfig.proxy.bind_address || 'default-bind'}
+                                                type="text"
+                                                defaultValue={appConfig.proxy.bind_address || ''}
+                                                placeholder="127.0.0.1 / ::1 / 192.168.1.10"
+                                                className="input input-bordered input-sm w-full mt-1 font-mono"
+                                                onBlur={async (event) => {
+                                                    const address = event.target.value.trim();
+                                                    if (address !== (appConfig.proxy.bind_address || '')) {
+                                                        await updateProxyConfig({ bind_address: address || undefined });
+                                                        // Reload normalization, or restore the saved value after validation fails.
+                                                        await useConfigStore.getState().loadConfig();
+                                                    }
+                                                }}
+                                                onKeyDown={(event) => {
+                                                    if (event.key === 'Enter') event.currentTarget.blur();
+                                                }}
+                                            />
+                                        </label>
+                                        <p className="text-xs text-gray-500 dark:text-gray-400">{t('proxy.config.bind_address_hint')}</p>
                                         {(appConfig.proxy.allow_lan_access || false) && (
                                             <p className="text-xs text-amber-600 dark:text-amber-400 font-medium">
                                                 {t('proxy.config.allow_lan_access_warning')}
@@ -2775,7 +2804,7 @@ print(response.choices[0].message.content)`;
                             <div className="p-4">
                                 <div className="bg-gray-50/60 dark:bg-base-200/50 rounded-xl p-3 border border-gray-200/60 dark:border-base-300">
                                     <CliSyncCard
-                                        proxyUrl={status.running ? status.base_url : `http://127.0.0.1:${appConfig.proxy.port || 8045}`}
+                                        proxyUrl={getProxyBaseUrl()}
                                         apiKey={appConfig.proxy.api_key}
                                     />
                                 </div>

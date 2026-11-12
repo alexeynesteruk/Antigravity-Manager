@@ -218,26 +218,9 @@ fn truncate_str(s: &str, max_len: usize) -> String {
     }
 }
 
-fn read_proxy_port_and_key() -> (u16, Option<String>) {
-    if let Ok(data_dir) = account::get_data_dir() {
-        let cfg_path = data_dir.join("gui_config.json");
-        if let Ok(content) = std::fs::read_to_string(cfg_path) {
-            if let Ok(val) = serde_json::from_str::<serde_json::Value>(&content) {
-                let p = val
-                    .get("proxy")
-                    .and_then(|p| p.get("port"))
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(8045) as u16;
-                let k = val
-                    .get("proxy")
-                    .and_then(|p| p.get("api_key"))
-                    .and_then(|v| v.as_str())
-                    .map(|s| s.to_string());
-                return (p, k);
-            }
-        }
-    }
-    (8045, None)
+fn read_proxy_endpoint_and_key() -> Result<(String, Option<String>), String> {
+    let config = crate::modules::config::load_app_config()?;
+    Ok((config.proxy.local_base_url(), Some(config.proxy.api_key)))
 }
 
 /// 一键同步 Agent 工具配置命令（CLI 与 Headless 环境）
@@ -259,9 +242,8 @@ async fn handle_sync_command(args: &[String]) -> Result<(), String> {
         i += 1;
     }
 
-    let (port, api_key_opt) = read_proxy_port_and_key();
+    let (proxy_url, api_key_opt) = read_proxy_endpoint_and_key()?;
     let api_key = api_key_opt.unwrap_or_default();
-    let proxy_url = format!("http://127.0.0.1:{}", port);
 
     println!(
         "\x1b[34m[Antigravity CLI]\x1b[0m 正在一键同步 Agent 工具配置 (目标: \x1b[1m{}\x1b[0m)...",
@@ -378,7 +360,9 @@ async fn handle_sync_command(args: &[String]) -> Result<(), String> {
 
 async fn try_switch_via_local_api(account_id: &str, target_ide: &str) -> bool {
     // 读取本地配置中的端口与密钥
-    let (port, api_key) = read_proxy_port_and_key();
+    let Ok((base_url, api_key)) = read_proxy_endpoint_and_key() else {
+        return false;
+    };
 
     let client = match reqwest::Client::builder()
         .timeout(std::time::Duration::from_millis(1500))
@@ -388,7 +372,7 @@ async fn try_switch_via_local_api(account_id: &str, target_ide: &str) -> bool {
         Err(_) => return false,
     };
 
-    let url = format!("http://127.0.0.1:{}/api/accounts/switch", port);
+    let url = format!("{}/api/accounts/switch", base_url);
     let mut req = client.post(&url).json(&serde_json::json!({
         "accountId": account_id,
         "targetIde": target_ide,

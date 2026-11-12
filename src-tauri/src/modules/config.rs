@@ -305,8 +305,14 @@ pub fn parse_and_migrate_config(content: &str) -> Result<(AppConfig, bool), Stri
         }
     }
 
-    let config: AppConfig = serde_json::from_value(v)
+    let mut config: AppConfig = serde_json::from_value(v)
         .map_err(|e| format!("failed_to_convert_config_after_migration: {}", e))?;
+
+    let old_address = config.proxy.bind_address.clone();
+    let old_lan = config.proxy.allow_lan_access;
+    config.proxy.normalize_bind_address()?;
+    modified |=
+        old_address != config.proxy.bind_address || old_lan != config.proxy.allow_lan_access;
 
     Ok((config, modified))
 }
@@ -320,10 +326,12 @@ pub fn save_app_config(config: &AppConfig) -> Result<(), String> {
 }
 
 fn save_app_config_locked(config: &AppConfig) -> Result<(), String> {
+    let mut config = config.clone();
+    config.proxy.normalize_bind_address()?;
     let data_dir = get_data_dir()?;
     let config_path = data_dir.join(CONFIG_FILE);
 
-    let content = serde_json::to_string_pretty(config)
+    let content = serde_json::to_string_pretty(&config)
         .map_err(|e| format!("failed_to_serialize_config: {}", e))?;
 
     crate::utils::fs::write_atomic(&config_path, content.as_bytes())
@@ -333,6 +341,28 @@ fn save_app_config_locked(config: &AppConfig) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn invalid_config_load_and_bind_save_preserve_existing_file() {
+        let _dir = crate::proxy::monitor::prompt_log_tests::TestDataDir::new();
+        let path = get_data_dir().unwrap().join(CONFIG_FILE);
+        let malformed = b"{ invalid original configuration";
+        fs::write(&path, malformed).unwrap();
+        assert!(load_app_config().is_err());
+        assert_eq!(fs::read(&path).unwrap(), malformed);
+
+        let mut config = AppConfig::default();
+        config.proxy.bind_address = Some("::1".into());
+        config.proxy.allow_lan_access = true;
+        save_app_config(&config).unwrap();
+        let loaded = load_app_config().unwrap();
+        assert_eq!(loaded.proxy.get_bind_address(), "::1");
+        assert!(!loaded.proxy.allow_lan_access);
+        let saved = fs::read(&path).unwrap();
+        config.proxy.bind_address = Some("invalid-host".into());
+        assert!(save_app_config(&config).is_err());
+        assert_eq!(fs::read(&path).unwrap(), saved);
+    }
 
     #[test]
     fn migration_reads_do_not_overwrite_concurrent_saves() {

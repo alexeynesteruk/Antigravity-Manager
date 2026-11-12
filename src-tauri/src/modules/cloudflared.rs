@@ -356,7 +356,10 @@ impl CloudflaredManager {
             return Err("Cloudflared not installed".to_string());
         }
 
-        let local_url = format!("http://localhost:{}", config.port);
+        let local_url = crate::proxy::config::ProxyConfig::base_url_for_bind(
+            app_config.proxy.get_bind_address(),
+            config.port,
+        );
         info!("[cloudflared] Starting tunnel to: {}", local_url);
 
         let bin_path = self.current_bin_path();
