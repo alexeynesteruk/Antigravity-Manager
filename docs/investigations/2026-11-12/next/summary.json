@@ -1,0 +1,73 @@
+{
+  "exported_at_utc": "2026-11-12T23:36:48.370310+00:00",
+  "local_head": "abbb4da87c751f2797a5940317f6cb889837e0b4",
+  "includes_uncommitted_changes": true,
+  "source_snapshot": {
+    "files": 386,
+    "sha256_of_path_and_sha256_pairs": "4e2cdb283a11ccef8d9657348fa373b7f0d365db3fc8d4681346eee3b0af7b5e",
+    "byte_scope": "Raw working-tree bytes at review time, before Git newline normalization"
+  },
+  "forks": {
+    "listed": 3576,
+    "readable": 3475,
+    "unavailable": 101,
+    "unavailable_errors": {
+      "NOT_FOUND": 101
+    },
+    "distinct_default_heads": 451,
+    "with_prs": 80
+  },
+  "prs": {
+    "all": 1853,
+    "parent": 590,
+    "parent_open": 8,
+    "forks": 1263,
+    "origin": 0,
+    "enumeration_errors": 0
+  },
+  "inventory": {
+    "forks.csv": {
+      "path": "../refresh/forks.csv",
+      "sha256": "31c7586195f291cb2e8c55e1a87aa729a089c7cdb8168fa8cb4262957c313c9e",
+      "identical_to_previous_export": true
+    },
+    "pull-requests.csv": {
+      "path": "../refresh/pull-requests.csv",
+      "sha256": "74b7b86280aa7320330ec78b8c9be7d5efe778762c905b2f6610499a75ab4a31",
+      "identical_to_previous_export": true
+    }
+  },
+  "source_and_runtime_changes": false,
+  "application_tests_or_builds": false,
+  "user_credentials_accessed": false,
+  "provider_calls": false,
+  "remote_mutations": false,
+  "coverage_limits": [
+    "Full readable metadata enumeration; selected patches inspected",
+    "All historical code and nondefault fork branches were not audited",
+    "101 unavailable forks could not be read"
+  ],
+  "reports": {
+    "review-next.md": {
+      "path": "../review-next.md",
+      "sha256": "021b95a7c3d49f6a2ca792986d2ca0fa0e69cd6668622882c4564b00cbbf4f17",
+      "bytes": 15155
+    },
+    "review-next-local.md": {
+      "path": "../review-next-local.md",
+      "sha256": "9a1f52333f6693a068d57541bb6a665c152a1a4ae8cafe2ccca777d041eaf22d",
+      "bytes": 11869
+    },
+    "review-next-upstream.md": {
+      "path": "../review-next-upstream.md",
+      "sha256": "9cf2c97a5ad736593d61ed2e05f19ce476ced3948294de13748bcd4b2d3b22de",
+      "bytes": 11859
+    },
+    "review-next-forks.md": {
+      "path": "../review-next-forks.md",
+      "sha256": "a03fd8e7f163cd85c27c76ed908ddf6500beb7c1ac1a6baefcb608ffd3205064",
+      "bytes": 12714
+    }
+  },
+  "artifact_hash_encoding": "Git-normalized LF bytes"
+}

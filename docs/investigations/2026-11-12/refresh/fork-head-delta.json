@@ -1,0 +1,72 @@
+[
+  {
+    "repository": "oneSeeker279/Antigravity-Manager",
+    "old_sha": null,
+    "new_sha": "9b82fb7ef51c42e9d1662a14bd5b718da0525cd8",
+    "subject": "Merge pull request #3878 from snailb1007/fix/merge-object-unions",
+    "pr_count": 0
+  },
+  {
+    "repository": "qianiqan2000/Antigravity-Manager",
+    "old_sha": null,
+    "new_sha": "9b82fb7ef51c42e9d1662a14bd5b718da0525cd8",
+    "subject": "Merge pull request #3878 from snailb1007/fix/merge-object-unions",
+    "pr_count": 0
+  },
+  {
+    "repository": "huiyull/Antigravity-Manager",
+    "old_sha": null,
+    "new_sha": "9b82fb7ef51c42e9d1662a14bd5b718da0525cd8",
+    "subject": "Merge pull request #3878 from snailb1007/fix/merge-object-unions",
+    "pr_count": 0
+  },
+  {
+    "repository": "Teee3047/Antigravity-Manager",
+    "old_sha": "a40054fa0de5cce76df15312160ee2a7a28421e2",
+    "new_sha": "f0e2b8677cbc4cf12099ed3a2b24a3c15084a96a",
+    "subject": "fix(proxy): System \u8f68\u4fdd\u7559\u8c03\u7528\u65b9\u7cfb\u7edf\u8eab\u4efd\uff0c\u505c\u6b62\u5b98\u65b9 Antigravity \u6539\u5199 (#4)",
+    "pr_count": 4
+  },
+  {
+    "repository": "FEI352/Antigravity-Manager-fork",
+    "old_sha": null,
+    "new_sha": "daaadf0547f3fda1aa1ce026d25c3a855793b1c6",
+    "subject": "ci: open an issue when the upstream sync fails",
+    "pr_count": 0
+  },
+  {
+    "repository": "alexeynesteruk/Antigravity-Manager",
+    "old_sha": "87fd5464e80e84b2f7e19b64fa4dba0f76afc902",
+    "new_sha": "abbb4da87c751f2797a5940317f6cb889837e0b4",
+    "subject": "docs(review): record fork analysis and Google visibility findings (Re\u2026",
+    "pr_count": 0
+  },
+  {
+    "repository": "tt-52101/Antigravity-Manager",
+    "old_sha": "2d5e02d7da688d65dde91ce1981bcd725a6ef275",
+    "new_sha": "9b82fb7ef51c42e9d1662a14bd5b718da0525cd8",
+    "subject": "Merge pull request #3878 from snailb1007/fix/merge-object-unions",
+    "pr_count": 0
+  },
+  {
+    "repository": "koeria/Antigravity-Manager",
+    "old_sha": "2d5e02d7da688d65dde91ce1981bcd725a6ef275",
+    "new_sha": "9b82fb7ef51c42e9d1662a14bd5b718da0525cd8",
+    "subject": "Merge pull request #3878 from snailb1007/fix/merge-object-unions",
+    "pr_count": 0
+  },
+  {
+    "repository": "Ahmed-Refaat/Antigravity-Manager",
+    "old_sha": "29bc03192eea07595d1487ab8f4069d91ec86723",
+    "new_sha": "f01f02619448fd890334fb5f383c70291cfa4643",
+    "subject": "\ud83d\udd04 Keep alive - 2026-11-12 19:14 UTC",
+    "pr_count": 0
+  },
+  {
+    "repository": "biaggii/Antigravity-Manager",
+    "old_sha": "4d980fc9a521fbeb3d4d9049550ca2705b2b876d",
+    "new_sha": "9b82fb7ef51c42e9d1662a14bd5b718da0525cd8",
+    "subject": "Merge pull request #3878 from snailb1007/fix/merge-object-unions",
+    "pr_count": 0
+  }
+]

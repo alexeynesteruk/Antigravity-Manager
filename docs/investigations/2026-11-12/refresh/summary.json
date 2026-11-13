@@ -1,0 +1,86 @@
+{
+  "exported_at_utc": "2026-11-12T22:47:08.863734+00:00",
+  "local_commit": "abbb4da87c751f2797a5940317f6cb889837e0b4",
+  "review_includes_uncommitted_changes": true,
+  "forks": {
+    "listed_unique": 3576,
+    "readable": 3475,
+    "unavailable": 101,
+    "error_types": {
+      "NOT_FOUND": 101
+    },
+    "distinct_default_heads": 451,
+    "ancestor_heads": 1622,
+    "nonancestor_heads": 1853,
+    "forks_with_prs": 80
+  },
+  "pull_requests": {
+    "all": {
+      "OPEN": 70,
+      "MERGED": 1564,
+      "CLOSED": 219,
+      "total": 1853
+    },
+    "parent": {
+      "CLOSED": 196,
+      "MERGED": 386,
+      "OPEN": 8,
+      "total": 590
+    },
+    "origin": {
+      "total": 0
+    },
+    "forks": {
+      "OPEN": 62,
+      "MERGED": 1178,
+      "CLOSED": 23,
+      "total": 1263
+    },
+    "enumeration_errors": 0
+  },
+  "coverage_limits": {
+    "all_readable_listed_fork_metadata_enumerated": true,
+    "all_pr_pages_for_repositories_with_prs_enumerated": true,
+    "every_fork_code_audited": false,
+    "all_nondefault_fork_branches_enumerated": false,
+    "private_or_unavailable_forks_audited": false,
+    "patches_reviewed_selectively": true
+  },
+  "actions": {
+    "source_changes": false,
+    "runtime_config_changes": false,
+    "credential_access": false,
+    "google_requests": false,
+    "merges": false,
+    "remote_comments": false,
+    "tests_or_builds": false
+  },
+  "artifact_hashes": {
+    "fork-head-delta.json": "9b1a516c65d2ec70dc205d8c44d96f3c10e36a7f55f32698b197b6614262231d",
+    "forks.csv": "31c7586195f291cb2e8c55e1a87aa729a089c7cdb8168fa8cb4262957c313c9e",
+    "npm-audit.json": "7665e171190c4d7cfe8fcf65f065d6533d9650ffadcf17f40a391c9f61846b1b",
+    "pr-delta.json": "1868d51aee7c253d457de222d56eae0b9bfdff4d312dd596798ce7ec008c91ec",
+    "pull-requests.csv": "74b7b86280aa7320330ec78b8c9be7d5efe778762c905b2f6610499a75ab4a31",
+    "rust-osv-details.json": "87dc8b08fe1d7c3da3a1764091a3ef1dcd6b526283700abdf44ba6906ca815b2",
+    "rust-osv.json": "7a8d551d5f9a821e60195d67c376955bfc667aa4a879bbd95dfb0a4426e8415b"
+  },
+  "review_reports": {
+    "review-refresh.md": {
+      "bytes": 13892,
+      "sha256": "a7fa7c685d163c0406c6dcc9c5cc5807064ee0f493cb8a2dbf7e3123c810f25f"
+    },
+    "review-refresh-local.md": {
+      "bytes": 9629,
+      "sha256": "ed5c7a8545a935798e402ed8ae5f3b56c1114716a862001b4b0556b9bc2cb19c"
+    },
+    "review-refresh-upstream.md": {
+      "bytes": 16269,
+      "sha256": "f5c8d60ca9f950697e36783769ac5c103dbd663fbefa26d38be4ba36332f8449"
+    },
+    "review-refresh-forks.md": {
+      "bytes": 16555,
+      "sha256": "49f7b3e019664ad372564a0752b6edaf2a851026627de3f347a4d43cf53a0b3d"
+    }
+  },
+  "artifact_hash_encoding": "Git-normalized LF bytes"
+}

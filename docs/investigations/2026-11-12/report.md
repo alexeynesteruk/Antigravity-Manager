@@ -70,7 +70,7 @@ Track transport liveness separately from complete-event generation progress in t
 
 **P2.** [account.rs](../../../src-tauri/src/modules/account.rs), lines 3356–3393, removes credential files and triggers runtime eviction before saving the changed index. File deletion errors are ignored. An index-write failure leaves references to removed credentials; locked Windows files can survive silently while deletion reports success.
 
-Apply the safer single-account ordering already present around line 3337: validate paths, persist membership changes first, then clean files with explicit partial-failure reporting and retry. Keep source recovery and managed-path protections. This is a residual batch-path defect, not evidence that the upstream orphan-account fix is entirely missing.
+Apply the safer single-account ordering already present around line 3337: validate paths, persist membership changes first, then clean files with explicit partial-failure reporting and the remaining credential IDs. Review current account membership and retained files before further cleanup: an intervening import or restore may reuse an ID, and another deletion targets the current account. Keep source recovery and managed-path protections. This is a residual batch-path defect, not evidence that the upstream orphan-account fix is entirely missing.
 
 ### Pedal mode restoration depends on one browser
 

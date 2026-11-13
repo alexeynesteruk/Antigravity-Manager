@@ -85,20 +85,21 @@
   "csv_formula_prefix_escaping": "Strings beginning with = + - @ after optional whitespace receive a leading apostrophe.",
   "artifacts": {
     "report.md": {
-      "bytes": 27186,
-      "sha256": "7551138c4806acd7b54afc5cfd0529970bae55bd0e9381a23f547dfcd830d7fa"
+      "bytes": 27386,
+      "sha256": "e8d7eb6a3547039bce3f3b862c620f3741035632b9c98a71df235275d9a67c05"
     },
     "google-proxy-observability.md": {
       "bytes": 9654,
       "sha256": "b32211bed5e71a3f78833d7e01672d6bdd0c3c54b0ec1c392cecad302cd104c1"
     },
     "forks.csv": {
-      "bytes": 917107,
-      "sha256": "9de49baf8caa218761e6d326313bd1a8617c3fcf58642f099446cf3a54c25f81"
+      "bytes": 913532,
+      "sha256": "00ef1fcc756d5e42a0d642202fe56bfbe8ff43256cb4bfa95118d9cd8de7e95e"
     },
     "pull-requests.csv": {
-      "bytes": 574195,
-      "sha256": "a9b1784b6aff0ed52a9b5012bc8044d6d13df52b5d73aa857919f0418f184ce5"
+      "bytes": 572346,
+      "sha256": "05d097d74b9ba458f8b3e5c113d8ac1e2ef5363f5e47d2ce21fa08a83dfcf82e"
     }
-  }
+  },
+  "artifact_hash_encoding": "Git-normalized LF bytes; refreshed during commit consolidation"
 }

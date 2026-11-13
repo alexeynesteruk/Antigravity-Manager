@@ -1,0 +1,74 @@
+[
+  {
+    "repository": "Teee3047/Antigravity-Manager",
+    "number": 4,
+    "title": "fix(proxy): System \u8f68\u4fdd\u7559\u8c03\u7528\u65b9\u7cfb\u7edf\u8eab\u4efd\uff0c\u505c\u6b62\u5b98\u65b9 Antigravity \u6539\u5199",
+    "state": "MERGED",
+    "url": "https://github.com/Teee3047/Antigravity-Manager/pull/4",
+    "head_sha": "6fa9af518245a0096010fa014af1e9e31d1c5355",
+    "kind": "new"
+  },
+  {
+    "repository": "lbjlaq/Antigravity-Manager",
+    "number": 3921,
+    "title": "fix(sanitizer): collapse malformed period-comma artifact from identity comma continuation",
+    "state": "OPEN",
+    "url": "https://github.com/lbjlaq/Antigravity-Manager/pull/3921",
+    "head_sha": "f2143689a5a35c8e449f1a82a5c5d22e266b00a4",
+    "kind": "new"
+  },
+  {
+    "repository": "lbjlaq/Antigravity-Manager",
+    "number": 3923,
+    "title": "fix(oauth): retry transient token-exchange failures and clarify network-only error (Ref #3920)",
+    "state": "OPEN",
+    "url": "https://github.com/lbjlaq/Antigravity-Manager/pull/3923",
+    "head_sha": "c0666dcff9a1395cdc91da126b4d1e3126da097b",
+    "kind": "new"
+  },
+  {
+    "repository": "lbjlaq/Antigravity-Manager",
+    "number": 3924,
+    "title": "fix(proxy): \u5168\u6c60 banned \u540e\u8fd4\u56de\u660e\u786e\u5c01\u7981\u8bca\u65ad\uff0c\u66ff\u4ee3\u8bef\u5bfc\u6027 429 \"Token pool is empty\" (Fixes #3919)",
+    "state": "OPEN",
+    "url": "https://github.com/lbjlaq/Antigravity-Manager/pull/3924",
+    "head_sha": "1ca1abcb3a88a1bc74f2ce0705f627a520a07395",
+    "kind": "new"
+  },
+  {
+    "repository": "lbjlaq/Antigravity-Manager",
+    "number": 3925,
+    "title": "fix(proxy): stop unconditionally hijacking </skills> tags in OpenAI mapping (Fixes #3914)",
+    "state": "OPEN",
+    "url": "https://github.com/lbjlaq/Antigravity-Manager/pull/3925",
+    "head_sha": "bfc6927b3432615bcb04eb4c3678aafc738cb599",
+    "kind": "new"
+  },
+  {
+    "repository": "lbjlaq/Antigravity-Manager",
+    "number": 3926,
+    "title": "fix(proxy): OpenAIChat \u6d41\u5f0f EOF \u5224\u7a7a\u524d\u4f18\u5148\u51b2\u5237\u5c3e\u90e8\u6b8b\u4f59\u7f13\u51b2\u533a\uff0c\u4fee\u590d\u65e0\u6362\u884c\u5c3e\u5e27\u88ab\u4e22\u5f03 (Fixes #3911)",
+    "state": "OPEN",
+    "url": "https://github.com/lbjlaq/Antigravity-Manager/pull/3926",
+    "head_sha": "b8862658bb1b3c89514b46b49e7cd1a8ccd3ec60",
+    "kind": "new"
+  },
+  {
+    "repository": "lbjlaq/Antigravity-Manager",
+    "number": 3927,
+    "title": "fix(catalog): add Gemini 4 Hydrogen across model catalog layers",
+    "state": "OPEN",
+    "url": "https://github.com/lbjlaq/Antigravity-Manager/pull/3927",
+    "head_sha": "59abba6178322d911fc58690795b8a22e6230306",
+    "kind": "new"
+  },
+  {
+    "repository": "lbjlaq/Antigravity-Manager",
+    "number": 3928,
+    "title": "fix(app,config): enable nofile limit raise on Linux and persist 32k thinking-budget migration flag",
+    "state": "OPEN",
+    "url": "https://github.com/lbjlaq/Antigravity-Manager/pull/3928",
+    "head_sha": "4d78c2fc867b96315a89aa3d2620e31796d7c549",
+    "kind": "new"
+  }
+]
